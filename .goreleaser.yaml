@@ -1,0 +1,62 @@
+version: 2
+
+project_name: clavesa
+
+builds:
+  - id: clavesa
+    main: ./cmd/clavesa
+    binary: clavesa
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: clavesa
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE*
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: vesahyp
+    name: clavesa
+  prerelease: auto
+  footer: |
+    Full changes: [CHANGELOG.md](https://github.com/vesahyp/clavesa/blob/main/CHANGELOG.md)
+
+    macOS direct downloads are unsigned — `brew install vesahyp/clavesa/clavesa` is the recommended path on macOS.
+
+brews:
+  - name: clavesa
+    repository:
+      owner: vesahyp
+      name: homebrew-clavesa
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: clavesa-release-bot
+      email: noreply@clavesa.dev
+    homepage: https://github.com/vesahyp/clavesa
+    description: "Visual ETL tool where pipelines are Terraform"
+    license: MIT
+    directory: Formula
+    test: |
+      system "#{bin}/clavesa", "version"
+    install: |
+      bin.install "clavesa"

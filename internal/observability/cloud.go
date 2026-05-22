@@ -708,9 +708,15 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	if err != nil {
 		return nil, fmt.Errorf("get history: %w", err)
 	}
+	startedAt := ""
+	if desc.StartDate != nil {
+		startedAt = desc.StartDate.UTC().Format("2006-01-02T15:04:05.000Z")
+	}
 	return &ExecutionStatesResult{
-		Status: string(desc.Status),
-		States: StateStatusesFromHistory(hist.Events),
+		Status:    string(desc.Status),
+		States:    StateStatusesFromHistory(hist.Events),
+		RunID:     q.ExecutionRef,
+		StartedAt: startedAt,
 	}, nil
 }
 

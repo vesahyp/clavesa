@@ -55,16 +55,34 @@ const nodeTypes = {
 // Layout helper
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-node height used by both dagre (rank/node separation) and React Flow
+ * (rendered card height). When a node has a column profile, the card grows
+ * to fit up to 5 rows plus a "+N more" footer — dagre needs the real height
+ * or downstream nodes pile up on top of each other (#layout-overlap).
+ */
+function nodeHeightFor(nodeId: string, nodeSchemas?: Map<string, Column[]>): number {
+  const columns = nodeSchemas?.get(nodeId);
+  const displayCount = columns ? Math.min(columns.length, 5) : 0;
+  const hasMore = columns && columns.length > 5;
+  if (displayCount === 0) return NODE_HEIGHT;
+  return 80 + displayCount * 18 + (hasMore ? 16 : 0);
+}
+
 function computeLayout(
   nodes: PipelineGraphType["nodes"],
-  edges: PipelineGraphType["edges"]
+  edges: PipelineGraphType["edges"],
+  nodeSchemas?: Map<string, Column[]>
 ): Map<string, { x: number; y: number }> {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph(DAGRE_GRAPH_OPTS);
 
+  const heights = new Map<string, number>();
   for (const node of nodes) {
-    g.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+    const h = nodeHeightFor(node.id, nodeSchemas);
+    heights.set(node.id, h);
+    g.setNode(node.id, { width: NODE_WIDTH, height: h });
   }
 
   for (const edge of edges) {
@@ -76,10 +94,11 @@ function computeLayout(
   const positions = new Map<string, { x: number; y: number }>();
   for (const nodeId of g.nodes()) {
     const { x, y } = g.node(nodeId);
+    const h = heights.get(nodeId) ?? NODE_HEIGHT;
     // dagre positions are centred — React Flow expects top-left corner
     positions.set(nodeId, {
       x: x - NODE_WIDTH / 2,
-      y: y - NODE_HEIGHT / 2,
+      y: y - h / 2,
     });
   }
   return positions;
@@ -456,7 +475,7 @@ export function PipelineGraph({
     const allNodes = [...syntheticNodes, ...graph.nodes];
     const allEdges = [...graph.edges, ...syntheticEdges];
 
-    const positions = computeLayout(allNodes, allEdges);
+    const positions = computeLayout(allNodes, allEdges, nodeSchemas);
     const loadingChain = loadingNodeId
       ? findUpstreamChain(allEdges, loadingNodeId)
       : new Set<string>();
@@ -477,11 +496,7 @@ export function PipelineGraph({
     const rfNodes: RFNode<PipelineNodeData>[] = allNodes.map((node) => {
       const pos = positions.get(node.id) ?? { x: 0, y: 0 };
       const columns = nodeSchemas?.get(node.id);
-      const displayCount = columns ? Math.min(columns.length, 5) : 0;
-      const hasMore = columns && columns.length > 5;
-      const nodeHeight = displayCount > 0
-        ? 80 + displayCount * 18 + (hasMore ? 16 : 0)
-        : NODE_HEIGHT;
+      const nodeHeight = nodeHeightFor(node.id, nodeSchemas);
       // The (+) menu shows in the editor on real transform/source nodes
       // and on registered-source renderings. Destinations have no output;
       // external-table renderings stay read-only. `allEdges` includes the

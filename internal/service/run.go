@@ -210,9 +210,22 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	result := &RunResult{Workdir: workdir, RunID: runID}
 	outputPath := map[string]string{}   // nodeID -> path containing this node's output data
 	outputFormat := map[string]string{} // nodeID -> format for downstream readers ("parquet" for transforms; source-declared otherwise)
+	skippedThisRun := map[string]bool{} // nodeID -> true when the node skipped this run (cascade-skip source of truth)
+	// Cascade-skipped nodes bypass the runner entirely, so they leave no
+	// node_runs row behind. Collect them here in topological order so
+	// recordLocalRun can backfill one row per node in its single end-of-run
+	// runner invocation (UI Runs grid would otherwise show "missing").
+	var cascadeSkipped []string
 	nodeByID := map[string]*graph.Node{}
 	for i := range g.Nodes {
 		nodeByID[g.Nodes[i].ID] = &g.Nodes[i]
+	}
+	// Reverse adjacency for cascade-skip: parents[nodeID] = upstream node IDs
+	// (only intra-pipeline edges; `sources.<name>` references are workspace-
+	// level registry entries and don't appear in g.Edges).
+	parents := map[string][]string{}
+	for _, e := range g.Edges {
+		parents[e.ToNode] = append(parents[e.ToNode], e.FromNode)
 	}
 
 	finalErr := error(nil)
@@ -238,10 +251,48 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			outputFormat[nodeID] = sourceFormat(node)
 			status.Status = "ok"
 			status.Output = path
-			channel.nodeSucceeded(nodeID)
+			// Source nodes don't write Iceberg outputs; no row count to thread.
+			channel.nodeSucceeded(nodeID, nil)
 
 		case "transform":
 			channel.nodeEntered(nodeID)
+			// Auto-generated Iceberg table id matches the runner's
+			// _table_id_for() — empty `target` triggers auto-table mode in
+			// the runner, and we mirror its derivation here so downstream
+			// transforms can read via spark.table(...). Iceberg in local
+			// matches CLAUDE.md's "Iceberg is the default output" rule and
+			// closes the catalog/observability parity gap with cloud.
+			tableID := autoIcebergTableID(catalog, schema, nodeID)
+
+			// Cascade-skip: if every parent node skipped this run, the
+			// upstream tables are bit-for-bit identical to last run, so this
+			// transform's output would be too. Skip without invoking the
+			// runner. Only fires when the node has ≥1 intra-pipeline parent;
+			// source-only transforms (`sources.<name>` reads with no edges)
+			// take their own skip decision via the runner's per-input check.
+			if ps := parents[nodeID]; len(ps) > 0 {
+				allSkipped := true
+				for _, p := range ps {
+					if !skippedThisRun[p] {
+						allSkipped = false
+						break
+					}
+				}
+				if allSkipped {
+					outputPath[nodeID] = tableID
+					outputFormat[nodeID] = "iceberg"
+					skippedThisRun[nodeID] = true
+					cascadeSkipped = append(cascadeSkipped, nodeID)
+					reason := "all upstreams skipped"
+					status.Status = "skipped"
+					status.Output = tableID
+					status.Note = reason
+					channel.nodeSkipped(nodeID, reason)
+					result.Nodes = append(result.Nodes, status)
+					continue
+				}
+			}
+
 			inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
 			if ierr != nil {
 				status.Status = "failed"
@@ -251,15 +302,8 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 				finalErr = fmt.Errorf("transform %s inputs: %w", nodeID, ierr)
 				goto done
 			}
-			// Auto-generated Iceberg table id matches the runner's
-			// _table_id_for() — empty `target` triggers auto-table mode in
-			// the runner, and we mirror its derivation here so downstream
-			// transforms can read via spark.table(...). Iceberg in local
-			// matches CLAUDE.md's "Iceberg is the default output" rule and
-			// closes the catalog/observability parity gap with cloud.
-			tableID := autoIcebergTableID(catalog, schema, nodeID)
 
-			rerr := s.runTransform(ctx, image, abs, workdir, node, inputs, tableID, channel.logPathFor(nodeID), runID, catalog, schema, systemCatalog)
+			skipReason, outputRows, rerr := s.runTransform(ctx, image, abs, workdir, node, inputs, tableID, channel.logPathFor(nodeID), runID, catalog, schema, systemCatalog)
 			if rerr != nil {
 				status.Status = "failed"
 				status.Note = rerr.Error()
@@ -268,11 +312,28 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 				finalErr = fmt.Errorf("transform %s: %w", nodeID, rerr)
 				goto done
 			}
+			if skipReason != "" {
+				// Runner reported a non-error skip (e.g. partitioned source
+				// caught up to "now", or an incremental input has no new
+				// snapshots). The Iceberg table still exists from prior runs,
+				// so seed outputPath/outputFormat with the table id and mark
+				// the node skipped so the cascade-skip check above fires for
+				// every downstream transform.
+				outputPath[nodeID] = tableID
+				outputFormat[nodeID] = "iceberg"
+				skippedThisRun[nodeID] = true
+				status.Status = "skipped"
+				status.Output = tableID
+				status.Note = skipReason
+				channel.nodeSkipped(nodeID, skipReason)
+				result.Nodes = append(result.Nodes, status)
+				continue
+			}
 			outputPath[nodeID] = tableID
 			outputFormat[nodeID] = "iceberg" // upstream-of-transform descriptor: bare string → spark.table()
 			status.Status = "ok"
 			status.Output = tableID
-			channel.nodeSucceeded(nodeID)
+			channel.nodeSucceeded(nodeID, outputRows)
 
 		case "destination":
 			// V1: report the upstream output that would be written.
@@ -298,7 +359,7 @@ done:
 	// → runs-writer Lambda that does the same write through Athena). Best-effort:
 	// a failure here logs to stderr but doesn't change the run's outcome — the
 	// data the user cares about already landed via runTransform.
-	recordLocalRun(ctx, image, abs, channel)
+	recordLocalRun(ctx, image, abs, channel, cascadeSkipped)
 	if finalErr != nil {
 		return result, finalErr
 	}
@@ -695,7 +756,20 @@ func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string
 // `clavesa.clavesa_<pipeline>.<node>__default`); a path-form string
 // would route plain-Parquet output (reserved for destination overrides; not
 // emitted by the local pipeline-run flow today).
-func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, logPath, pipelineRunID, catalog, schema, systemCatalog string) error {
+// runTransform runs one node through the runner container and reports the
+// outcome with three states:
+//   - (skipReason="", err=nil)    → ran successfully, downstream may proceed
+//   - (skipReason!="", err=nil)   → runner reported {"status":"skipped",...}
+//     (e.g. no new partitions / no new snapshots) — not a failure, caller
+//     should mark the node skipped and continue the DAG.
+//   - (skipReason="", err!=nil)   → real failure (container error, malformed
+//     output, runner error message, unexpected status value).
+//
+// outputRows is non-nil when the runner wrote at least one Iceberg-mode
+// output and reported the added-records sum across them; the caller
+// stamps it onto state.json so the dashboard's node-detail drawer can
+// show "Rows written" without a Spark roundtrip.
+func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, logPath, pipelineRunID, catalog, schema, systemCatalog string) (string, *int64, error) {
 	language, _ := node.Config["language"].(string)
 	if language == "" {
 		language = "sql"
@@ -703,15 +777,15 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 
 	logic, lerr := readNodeLogic(node, language, pipelineDir)
 	if lerr != nil {
-		return lerr
+		return "", nil, lerr
 	}
 
 	logicPath := filepath.Join(workdir, node.ID, "logic.txt")
 	if err := os.MkdirAll(filepath.Dir(logicPath), 0o755); err != nil {
-		return err
+		return "", nil, err
 	}
 	if err := os.WriteFile(logicPath, []byte(logic), 0o644); err != nil {
-		return err
+		return "", nil, err
 	}
 
 	// Pass the explicit table_id through. The runner's _resolve_output sees
@@ -749,7 +823,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	pipelineName := filepath.Base(pipelineDir)
 	warehouse := workspace.LocalWarehouseDir(s.workspace)
 	if err := os.MkdirAll(warehouse, 0o755); err != nil {
-		return fmt.Errorf("create warehouse: %w", err)
+		return "", nil, fmt.Errorf("create warehouse: %w", err)
 	}
 	// Local-side watermark directory for v0.24.0's iceberg_table_incremental
 	// kind (and any future watermark-tracking inputs). The runner reads / writes
@@ -757,7 +831,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	// for the same purpose. ADR-014 local-cloud parity.
 	watermarks := filepath.Join(pipelineDir, ".clavesa", "watermarks")
 	if err := os.MkdirAll(watermarks, 0o755); err != nil {
-		return fmt.Errorf("create watermarks dir: %w", err)
+		return "", nil, fmt.Errorf("create watermarks dir: %w", err)
 	}
 
 	args := []string{"run", "--rm", "-i"}
@@ -787,7 +861,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	for _, name := range envVarsForCredentials(inputs) {
 		v, present := os.LookupEnv(name)
 		if !present {
-			return fmt.Errorf("credential references env var %q which is not set in the current shell", name)
+			return "", nil, fmt.Errorf("credential references env var %q which is not set in the current shell", name)
 		}
 		args = append(args, "-e", name+"="+v)
 	}
@@ -908,22 +982,48 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		_ = logFile.Close()
 	}
 	if runErr != nil {
-		return fmt.Errorf("docker run: %w\nstderr: %s", runErr, stderr.String())
+		return "", nil, fmt.Errorf("docker run: %w\nstderr: %s", runErr, stderr.String())
 	}
 
 	// Runner writes a single JSON object to stdout. Parse to surface errors.
 	resp := map[string]any{}
 	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); err != nil {
-		return fmt.Errorf("parse runner output: %w\nstdout: %s\nstderr: %s",
+		return "", nil, fmt.Errorf("parse runner output: %w\nstdout: %s\nstderr: %s",
 			err, stdout.String(), stderr.String())
 	}
 	if errMsg, _ := resp["error"].(string); errMsg != "" {
-		return fmt.Errorf("runner error: %s", errMsg)
+		return "", nil, fmt.Errorf("runner error: %s", errMsg)
 	}
-	if status, _ := resp["status"].(string); status != "ok" {
-		return fmt.Errorf("runner status: %v\nstdout: %s", resp["status"], stdout.String())
+	// output_rows is the added-records sum across this invocation's
+	// Iceberg outputs (runner.py builds it). Optional — path-mode-only
+	// transforms and skipped runs leave it unset.
+	var outputRows *int64
+	if v, ok := resp["output_rows"]; ok {
+		switch n := v.(type) {
+		case float64:
+			x := int64(n)
+			outputRows = &x
+		case json.Number:
+			if x, err := n.Int64(); err == nil {
+				outputRows = &x
+			}
+		}
 	}
-	return nil
+	switch status, _ := resp["status"].(string); status {
+	case "ok":
+		return "", outputRows, nil
+	case "skipped":
+		// Runner-emitted skip carries a human-readable reason (see runner.py
+		// — "input X has no new partitions", "backfill targets …"). Pass it
+		// up so the run record + UI can render it inline.
+		reason, _ := resp["reason"].(string)
+		if reason == "" {
+			reason = "skipped"
+		}
+		return reason, outputRows, nil
+	default:
+		return "", nil, fmt.Errorf("runner status: %v\nstdout: %s", resp["status"], stdout.String())
+	}
 }
 
 // recordLocalRun invokes the runner image once with CLAVESA_RECORD_RUN=1
@@ -936,7 +1036,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 // logs to stderr and returns nil. The run already finished and its data is
 // already on disk; failing here would punish the user for an observability
 // concern they didn't ask for.
-func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *runChannel) {
+func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *runChannel, cascadeSkipped []string) {
 	pipelineName := filepath.Base(pipelineDir)
 	// Resolve ADR-016 (catalog, schema) the same way RunPipeline does so
 	// the runs row lands in the same Glue DB as the node_runs row this
@@ -976,6 +1076,23 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *run
 		payload["duration_ms"] = *channel.state.DurationMs
 	} else {
 		payload["duration_ms"] = channel.endedMs - channel.startMs
+	}
+	// Backfill node_runs rows for cascade-skipped nodes — the cascade path
+	// bypassed the runner entirely so they wouldn't otherwise appear in the
+	// Runs grid. One row per node, all sharing the run's sf_execution_arn so
+	// the dashboard joins them to this execution.
+	if len(cascadeSkipped) > 0 {
+		nowMs := channel.endedMs
+		skipped := make([]map[string]any, 0, len(cascadeSkipped))
+		for _, nodeID := range cascadeSkipped {
+			skipped = append(skipped, map[string]any{
+				"node":          nodeID,
+				"reason":        "all upstreams skipped",
+				"started_at_ms": nowMs,
+				"ended_at_ms":   nowMs,
+			})
+		}
+		payload["cascade_skipped_nodes"] = skipped
 	}
 	channel.mu.Unlock()
 
@@ -1199,7 +1316,7 @@ func (c *runChannel) nodeEntered(nodeID string) {
 	_ = observability.WriteRunState(c.pipelineDir, c.state)
 }
 
-func (c *runChannel) nodeSucceeded(nodeID string) {
+func (c *runChannel) nodeSucceeded(nodeID string, outputRows *int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	prev := c.state.States[nodeID]
@@ -1213,6 +1330,7 @@ func (c *runChannel) nodeSucceeded(nodeID string) {
 		EnteredAt:  prev.EnteredAt,
 		ExitedAt:   now.Format(time.RFC3339Nano),
 		DurationMs: dur,
+		OutputRows: outputRows,
 	}
 	_ = observability.WriteRunState(c.pipelineDir, c.state)
 }

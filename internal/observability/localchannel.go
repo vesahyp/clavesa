@@ -42,6 +42,12 @@ type NodeRunState struct {
 	DurationMs *int64 `json:"duration_ms,omitempty"`
 	ErrorClass string `json:"error_class,omitempty"`
 	ErrorMsg   string `json:"error_msg,omitempty"`
+	// OutputRows is the runner-reported added-records sum across every
+	// Iceberg-mode output for this invocation. Nil when the transform
+	// wrote no Iceberg outputs (path-mode-only, skipped). Carried in
+	// state.json so the dashboard's node-detail drawer can read it
+	// without going through Spark / Iceberg.
+	OutputRows *int64 `json:"output_rows,omitempty"`
 }
 
 // runsRoot returns <pipelineDir>/.clavesa/runs (the parent of every run's
@@ -198,6 +204,14 @@ func WriteRunState(pipelineDir string, state *RunStateFile) error {
 
 // ReadRunState reads one run's state.json. Returns os.ErrNotExist when the
 // run directory is absent so callers can render "no such run" cleanly.
+//
+// If the persisted status is RUNNING but the file hasn't been touched in
+// OrphanThreshold, returns a modified copy with status=FAILED and an
+// OrphanedRun error class. The orchestrator (`runChannel`) writes
+// state.json on every transition + one final write at finish(); a stale
+// RUNNING file means the orchestrator was killed (pkill, SIGKILL, crash)
+// before it could write a terminal state. Without this, the dashboard
+// keeps painting old, dead runs as if they were still in flight.
 func ReadRunState(pipelineDir, runID string) (*RunStateFile, error) {
 	path := RunStatePath(pipelineDir, runID)
 	data, err := os.ReadFile(path)
@@ -208,7 +222,55 @@ func ReadRunState(pipelineDir, runID string) (*RunStateFile, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	if s.Status == "RUNNING" {
+		if info, statErr := os.Stat(path); statErr == nil {
+			if age := time.Since(info.ModTime()); age > OrphanThreshold {
+				markOrphaned(&s, age)
+			}
+		}
+	}
 	return &s, nil
+}
+
+// OrphanThreshold is how long a state.json can go unmodified before a
+// RUNNING run is treated as orphaned. The orchestrator writes the file
+// on every state transition and at finish, so a healthy run rewrites it
+// every few seconds. Var (not const) so tests can lower it.
+var OrphanThreshold = 60 * time.Second
+
+// markOrphaned downgrades a stale RUNNING state file to FAILED in place.
+// Mutates the passed struct — caller already has it on the stack.
+func markOrphaned(s *RunStateFile, age time.Duration) {
+	s.Status = "FAILED"
+	if s.ErrorClass == "" {
+		s.ErrorClass = "OrphanedRun"
+	}
+	if s.ErrorMsg == "" {
+		s.ErrorMsg = fmt.Sprintf(
+			"no state.json update in %s — orchestrator was killed or crashed before writing a terminal state",
+			age.Round(time.Second),
+		)
+	}
+	if s.FailedStep == "" {
+		for nodeID, ns := range s.States {
+			if ns.Status == "RUNNING" {
+				s.FailedStep = nodeID
+				break
+			}
+		}
+	}
+	// Downgrade any per-node RUNNING entries the same way so the
+	// dashboard's in-flight overlay doesn't keep painting them as
+	// running indefinitely.
+	for nodeID, ns := range s.States {
+		if ns.Status == "RUNNING" {
+			ns.Status = "FAILED"
+			if ns.ErrorClass == "" {
+				ns.ErrorClass = "OrphanedRun"
+			}
+			s.States[nodeID] = ns
+		}
+	}
 }
 
 // ListRunIDs returns run IDs ordered newest-first by mtime of state.json.

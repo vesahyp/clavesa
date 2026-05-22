@@ -3,14 +3,19 @@ package observability
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/pathutil"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // LocalProvider satisfies Provider for compute = "local" pipelines.
@@ -70,8 +75,10 @@ func (p *LocalProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	}
 
 	out := &ExecutionStatesResult{
-		Status: st.Status,
-		States: make(map[string]StateStatus, len(st.States)),
+		Status:    st.Status,
+		States:    make(map[string]StateStatus, len(st.States)),
+		RunID:     st.RunID,
+		StartedAt: st.StartedAt,
 	}
 	for nodeID, s := range st.States {
 		out.States[nodeID] = StateStatus{
@@ -186,6 +193,18 @@ func (p *LocalProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
 	}
 	if q.Node != "" && !validIdentifier(q.Node) {
 		return nil, fmt.Errorf("invalid node name: %q", q.Node)
+	}
+
+	// Fast path: the dashboard's grid hits this endpoint with no
+	// `arn` filter and just needs per-cell status + duration. state.json
+	// already has both — sourcing them direct from the filesystem avoids
+	// the 1.5s-warm / 30s-cold Spark roundtrip that was making the grid
+	// look like it lost its data on every refresh. The Sheet's drill-
+	// down (arn-filtered) still goes through Spark below to pick up the
+	// richer columns (image digest, module version, output rows) that
+	// state.json doesn't carry.
+	if q.SfExecutionARN == "" {
+		return p.nodeRunsFromState(q)
 	}
 
 	dbName := q.Database
@@ -343,6 +362,276 @@ func (p *LocalProvider) Runs(ctx context.Context, q RunsQuery) (*RunsResult, err
 	return &RunsResult{Rows: out, Truncated: truncated}, nil
 }
 
+// tablesFromMetadata walks the Iceberg warehouse directly: one
+// subdirectory per output table, each carrying a `metadata/` dir whose
+// `version-hint.text` points at the current `vN.metadata.json`. That
+// JSON has every column the dashboard renders — row count, byte size,
+// last writer's run id, snapshot timestamp — without a Spark roundtrip.
+//
+// Returns (nil, false) when the warehouse or per-pipeline namespace
+// dir is missing; callers fall through to the Spark path (which
+// likewise treats missing tables as an empty success). Reads are
+// independent per table so one malformed metadata.json doesn't poison
+// the whole listing — that table is skipped and logging stays at the
+// caller.
+func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) {
+	warehouse := workspace.LocalWarehouseDir(p.workspaceRoot)
+	if _, err := os.Stat(warehouse); err != nil {
+		return nil, false
+	}
+	// `<catalog>__<schema>` is the Iceberg-on-Hadoop encoding of the
+	// pipeline's three-level namespace. Identical formula to the
+	// runner's `_glue_db()` so we read what the runner wrote.
+	pipelineDir := q.PipelineDir
+	if pipelineDir == "" {
+		pipelineDir = q.PipelineName
+	}
+	abs := pathutil.ResolveDir(p.workspaceRoot, pipelineDir)
+	catalog := ""
+	if m, _ := workspace.Load(p.workspaceRoot); m != nil {
+		catalog = m.CatalogIdentifier()
+	}
+	schema := readSchemaDefault(abs)
+	if schema == "" {
+		schema = filepath.Base(abs)
+	}
+	namespaceDir := filepath.Join(warehouse, identutil.EncodeGlueDatabase(catalog, schema))
+	entries, err := os.ReadDir(namespaceDir)
+	if err != nil {
+		// Pipeline namespace not present yet (fresh pipeline, no
+		// successful run): empty rows is the correct cloud-parity
+		// answer, not a 500. Distinguish from "warehouse missing
+		// entirely" so callers fall through to Spark only when there's
+		// no filesystem signal at all.
+		if errors.Is(err, os.ErrNotExist) {
+			return &TablesResult{Rows: []TableInfo{}}, true
+		}
+		return nil, false
+	}
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	out := make([]TableInfo, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		tableName := e.Name()
+		info, ok := readIcebergCurrentSnapshot(filepath.Join(namespaceDir, tableName))
+		if !ok {
+			continue
+		}
+		node, outputKey := splitTableName(tableName)
+		info.Pipeline = q.PipelineName
+		info.Node = node
+		info.OutputKey = outputKey
+		info.TableName = tableName
+		info.TableID = fmt.Sprintf("clavesa.%s.%s", identutil.EncodeGlueDatabase(catalog, schema), tableName)
+		out = append(out, info)
+	}
+	// Newest snapshot first — matches the Spark path's `ORDER BY
+	// snapshot_ts DESC` so the dashboard's "freshest first" sort stays
+	// stable regardless of which provider answered.
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].SnapshotTS > out[j].SnapshotTS
+	})
+	truncated := false
+	if len(out) > limit {
+		out = out[:limit]
+		truncated = true
+	}
+	return &TablesResult{Rows: out, Truncated: truncated}, true
+}
+
+// splitTableName separates `<node>__<output_key>` into its parts. The
+// runner writes outputs as `{node}__{key}` (default key is `default`),
+// so the rightmost `__` is the splitter. Tables that don't follow the
+// pattern are returned with node = full name + outputKey = "".
+func splitTableName(name string) (node, outputKey string) {
+	i := strings.LastIndex(name, "__")
+	if i < 0 {
+		return name, ""
+	}
+	return name[:i], name[i+2:]
+}
+
+// readIcebergCurrentSnapshot reads <table>/metadata/version-hint.text +
+// the pointed-at v<N>.metadata.json and projects the current snapshot's
+// summary into a TableInfo. Returns ok=false when the table isn't a
+// valid Iceberg table (missing metadata dir, malformed JSON, no
+// current snapshot — happens transiently while a writer is committing).
+func readIcebergCurrentSnapshot(tableDir string) (TableInfo, bool) {
+	metaDir := filepath.Join(tableDir, "metadata")
+	hintBytes, err := os.ReadFile(filepath.Join(metaDir, "version-hint.text"))
+	if err != nil {
+		return TableInfo{}, false
+	}
+	version := strings.TrimSpace(string(hintBytes))
+	if version == "" {
+		return TableInfo{}, false
+	}
+	metaPath := filepath.Join(metaDir, "v"+version+".metadata.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return TableInfo{}, false
+	}
+	var meta struct {
+		CurrentSnapshotID json.Number `json:"current-snapshot-id"`
+		Snapshots         []struct {
+			SnapshotID  json.Number       `json:"snapshot-id"`
+			TimestampMs int64             `json:"timestamp-ms"`
+			Summary     map[string]string `json:"summary"`
+		} `json:"snapshots"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return TableInfo{}, false
+	}
+	currentID := meta.CurrentSnapshotID.String()
+	if currentID == "" || currentID == "0" {
+		return TableInfo{}, false
+	}
+	var snap *struct {
+		SnapshotID  json.Number       `json:"snapshot-id"`
+		TimestampMs int64             `json:"timestamp-ms"`
+		Summary     map[string]string `json:"summary"`
+	}
+	for i := range meta.Snapshots {
+		if meta.Snapshots[i].SnapshotID.String() == currentID {
+			snap = &meta.Snapshots[i]
+			break
+		}
+	}
+	if snap == nil {
+		return TableInfo{}, false
+	}
+	info := TableInfo{
+		SnapshotID: snap.SnapshotID.String(),
+		SnapshotTS: time.UnixMilli(snap.TimestampMs).UTC().Format("2006-01-02T15:04:05.000Z"),
+	}
+	if v, ok := snap.Summary["total-records"]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			info.RowCount = &n
+		}
+	}
+	if v, ok := snap.Summary["total-data-files"]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			info.FileCount = &n
+		}
+	}
+	if v, ok := snap.Summary["total-files-size"]; ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			info.TotalBytes = &n
+		}
+	}
+	if v, ok := snap.Summary["clavesa.run-id"]; ok {
+		info.LastWriterRunID = v
+	}
+	return info, true
+}
+
+// nodeStatusFromState normalises the channel's UPPERCASE state enum
+// (PENDING/RUNNING/SUCCEEDED/FAILED/SKIPPED) to the lowercase strings
+// the runner stamps onto node_runs Iceberg rows and the dashboard cell
+// renderer expects. SUCCEEDED → "ok" is the only non-obvious mapping;
+// it predates this codepath (the runner emits "ok" because Iceberg
+// rows are written from runner.py).
+func nodeStatusFromState(state string) string {
+	switch state {
+	case "SUCCEEDED":
+		return "ok"
+	case "FAILED":
+		return "failed"
+	case "RUNNING":
+		return "running"
+	case "SKIPPED":
+		return "skipped"
+	default:
+		return strings.ToLower(state)
+	}
+}
+
+// nodeRunsFromState fans out one row per (run, node) by reading every
+// state.json on disk — the dashboard grid's bulk-fetch fast path. Skips
+// the Spark roundtrip the Iceberg-backed node_runs path needs (1.5s
+// warm, 15-30s cold). Doesn't carry the richer columns the runner
+// stamps onto the Iceberg row (runner_image_digest, module_version,
+// output_rows, cold_start, memory_mb, lambda_request_id) — the Sheet's
+// drill-down, which passes an arn filter, falls back through the Spark
+// path above to pick those up.
+func (p *LocalProvider) nodeRunsFromState(q NodeRunsQuery) (*NodeRunsResult, error) {
+	pipelineRef := q.PipelineDir
+	if pipelineRef == "" {
+		pipelineRef = q.PipelineName
+	}
+	dir := pipelineRef
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(p.workspaceRoot, dir)
+	}
+
+	runIDs, err := ListRunIDs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("list local runs: %w", err)
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+
+	out := make([]NodeRun, 0, len(runIDs)*4)
+	for _, rid := range runIDs {
+		st, err := ReadRunState(dir, rid)
+		if err != nil {
+			continue
+		}
+		for nodeID, ns := range st.States {
+			if q.Node != "" && nodeID != q.Node {
+				continue
+			}
+			// PENDING entries are seeded by the orchestrator before any
+			// node enters — they're not "this happened" records and the
+			// dashboard expects their absence so its in-flight overlay
+			// (liveStates) drives the cell color. Emitting them here
+			// would paint queued cells as if they had finished.
+			if ns.Status == "" || ns.Status == "PENDING" {
+				continue
+			}
+			started := ns.EnteredAt
+			if started == "" {
+				started = st.StartedAt
+			}
+			out = append(out, NodeRun{
+				RunID:    st.RunID,
+				Pipeline: st.Pipeline,
+				Node:     nodeID,
+				// Map state.json's uppercase enum to the runner's
+				// lowercase convention used by node_runs Iceberg rows
+				// and the dashboard's nodeCellState. Plain lowercasing
+				// would emit "succeeded", which doesn't match the
+				// grid's `=== "ok"` check and would silently render
+				// every success as a skip.
+				Status:         nodeStatusFromState(ns.Status),
+				StartedAt:      started,
+				EndedAt:        ns.ExitedAt,
+				DurationMs:     ns.DurationMs,
+				ComputeTarget:  "local",
+				ErrorClass:     ns.ErrorClass,
+				ErrorMsg:       ns.ErrorMsg,
+				OutputRows:     ns.OutputRows,
+				SfExecutionARN: st.RunID,
+			})
+		}
+	}
+
+	truncated := false
+	if len(out) > limit {
+		out = out[:limit]
+		truncated = true
+	}
+	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
+}
+
 // Tables reads current-state-per-table from <pipeline>.tables. The runner
 // appends one row per Iceberg-output write; we project the latest row per
 // table_id so the UI surfaces "where is each table now?" without each
@@ -352,6 +641,16 @@ func (p *LocalProvider) Runs(ctx context.Context, q RunsQuery) (*RunsResult, err
 func (p *LocalProvider) Tables(ctx context.Context, q TablesQuery) (*TablesResult, error) {
 	if !validPipelineName(q.PipelineName) {
 		return nil, fmt.Errorf("invalid pipeline name: %q", q.PipelineName)
+	}
+	// Fast path: read each output table's Iceberg metadata.json directly.
+	// The dashboard's left-rail row counts come from here; the Spark-
+	// backed system-catalog read below would take 1-30s and made every
+	// node read "no data yet" until Spark warmed. Falls back to Spark
+	// when the warehouse / pipeline dir is missing — preserves cloud-
+	// like behaviour for fresh workspaces where the metadata directory
+	// hasn't been written yet.
+	if res, ok := p.tablesFromMetadata(q); ok {
+		return res, nil
 	}
 	dbName := q.Database
 	// Workspace-wide system DB (ADR-016 v0.20.0): the `tables` table holds

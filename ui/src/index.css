@@ -47,6 +47,9 @@
   --status-running: oklch(0.770 0.169 80);  /* amber-500 */
   --status-failed: oklch(0.628 0.226 27);   /* red-500 */
   --status-pending: oklch(0.652 0.019 252); /* slate-400 */
+  --status-skipped: oklch(0.554 0.046 257); /* slate-500 — distinct from
+                                                pending (paler) and from
+                                                missing (no fill at all) */
 }
 
 @theme inline {
@@ -74,6 +77,7 @@
   --color-status-running: var(--status-running);
   --color-status-failed: var(--status-failed);
   --color-status-pending: var(--status-pending);
+  --color-status-skipped: var(--status-skipped);
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);

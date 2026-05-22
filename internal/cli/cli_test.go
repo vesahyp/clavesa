@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,22 @@ import (
 	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
+
+func TestVersion(t *testing.T) {
+	t.Parallel()
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"version"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	got := strings.TrimSpace(out.String())
+	if got != service.ModuleVersion {
+		t.Fatalf("version output = %q, want %q", got, service.ModuleVersion)
+	}
+}
 
 // setupWorkspace creates a minimal pipeline fixture in a temp dir and returns
 // the workspace root.

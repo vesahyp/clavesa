@@ -72,7 +72,7 @@ export function AppSidebar() {
         </span>
         {!collapsed && (
           <span className="ml-2 truncate text-base font-semibold tracking-tight">
-            Clavesa
+            Clavesλ
           </span>
         )}
       </div>

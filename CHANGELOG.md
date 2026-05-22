@@ -12,6 +12,65 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.0.1] — 2026-05-22
+
+### Added
+
+- **Prebuilt binaries on every release.** GitHub Actions cross-compiles
+  `darwin/amd64`, `darwin/arm64`, `linux/amd64`, `linux/arm64` on tag
+  push and attaches tar.gz archives + checksums to the GitHub Release.
+- **Homebrew tap** at `vesahyp/homebrew-clavesa`. Install with
+  `brew install vesahyp/clavesa/clavesa`; `brew upgrade` picks up new
+  versions automatically.
+- **`clavesa version`** subcommand prints the module version. Used by the
+  Homebrew formula's smoke test and as a quick discoverability path for
+  anyone wondering which build they're on.
+- **Pipeline dashboard "Runs" tab** (renamed from "Nodes"). Airflow-style
+  status squares (ok / failed / running / skipped / missing) with hover
+  tooltips; "← N older / N newer →" pills when older / newer runs are off
+  screen.
+- **Run-detail Sheet** — clicking a run column header opens a right-side
+  panel with header, DAG, and per-node breakdown. `?run=<id>` URL state;
+  `/pipelines/run?…` redirects in for deep-link parity.
+- **Cascade skip:** when every upstream of a transform skipped this run,
+  the transform skips too — no runner invocation, no Spark cold start.
+  Backfilled node_runs rows record the skip.
+- **Persistent Spark indicator** in the top header — idle / starting /
+  ready, with tooltip on what needs Spark.
+- **Live in-flight column** in the grid, sourced from state.json, with
+  per-node cells painting live as the run progresses.
+
+### Changed
+
+- **Dashboard reads from the filesystem,** not Spark. Node-runs project
+  from `state.json` files, tables-state from each Iceberg
+  `metadata.json`. ~40× faster on node-runs, ~20× on tables-state. The
+  drill-down Sheet still hits Spark for the richer columns
+  (`runner_image_digest`, `cold_start`, etc.).
+- **"Rows written" reports net change** (`added - deleted`) instead of
+  raw `added-records`. A pure-update merge that rewrites rows in place
+  now honestly reports 0.
+- **Cloud-only panels** ("Recent executions", "Backfills") hide based on
+  workspace env mode, not the per-pipeline `compute` attribute — a
+  pipeline that doesn't declare `compute = "local"` no longer nags about
+  `terraform apply` while running locally.
+- **Run pipeline** stays on the dashboard. The new column appears in the
+  grid live; opening the Sheet is explicit.
+- **Brand:** sidebar / tab title now read **Clavesλ**, with a database
+  SVG favicon.
+
+### Fixed
+
+- **Orphan RUNNING runs** (state.json from a killed orchestrator) are
+  auto-downgraded to FAILED on read when the file hasn't been touched in
+  60s — the dashboard stops painting them as in-flight indefinitely.
+- **`UNKNOWN_MODULE_SOURCE` validator gap** that flagged every node in a
+  v0.30.0+ pipeline (the embedded `../.clavesa/modules/vX.Y.Z/...` source
+  shape was missing from the allowlist).
+- **Graph-tab node overlap** when nodes carry column profiles — dagre
+  now gets the rendered card height per node so adjacent rows no longer
+  collide.
+
 ## [v1.0.0] — 2026-05-21
 
 ### Changed

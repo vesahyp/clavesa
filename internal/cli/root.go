@@ -44,6 +44,7 @@ Quick start:
 		newSourceCmd(),
 		newCredentialCmd(),
 		newDashboardsCmd(),
+		newVersionCmd(),
 	)
 
 	return root

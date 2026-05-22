@@ -406,6 +406,15 @@ func (p *parser) parseModuleBlock() (*graph.Node, []graph.Edge, error) {
 	return node, edges, nil
 }
 
+// IsRecognisedModuleSource reports whether source matches one of the
+// four forms the parser knows how to read.
+func IsRecognisedModuleSource(source string) bool {
+	return clavesaSourceRE.MatchString(source) ||
+		githubSourceRE.MatchString(source) ||
+		embeddedModuleSourceRE.MatchString(source) ||
+		localModuleSourceRE.MatchString(source)
+}
+
 // nodeTypeFromSource returns "source", "transform", "destination", or "" from
 // a source string like "clavesa/source/aws", "../../modules/source/aws",
 // "github.com/vesahyp/clavesa//modules/source/aws?ref=v0.1.0", or the

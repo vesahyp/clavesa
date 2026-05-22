@@ -1,18 +1,18 @@
 /**
- * RuntimeStatus — ambient warm-Spark worker indicator.
+ * RuntimeStatus — persistent warm-Spark worker indicator.
  *
- * The first Catalog/table query of a fresh `clavesa ui` session
- * blocks ~30s while the warm-Spark container boots, with no UI hint.
- * This sits in the app header and surfaces that:
+ * Sits in the app header and ALWAYS surfaces Spark's state, because
+ * silent Spark-startup races and dead-container "no data yet" surfaces
+ * have repeatedly confused users into thinking the UI was broken.
  *
- *   - invisible when nothing is happening (the steady state)
- *   - amber pulsing "Starting Spark…" while a worker is spawning
- *   - a brief green "Spark ready" once it finishes, then gone
+ *   - grey "Spark idle"       — no worker yet (will spawn on first query)
+ *   - amber "Starting Spark…" — container booting (~30s cold)
+ *   - green "Spark ready"     — warm worker accepting queries
  *
- * Backed by GET /api/runtime/workers (see useRuntimeWorkers).
+ * Steady state is a single dim line — easy to ignore once you trust it,
+ * but unmissable when it changes. Backed by GET /api/runtime/workers
+ * (see useRuntimeWorkers).
  */
-
-import { useEffect, useRef, useState } from "react";
 
 import {
   Tooltip,
@@ -21,53 +21,87 @@ import {
 } from "@/components/ui/tooltip";
 import { useRuntimeWorkers } from "@/lib/queries";
 
-// How long the green "Spark ready" confirmation stays up after a spawn
-// finishes before the indicator goes quiet again.
-const READY_FLASH_MS = 1500;
+function formatAge(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
 
 export function RuntimeStatus() {
   const { data } = useRuntimeWorkers();
-  const spawning = (data?.workers ?? []).some((w) => w.state === "spawning");
-
-  // Show a brief "Spark ready" confirmation on the spawning→done edge.
-  const [justReady, setJustReady] = useState(false);
-  const wasSpawning = useRef(false);
-  useEffect(() => {
-    if (wasSpawning.current && !spawning) {
-      setJustReady(true);
-      const t = setTimeout(() => setJustReady(false), READY_FLASH_MS);
-      wasSpawning.current = spawning;
-      return () => clearTimeout(t);
-    }
-    wasSpawning.current = spawning;
-  }, [spawning]);
+  const workers = data?.workers ?? [];
+  const spawning = workers.find((w) => w.state === "spawning");
+  const ready = workers.find((w) => w.state === "ready");
 
   if (spawning) {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <div className="flex animate-in fade-in-0 items-center gap-1.5 text-xs text-muted-foreground">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <span className="h-2 w-2 animate-pulse rounded-full bg-status-running" />
             <span>Starting Spark…</span>
           </div>
         </TooltipTrigger>
         <TooltipContent className="max-w-xs">
           The local Spark worker is booting (~30s on a cold start). The
-          first Catalog or table query waits for it; every query after
-          that is near-instant.
+          first catalog / dashboard query waits for it; every query
+          after that is near-instant.
         </TooltipContent>
       </Tooltip>
     );
   }
 
-  if (justReady) {
+  if (ready) {
     return (
-      <div className="flex animate-in fade-in-0 items-center gap-1.5 text-xs text-muted-foreground">
-        <span className="h-2 w-2 rounded-full bg-status-success" />
-        <span>Spark ready</span>
-      </div>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="h-2 w-2 rounded-full bg-status-success" />
+            <span>Spark ready</span>
+          </div>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          <div className="space-y-1 text-left">
+            <div className="font-medium text-foreground">
+              Warm Spark worker running
+            </div>
+            <div>Up for {formatAge(ready.age_ms)}.</div>
+            <div className="break-all font-mono text-[10px] text-muted-foreground">
+              {ready.warehouse}
+            </div>
+            <div className="text-muted-foreground">
+              Powers catalog reads, table samples, and the run-detail
+              drill-down. The dashboard's runs grid sources directly
+              from state.json files and doesn't need Spark.
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
     );
   }
 
-  return null;
+  // No worker yet — fresh `clavesa ui` session, or evicted during a
+  // pipeline run (the orchestrator releases the warm worker to free
+  // memory for transform containers). Distinct from "spawning" so the
+  // user can tell at a glance whether their next query will pay the
+  // cold-start tax.
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground/70">
+          <span className="h-2 w-2 rounded-full bg-muted-foreground/40" />
+          <span>Spark idle</span>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs">
+        No warm Spark worker is running. The next catalog / table /
+        drill-down query spawns one (~30s on cold start). Dashboard
+        reads (runs, node_runs, tables-state) go through the filesystem
+        and don't need Spark.
+      </TooltipContent>
+    </Tooltip>
+  );
 }

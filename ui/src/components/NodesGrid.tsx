@@ -1,21 +1,34 @@
 /**
- * NodesGrid — the pipeline dashboard's "Nodes" view.
+ * NodesGrid — the pipeline dashboard's "Runs" view.
  *
  * One row per pipeline node, in topological order. The sticky left panel
  * shows the node's identity and its output table's current state; to the
  * right is a run matrix — one column per run, grouped by day, newest on
- * the right. Each cell is a bar whose height encodes that node's runtime
- * for that run (Airflow-style), so a row reads as the node's duration
- * trend. Clicking a node or a cell opens its detail in a right drawer.
+ * the right. Each cell is an Airflow-style status square: solid colored
+ * background + status icon overlay (✓ ok, ✗ failed, spinner running,
+ * skip-arrow skipped, dashed empty for missing). Clicking a node or a
+ * cell opens its detail in a right drawer; clicking a column header
+ * opens the run-detail Sheet (handled by the parent).
  */
 
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { Play } from "lucide-react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Check, ChevronLeft, ChevronRight, Loader2, Play, SkipForward, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { formatDuration, formatRelative } from "@/lib/format";
 import { runVariant, type StatusVariant } from "@/lib/runStatus";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   NodeDetailDrawer,
   type NodeInvocation,
@@ -52,6 +65,23 @@ function nodeCellState(nr: NodeRun): CellState {
   return "skipped"; // skipped / unknown
 }
 
+/**
+ * Visual recipe for one status. Square colour + icon are the only two
+ * channels that vary; sharing the recipe keeps the cell, the legend, and
+ * any future surface (run header dots, breakdown chips) in lockstep.
+ */
+const CELL_VARIANTS: Record<
+  CellState,
+  { bg: string; icon: React.ComponentType<{ className?: string }> | null; label: string }
+> = {
+  ok: { bg: "bg-status-success", icon: Check, label: "ok" },
+  failed: { bg: "bg-status-failed", icon: X, label: "failed" },
+  running: { bg: "bg-status-running", icon: Loader2, label: "running" },
+  skipped: { bg: "bg-status-skipped", icon: SkipForward, label: "skipped" },
+  pending: { bg: "bg-muted-foreground/25", icon: null, label: "queued" },
+  missing: { bg: "", icon: null, label: "no record" },
+};
+
 /** HH:mm for a run column header. */
 function runTime(iso: string): string {
   const d = new Date(iso);
@@ -86,55 +116,41 @@ function dayLabel(iso: string): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-const FULL_BAR = 28;
-const MIN_BAR = 4;
-
-/** The bar drawn inside one grid cell. ok/failed encode duration as height. */
-function CellBar({
-  state,
-  durationMs,
-  nodeMax,
-}: {
-  state: CellState;
-  durationMs: number | null | undefined;
-  nodeMax: number;
-}) {
+/** Status square drawn inside one grid cell. */
+function CellSquare({ state }: { state: CellState }) {
   if (state === "missing") {
-    return <div className="h-1 w-5 rounded-sm border border-dashed border-border" />;
+    return (
+      <div className="h-6 w-6 rounded-md border border-dashed border-border" />
+    );
   }
-  if (state === "pending") {
-    return <div className="h-1 w-5 rounded-sm bg-muted-foreground/25" />;
-  }
-  if (state === "running") {
-    return <div className="h-7 w-5 animate-pulse rounded-sm bg-status-running" />;
-  }
-  if (state === "skipped") {
-    return <div className="h-1.5 w-5 rounded-sm bg-muted-foreground/40" />;
-  }
-  const h =
-    durationMs && durationMs > 0 && nodeMax > 0
-      ? Math.max(MIN_BAR, Math.round((durationMs / nodeMax) * FULL_BAR))
-      : MIN_BAR;
+  const v = CELL_VARIANTS[state];
+  const Icon = v.icon;
   return (
     <div
       className={cn(
-        "w-5 rounded-sm",
-        state === "ok" ? "bg-status-success" : "bg-status-failed",
+        "grid h-6 w-6 place-items-center rounded-md",
+        v.bg,
+        state === "pending" && "animate-pulse",
       )}
-      style={{ height: `${h}px` }}
-    />
+    >
+      {Icon && (
+        <Icon
+          className={cn(
+            "h-3.5 w-3.5 text-white",
+            state === "running" && "animate-spin",
+          )}
+        />
+      )}
+    </div>
   );
 }
 
-const LEGEND: { label: string; node: React.ReactNode }[] = [
-  { label: "ok", node: <span className="h-3 w-3 rounded-sm bg-status-success" /> },
-  { label: "failed", node: <span className="h-3 w-3 rounded-sm bg-status-failed" /> },
-  { label: "running", node: <span className="h-3 w-3 rounded-sm bg-status-running" /> },
-  { label: "skipped", node: <span className="h-1.5 w-3 rounded-sm bg-muted-foreground/40" /> },
-  {
-    label: "didn't run",
-    node: <span className="h-1 w-3 rounded-sm border border-dashed border-border" />,
-  },
+const LEGEND: { state: CellState; label: string }[] = [
+  { state: "ok", label: "ok" },
+  { state: "failed", label: "failed" },
+  { state: "running", label: "running" },
+  { state: "skipped", label: "skipped" },
+  { state: "missing", label: "no record" },
 ];
 
 export interface NodesGridProps {
@@ -151,6 +167,12 @@ export interface NodesGridProps {
   /** Local pipeline — selects the execution-logs addressing mode. */
   isLocal: boolean;
   dir: string;
+  /**
+   * Click on a run column header. Parent owns URL state; this lets the
+   * dashboard open the RunDetail Sheet (and persist `?run=…`) instead of
+   * the grid navigating to a separate page.
+   */
+  onRunSelect: (runId: string) => void;
 }
 
 export function NodesGrid({
@@ -162,8 +184,8 @@ export function NodesGrid({
   liveStates,
   isLocal,
   dir,
+  onRunSelect,
 }: NodesGridProps) {
-  const navigate = useNavigate();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [selected, setSelected] = useState<{
     node: string;
@@ -205,6 +227,46 @@ export function NodesGrid({
     if (el) el.scrollLeft = el.scrollWidth;
   }, [cols.length]);
 
+  // Track overflow so the edge fades + scroll buttons appear only when
+  // there's actually something hidden. Without this affordance the grid
+  // looks like the whole run history fits on screen even when 6+ runs
+  // are scrolled off the left edge.
+  const [scrollState, setScrollState] = useState({
+    canLeft: false,
+    canRight: false,
+    hiddenLeftCount: 0,
+    hiddenRightCount: 0,
+  });
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const COL_PX = 56; // matches `w-14` on the run-header cells
+    const update = () => {
+      const slack = 1; // sub-pixel rounding tolerance
+      const right = el.scrollWidth - el.clientWidth - el.scrollLeft;
+      setScrollState({
+        canLeft: el.scrollLeft > slack,
+        canRight: right > slack,
+        hiddenLeftCount: Math.round(el.scrollLeft / COL_PX),
+        hiddenRightCount: Math.round(Math.max(0, right) / COL_PX),
+      });
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    // ResizeObserver catches sidebar collapse / window resize so the
+    // affordance disappears the moment the grid actually fits.
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener("scroll", update);
+      ro.disconnect();
+    };
+  }, [cols.length, nodeOrder.length]);
+  const scrollBy = (dx: number) => {
+    const el = scrollRef.current;
+    if (el) el.scrollBy({ left: dx, behavior: "smooth" });
+  };
+
   // execution arn → node → NodeRun. node_runs join to runs on
   // sf_execution_arn (a node_run's own run_id is per-invocation).
   const matrix = useMemo(() => {
@@ -215,17 +277,6 @@ export function NodesGrid({
       const prev = inner.get(nr.node);
       if (!prev || prev.started_at < nr.started_at) inner.set(nr.node, nr);
       m.set(key, inner);
-    }
-    return m;
-  }, [nodeRuns]);
-
-  // Longest duration per node, for per-row bar normalization.
-  const nodeMax = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const nr of nodeRuns) {
-      if (nr.duration_ms && nr.duration_ms > 0) {
-        m.set(nr.node, Math.max(m.get(nr.node) ?? 0, nr.duration_ms));
-      }
     }
     return m;
   }, [nodeRuns]);
@@ -242,11 +293,9 @@ export function NodesGrid({
     return out;
   }, [selected, cols, matrix]);
 
-  function openRun(runId: string) {
-    navigate(
-      `/pipelines/run?dir=${encodeURIComponent(dir)}&run=${encodeURIComponent(runId)}`,
-    );
-  }
+  // Run-header click → parent's URL-state owner opens the Sheet.
+  // `dir` stays in props for the per-node drawer below.
+  void dir;
 
   if (nodeOrder.length === 0) {
     return (
@@ -257,13 +306,70 @@ export function NodesGrid({
   }
 
   return (
+    <TooltipProvider delayDuration={250}>
     <div className="p-4">
-      <div ref={scrollRef} className="overflow-x-auto">
-        <table className="border-separate border-spacing-0">
+      {/* Scroll affordance — only renders when the grid actually
+          overflows. Sits in its own row above the table so the
+          gradient/chevrons never overlap the sticky node-name column.
+          The justify-end placement matches the timeline reading order
+          (newest on the right) — older runs scroll back via the left
+          chevron + count, newer runs forward via the right chevron. */}
+      {(scrollState.canLeft || scrollState.canRight) && (
+        <div className="mb-1 flex items-center justify-end gap-2 text-[10px] text-muted-foreground">
+          {scrollState.canLeft && (
+            <button
+              type="button"
+              onClick={() => scrollBy(-56 * 5)}
+              aria-label={`Scroll back to older runs (${scrollState.hiddenLeftCount} hidden)`}
+              className="flex items-center gap-1 rounded-full border border-border px-2 py-0.5 transition-colors hover:bg-muted/60 hover:text-foreground"
+            >
+              <ChevronLeft className="h-3 w-3" />
+              <span>{scrollState.hiddenLeftCount} older</span>
+            </button>
+          )}
+          {scrollState.canRight && (
+            <button
+              type="button"
+              onClick={() => scrollBy(56 * 5)}
+              aria-label={`Scroll forward to newer runs (${scrollState.hiddenRightCount} hidden)`}
+              className="flex items-center gap-1 rounded-full border border-border px-2 py-0.5 transition-colors hover:bg-muted/60 hover:text-foreground"
+            >
+              <span>{scrollState.hiddenRightCount} newer</span>
+              <ChevronRight className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+      )}
+      <div className="relative">
+        {/* Edge fades — purely visual cue that more cells scroll past
+            the right side. They sit only on the data band's vertical
+            extent (top of the day-group header to the bottom of the
+            last row) and start AFTER the sticky node-name column
+            ends, so they don't darken node names. Z-30 to stay above
+            the data cells; pointer-events-none so they never eat
+            wheel / click events. The hard-coded 360px matches the
+            sticky panel: w-36 (node name) + gap + w-44 (table name) +
+            padding, computed once in the grid's td/th. Recompute if
+            those widths change. */}
+        {scrollState.canLeft && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute top-0 z-30 h-full w-8 bg-gradient-to-r from-card to-transparent"
+            style={{ left: 360 }}
+          />
+        )}
+        {scrollState.canRight && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute right-0 top-0 z-30 h-full w-8 bg-gradient-to-l from-card to-transparent"
+          />
+        )}
+        <div ref={scrollRef} className="overflow-x-auto">
+          <table className="border-separate border-spacing-0">
           <thead>
             {/* Day-group band */}
             <tr>
-              <th className="sticky left-0 z-10 bg-card pb-1 text-left">
+              <th className="sticky left-0 z-20 bg-card pb-1 text-left">
                 <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Node · output table
                 </span>
@@ -285,7 +391,7 @@ export function NodesGrid({
             </tr>
             {/* Per-run header — play icon + time */}
             <tr>
-              <th className="sticky left-0 z-10 bg-card" />
+              <th className="sticky left-0 z-20 bg-card" />
               {cols.map((r) => (
                 <th
                   key={r.run_id}
@@ -295,7 +401,7 @@ export function NodesGrid({
                   )}
                 >
                   <button
-                    onClick={() => openRun(r.run_id)}
+                    onClick={() => onRunSelect(r.run_id)}
                     title={`${r.status} · ${runWhen(r.started_at)} · ${formatDuration(r.duration_ms)}`}
                     aria-label={`Run ${r.run_id}`}
                     className="flex w-14 flex-col items-center gap-0.5 rounded-md pb-1 pt-1.5 transition-colors hover:bg-muted/60"
@@ -320,13 +426,12 @@ export function NodesGrid({
           <tbody>
             {nodeOrder.map((node) => {
               const info = nodeInfo.get(node);
-              const max = nodeMax.get(node) ?? 0;
               const isSelectedNode = selected?.node === node;
               return (
                 <tr key={node} className="group">
                   <td
                     className={cn(
-                      "sticky left-0 z-10 bg-card group-hover:bg-muted/40",
+                      "sticky left-0 z-20 bg-card group-hover:bg-muted/40",
                       isSelectedNode && "bg-muted/50",
                     )}
                   >
@@ -367,23 +472,33 @@ export function NodesGrid({
                     if (nr) {
                       state = nodeCellState(nr);
                     } else if (r.status === "RUNNING") {
-                      state =
-                        liveStates.get(node) === "running"
-                          ? "running"
-                          : "pending";
+                      // In-flight column: surface every node's live state,
+                      // not just "running". Without this, succeeded /
+                      // failed nodes that already finished mid-run render
+                      // as pending (empty) and the column looks frozen.
+                      const live = liveStates.get(node);
+                      if (live === "running") state = "running";
+                      else if (live === "succeeded") state = "ok";
+                      else if (live === "failed") state = "failed";
+                      else state = "pending";
                     } else {
                       state = "missing";
                     }
-                    const detail = nr
-                      ? `${node} · ${nr.status}` +
-                        (nr.duration_ms != null
-                          ? ` · ${formatDuration(nr.duration_ms)}`
-                          : "") +
-                        (nr.output_rows != null
-                          ? ` · ${nr.output_rows} rows`
-                          : "") +
-                        (nr.error_class ? ` · ${nr.error_class}` : "")
-                      : `${node} · ${state}`;
+                    const tooltipLines: string[] = [
+                      `${node} · ${CELL_VARIANTS[state].label}`,
+                    ];
+                    if (nr?.duration_ms != null) {
+                      tooltipLines.push(formatDuration(nr.duration_ms));
+                    }
+                    if (nr?.output_rows != null) {
+                      tooltipLines.push(`${nr.output_rows} rows`);
+                    }
+                    if (nr?.error_msg) {
+                      tooltipLines.push(nr.error_msg);
+                    } else if (nr?.error_class) {
+                      tooltipLines.push(nr.error_class);
+                    }
+                    const ariaLabel = tooltipLines.join(" · ");
                     return (
                       <td
                         key={r.run_id}
@@ -392,25 +507,38 @@ export function NodesGrid({
                           firstOfDay.has(r.run_id) && "border-l border-border",
                         )}
                       >
-                        <button
-                          onClick={() =>
-                            setSelected({ node, runId: r.run_id })
-                          }
-                          title={detail}
-                          aria-label={detail}
-                          className={cn(
-                            "flex h-9 w-14 items-end justify-center pb-1 transition-colors hover:bg-muted/60",
-                            selected?.node === node &&
-                              selected.runId === r.run_id &&
-                              "bg-muted/60",
-                          )}
-                        >
-                          <CellBar
-                            state={state}
-                            durationMs={nr?.duration_ms}
-                            nodeMax={max}
-                          />
-                        </button>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button
+                              onClick={() =>
+                                setSelected({ node, runId: r.run_id })
+                              }
+                              aria-label={ariaLabel}
+                              className={cn(
+                                "flex h-9 w-14 items-center justify-center rounded-md transition-colors hover:bg-muted/60",
+                                selected?.node === node &&
+                                  selected.runId === r.run_id &&
+                                  "bg-muted/60",
+                              )}
+                            >
+                              <CellSquare state={state} />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent side="top" className="max-w-xs">
+                            <div className="space-y-0.5 text-left">
+                              {tooltipLines.map((line, i) => (
+                                <div
+                                  key={i}
+                                  className={cn(
+                                    i === 0 ? "font-medium" : "text-muted-foreground",
+                                  )}
+                                >
+                                  {line}
+                                </div>
+                              ))}
+                            </div>
+                          </TooltipContent>
+                        </Tooltip>
                       </td>
                     );
                   })}
@@ -419,6 +547,7 @@ export function NodesGrid({
             })}
           </tbody>
         </table>
+        </div>
       </div>
 
       {cols.length === 0 && (
@@ -430,12 +559,14 @@ export function NodesGrid({
 
       <div className="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
         {LEGEND.map((l) => (
-          <span key={l.label} className="flex items-center gap-1.5">
-            {l.node}
+          <span key={l.state} className="flex items-center gap-1.5">
+            <CellSquare state={l.state} />
             {l.label}
           </span>
         ))}
-        <span className="text-muted-foreground/70">· taller bar = longer runtime</span>
+        <span className="text-muted-foreground/70">
+          · hover any cell for duration + reason
+        </span>
       </div>
 
       {selected && (
@@ -455,5 +586,6 @@ export function NodesGrid({
         />
       )}
     </div>
+    </TooltipProvider>
   );
 }

@@ -18,7 +18,7 @@ func Validate(g graph.PipelineGraph) []graph.ValidationMessage {
 
 	// UNKNOWN_MODULE_SOURCE
 	for _, n := range g.Nodes {
-		if !clavesaSourceRE.MatchString(n.ModuleSource) && !githubSourceRE.MatchString(n.ModuleSource) {
+		if !IsRecognisedModuleSource(n.ModuleSource) {
 			msgs = append(msgs, graph.ValidationMessage{
 				Code:    graph.CodeUnknownModuleSource,
 				Message: fmt.Sprintf("node %q has unrecognised module source %q", n.ID, n.ModuleSource),

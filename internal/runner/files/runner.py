@@ -1527,10 +1527,30 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
             writer = writer.tableProperty("location", location)
         writer.create()
 
-    # Per-output added-records is what node_runs.output_rows wants — the
-    # rows this run contributed. Different from row["row_count"] (total
-    # in the table after this commit), which double-counts under append.
-    return _int_or_none("added-records")
+    # Net rows this commit contributed = added-records - deleted-records.
+    #
+    # Why the subtraction: Iceberg's `added-records` counts rows in the
+    # new data files. For an append that's literally "new rows". For a
+    # COW merge, Iceberg rewrites entire data files in place — so
+    # `added-records` = "rows in the rewritten files" even when none of
+    # them actually changed value. An idempotent merge over a full-read
+    # dim_* transform (read 1k rows of enriched, GROUP BY → 80 distinct
+    # keys, MERGE into a dim with the same 80 keys) reports
+    # added=80/deleted=80, which used to surface as "80 rows written"
+    # despite the table being byte-identical afterwards.
+    #
+    # `added - deleted` collapses both cases honestly: append gives
+    # N - 0 = N; pure-update merge gives N - N = 0; insert-of-K into
+    # existing-N gives (N+K) - N = K. Replace (full overwrite) can
+    # come back negative when the new snapshot has fewer rows than the
+    # old; we clamp to >= 0 there since "Rows written: -3" is more
+    # confusing than informative.
+    added = _int_or_none("added-records")
+    deleted = _int_or_none("deleted-records")
+    if added is None:
+        return None
+    net = added - (deleted or 0)
+    return net if net > 0 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1818,6 +1838,41 @@ def run_record_run() -> None:
         "error_msg": error_msg,
     }
     _record_run(row)
+
+    # Backfill node_runs rows for cascade-skipped nodes — service.RunPipeline
+    # bypasses the runner for these so they wouldn't otherwise appear in the
+    # Runs grid. Sharing this invocation's Spark session keeps the cost ~0s
+    # vs invoking the runner once per skipped node (Spark startup × N).
+    cascade = payload.get("cascade_skipped_nodes") or []
+    if cascade:
+        run_id_str = str(payload["run_id"])
+        pipeline_name = str(payload["pipeline"])
+        sf_arn = payload.get("sf_execution_arn") or ""
+        runner_image_digest = os.environ.get("CLAVESA_RUNNER_IMAGE_DIGEST", "")
+        module_version = os.environ.get("CLAVESA_MODULE_VERSION", "")
+        for entry in cascade:
+            entry_started_ms = int(entry.get("started_at_ms") or started_ms)
+            entry_ended_ms = int(entry.get("ended_at_ms") or entry_started_ms)
+            _record_node_run({
+                "run_id": run_id_str,
+                "pipeline": pipeline_name,
+                "node": str(entry["node"]),
+                "started_at": _dt.datetime.fromtimestamp(entry_started_ms / 1000, tz=_dt.timezone.utc),
+                "ended_at": _dt.datetime.fromtimestamp(entry_ended_ms / 1000, tz=_dt.timezone.utc),
+                "duration_ms": max(entry_ended_ms - entry_started_ms, 0),
+                "status": "skipped",
+                "compute_target": "local",
+                "memory_mb": None,
+                "cold_start": None,
+                "lambda_request_id": None,
+                "sf_execution_arn": sf_arn,
+                "error_class": "",
+                "error_msg": entry.get("reason") or "all upstreams skipped",
+                "runner_image_digest": runner_image_digest,
+                "module_version": module_version,
+                "output_rows": None,
+            })
+
     print(json.dumps({"status": "ok"}), flush=True)
 
 
@@ -1887,6 +1942,14 @@ def handler(event, context):
                         f"[clavesa] tables row write failed for {target!r}: {table_exc!r}",
                         file=sys.stderr,
                     )
+        # Surface output_rows on the response so the Go orchestrator can
+        # stamp it onto state.json (and the dashboard's node-detail
+        # drawer can read it without spinning Spark up to query the
+        # Iceberg node_runs table). None when the transform wrote no
+        # Iceberg outputs — path-mode-only writes and skipped runs both
+        # land here.
+        if isinstance(response, dict) and output_rows_total is not None:
+            response["output_rows"] = output_rows_total
         return response
     except Exception as exc:
         status = "failed"

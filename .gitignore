@@ -13,5 +13,6 @@ e2e/test-results
 *.tfstate.*
 modules/**/*.zip
 bin/
+dist/
 e2e/.e2e-workspace
-clavesa
+/clavesa

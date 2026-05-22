@@ -371,6 +371,15 @@ type ExecutionStatesResult struct {
 	Status string `json:"status"`
 	// States maps node name → per-node status.
 	States map[string]StateStatus `json:"states"`
+	// RunID identifies the execution this state belongs to. Empty when
+	// the provider couldn't resolve one (no runs yet, malformed state
+	// file). Lets the dashboard synthesise a run column for an in-flight
+	// execution that hasn't yet landed in the runs table.
+	RunID string `json:"run_id,omitempty"`
+	// StartedAt is the ISO-8601 UTC moment the execution began. Empty
+	// when unknown; the dashboard falls back to "now" so the synthetic
+	// column still gets a sortable position.
+	StartedAt string `json:"started_at,omitempty"`
 }
 
 // ExecutionLogsQuery selects log events for one node within one execution.

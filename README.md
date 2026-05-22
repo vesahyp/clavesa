@@ -49,7 +49,30 @@ Clavesa is a fourth shape: a lakehouse platform you own, with the authoring ergo
 - **Terraform 1.x** on your PATH.
 - **AWS credentials configured** (e.g. `AWS_PROFILE` or `aws sso login`) with permission to create the resources the modules manage in the target account: Lambda, Step Functions, EventBridge, IAM roles, Glue Data Catalog, S3, ECR, CloudWatch Logs. Nothing is centrally hosted. Every resource lives in your account.
 
-**There's no released binary yet.** You build from source. The short version is `brew install mise && mise install && make build`; full toolchain notes are in [Development](#development).
+### Install
+
+**macOS (recommended):** install via Homebrew tap, picks up updates with `brew upgrade`.
+
+```bash
+brew install vesahyp/clavesa/clavesa
+clavesa version
+```
+
+**Linux:** download the prebuilt tarball for your architecture, extract, drop the binary on your PATH.
+
+```bash
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -L https://github.com/vesahyp/clavesa/releases/latest/download/clavesa_$(curl -s https://api.github.com/repos/vesahyp/clavesa/releases/latest | grep tag_name | cut -d'"' -f4)_linux_${ARCH}.tar.gz | tar -xz
+./clavesa version
+```
+
+Direct macOS downloads from the Releases page are **unsigned**, so Gatekeeper will refuse to run them. Use `brew install` on macOS — Homebrew strips the quarantine attribute on install.
+
+**From source** (if you'd rather build locally — see [Development](#development) for toolchain notes):
+
+```bash
+brew install mise && mise install && make build
+```
 
 ---
 

@@ -48,11 +48,13 @@ import { NodePalette } from "@/components/NodePalette";
 import { DataPreview } from "@/components/DataPreview";
 import { ValidationBadge } from "@/components/ValidationBadge";
 import { PipelineSettings } from "@/components/PipelineSettings";
+import { RunDetailSheet } from "@/components/RunDetailSheet";
 import { SourceInspectorDrawer } from "@/components/SourceInspectorDrawer";
 import type { Column, Node } from "@/types/pipeline";
 import {
   useBackfills,
   useCatalogTables,
+  useEnvironmentMode,
   useExecutionStates,
   useLineage,
   useNodeRuns,
@@ -114,10 +116,32 @@ function incomingTransformEdgeMap(
 }
 
 export function PipelineDashboard() {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
   const dir = searchParams.get("dir") ?? "";
+  const selectedRunId = searchParams.get("run") ?? null;
+  // Open / close the run-detail Sheet via URL — single source of truth so
+  // deep links and the back button both work. Replace (not push) so the
+  // browser history doesn't grow a sheet-open / sheet-close pair per click.
+  const openRunDetail = (runId: string) => {
+    setSearchParams(
+      (prev) => {
+        prev.set("run", runId);
+        return prev;
+      },
+      { replace: true },
+    );
+  };
+  const closeRunDetail = () => {
+    setSearchParams(
+      (prev) => {
+        prev.delete("run");
+        return prev;
+      },
+      { replace: true },
+    );
+  };
 
   // Resolve pipeline name from dir via the workspace pipeline list.
   const pipelines = usePipelines();
@@ -193,7 +217,7 @@ export function PipelineDashboard() {
   }, [catalogTables.data, dir]);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewedNodeId, setPreviewedNodeId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"graph" | "nodes">("graph");
+  const [activeTab, setActiveTab] = useState<"graph" | "runs">("graph");
 
   // Per-node Iceberg output table for the DAG node footers — same
   // derivation the editor uses, so both DAGs name their outputs alike.
@@ -213,6 +237,14 @@ export function PipelineDashboard() {
   // channel (ADR-014). Cloud pipelines keep the legacy ARN path so the SFN
   // history continues to back the polling.
   const isLocal = pipelineMeta?.compute === "local";
+  // Workspace env mode is the right gate for "is this user running cloud
+  // stuff right now?" decisions (Recent executions, Backfills). `isLocal`
+  // above is per-pipeline and tells us which runner channel to poll —
+  // distinct concept; don't conflate the two. A workspace in local env
+  // shouldn't nag about cloud deployments even for pipelines that haven't
+  // declared `compute = "local"`.
+  const envMode = useEnvironmentMode();
+  const isLocalEnv = envMode.data?.mode === "local";
   // A pipeline with zero nodes has no compute target, no warehouse, no
   // runs anywhere — querying observability surfaces produces backend
   // errors (cloud Athena 400, local runner spin-up) that surface as
@@ -223,14 +255,22 @@ export function PipelineDashboard() {
   const queryDir = hasNodes ? dir : "";
   const status = usePipelineStatus(queryDir);
   const trackedExecutionArn = useMemo(() => {
-    if (isLocal) return "";
+    if (isLocalEnv) return "";
     const execs = status.data?.executions ?? [];
     const running = execs.find((e) => e.status === "RUNNING");
     if (running) return running.execution_arn;
     return execs[0]?.execution_arn ?? "";
-  }, [status.data, isLocal]);
+  }, [status.data, isLocalEnv]);
+  // Live-states dispatch follows the workspace env mode, not the per-
+  // pipeline `compute` attr. The local channel (state.json) is written
+  // by `clavesa pipeline run` regardless of whether the pipeline
+  // declares compute = "local", so a workspace in local env always has
+  // a valid filesystem source to poll. Conflating the two surfaces the
+  // same kind of bug the cloud-nag fix already had: a pipeline that
+  // doesn't declare compute silently falls into the cloud path and
+  // never sees its live state.
   const states = useExecutionStates(
-    isLocal ? { dir: queryDir } : { arn: trackedExecutionArn },
+    isLocalEnv ? { dir: queryDir } : { arn: trackedExecutionArn },
   );
   const nodeStatuses = useMemo(() => {
     const m = new Map<string, "running" | "succeeded" | "failed">();
@@ -262,10 +302,39 @@ export function PipelineDashboard() {
     dir: queryDir,
   });
 
+  // Synthetic in-flight run for the Runs grid. Local runs only get a
+  // runs-table row at end-of-run (recordLocalRun), so during the actual
+  // execution there's no column for the grid to render the live states
+  // against. When the live-state channel reports RUNNING, append a
+  // synthetic row sourced from it so cells can paint pending/running
+  // *while the run is happening*. Drops itself the instant the real row
+  // lands (they share run_id, so the de-dup check on the next refetch
+  // wins).
+  const gridRuns = useMemo<Run[]>(() => {
+    const rows = runs.data?.rows ?? [];
+    const live = states.data;
+    if (!live || live.status !== "RUNNING" || !live.run_id) return rows;
+    if (rows.some((r) => r.run_id === live.run_id)) return rows;
+    const synthetic: Run = {
+      run_id: live.run_id,
+      pipeline: pipelineName,
+      sf_execution_arn: live.run_id,
+      status: "RUNNING",
+      trigger: "manual",
+      started_at: live.started_at || new Date().toISOString(),
+      ended_at: "",
+      duration_ms: null,
+      failed_step: "",
+      error_class: "",
+      error_msg: "",
+    };
+    return [...rows, synthetic];
+  }, [runs.data, states.data, pipelineName]);
+
   // Backfills (Gate 1). Cloud-only today — the service invokes Lambda + Glue
   // directly so local pipelines surface an empty list. Errors are non-fatal
   // (an un-deployed pipeline returns 502); the card swallows them.
-  const backfills = useBackfills(!isLocal && hasNodes ? dir : "");
+  const backfills = useBackfills(!isLocalEnv && hasNodes ? dir : "");
   const transformNodeIds = useMemo(
     () =>
       (graph?.nodes ?? [])
@@ -446,16 +515,16 @@ export function PipelineDashboard() {
       <RunPipelineButton
         dir={dir}
         disabled={!hasNodes}
-        onRunSucceeded={(result) => {
+        onRunSucceeded={() => {
+          // Stay on the dashboard — toast + grid refresh are enough
+          // confirmation. The new run column appears via the synthetic
+          // in-flight row while running and lands as a real column when
+          // the query invalidation refetches. Users open the Sheet
+          // explicitly by clicking the column header.
           void qc.invalidateQueries({ queryKey: ["runs"] });
           void qc.invalidateQueries({ queryKey: ["node-runs"] });
           void qc.invalidateQueries({ queryKey: ["catalog"] });
           void qc.invalidateQueries({ queryKey: ["execution-states"] });
-          if (result.run_id) {
-            navigate(
-              `/pipelines/run?dir=${encodeURIComponent(dir)}&run=${encodeURIComponent(result.run_id)}`,
-            );
-          }
         }}
       />
       <Button
@@ -589,35 +658,56 @@ export function PipelineDashboard() {
       {hasNodes && (
         <Tabs
           value={activeTab}
-          onValueChange={(v) => setActiveTab(v as "graph" | "nodes")}
+          onValueChange={(v) => setActiveTab(v as "graph" | "runs")}
         >
           <TabsList>
             <TabsTrigger value="graph">Graph</TabsTrigger>
-            <TabsTrigger value="nodes">Nodes</TabsTrigger>
+            <TabsTrigger value="runs">Runs</TabsTrigger>
           </TabsList>
 
-          {/* Nodes — one row per node: its output table + run matrix.
+          {/* Runs — node × run matrix: one row per node, columns are recent runs.
               Cloud-only execution / backfill cards sit below it. */}
-          <TabsContent value="nodes" className="space-y-6">
+          <TabsContent value="runs" className="space-y-6">
             <Card>
               <CardHeader className="flex-row items-center justify-between pb-3">
-                <CardTitle>Nodes</CardTitle>
-                {runs.data && (
-                  <span className="text-xs text-muted-foreground">
-                    {nodeOrder.length} node{nodeOrder.length === 1 ? "" : "s"} ·
-                    last {runs.data.rows.length}
-                    {runs.data.truncated ? "+" : ""} runs
-                  </span>
-                )}
+                <CardTitle>Runs</CardTitle>
+                <div className="flex items-center gap-3">
+                  {/* Background-fetch indicator. `isLoading` is first-load
+                      only; once the cache has data, polling refetches set
+                      `isFetching` instead — without this label the grid
+                      reads as "stuck" while Spark warms or runs land. */}
+                  {(runs.isFetching || nodeRuns.isFetching) &&
+                    !runs.isLoading &&
+                    !nodeRuns.isLoading && (
+                      <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        refreshing
+                      </span>
+                    )}
+                  {runs.data && (
+                    <span className="text-xs text-muted-foreground">
+                      {nodeOrder.length} node
+                      {nodeOrder.length === 1 ? "" : "s"} · last{" "}
+                      {gridRuns.length}
+                      {runs.data.truncated ? "+" : ""} runs
+                    </span>
+                  )}
+                </div>
               </CardHeader>
               <CardContent className="p-0">
-                {(runs.isLoading || nodeRuns.isLoading) && (
+                {/* Skeleton only while we genuinely have nothing — gridRuns
+                    includes the synthetic in-flight column, so as soon as
+                    that exists we render the grid even if node_runs is
+                    still loading (it goes slow while the runner container
+                    has the Spark worker pinned during a live run). */}
+                {gridRuns.length === 0 && (runs.isLoading || nodeRuns.isLoading) && (
                   <div className="space-y-2 p-6">
                     <Skeleton className="h-4 w-full" />
                     <Skeleton className="h-4 w-2/3" />
                   </div>
                 )}
-                {!runs.isLoading &&
+                {gridRuns.length === 0 &&
+                  !runs.isLoading &&
                   !nodeRuns.isLoading &&
                   Boolean(runs.error) && (
                     <div className="p-6 text-xs text-muted-foreground">
@@ -625,9 +715,9 @@ export function PipelineDashboard() {
                       <strong>Run pipeline</strong> — each run adds a column.
                     </div>
                   )}
-                {!runs.isLoading && !nodeRuns.isLoading && !runs.error && (
+                {gridRuns.length > 0 && (
                   <NodesGrid
-                    runs={runs.data?.rows ?? []}
+                    runs={gridRuns}
                     nodeRuns={nodeRuns.data?.rows ?? []}
                     nodeOrder={nodeOrder}
                     nodeInfo={nodeInfo}
@@ -635,13 +725,14 @@ export function PipelineDashboard() {
                     liveStates={nodeStatuses}
                     isLocal={isLocal}
                     dir={dir}
+                    onRunSelect={openRunDetail}
                   />
                 )}
               </CardContent>
             </Card>
 
-            {/* Recent executions — cloud-only (SFN). */}
-            {!isLocal && (
+            {/* Recent executions — cloud-only (SFN), workspace-env gated. */}
+            {!isLocalEnv && (
               <Card>
                 <CardHeader className="pb-3">
                   <CardTitle>Recent executions</CardTitle>
@@ -681,8 +772,8 @@ export function PipelineDashboard() {
               </Card>
             )}
 
-            {/* Backfills (Gate 1) — cloud-only. */}
-            {!isLocal && (
+            {/* Backfills (Gate 1) — cloud-only, workspace-env gated. */}
+            {!isLocalEnv && (
               <Card>
                 <CardHeader className="flex-row items-center justify-between pb-3">
                   <CardTitle className="flex items-center gap-2">
@@ -893,7 +984,7 @@ export function PipelineDashboard() {
         <PipelineSettings dir={dir} onClose={() => setSettingsOpen(false)} />
       )}
 
-      {!isLocal && (
+      {!isLocalEnv && (
         <BackfillStageDialog
           open={bfDialogOpen}
           onOpenChange={setBfDialogOpen}
@@ -908,6 +999,13 @@ export function PipelineDashboard() {
           }}
         />
       )}
+
+      {/* Per-run drill-down opens via `?run=…` from the NodesGrid header. */}
+      <RunDetailSheet
+        dir={dir}
+        runId={selectedRunId}
+        onClose={closeRunDetail}
+      />
     </div>
   );
 }

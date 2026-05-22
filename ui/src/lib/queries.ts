@@ -376,6 +376,11 @@ export type StateStatus = z.infer<typeof StateStatus>;
 const ExecutionStatesResponse = z.object({
   status: z.string(),
   states: z.record(z.string(), StateStatus),
+  // Lets the dashboard render an in-flight run as a synthetic Runs-grid
+  // column before the runs-table row exists (locally that row only
+  // lands at end-of-run via recordLocalRun).
+  run_id: z.string().optional().default(""),
+  started_at: z.string().optional().default(""),
 });
 export type ExecutionStatesResponse = z.infer<typeof ExecutionStatesResponse>;
 

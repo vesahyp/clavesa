@@ -2,6 +2,7 @@ package observability_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -269,11 +270,15 @@ func TestLocalProviderNodeRunsViaQuery(t *testing.T) {
 	}
 	p := observability.NewLocalProvider(workspace).WithQueryRunner(stub)
 
+	// Pass an SfExecutionARN — without it the dashboard fast path bypasses
+	// Spark in favour of state.json files; this test specifically covers
+	// the Spark-backed drill-down used by the run-detail Sheet.
 	res, err := p.NodeRuns(context.Background(), observability.NodeRunsQuery{
-		PipelineName: "demo",
-		Database:     "clavesa_demo",
-		PipelineDir:  "demo",
-		Limit:        50,
+		PipelineName:   "demo",
+		Database:       "clavesa_demo",
+		PipelineDir:    "demo",
+		SfExecutionARN: "r1",
+		Limit:          50,
 	})
 	if err != nil {
 		t.Fatalf("NodeRuns: %v", err)
@@ -293,6 +298,88 @@ func TestLocalProviderNodeRunsViaQuery(t *testing.T) {
 	// Query targets the per-pipeline namespace using the same shape Athena uses.
 	if !contains(stub.gotSQL, "clavesa_demo.node_runs") {
 		t.Errorf("SQL did not target clavesa_demo.node_runs:\n%s", stub.gotSQL)
+	}
+}
+
+// TestLocalProviderNodeRunsFromState covers the dashboard fast path —
+// no SfExecutionARN means the provider projects per-(run,node) rows
+// from state.json directly, bypassing Spark entirely.
+func TestLocalProviderNodeRunsFromState(t *testing.T) {
+	workspace := t.TempDir()
+	pipelineDir := filepath.Join(workspace, "demo")
+	if err := os.MkdirAll(pipelineDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dur := int64(1234)
+	st := &observability.RunStateFile{
+		RunID:     "r1",
+		Pipeline:  "demo",
+		Status:    "SUCCEEDED",
+		StartedAt: "2026-05-07T10:00:00Z",
+		EndedAt:   "2026-05-07T10:00:02Z",
+		Trigger:   "manual",
+		States: map[string]observability.NodeRunState{
+			"transform_a": {
+				Status:     "SUCCEEDED",
+				EnteredAt:  "2026-05-07T10:00:00.100Z",
+				ExitedAt:   "2026-05-07T10:00:01.334Z",
+				DurationMs: &dur,
+			},
+			"transform_b": {
+				Status:     "SKIPPED",
+				ErrorMsg:   "all upstreams skipped",
+				DurationMs: nil,
+			},
+		},
+	}
+	if err := observability.WriteRunState(pipelineDir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a stub that would explode if the Spark path got hit — the fast
+	// path must not invoke it.
+	stub := &stubQueryRunner{err: fmt.Errorf("query runner must not be called for bulk dashboard fetch")}
+	p := observability.NewLocalProvider(workspace).WithQueryRunner(stub)
+
+	res, err := p.NodeRuns(context.Background(), observability.NodeRunsQuery{
+		PipelineName: "demo",
+		Database:     "clavesa_demo",
+		PipelineDir:  "demo",
+		Limit:        50,
+	})
+	if err != nil {
+		t.Fatalf("NodeRuns: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2: %+v", len(res.Rows), res.Rows)
+	}
+	if stub.gotSQL != "" {
+		t.Errorf("Spark path was invoked unexpectedly:\n%s", stub.gotSQL)
+	}
+	byNode := map[string]observability.NodeRun{}
+	for _, r := range res.Rows {
+		byNode[r.Node] = r
+	}
+	if a, ok := byNode["transform_a"]; !ok {
+		t.Errorf("transform_a row missing")
+	} else {
+		// Maps state.json's SUCCEEDED → "ok" to match the runner's
+		// node_runs convention; the grid checks `=== "ok"` literally.
+		if a.Status != "ok" {
+			t.Errorf("transform_a status = %q, want %q", a.Status, "ok")
+		}
+		if a.DurationMs == nil || *a.DurationMs != 1234 {
+			t.Errorf("transform_a duration = %v, want 1234", a.DurationMs)
+		}
+		if a.SfExecutionARN != "r1" {
+			t.Errorf("transform_a sf_execution_arn = %q, want r1", a.SfExecutionARN)
+		}
+	}
+	if b, ok := byNode["transform_b"]; !ok {
+		t.Errorf("transform_b row missing")
+	} else if b.Status != "skipped" {
+		t.Errorf("transform_b status = %q, want %q", b.Status, "skipped")
 	}
 }
 
