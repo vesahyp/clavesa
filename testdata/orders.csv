@@ -1,0 +1,7 @@
+order_id,amount,status,ts
+ord-001,150.00,complete,2024-01-01T10:00:00Z
+ord-002,75.50,pending,2024-01-01T11:00:00Z
+ord-003,0.00,complete,2024-01-01T12:00:00Z
+ord-004,200.00,shipped,2024-01-01T13:00:00Z
+ord-005,-10.00,pending,2024-01-01T14:00:00Z
+ord-006,50.00,complete,2024-01-01T15:00:00Z

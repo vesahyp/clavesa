@@ -1,0 +1,1354 @@
+# Changelog
+
+User-visible changes only. Implementation rationale lives in commit messages
+(`git log <hash>` for any line below). Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions track
+`ModuleVersion` in `internal/service/version.go`, which is the `?ref=vX.Y.Z`
+git tag workspace `.tf` pins against.
+
+**Release rule:** every `ModuleVersion` bump needs a CHANGELOG entry, an
+annotated tag pushed to origin, and green tests + `terraform validate`. See
+`CLAUDE.md` "Releasing a new module version".
+
+## [Unreleased]
+
+## [v1.0.0] — 2026-05-21
+
+### Changed
+
+- **Renamed astrophage → clavesa.** Go module path, binary name (`bin/clavesa`),
+  CLI command, `CLAVESA_*` env vars, `clavesa_<pipeline>` Iceberg namespace
+  prefix, `<workspace>/.clavesa/` metadata dir, `clavesa:*` AWS resource tags,
+  local Docker tag (`clavesa/transform-runner`). No upgrade path from v0.x;
+  existing v0.x deployments continue to resolve their old `?ref=` via the
+  renamed GitHub repo. New deploys land on v1.0.0 fresh.
+
+### Added
+
+- **MIT LICENSE** at the repo root. Copyright 2026 Vesa Hyppönen.
+
+## [v0.30.0] — 2026-05-21
+
+### Changed
+
+- **Terraform modules now ship embedded in the binary.** `workspace init`
+  extracts them into `<workspace>/.clavesa/modules/v0.30.0/`; generated
+  pipeline and workspace `.tf` files reference modules via relative
+  local paths (`../.clavesa/modules/v0.30.0/<type>/aws`). `terraform
+  init` no longer fetches from GitHub. `pipeline upgrade` rewrites legacy
+  `github.com/vesahyp/clavesa//modules/...?ref=` source URLs into the
+  embedded form at the current `ModuleVersion`.
+- **Node editor splits into Code and Settings tabs and gains an
+  expand-to-fullscreen toggle.** Clicking a transform in the pipeline
+  dashboard still opens the right drawer, but the contents are now
+  split — *Code* (inputs + SQL/Python editor + output sample) and
+  *Settings* (output mode, merge keys, stats, compute target,
+  incremental upstream toggles). The expand button (top-right of the
+  drawer) swaps the drawer for an overlay that covers the page area
+  (left nav stays visible) with a single-column Code layout — inputs,
+  editor, then output sample. `Esc` collapses the overlay before
+  closing the panel; the SQL/Python buffer survives tab switches.
+- **Editor folded into the pipeline dashboard.** `/pipelines/dashboard?dir=…`
+  is now the single pipeline page — authoring (DAG, ConfigPanel, node
+  palette, preview, pipeline settings) lives in the Graph tab alongside
+  the Nodes grid, history, and backfills. The `/editor` route redirects.
+- **Click a source or external-table node in the DAG** to open a
+  read-only inspector showing the source kind, location, and inferred
+  columns (or the catalog row + columns for an external table).
+- **Click any node on the run page DAG** to open a drawer with its
+  inputs, output, run status, and step logs — no more bouncing back to
+  the editor to triage a failed step.
+- **Remove a transform input with the X button on each input row** —
+  source attachments, external-table references, and upstream edges
+  all share one affordance.
+- **Edge-delete keybinding works again.** Clicking an edge then pressing
+  Backspace or Delete removes it. The previous attempt was swallowed by
+  upstream keydown handlers.
+- **Pipeline-specific actions moved from the global header to the local
+  pipeline header.** Run, Settings, and the validation badge now live in
+  PipelineHealthHeader's right side; the app's top bar holds workspace-
+  level affordances only (AWS profile, env toggle).
+- **DAG nodes show columns and write mode without a click.** Catalog-
+  resolved column lists populate every node whose Iceberg table exists,
+  and the footer shows the output write mode (`replace`/`append`/`merge`)
+  next to the deploy target.
+- **Editor drawer extends to the full app height.** ConfigPanel and the
+  source / external-table inspector now overlay at the app-shell level
+  rather than inside the Graph tab card, so they're not cropped.
+- **Auto-preview when an output table exists.** Opening a transform whose
+  Iceberg table has rows now samples 10 rows inline and lists the output
+  columns in the right-side inputs browser — no Preview click needed.
+  The Preview button still re-executes when you want to validate unsaved
+  SQL edits.
+
+### Added
+
+- **`clavesa source detach`** — remove an attached input from a
+  transform regardless of kind (registry source, external table, or
+  upstream edge). The HTTP twin is `POST /api/pipeline/inputs/detach`.
+
+### Fixed
+
+- **Pipeline dashboard's per-node run cells populate again for pipelines
+  whose name contains a hyphen** (e.g. `cloudfront-model`). The
+  `/api/data/{node-runs,runs,tables-state}` validator rejected hyphens
+  on the `pipeline=` query param, and the UI silently underscored the
+  name before querying — a contract that broke once the runner started
+  storing the literal `pipeline_name` (dashes preserved) in
+  `node_runs.pipeline` / `runs.pipeline`. Validator now accepts the
+  shape `pipeline create` accepts; UI passes the dir-derived name as-is.
+
+- **Catalog page now labels `column_stats` and `dashboards` as clavesa
+  system tables.** Both live in the workspace system catalog alongside
+  `node_runs` / `runs` / `tables` but the allowlist was incomplete, so
+  they rendered as user tables.
+
+### Changed
+
+- **README quick-start now lands raw NYC TLC trip data as its own
+  `trips` transform with `Compute column stats` turned on**, then
+  aggregates into `revenue_by_payment`. The Column profile card on
+  `/tables/.../trips__default` is part of the documented walkthrough.
+
+- **Preview reuses each upstream transform's existing Iceberg snapshot
+  when the pipeline hasn't been edited since the last run.** Previously
+  every Preview re-ran every upstream (and re-fetched every source);
+  now an upstream's already-materialized output is sampled directly,
+  skipping the SQL/PySpark re-execution and the source fetch behind
+  it. Any edit to a `.tf`/`.sql`/`.py` file in the pipeline dir
+  invalidates the snapshot and falls back to a full re-execute, so
+  unsaved upstream edits are never silently ignored.
+
+## [v0.29.0] - 2026-05-20
+
+### Changed
+
+- **The SQL and Python editors are now CodeMirror 6 (was Monaco).** Same
+  keywords, schema-aware completion, advisory SQL parse warning, and
+  catalog-insert in the dashboard editor. The swap fixes the space-key
+  bug where typing space inside the suggest widget sometimes inserted
+  a dot.
+
+### Fixed
+
+- **Pipeline dashboard's sticky health header no longer gets painted over
+  by the nodes grid as you scroll.** Both were on `z-10`; bumped the
+  header to `z-30` so page chrome outranks embedded scroll content.
+
+- **`compute=local` pipelines with a partitioned S3 source now get AWS
+  credentials forwarded into the runner container.** `hasS3Input` only
+  matched `kind=s3`, not the `kind=partitioned_path` shape registered
+  s3 sources resolve to at run time, so the bronze transform failed
+  with "Unable to locate credentials".
+
+### Added
+
+- **Opt-in column stats on the Catalog table page.** Toggle "Compute
+  column stats" on a transform (editor checkbox or `node edit
+  --output-stats`) to render a Column profile card with null %, approx
+  distinct, top-10 values, min/max, and p50/p95 per column. Default off.
+
+- **The SQL transform editor has autocomplete and a syntax check.**
+  Completion covers SparkSQL keywords and the transform's input aliases
+  and columns; `<alias>.` suggests that input's columns. A best-effort
+  parse flags syntax errors as advisory warnings (Preview stays the
+  authoritative check). The space key no longer accepts a suggestion
+  mid-type.
+
+- **Nodes can be renamed.** Click a node's name in the editor config
+  panel to rename it, or run `clavesa node rename <pipeline> <old>
+  <new>`. The rename moves the module block, every downstream edge that
+  reads it, and the transform's SQL/PySpark script files. Note: a node's
+  id is also its Iceberg output table name, so a rename renames that
+  table too.
+
+- **Compute target is editable in the pipeline editor.** A transform's
+  config panel has a **Compute** select — `lambda` / `fargate` /
+  `emr-serverless` — matching what `node edit --set compute=` already did
+  on the CLI.
+
+- **In-UI dashboard builder.** Create and edit dashboards from
+  `/dashboards` — name datasets, bind widgets, save. New `clavesa
+  dashboards` CLI: `list` / `show` / `render` / `apply` / `delete`.
+- **Stacked bar and bar+line chart widgets.** Stacked bar picks an x
+  column and several value columns, stacking one segment per value
+  column; bar+line draws a bar metric and a line metric on a shared x
+  with dual axes.
+- **Filter box on the Dashboards and Credentials lists**, matching the
+  Catalog, Pipelines, and Sources pages.
+- **Table detail shows the fully-qualified table name** —
+  `clavesa.<catalog>__<schema>.<table>` — with a copy button, so it
+  drops straight into a dashboard dataset or ad-hoc SQL.
+- **Pipeline commands infer the directory from the current directory.**
+  Every command that takes a `<pipeline-dir>` argument now accepts it as
+  optional — omit it and the command uses the current directory once you
+  have cd'd into the pipeline. Run outside any pipeline with no argument
+  and the command reports a clear error instead of a bare usage line.
+
+### Changed
+
+- **Pipeline editor wiring is a guided menu, not drag-to-connect.** Each
+  node's output handle has a **+** button: create a downstream node
+  already wired in, or connect to an existing one. It works on registered
+  source nodes too — the menu attaches the source into a new or existing
+  transform. Connecting two nodes no longer drops earlier inputs. Select
+  an edge and press Backspace to remove it.
+
+- **Dashboard editing is direct-manipulation.** Drag widgets to move
+  them and drag a corner to resize, instead of typing grid coordinates.
+  Chart fields are picked from dropdowns of the dataset's real columns,
+  dataset SQL has a **Run** button that previews the result inline, and
+  **Add widget** opens a type picker that seeds sensible defaults. The
+  editor is split into **Datasets** and **Widgets** tabs, and each
+  dataset's SQL editor has a table browser listing the pipeline's tables
+  and columns — click one to drop its name into the query. Saving keeps
+  the editor open instead of kicking back to the rendered view.
+- **Left-nav order** groups the surfaces you work in — Catalog,
+  Pipelines, Dashboards — ahead of the Sources and Credentials
+  registries, instead of interleaving them.
+- **Dashboards are a shared system table.** Dashboards moved from
+  per-workspace JSON files into the `dashboards` system Iceberg table, so
+  everyone with workspace access sees the same ones. They follow a
+  datasets model: a named SQL query feeds one or more widgets, and each
+  dataset names its own pipeline — one dashboard can blend several.
+  Existing dashboard files migrate automatically on first load.
+
+- **`pipeline backfill diff/promote/discard` take the pipeline directory
+  as a positional argument**, e.g. `backfill diff <pipeline-dir> <run_id>`.
+  The `--dir` flag is removed, matching every other pipeline command.
+- **Commands prefer the workspace you are standing in.** When the current
+  directory is inside a workspace, that workspace wins over one pinned by
+  `workspace use`. The pinned workspace still applies from anywhere else.
+
+### Fixed
+
+- **The run-detail DAG shows registered sources.** The per-run graph at
+  `/pipelines/run` omitted `source:` nodes; it now renders them like the
+  editor and pipeline dashboard do.
+
+- **Dashboard bar and line charts render correctly.** They were drawn
+  with `hsl(var(--primary))`, which a browser does not resolve in an SVG
+  attribute — bars came out black and lines were invisible; the color is
+  now a resolved literal and line widgets show point dots. Y-axis ticks
+  compact large numbers (`60M` instead of a clipped `00000`), and the
+  hover tooltip is dark-themed, names both the X and Y columns, and
+  shows values with thousands separators (`65,533,599.31`). Big-number
+  widgets likewise show a compact value (`79.46M`) with the exact figure
+  on hover.
+- **Drawing an edge from a source node in the editor no longer corrupts
+  the pipeline.** Source nodes are read-only; an edge from one used to be
+  written as invalid HCL, leaving the pipeline's `.tf` unparseable. The
+  editor now refuses the connection and `add-edge` rejects an unknown
+  from-node.
+
+## [v0.28.0] — 2026-05-19
+
+### Added
+
+- **Snapshot provenance on the table timeline.** Every entry on a
+  table's Volume timeline now carries a badge for what produced it —
+  `backfill`, `triggered`, `scheduled`, or `manual` — alongside the
+  runner invocation id. Snapshots written outside clavesa show as
+  `external`. Works the same for local and deployed pipelines.
+
+### Fixed
+
+- **Backfill review screen no longer errors on leaving.** Promoting or
+  discarding a backfill could fire failed requests against the
+  just-dropped staging table; the page now exits cleanly.
+
+## [v0.27.0] — 2026-05-18
+
+### Added
+
+- **AWS profile switcher in the app header.** The AWS identity chip is
+  now a dropdown: it shows `profile · account-id` and lets you switch to
+  any profile in `~/.aws`. The choice is persisted per-workspace
+  (`.clavesa/aws-profile.json`, gitignored) and the server restarts
+  itself to apply it. CLI twin: `clavesa workspace use --profile`.
+
+- **Compute deploy-target badge on transform nodes.** Each transform
+  node in the pipeline graph shows its `compute` target (`lambda` /
+  `fargate` / `emr-serverless`) as a small chip in the node footer.
+
+- **AWS identity chip in the app header.** Shows which AWS account /
+  profile the UI server is operating as — the quick answer to "why did
+  this preview/run 403?". Hidden in local-only mode. Backed by
+  `GET /api/runtime/identity`.
+
+- **Warm-Spark status in the app header.** The first Catalog or table
+  query of a session waited ~30s while the local Spark worker booted,
+  with no hint. The header now shows a "Starting Spark…" indicator
+  while it spawns and a brief "Spark ready" when it finishes; it stays
+  hidden otherwise. Backed by `GET /api/runtime/workers`.
+
+- **Workspace environment mode (local / cloud).** A per-workspace mode
+  drives local-vs-cloud dispatch for pipeline runs and the observability
+  surfaces; it defaults to `local`. Set it from the CLI —
+  `clavesa workspace use --env local|cloud`, or `pipeline run --env`
+  to override a single run — or from the UI: a Local/Cloud toggle in the
+  app header switches the whole workspace and refetches every page.
+
+- **Schema-ownership validation (ADR-016).** `pipeline create`, the
+  orchestration emitter, and `pipeline deploy` now refuse a configuration
+  where a pipeline's schema is already owned by another pipeline in the
+  workspace, with an error naming the conflicting pipeline. Each schema has
+  exactly one producing pipeline.
+
+- **Schema-scoped Catalog view.** The Catalog page accepts `?catalog=`
+  and `?schema=` query params and filters to that catalog or schema,
+  with an active-filter banner and a clear affordance. Catalog and
+  schema names — in the Catalog headers and the TableDetail breadcrumb
+  — are now links that set them. `clavesa workspace tables` gains
+  matching `--catalog` / `--schema` filter flags.
+- **Preview a registered source.** New `clavesa source preview
+  <name>` CLI command and a per-row Preview button on `/sources` sample
+  a source's data — http and s3 — without attaching it to a pipeline.
+- **Cookbook recipe: changing HTTP source.** New
+  `docs/cookbook/http-changing-source.md` — re-fetch a moving HTTP API
+  (Hacker News) into a merge-keyed dimension plus an append snapshot
+  fact that captures the change history the API never exposes.
+  Backed by `GET /api/sources/{name}/preview`. Credential-backed sources
+  aren't previewable yet (works in `pipeline run`).
+- **Edit a registered source.** New `clavesa source edit <name>` CLI
+  command and a per-row edit form on `/sources` update a source's URL,
+  format, credentials, partitions, and start-from in place — previously
+  the only way to change a source was delete + re-register. The name is
+  fixed (pipelines reference it); renaming is still delete + register.
+  Backed by `PUT /api/sources/{name}`.
+- **Pipeline delete from the UI.** Each pipeline card on `/pipelines`
+  carries a trash affordance that fires a confirm dialog and the new
+  `DELETE /api/pipelines?dir=` endpoint, mirroring `clavesa pipeline
+  delete --force`. The confirm dialog is the UI equivalent of the
+  mandatory `--force` flag; cloud teardown still requires `clavesa
+  pipeline destroy` first.
+- **Pipeline module-version chip on the per-pipeline dashboard.** Shows
+  `Module: vX.Y.Z` with `→ vY.Z.A` and an Upgrade button when the
+  pipeline's `?ref=` lags behind the latest tag on
+  github.com/vesahyp/clavesa. Backed by new `GET
+  /api/pipeline/module-version` and `POST /api/pipeline/upgrade`
+  endpoints that delegate to `service.UpgradePipeline` — same code path
+  the CLI's `pipeline upgrade` uses, so both surfaces rewrite .tf and
+  re-sync orchestration identically.
+- **Keyboard input wiring in the editor.** The transform Inputs panel
+  gains a "Pipeline node" tab alongside Source and Workspace table:
+  pick an upstream transform in the same pipeline and type the SQL
+  alias, the typed mirror of dragging an edge in the DAG (and of the
+  CLI's `node connect --from … --input …`). Intra-pipeline node inputs
+  now also appear in the panel's input list, not just the DAG.
+- **Source-registration inference hint.** The `/sources` register form
+  shows the kind / bucket / prefix / format it will infer from the
+  pasted URL, live as you type, before submitting.
+- **Workspace creation from the UI.** `clavesa ui` started in a
+  directory with no `clavesa.json` now shows a "Create a workspace"
+  screen instead of a broken app. The create action POSTs to the new
+  `POST /api/workspace/init` — same code path as
+  `clavesa workspace init` (manifest, workspace Terraform, runner
+  source, local preview image). No server restart needed: the root
+  directory is unchanged, it just gains a manifest.
+- **`clavesa pipeline lineage <dir>` CLI command.** Prints the
+  data-lineage graph (source/transform/destination edges, the catalog
+  table each edge flows through, cross-pipeline reads) the UI's
+  TableDetail panel already showed. `--json` for scripting. Closes a
+  CLI/UI parity gap found in the `--json` audit.
+- **`clavesa workspace tables` CLI command.** Lists every Iceberg
+  table the workspace catalog owns — the CLI counterpart of the
+  Catalog page. `--json` for scripting. Both surfaces call the same
+  `CatalogHandler.Tables` core, so the list is identical. Local-pipeline
+  tables show without AWS; cloud (Glue) tables need credentials.
+- **Type-to-filter search on the list pages.** Catalog, Pipelines, and
+  Sources each gain a search box that filters the list client-side as
+  you type — Esc or the inline clear button resets it. Catalog matches
+  table name, node, output key, catalog, and schema; the count line
+  shows `N of M` while filtering. Matching substrings are highlighted in
+  the rows that survive the filter.
+
+### Changed
+
+- **CLI commands honor the workspace's AWS profile.** Every CLI command
+  now applies `.clavesa/aws-profile.json` (the profile the UI
+  switcher / `workspace use --profile` sets) — previously only
+  `clavesa ui` did, so a terminal `pipeline run` against a
+  cross-account source still needed `AWS_PROFILE` exported by hand.
+  `pipeline run` and `pipeline deploy` / `workspace deploy` also print a
+  one-line target summary (environment mode + AWS profile) to stderr.
+
+- **The local/cloud toggle is now authoritative.** The workspace
+  environment mode is the sole switch for local-vs-cloud dispatch — the
+  per-node `compute` attr no longer overrides it. Previously any
+  pipeline still carrying `compute = "local"` stayed pinned to the
+  local warehouse regardless of the toggle, so switching to Cloud
+  appeared to do nothing.
+
+- **"Run pipeline" gives immediate feedback.** Clicking Run now jumps
+  straight to the run page, which shows the run live (DAG colored per
+  node) instead of the UI freezing until the whole run finished. Local
+  runs dispatch in the background; a second run of the same pipeline
+  while one is in flight is rejected with a clear message.
+
+- **Pipeline ≡ schema is visible in the UI.** Each Catalog schema
+  section now names its producing pipeline and links to that pipeline's
+  dashboard; Pipelines list cards show the schema each pipeline writes
+  into. The New pipeline dialog hides the schema field behind an
+  "Advanced" disclosure — schema defaults to the pipeline name.
+
+- **`compute` is now strictly a cloud deploy target.** `node add` no
+  longer writes `compute = "local"` and `node edit --set compute=local`
+  is rejected — `compute` selects `lambda` / `fargate` /
+  `emr-serverless`. Pipelines run locally by default regardless.
+  `pipeline upgrade` strips the legacy `compute = "local"` attribute
+  from existing pipelines' `.tf`.
+
+- **Editor laid out around the canvas.** The DAG canvas now fills the
+  editor; the node palette, config panel and data preview overlay it
+  instead of permanently flanking it. "Add node" is a floating button
+  (top-left) that opens a popover. Selecting a node opens a right-edge
+  config drawer — closed with its ✕ or Escape — and pans the canvas so
+  the node stays clear of the drawer. Preview opens as a centered modal
+  (closes on Escape or an outside click), and renders rows as a real
+  column-header grid with a sticky header and horizontal scroll —
+  previously each record was transposed into one row per field, which
+  was unnavigable for wide tables like CloudFront logs (30+ columns).
+
+- **Cross-pipeline reads now work on `compute = "local"`.** A local
+  transform can read another pipeline's Iceberg table via `node connect
+  --from-table <schema>.<table>` — previously this only resolved under
+  `compute = "lambda"`. The local Iceberg warehouse moved from per-pipeline
+  (`<pipeline>/.clavesa/warehouse/`) to one workspace-shared warehouse
+  (`<workspace>/.clavesa/warehouse/`), so every local pipeline's tables
+  share one Hadoop catalog. Existing workspaces auto-migrate their
+  per-pipeline warehouses on first load; pre-migration local run history
+  for all but one pipeline is dropped and rebuilds on the next run.
+
+- **Pipeline dashboard redesigned around health and a nodes grid.** A
+  pinned header answers "is this pipeline healthy?" at a glance — status,
+  last run, success rate. Below it, two tabs: Nodes and Graph. The Nodes
+  tab is one row per node — its output table (row count + freshness) on
+  the left, an Airflow-style run matrix on the right: one column per run
+  grouped by day (newest right, each header showing the run's time and
+  total duration), each cell a bar whose height encodes that node's
+  runtime for that run, so a row reads as the node's duration trend.
+  Clicking a node or a cell opens a right-side detail drawer in place —
+  the node's inputs, output table + write mode, the chosen run's facts
+  (rows written, cold start, compute, runner build, error) and its step
+  logs — with a run switcher; a run-column header still opens the full
+  run page. Replaces the old stack of disconnected cards (run history,
+  per-node activity, output tables) — node, its table, and its runs now
+  read as one row instead of three separate vocabularies.
+- **Navigation redesign — collapsible sidebar + breadcrumb header.** The
+  global nav (Catalog, Sources, Credentials, Pipelines, Dashboards) moved
+  from a per-page top bar into a left sidebar that collapses to an icon
+  rail; the collapse state is remembered. The header now shows a
+  breadcrumb of the current location — every segment clickable, so going
+  up a level is one click — and the page's own actions. One consistent
+  shell across every page, including the editor, which previously had a
+  bespoke bar with no global nav. The ad-hoc per-page "Back to …" links
+  are gone; the breadcrumb replaces them.
+- **The Pipelines list uses full-width rows, with compute target and run
+  health.** It was a grid of cards while every other list page (Catalog,
+  Sources, Credentials) used full-width rows; it now matches them — one
+  row per pipeline. Each row also shows the compute target (`local` /
+  `lambda` / …) and a strip of the last few runs colored by status, with
+  the latest run's recency. The run strip loads lazily per row, so the
+  list itself still renders instantly.
+- **Pipeline DAG shows where each transform writes and how edges read.**
+  On both the editor and the pipeline dashboard, every transform node
+  footer names its Iceberg output table (`<schema>.<table>`), linked to
+  the table's Catalog page. Edges into a transform marked
+  `incremental_input` are drawn dashed and animated with an `incremental`
+  label; full-read edges stay plain.
+- **Pipelines show the registered sources they consume.** The
+  `/pipelines` cards list each pipeline's `sources.<name>` references as
+  chips, and the per-pipeline dashboard DAG renders them as source nodes
+  feeding the transforms. `pipeline list --json` (and `GET /pipelines`)
+  carry a new `sources` array. Covers both the http and typed-s3
+  reference forms.
+- **Catalog groups tables by catalog, with schemas nested inside.**
+  Each catalog is one box; its schemas (one per pipeline) are labelled,
+  collapsible sub-sections within it, instead of every `(catalog,
+  schema)` pair being a separate card that repeated the catalog name. A
+  catalog reads as one data model.
+- **The `__default` output-key suffix is hidden in the UI.** Catalog
+  rows, the TableDetail heading/breadcrumb, and the pipeline dashboard's
+  Output tables card show `revenue_by_payment` instead of
+  `revenue_by_payment__default` for single-output transforms.
+  Multi-output nodes still show their key. The underlying Glue/Iceberg
+  table identifier is unchanged.
+- **`POST /api/pipeline/edges` and `GET /api/pipelines` now delegate to
+  the service layer.** Both HTTP handlers carried their own copy of
+  logic the CLI reached through `service.AddEdge` / `service.ListPipelines`.
+  The edge handler's inline version *replaced* a transform's whole
+  `inputs` map on every connect, silently dropping other edges into the
+  same node; routing through `service.AddEdge` (which merges) fixes that.
+  `service.PipelineInfo` gained the `cloud` / `compute` fields the list
+  handler used to compute on its own, so the CLI's `pipeline list --json`
+  now reports them too.
+
+### Fixed
+
+- **Merge-mode transform outputs now deploy to cloud.** A transform with
+  `mode = "merge"` + `merge_keys` previously failed `terraform plan` —
+  the transform module's output validation only accepted `replace` and
+  `append`. Merge is the idempotent shape for dimension tables and
+  backfill promotes.
+
+- **Cloud mode no longer 500s on an undeployed workspace.** Switching a
+  workspace with no deployed AWS infrastructure to Cloud now shows empty
+  observability surfaces (Catalog, dashboards, table snapshots, run
+  history) instead of 500 errors.
+
+- **DAG node-output labels show the pipeline's own schema.** A node's
+  output-table footer derived the schema from a lineage `via_table`,
+  which for a pipeline that only reads cross-pipeline pointed at the
+  *upstream* pipeline's schema — the silver `events` node showed
+  `bronze.events` instead of `silver.events`. The lineage response now
+  carries the queried pipeline's own catalog + schema; the label uses
+  that directly.
+
+- **Preview works for transforms that read cross-pipeline.** Previewing a
+  transform whose input is an ADR-016 `external_inputs` (`--from-table`)
+  reference failed — preview resolved graph edges and registered sources
+  but not cross-pipeline tables, so the runner got an empty input map
+  (`KeyError` / `TABLE_OR_VIEW_NOT_FOUND`). Preview now samples the
+  referenced table from the workspace-shared local warehouse via a
+  query-mode runner. Also: the UI preview endpoint now resolves a
+  `sql = file("…")` attribute to the file's contents (it already did so
+  for `python = file("…")`).
+
+- **Graphs show where a transform's data comes from.** The DAG derived
+  synthetic upstream nodes only for registered sources
+  (`source_inputs`), and only on the per-pipeline dashboard. A pipeline
+  whose only input is a cross-pipeline read (`external_inputs`) — or any
+  pipeline opened in the editor — rendered a lone disconnected node. The
+  derivation now also covers cross-pipeline reads, and the editor enables
+  it too (synthetic source / external nodes are read-only — clicks on
+  them are ignored).
+
+- **Editor no longer blanks on a transform with an `s3` source input.**
+  Selecting a node whose `source_inputs` held a kind=s3 attachment crashed
+  the ConfigPanel (React error #31 — the resolved `{spec_name, bucket,
+  prefix, format}` descriptor was rendered directly as a child). The
+  inputs list now shows `sources.<name>` for both the s3 descriptor form
+  and the http string sentinel.
+
+- **Hive-partitioned `s3` sources keep their partition columns.** The
+  runner read prefix-style sources with `recursiveFileLookup`, which finds
+  nested files but disables Spark's partition discovery — a source laid
+  out `…/day=26/hour=NN/` lost the `hour` column. The runner now detects a
+  Hive-partition layout (`name=value/` children) and reads it with default
+  partition discovery instead, so the keys surface as columns; non-Hive
+  nested layouts still use `recursiveFileLookup`. Runner-image change.
+
+- **Failed-transform errors show the real message.** The runner recorded
+  a failed node's `error_msg` with `repr(exc)`, which for PySpark
+  exceptions is just `AnalysisException()` — the message dropped. Run
+  detail now shows the actual Spark error (e.g. the unresolved-column name
+  and suggestions). Runner-image change; rebuild with `make build-runner`.
+
+- **Editor DAG zoom controls are dark-themed.** The React Flow `<Controls>`
+  buttons rendered with the library's default white background, showing as
+  a stray white box bottom-left of the canvas. They now match the dark
+  editor theme, like the minimap.
+- **TableDetail sample rows no longer render large numbers in scientific
+  notation.** A revenue figure now reads as `79456384.28`, not
+  `7.945638428e+07`. Affects local-catalog sample rows and dashboard
+  query results.
+- **Editor: connecting a second input to a transform no longer drops the
+  first.** `POST /api/pipeline/edges` replaced the node's entire `inputs`
+  map instead of merging — a transform wired to two upstreams via the UI
+  kept only the last one. (See Changed above.)
+- **Warm-Spark runner picked up a workspace created mid-session.** The
+  persistent query runner resolved its Docker image name once at
+  `clavesa ui` startup; if the workspace didn't exist yet it cached
+  the invalid `clavesa//transform-runner` reference and every
+  catalog / dashboard query failed with "docker: invalid reference
+  format". The image name is now resolved lazily per container spawn.
+- **Preview now resolves registry-source inputs.** Transforms whose inputs
+  reference a workspace-registered source (`inputs = { x = "sources.<name>" }`
+  or a typed `source_inputs[x] = { spec_name = "..." }` block) previewed
+  empty and failed with `TABLE_OR_VIEW_NOT_FOUND` since v0.21.0. Both the
+  CLI (`clavesa node preview`) and the editor's Preview button now
+  fetch http and s3 sources from the workspace registry, matching what
+  `pipeline run` already does.
+- **Editor Preview no longer 400s on relative pipeline dirs.** The UI
+  sends `dir=demo`; the preview HTTP handler now resolves that against
+  the active workspace (CLI sends absolute paths and was unaffected).
+
+## [v0.26.0] — 2026-05-14
+
+### Added
+
+- Uniform AWS resource tagging across every workspace-managed
+  resource. Workspace-emitted `main.tf` now declares
+  `provider "aws" { default_tags { tags = {...} } }` with
+  `clavesa:workspace` + `clavesa:managed-by = "clavesa"`,
+  so every resource any module creates carries the workspace identity
+  even if a module forgets to thread tags explicitly. `transform`,
+  `source`, and `destination` modules gain a `tags` input variable
+  (default `{}`) that merges on top of each module's own `clavesa:*`
+  tags. Tag schema documented in `docs/architecture.md` under
+  "Resource tagging". One-time billing-console activation of the
+  `clavesa:*` keys is still required for Cost Explorer to roll up
+  spend by workspace / pipeline.
+
+### Changed
+
+- `clavesa workspace destroy` now sweeps the workspace's system-catalog
+  Glue DB (`<system_catalog>__pipelines`, holding the multi-writer
+  `runs` / `node_runs` / `tables` tables across every pipeline in the
+  workspace) before invoking `terraform destroy`. Same shape as the
+  shipped `pipeline destroy` sweep — explicit `yes` confirmation,
+  per-table delete via the Glue SDK, `--skip-sweep` to bypass. Pipelines
+  should still be destroyed individually first via `clavesa pipeline
+  destroy`; this command does not chain into per-pipeline destroys.
+- `clavesa pipeline destroy` now sweeps runtime-created Glue tables
+  before invoking `terraform destroy`. The runner creates Iceberg
+  tables (`<node>__<output>`, plus per-pipeline storage) at execution
+  time; none of them are in terraform state, so vanilla `terraform
+  destroy` refused with "database is not empty" on
+  `aws_glue_catalog_database.pipeline` and the user had to drop into
+  the AWS console. The sweep lists every table in the pipeline's Glue
+  DB (default `<catalog>__sanitize(<pipeline>)` per ADR-016), prints
+  them, asks for explicit `yes` confirmation, then deletes each via
+  the Glue SDK before running `terraform destroy`. `--skip-sweep`
+  bypasses the step; `--glue-db <name>` targets a different DB (use
+  when `var.schema` was overridden from its default). System-DB row
+  cleanup (workspace-shared runs / node_runs / tables) is NOT done —
+  those rows live inside multi-writer Iceberg tables and would need an
+  Athena DELETE; filed as a follow-up.
+- `clavesa workspace deploy` and `clavesa pipeline deploy` now run
+  the substantive lifecycle `terraform init -upgrade → plan -out=tfplan
+  → apply tfplan` with preflight checks, instead of one-shot
+  `terraform apply`. Preflight refuses to invoke terraform when
+  `clavesa.json` is missing, when AWS credentials don't resolve
+  (10s `sts:GetCallerIdentity` against the default credential chain),
+  or — for `workspace deploy` only — when the local runner image's
+  `clavesa.runner_sha` label doesn't match the embedded runner files
+  (catches the stale-image-pushed-silently case). The flow saves the
+  plan to `tfplan` and pauses for a `yes` confirmation before applying;
+  the plan is removed on success or cancel. New `--yes` / `-y` skips
+  the prompt (CI / scripted use); new `--plan-only` stops after `plan`
+  without applying. Preflight prints the resolved AWS account + ARN
+  before invoking terraform so it's clear which account is about to
+  receive the apply.
+
+### Added
+
+- Workspace bucket gets an S3 lifecycle rule expiring objects under
+  `athena-results/` (the Athena workgroup's query-result location)
+  after `athena_results_retention_days` days (default 14). Without
+  this, a workspace running daily accumulates one tiny result object
+  per Catalog page hit, dashboard widget reload, and Athena query —
+  tens of thousands per year. Set the variable to 0 to disable. Per-
+  pipeline `<pipeline>/_athena-results/` written by `runs_writer` is
+  not covered (lifecycle prefix filters can't match a wildcard
+  segment); lower-volume, deferred.
+
+## [v0.25.0] — 2026-05-14
+
+### Changed
+
+- New pipelines now default `trigger_batch_window = "rate(1 minute)"`
+  in their `variables.tf` (was: `null`). S3-event-driven pipelines
+  (`source register --kind s3 … --manage-notifications` + transform
+  attach) now deploy with a working SQS poller Lambda end-to-end with
+  no extra config — matching what `s3-trigger.md`
+  promises. Before this, the EventBridge → SQS path was wired but no
+  poller drained the queue, so dropped S3 files never triggered runs.
+  Existing pipelines on disk keep their old `null` default until the
+  user manually edits `variables.tf` or sets the value in
+  `terraform.tfvars`; future fresh `pipeline create` invocations get
+  the new default.
+
+### Fixed
+
+- `node_runs` and `tables` Iceberg data now lands at the workspace-shared
+  `s3://<bucket>/_system/pipelines/<table>/` prefix, matching where
+  `runs` already lives. Previously these two were auto-located by Spark
+  under the invoking pipeline's per-pipeline `_warehouse/` prefix, so a
+  second pipeline in the same workspace would have written to a
+  different S3 path even though both register against the workspace-
+  wide system Glue DB. Tables created before this change keep their
+  existing location (Iceberg pins LOCATION at create time); fresh
+  deployments get the unified path.
+- S3-trigger pipelines no longer occasionally miss a freshly-arrived
+  event. The poller Lambda now uses `receive_message(VisibilityTimeout=0)`
+  instead of `ApproximateNumberOfMessages`, which is eventually
+  consistent. IAM policy gains `sqs:ReceiveMessage`, drops
+  `sqs:GetQueueAttributes`.
+- Workspace `main.tf` no longer emits the `data.aws_region.current.name`
+  deprecation warning on every `terraform plan` / `apply`. Renamed to
+  `.region` (AWS provider v6+ form).
+- `clavesa node edit … --output-merge-keys <col>` on its own now
+  flips the output's `mode` to `"merge"` in the emitted HCL — the flag's
+  help text and `merge-dim-table.md` both promise this, but the CLI was
+  only setting `merge_keys` while leaving `mode` empty. Side effect:
+  the local-pipeline-run path fell through to `mode = "replace"` and
+  ran a full-table `createOrReplace` instead of `MERGE INTO`, so
+  snapshot history showed repeated `append +N` ops instead of the COW
+  `overwrite +N/-N` the recipe documents. Now matches the cloud
+  orchestration path and the runner's own merge-keys-implies-merge
+  default.
+
+### Added
+
+- TableDetail's **Lineage** panel now surfaces registered-source upstreams
+  (`inputs = { x = "sources.<name>" }`) as a synthetic upstream chip
+  labelled `sources.<name> · source-registry`. Previously the panel said
+  "No upstream" for transforms whose only input was a registered source,
+  contradicting the `multi-stage-pipeline` cookbook's claim that bronze's
+  lineage shows the source as upstream.
+
+### Fixed
+
+- `clavesa workspace init --workspace <dir>` now creates `<dir>` if it
+  doesn't exist. Previously the command errored with a confusing message
+  pointing at `clavesa.json`, forcing every cookbook to start with
+  `mkdir -p <dir>`.
+
+## [v0.24.0] — 2026-05-14
+
+### Added
+
+- **Snapshot-bounded incremental reads on transform upstreams.**
+  `multi-stage-pipeline.md`'s "what's coming" placeholder is now
+  shipped. Mark an upstream alias on a downstream transform with
+  `clavesa node edit <node> --incremental-input <alias>` (or the
+  matching checkbox in the editor's right-panel "Incremental upstream
+  reads" section). The runner reads only Iceberg snapshots committed
+  since the consumer's last successful run, tracking watermark per
+  `(consumer, alias)`. First run reads full, stamps watermark to the
+  current snapshot; subsequent runs read the
+  `(last_seen, current_snapshot]` range via Spark's
+  `start-snapshot-id` / `end-snapshot-id` options. ADR-014 parity:
+  local pipelines store watermarks under `.clavesa/watermarks/`,
+  cloud uses the existing pipeline-bucket convention. At-least-once
+  on retry, same caveat as partitioned-source incremental; pair with
+  `mode = "merge"` + `merge_keys` for idempotent shapes.
+- **Multi-output transforms work end-to-end** (rolled up from
+  Unreleased). `python-transform.md`'s "Multiple outputs" recipe was
+  honest-but-broken; the orchestration emitter hard-coded `outputs = {
+  default = "" }` so cloud deployments silently dropped non-default
+  keys back to runner-side auto-tables with no per-key mode or
+  merge_keys plumbing. Emitter now writes one entry per declared
+  `output_definitions` key, and local `pipeline run` carries the same
+  per-key payload. New `clavesa node edit --add-output <key>` /
+  `--remove-output <key>` flags declare extra output keys without
+  hand-editing HCL; matching "Extra outputs" list in the editor's
+  right-panel **Output** section. Single-default replace-mode
+  transforms emit unchanged (bare-string back-compat).
+
+## [v0.23.0] — 2026-05-14
+
+### Added
+
+- **Registered s3 sources auto-wire S3 event triggers.** Attaching a
+  kind=s3 source now materialises one `module "src_<name>"` per source
+  into `orchestration.tf`, so the SQS queue + EventBridge rule + poller
+  Lambda actually exist on `terraform apply`. Without this, registered
+  sources only fired on the cron schedule. Existing pipelines pick up
+  the wiring on the next `clavesa source attach` or `pipeline upgrade`.
+- **`source register --manage-notifications`.** Have terraform own the
+  source bucket's `aws_s3_bucket_notification` (EventBridge enabled).
+  Skips the out-of-band `aws s3api put-bucket-notification-configuration`
+  step when clavesa owns the bucket. Off by default; the resource is
+  authoritative and replaces other notification config. Matching
+  checkbox on `/sources` Register → Advanced.
+
+## [v0.22.0] — 2026-05-14
+
+### Added
+
+- **Registered s3 sources work on cloud-compute.** New
+  `var.source_inputs` on `modules/transform/aws` accepts the resolved
+  source descriptor (bucket / prefix / format / partitions /
+  start_from) as a typed object; `clavesa source attach` writes
+  there. Closes the TODO #29 plan-time rejection: cloud-deployed
+  transforms with registered s3 sources now `terraform plan` cleanly,
+  and the Lambda's IAM read scope includes the source bucket
+  automatically. Legacy `inputs = { x = "sources.X" }` still parses
+  and runs locally; cloud users with that shape re-`source attach` to
+  migrate.
+
+- **`source register --partitions` / `--start-from`.** Declare
+  Hive-style partition keys on a registered s3 source for incremental
+  reads. Runner walks the partition tree, advances a watermark each
+  run, reads only new partitions. Matching fields on the `/sources`
+  Register form (Advanced). Parquet only.
+
+- **`node edit --output-mode` / `--output-merge-keys`.** Set the
+  default-output write mode (`replace` / `append` / `merge`) and the
+  merge-key list from the CLI without hand-editing
+  `output_definitions` in `.tf`. The editor's right-panel grows a
+  matching "Output" section. ADR-015 parity for the merge workflow.
+
+- **Backfill UI (Gate 1, UI half).** PipelineDashboard grows a Backfills
+  card on cloud pipelines: list open staging tables, **Stage backfill**
+  opens a dialog (node + from + to + `--direct`), each row links to a
+  new `/backfills?dir=&run=` review page that mirrors `pipeline backfill
+  diff` (staging vs canonical row counts, schema match, merge-key
+  counts) plus inline **Promote** / **Discard** actions. ADR-015 parity
+  with the v0.21.0 CLI; backed by new `/api/backfills` REST endpoints.
+  Append-mode Promote uses a column dropdown sourced from the staging
+  schema (auto-picks `event_id`-shaped columns) with a live "would
+  update X / would insert Y" preview so the user sees consequences
+  before pressing the button; "just append anyway" is tucked under
+  Advanced. Local pipelines hide the card (cloud-only feature today).
+
+### Changed
+
+- **Backfill matching/new-key counts now count staging rows, not
+  joins.** `pipeline backfill diff` (and the new dedup-check) used
+  `staging JOIN canonical` which double-counted when canonical had
+  duplicate keys — "200 staging rows would update 400" was confusing
+  nonsense. Now uses `WHERE EXISTS` so matching + new always sums to
+  staging row count.
+
+### Fixed
+
+- **Backfill Stage dialog: clicking Stage was a silent dead end.** The
+  dialog mounts when the dashboard mounts (it's always present, just
+  hidden via the `open` prop), and `useState` captured an empty
+  `transformNodes` array because the pipeline graph fetch hadn't
+  returned yet. The dropdown visually showed `passthrough` (browsers
+  render the first option when a controlled `value=""` doesn't match),
+  but React state stayed empty — `handleStage` hit the "no node"
+  early-return, the toast fired and auto-faded in milliseconds, and
+  the user just saw a closed dialog and nothing else. Now a useEffect
+  syncs `node` when `transformNodes` lands. Caught the hard way by a
+  real button-click rather than a curl test.
+- **Console 502s after Promote/Discard.** React Query was refetching
+  the diff and dedup-check endpoints for a staging table that had
+  just been dropped. Switched to `removeQueries` for those per-run
+  keys before navigating away.
+
+- **Local `runs` table now matches the cloud schema (ADR-014 parity).**
+  v0.21.0 added `target_table` to the cloud runs_writer's Iceberg schema
+  but I missed the matching column in the runner-side `_runs_schema()`,
+  so local pipelines wrote 11-column runs tables while cloud wrote 12.
+  Surfaced by a README walkthrough against `/tmp/clavesa-readme-walk`:
+  catalog page showed `runs · 11 columns`. Existing local tables widen
+  on next write via `.option("mergeSchema", "true")`; no migration
+  needed. Caught the lesson too: runner-touching commits need the
+  README walkthrough before push, not after.
+
+### Removed
+
+## [v0.21.0] — 2026-05-13
+
+### Added
+
+- **Backfill (Gate 1) — CLI surface.** Replay a transform over a historical
+  partition window into a parallel Iceberg staging table; review before
+  promote.
+
+      clavesa pipeline backfill stage <dir> --node <n> --from <c> --to <c>
+      clavesa pipeline backfill list <dir>
+      clavesa pipeline backfill diff <run_id> --dir <pipeline>
+      clavesa pipeline backfill promote <run_id> --dir <pipeline>
+      clavesa pipeline backfill discard <run_id> --dir <pipeline>
+
+  Staging table named `<canonical>__backfill__<run_id>`, tagged in Glue
+  with `clavesa:backfill = true` plus the window range so the Catalog
+  page and `backfill list` can find it. Promote/discard route through
+  the runner Lambda (Spark MERGE INTO, same engine that wrote the
+  staging); diff reads via Athena (read-only COUNT + schema). Mode-aware
+  promote: `merge` outputs MERGE on declared keys; `append` outputs
+  refuse unless `--force-dedup <col>` (drops dupes via MERGE) or
+  `--allow-duplicates` (plain INSERT); `replace` outputs not supported
+  in this slice — use `--direct` at stage time.
+- **`--direct` escape hatch on stage** writes straight to the canonical
+  target, skipping staging. Trigger stamped as `backfill-direct` so it's
+  distinguishable from a normal manual run.
+- **Runner `_operation` event kind.** When the Lambda event carries
+  `_operation = "backfill_promote"` or `_operation = "backfill_discard"`,
+  the runner skips the transform path and runs the matching SparkSQL
+  MERGE / DROP TABLE. Same Spark/Iceberg path that powers transform
+  writes, so MERGE semantics stay consistent with `mode = "merge"`
+  outputs.
+
+### Changed
+
+- **`runs.target_table` column** added to the workspace system catalog's
+  `runs` Iceberg table. NULL on regular runs; on SFN-driven backfill
+  runs (future slice) the runs_writer Lambda extracts the staging table
+  from `_backfill.target_outputs` and records it so the UI can join
+  target → staging. `ALTER TABLE ADD COLUMNS` ships in the
+  runs_writer's bootstrap, so pre-v0.21 tables widen on next write.
+- **TRIGGER_VALUES** in runs_writer accepts `backfill` and
+  `backfill-direct` alongside `manual`/`scheduled`/`event`.
+
+### Fixed
+
+### Removed
+
+## [v0.20.2] — 2026-05-13
+
+### Added
+
+- **`mode = "merge"` output (Gate 4).** Transforms declare
+  `output_definitions = { default = { merge_keys = ["id"] } }`; the
+  runner generates `MERGE INTO target USING source ON keys WHEN MATCHED
+  UPDATE * WHEN NOT MATCHED INSERT *`. First run creates the table (no
+  rows to match against); subsequent runs upsert on the declared keys.
+  When `merge_keys` is set and `mode` is unset, defaults to `"merge"`.
+- **Node palette accepts an optional name** before adding a transform —
+  the node and its output table id (`<name>__default`) both carry the
+  name. Empty falls back to `transform1`.
+- **Editor breadcrumb links to the pipeline dashboard.** Click the
+  pipeline name in the editor header to reach Run pipeline.
+- **Editor input picker — cross-pipeline tables (ADR-016 Slice 2d).**
+  The transform "Add input" affordance gains a *Workspace table* tab
+  beside the existing *Source* tab. Picks any Iceberg table produced
+  by another pipeline in this workspace; writes the
+  `inputs = { alias = "<schema>.<table>" }` shorthand. New endpoint
+  `POST /api/pipeline/external-table/attach` is the HTTP twin of the
+  CLI `node connect --from-table` command.
+
+### Changed
+
+- **PipelinesList rows open the pipeline dashboard** (not the editor
+  directly). Dashboard's Open editor button keeps the round-trip one
+  click.
+- **Orchestration module `var.nodes` typed `any`** (was
+  `map(object({inputs = map(any), outputs = map(any), ...}))`).
+  Terraform's map-of-object unification refused multi-node pipelines
+  whose nodes carried mixed shapes — partitioned-source inputs (object)
+  next to Iceberg-table inputs (string), or merge outputs next to
+  replace outputs. The new emitter always writes dict-form outputs for
+  non-default modes, including `merge_keys = []` for non-merge outputs,
+  so the module accepts both old and new pipelines.
+
+### Fixed
+
+- **Partitioned-source reads now preserve Hive partition columns.**
+  Multi-path reads (`spark.read.parquet(*paths)`) drop year/month/day/
+  hour columns unless `basePath` is set, so a transform appending to a
+  table created in full-prefix mode failed with
+  `INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_FIND_DATA`. Runner now passes
+  `option("basePath", "s3://<bucket>/<prefix>/")` on partitioned reads.
+- README quick-start now matches reality 1:1 — UI surfaces, navigation
+  flow, table names, bonus-dashboard SQL.
+- Pipeline dashboard no longer 500s on a fresh pipeline (empty
+  ExecutionStates / NodeRuns).
+- Transform Save no longer 500s when the round-tripped config carries
+  `output_definitions = { default = {} }` or parser synthetic keys.
+- Pipeline-run OOM on default Docker Desktop memory: the warm-Spark
+  worker is now evicted for the duration of the run.
+- Inputs section refreshes immediately after Attach instead of needing
+  a node re-select.
+
+## [v0.20.1] — 2026-05-12
+
+### Added
+
+- **Cross-pipeline reads (ADR-016 Slice 2).** Transforms can address
+  Iceberg tables produced by other pipelines in the same workspace
+  via `<schema>.<table>` strings in their `inputs` map. CLI:
+  `clavesa node connect <pipeline> --from-table <schema>.<table>
+  --to <transform>`. Orchestration emitter resolves the reference to
+  the runner's `spark.table()` call at sync time.
+- **Cross-pipeline lineage edges.** The Lineage panel on TableDetail
+  surfaces upstream/downstream rows that cross pipeline boundaries
+  with a distinct chip + the producing/consuming pipeline name.
+  Unresolved references render as `(external)`.
+
+### Changed
+
+- **Catalog page and TableDetail surface the three-level namespace.**
+  Tables group under `<catalog> / <schema>` headers; the workspace
+  system catalog renders with a `system` badge and sorts last. Table
+  URLs become `/tables/<catalog>/<schema>/<table>`; pre-v0.20
+  `/tables/<db>/<table>` bookmarks auto-redirect.
+- **Transform IAM scoped to the workspace catalog instead of `*`**
+  (ADR-016 Slice 2). Transforms read any Iceberg table in their
+  workspace's `<catalog>__*` Glue DBs and `<bucket>/*/_warehouse/*`
+  S3 prefixes. Writes still pin to this pipeline's schema plus the
+  workspace system DB. Resolves Session F P2.
+
+## [v0.20.0] — 2026-05-12
+
+### Changed
+
+- **`runs` / `node_runs` / `tables` moved out of the pipeline schema**
+  into a workspace-owned `<workspace>_system.pipelines.*` catalog
+  (ADR-016). User pipeline schemas now show only the user's outputs.
+  Pre-v0.20 per-pipeline observability tables stay in place but are
+  no longer written or read — query them directly in Athena for history.
+
+- **Warm Spark worker for `clavesa ui`.** The Catalog / dashboards /
+  TableDetail pages used to spawn a fresh runner container per query,
+  paying the ~18-30s Spark JVM cold start every time (1–3 min on
+  the literal README landing page). One warm container per pipeline
+  warehouse now stays alive for the lifetime of the UI process: first
+  call ~15s, subsequent <500ms. Stopped cleanly on Ctrl-C; orphans
+  from a SIGKILL'd prior session are swept on next startup. CLI
+  one-shots (`pipeline run`, `node preview`) keep per-call containers.
+
+### Added
+
+### Removed
+
+- **Inline source modules — slice 4 (ADR-017) flag day.** Sources are
+  workspace-registry entries only. `clavesa node add --type source`
+  errors with a clear `source register` redirect; `node add --from`
+  is gone (was deprecated in slice 1, dead now). Service
+  `AddSourceFromURL`, HTTP `POST /pipeline/sources-from-url`, the UI
+  palette's "S3 Source" entry, and the `sourceFetchBridge` plumbing all
+  removed. Existing inline `module "src_X" { source = "...source/aws" }`
+  blocks in already-authored pipelines continue to parse and run for
+  backward compatibility — only the *creation* path is gone. The
+  README quick-start collapses from `node add --from … node connect …`
+  to `source register --from … source attach …`.
+
+### Added
+
+- **`s3` source kind — slice 3 (ADR-017).** Sources can now point at
+  same-account S3 prefixes, not just public http(s) URLs.
+  - **CLI:** `source register --from s3://bucket/prefix/` (auto-promotes
+    to `kind=s3`, derives bucket+prefix+format from the URL) or explicit
+    `--kind s3 --bucket … --prefix … --format …`.
+  - **UI:** the same single URL field handles both `https://` and
+    `s3://` — server sniffs the prefix.
+  - **Runner:** `kind=s3` reads via Spark's S3A. Recursive prefix
+    listing on by default for prefix-style paths so `s3://b/events/`
+    picks up `events/2024/jan.json` without users encoding the
+    partition layout.
+  - **Local pipeline-run** forwards `AWS_*` env vars + mounts `~/.aws`
+    read-only so `compute=local` pipelines pick up dev creds without
+    extra config. Honors `CLAVESA_S3_ENDPOINT` for moto/MinIO
+    test infrastructure.
+  - **Output cleanups:** `source list --json` and `credential list
+    --json` now include the `name` field (was previously dropped via
+    storage `json:"-"` tag, breaking `jq` pipes). `source delete
+    <unknown>` and `credential delete <unknown>` print "X not
+    registered" instead of leaking the filesystem path.
+  - **Bug fix:** `file:`-backed credentials now work for local pipeline
+    runs — workspace credentials dir is bind-mounted into the runner
+    container so the secret payload at the host-absolute path the
+    descriptor inlines actually resolves.
+- **Credentials registry — slice 2 (ADR-017).** Named secrets at
+  `<workspace>/.clavesa/credentials/<name>.json`; sources reference
+  them via `--credentials <name>`. The credential file records the
+  *reference*, not the secret material itself. Slice 2 supports
+  `kind=header` only.
+  - **CLI:** `clavesa credential register|list|show|delete`. Three
+    secret backends: `arn:aws:secretsmanager:...`, `env:VAR`,
+    `file:<workspace-rel>`. Local-only backends (`env:`/`file:`) get
+    rejected at orchestration emit for cloud-deployed transforms with a
+    clear message.
+  - **CLI source register** gains `--credentials <name>` (validated
+    against the registry at register time).
+  - **UI:** new `/credentials` route + nav link. `/sources` register
+    form gains a credential dropdown; rows show a `cred:` chip.
+  - **HTTP:** `GET/POST /api/credentials`, `GET/DELETE /api/credentials/{name}`.
+    409 + structured `{usages: [{source_name}]}` body when in use.
+  - **Runner:** kind=http path resolves the credential at runtime —
+    env/file backends in stdlib, `arn:aws:secretsmanager:` via boto3.
+  - **`workspace init`** writes `.gitignore` excluding
+    `.clavesa/credentials/*.secret` for `file:`-backed payloads.
+- **Workspace source registry — slice 1 (ADR-017).** Sources are now
+  workspace-level resources at `<workspace>/.clavesa/sources/<name>.json`.
+  Pipelines reference sources by name (`inputs = { x = "sources.<name>" }`)
+  alongside the existing inline `module "src_X"` shape (inline support is
+  removed in slice 4).
+  - **CLI:** `clavesa source register|list|show|delete|attach`. Slice 1
+    supports `kind=http` only (no auth — credentials registry lands in
+    slice 2). `delete` refuses when pipelines reference the source;
+    `--force` overrides.
+  - **UI:** new `/sources` route — list view, register form, delete with
+    inline dependency surfacing.
+  - **HTTP:** `GET/POST /api/sources`, `GET/DELETE /api/sources/{name}`,
+    `POST /api/sources/{name}/attach`.
+  - **Runner:** new `kind=http` input descriptor — runner downloads the
+    URL at execution time (cached per Lambda container) and reads the
+    file with the registered format.
+  - **Orchestration emitter / pipeline run:** both resolve `sources.<name>`
+    references against the workspace registry and emit kind-specific
+    runner descriptors.
+- URL-source authoring on both surfaces (ADR-015 parity):
+  - **CLI:** `clavesa node add --from <url>` fetches a public dataset
+    (http/https) into the pipeline's `inputs/` dir, infers `format`
+    from the file extension, and configures `bucket`/`prefix` in one
+    step. Implies `--type=source`; `--name` derives from the URL
+    filename when omitted.
+  - **UI:** new "Source from URL" affordance in the editor's node
+    palette — paste a URL, hit "Fetch & add", same backend service
+    method as the CLI.
+  - **HTTP:** `POST /api/pipeline/sources-from-url`.
+  Collapses the README quick-start's mkdir/curl/node-add/node-edit
+  dance into one command.
+- README: worked second-dashboard example over the demo pipeline's
+  `revenue_by_payment__default` gold table — a copy-pasteable JSON file
+  showing all four widget types against real data.
+
+### Fixed
+
+- Seeded `pipeline-runs-<name>` dashboard now queries the ADR-016
+  `<catalog>__<schema>` Glue namespace (e.g.
+  `clavesa_demo_ws__demo`) instead of the pre-ADR-016
+  `clavesa_<pipeline>` form. Previously the seed SQL silently
+  returned 0 rows on every workspace where workspace-name ≠
+  pipeline-name, which is most of them.
+- `node disconnect` and `DELETE /api/pipeline/edges/{id}` actually remove the
+  edge for transforms — previously they cleared a non-existent singular
+  `input` attr while the canonical `inputs = { … }` map went untouched.
+- `clavesa pipeline plan|deploy|destroy <pipeline>` now resolve the
+  pipeline arg against the active workspace, matching `pipeline run` and
+  every other `pipeline X <dir>` command.
+
+## [v0.19.0] — 2026-05-10
+
+### Added
+
+- `clavesa workspace use <path>` records the current workspace so later
+  commands resolve without `--workspace`.
+- `clavesa pipeline run` dispatches cloud pipelines to SFN
+  `StartExecution` (ADR-014). `--wait` blocks until terminal.
+- Workspace bucket: versioning, SSE-S3 default (KMS via `var.kms_key_id`),
+  public-access-block. New `var.force_destroy` (default `false`).
+- `make validate-examples` runs `terraform validate` on every module
+  example; gates `make release-check`.
+
+### Changed (breaking module contract)
+
+- `transform.runner_image` is required and must be a private ECR URI.
+  The old public-ECR default never worked.
+- `workspace.force_destroy` defaults to `false`. Tear-down of test
+  workspaces requires `force_destroy = true` or a manual `s3 rm` first.
+- Removed `modules/output-table/aws/` (dead module, no consumers).
+
+### Changed
+
+- `clavesa ui` auto-derives `ATHENA_OUTPUT_BUCKET` from
+  `terraform.tfstate` when unset.
+- `workspace init` / `pipeline create` print editor/CLI-oriented next
+  steps.
+- `runs.trigger` rejects unknown values (coerced to `"manual"`); allowed
+  set documented as `runs_writer/index.py:TRIGGER_VALUES`.
+- All module READMEs rewritten — old content described the retired
+  Athena/Glue Jobs/CTAS architecture.
+
+### Fixed
+
+- Pipeline dashboard run-history / node-runs / tables-state panels load
+  for cloud pipelines (post-ADR-016 DB encoding).
+- Empty pipelines render an empty state instead of a 500.
+
+## [v0.18.1] — 2026-05-09
+
+### Fixed
+
+- Orchestration module now creates the Glue DB at the same encoded
+  `<catalog>__<schema>` name the transform module writes to, so
+  run-history and table records land in the workspace's catalog
+  instead of an orphan `clavesa_<pipeline>` DB. Without this,
+  v0.18.0 cloud deploys failed on the transform Lambda's first
+  write (Glue `CreateDatabase` AccessDenied).
+
+### Changed (breaking module contract)
+
+- `modules/orchestration/aws` now requires `catalog` and `schema`
+  variables (parity with the v0.18.0 transform module). Pipelines
+  re-emit `orchestration.tf` automatically on the next mutation
+  via the v0.18.1 binary; manual callers must thread both through.
+
+## [v0.18.0] — 2026-05-09
+
+### Removed (breaking)
+
+- Pre-ADR-016 fallback paths dropped. `catalog` and `schema` are
+  required everywhere — runner, transform module, encoder, catalog
+  handler. Pipelines pinning to v0.18+ must thread both through
+  every transform module call or `terraform validate` fails.
+
+### Changed
+
+- Workspaces without a `catalog` field auto-migrate on first
+  `Manifest.Load` (gets `clavesa_<sanitize(name)>`). The
+  deferred slice 5 migrate-catalog tooling is dropped — this
+  one-shot covers the residual case.
+
+### Fixed
+
+- Catalog page (`GET /api/workspace/tables`) no longer surfaces
+  tables from other workspaces' Glue DBs in the same AWS account.
+  Pre-1g it filtered by the global `clavesa_` prefix; now it
+  scopes to the current workspace's catalog. Side benefit: the
+  500-error noise from cross-workspace S3 snapshot fetches is gone.
+
+## [v0.17.0] — 2026-05-09
+
+### Added — Three-level namespace (ADR-016 slices 1a–1f)
+
+- `<catalog>.<schema>.<table>` addressing end-to-end. New flags:
+  `workspace init --catalog`, `pipeline create --schema`, plus a
+  Schema field on the UI's New-pipeline form. Defaults:
+  `clavesa_<sanitize(workspace_name)>` and
+  `sanitize(pipeline_name)`. Display name and identifier are now
+  distinct (e.g. workspace `demo-ws` → Glue DB `clavesa_demo_ws`).
+- New-workspace Glue DBs encode as `<catalog>__<schema>` (e.g.
+  `clavesa_demo_ws__cloudfront` instead of `clavesa_cloudfront`)
+  — different workspaces no longer share a Glue namespace.
+- Legacy workspaces (no `catalog` field) keep today's
+  `clavesa_<pipeline>` until they migrate.
+- `pipeline create` over HTTP now matches the CLI: trigger vars,
+  `.gitignore`, orchestration sync, and seed dashboard. Previously
+  the HTTP shortcut had drifted.
+
+### Added — Dashboards
+
+- New `/dashboards` route. Saved SQL widgets (`big_number`, `line`,
+  `bar`, `table`) over the workspace catalog, authored as JSON in
+  `<workspace>/.clavesa/dashboards/<slug>.json`. First
+  `pipeline create` in an empty workspace seeds a "Pipeline runs"
+  dashboard. Recharts is lazy-loaded so the front-door bundle stays
+  ~229 KB gzip. In-UI authoring (drag-resize, query editor, save)
+  is follow-up.
+
+### Fixed — ADR-014 local↔cloud parity
+
+- Local pipeline run history populates the dashboard panel (was
+  always empty — querying an Iceberg table the local orchestrator
+  never wrote). Local provider now reads the filesystem progress
+  channel directly.
+- Local ExecutionLogs carry per-event `timestamp` (was always `""`).
+- Local SampleTable / Query responses carry per-column types.
+- ExecutionLogs response carries `source: "cloudwatch"|"local"` so
+  the UI can show backend-appropriate hints (`tail <file>` vs
+  "query CloudWatch directly").
+- `POST /api/dashboards/query` requires `dir` on both backends
+  (cloud previously accepted missing `dir` silently).
+- Run-duration line widget's X-axis now reads oldest → newest (was
+  reversed). Existing dashboards keep their old SQL until edited.
+- "Recent executions" placeholder card no longer renders on local
+  pipelines (duplicated the Run-history card downstack).
+- Catalog correctly labels the `tables` system table.
+
+### Fixed — Backend HTTP error contract
+
+- `GET /api/pipeline*` returns 404 (was 500) when `?dir=` doesn't
+  exist.
+- `POST /api/pipeline/edges` surfaces parse errors instead of
+  silently writing malformed Terraform.
+- `GET /api/workspace/tables` uses the standard `{"error":"…"}`
+  envelope and degrades to `aws_available: false` (was 500) when
+  Glue is unreachable.
+
+### Fixed
+
+- `CLAVESA_QUERY=1` runner mode no longer crashes on
+  `TimestampType` columns — Dockerfile installs `tzdata` and sets
+  `TZ=UTC`.
+
+## [v0.16.0] — 2026-05-08
+
+- Lineage panel on TableDetail: upstream + downstream neighbors, click-through.
+- Catalog freshness chip now lights up for cloud (`compute = "lambda"`)
+  pipelines, not just local.
+- Sample panel works for local-only Iceberg tables (was 500ing — went
+  through Athena unconditionally).
+- New `node_runs.output_rows` column (sum of added-records across this run's
+  Iceberg outputs); RunDetail surfaces it.
+- ~32 KB gzip off the data-first bundle by lazy-loading the legacy editor
+  (`/editor` only).
+
+## [v0.15.0] — 2026-05-08
+
+- Per-transform `freshness_sla = "4h"` → Fresh / Aging / Stale chip on
+  Catalog tiles. Hidden when no SLA declared.
+- Run-detail page (`/pipelines/run?dir=…&run=…`): pipeline DAG colored
+  by per-node status, triage strip (module version + image digest),
+  inline failure detail, per-node breakdown.
+- Per-node sparkline on the dashboard — recent run durations, surfaces
+  slow-creep regressions the pass/fail strip misses.
+- `clavesa_<pipeline>.tables` writer — runner appends one row per
+  Iceberg-mode output. Catalog dashboard panel shows row count + age
+  per table.
+- Local `pipeline run` writes Iceberg outputs by default (was plain
+  Parquet). Closes catalog parity gap.
+- Catalog snapshot fetches dispatch by pipeline dir — local tables
+  no longer 500.
+- Local `runs ↔ node_runs` join works (both sides now stamp
+  `sf_execution_arn` consistently).
+
+## [v0.14.0] — 2026-05-07
+
+- New `runner_image_digest` + `module_version` columns on `node_runs`.
+  "Which build produced this row?" is a SQL query now.
+- `runs.trigger` populated (manual / scheduled / event) via SFN-input
+  smuggling. Trigger badge on dashboard Run history.
+- Local `runs` table writer — `clavesa pipeline run` appends to
+  `clavesa_<pipeline>.runs` so the dashboard's run history works for
+  `compute = "local"` too.
+- Local–cloud observability parity (ADR-014). The `/api/data/*` and
+  `/api/pipeline/execution/*` endpoints accept `dir=`; new
+  `internal/observability/` package picks Cloud or Local provider per
+  request based on the pipeline's `compute` attr.
+- Filesystem progress channel for local runs at
+  `<pipelineDir>/.clavesa/runs/<runID>/`.
+- Per-pipeline Hadoop warehouse at `<pipelineDir>/.clavesa/warehouse/`
+  (was a shared `/tmp` dir).
+- Catalog page surfaces local Iceberg tables alongside Glue ones.
+- Fixed: `pipeline run` honored only Parquet sources, now CSV/JSON too.
+- Fixed: `workspace init` cache stopped serving stale runner images on
+  embedded-source edits.
+
+**Upgrade note:** existing cloud `node_runs` schema evolves on the first
+write after the upgrade (Iceberg mergeSchema). Trigger one transform run
+before querying the new columns from Athena.
+
+## [v0.13.0] — 2026-05-07
+
+- Per-pipeline run history queryable from Athena.
+  `clavesa_<pipeline>.runs` (per-execution rollup, EventBridge writer
+  Lambda) and `clavesa_<pipeline>.node_runs` (per-invocation, runner
+  self-reports). Same SQL surface as user data.
+- New endpoints: `GET /api/data/tables/{db}/{t}/snapshots`,
+  `/api/data/node-runs`, `/api/data/runs`,
+  `/api/pipeline/execution/{states,logs}`.
+- Data-first UI: Catalog at `/`, TableDetail at `/tables/:db/:table`,
+  per-pipeline dashboard at `/pipelines/dashboard?dir=…`. Legacy editor
+  remains at `/editor?dir=…`.
+- Live SFN run state on the editor DAG (PipelineNode borders pulse during
+  in-flight executions).
+- Inline CloudWatch log lines on failed nodes.
+- UI rewritten on Tailwind v4 + shadcn + TanStack Query. All backend
+  routes mount under `/api/*`.
+
+## [v0.12.0]
+
+Partitioned-source incremental reads + append output mode. Watermarks
+land per `(node, input_alias)`. (Pre-CHANGELOG era; see `git log
+v0.11.0..v0.12.0`.)
+
+## [v0.11.3]
+
+Fix: orchestration emits Iceberg table id for transform→transform inputs.
+See `8d244ed`.
+
+## [v0.11.2]
+
+`pipeline upgrade` re-syncs orchestration; Lambda image digest auto-
+updates via `aws_ecr_image` data source. See `b9b1428`.
+
+## [v0.11.1]
+
+Fix: `s3://` scheme mapping for Hadoop-AWS; widened Iceberg warehouse IAM.
+See `debd85a`.
+
+## [v0.11.0]
+
+Iceberg auto-tables — every transform output lands as an Iceberg table in
+Glue Data Catalog by default (per ADR-013). See `f67aa34`.
+
+[Unreleased]: https://github.com/vesahyp/clavesa/compare/v0.16.0...HEAD
+[v0.16.0]: https://github.com/vesahyp/clavesa/compare/v0.15.0...v0.16.0
+[v0.15.0]: https://github.com/vesahyp/clavesa/compare/v0.14.0...v0.15.0
+[v0.14.0]: https://github.com/vesahyp/clavesa/compare/v0.13.0...v0.14.0
+[v0.13.0]: https://github.com/vesahyp/clavesa/compare/v0.11.3...v0.13.0
+[v0.12.0]: https://github.com/vesahyp/clavesa/compare/v0.11.3...v0.12.0
+[v0.11.3]: https://github.com/vesahyp/clavesa/compare/v0.11.2...v0.11.3
+[v0.11.2]: https://github.com/vesahyp/clavesa/compare/v0.11.1...v0.11.2
+[v0.11.1]: https://github.com/vesahyp/clavesa/compare/v0.11.0...v0.11.1
+[v0.11.0]: https://github.com/vesahyp/clavesa/releases/tag/v0.11.0

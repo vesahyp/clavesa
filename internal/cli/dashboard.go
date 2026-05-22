@@ -1,0 +1,280 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/athena"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/sfn"
+	"github.com/spf13/cobra"
+
+	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/service"
+	wspkg "github.com/vesahyp/clavesa/internal/workspace"
+)
+
+// newDashboardsCmd implements `clavesa dashboards` — the CLI half of
+// the dashboards surface (ADR-015 parity with the UI). Dashboards live in
+// the `dashboards` system Iceberg table; these commands read and write it
+// through the same service layer the HTTP handler uses.
+func newDashboardsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "dashboards",
+		Short: "List, inspect, render, and author workspace dashboards",
+		Long: `Manage workspace dashboards — saved SQL widgets over the catalog.
+
+Dashboards are stored in the workspace's ` + "`dashboards`" + ` system
+Iceberg table, shared across everyone with workspace access.
+
+Examples:
+  clavesa dashboards list
+  clavesa dashboards show pipeline-runs-demo
+  clavesa dashboards render pipeline-runs-demo --json
+  clavesa dashboards apply revenue.json
+  clavesa dashboards delete revenue`,
+		RunE: requireSubcommand(),
+	}
+	cmd.AddCommand(
+		newDashboardsListCmd(),
+		newDashboardsShowCmd(),
+		newDashboardsRenderCmd(),
+		newDashboardsApplyCmd(),
+		newDashboardsDeleteCmd(),
+	)
+	return cmd
+}
+
+// newDashboardService builds a Service wired with an observability
+// resolver — every dashboards subcommand needs it, since the store reads
+// and writes a catalog table. The local provider is always available;
+// the cloud provider lights up only when AWS credentials load (a
+// cloud-mode workspace without them gets a clear error at dispatch).
+func newDashboardService(cmd *cobra.Command) (*service.Service, string, error) {
+	workspace, err := resolveWorkspace(cmd)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve workspace: %w", err)
+	}
+	var cloud observability.Provider
+	if awsCfg, cfgErr := awsconfig.LoadDefaultConfig(context.Background()); cfgErr == nil {
+		bucket := os.Getenv("ATHENA_OUTPUT_BUCKET")
+		if bucket == "" {
+			bucket = wspkg.PipelineBucket(workspace)
+		}
+		cloud = observability.NewCloudProvider(
+			athena.NewFromConfig(awsCfg), bucket,
+			sfn.NewFromConfig(awsCfg), cloudwatchlogs.NewFromConfig(awsCfg))
+	}
+	local := observability.NewLocalProvider(workspace)
+	resolver := observability.NewResolver(workspace, cloud, local)
+	return service.New(workspace).WithResolver(resolver), workspace, nil
+}
+
+func newDashboardsListCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List dashboards",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, _, err := newDashboardService(cmd)
+			if err != nil {
+				return err
+			}
+			list, err := svc.ListDashboards(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(os.Stdout, list)
+			}
+			if len(list) == 0 {
+				fmt.Println("No dashboards yet.")
+				return nil
+			}
+			rows := make([][]string, len(list))
+			for i, d := range list {
+				rows[i] = []string{d.Slug, d.Title}
+			}
+			printTable(os.Stdout, []string{"SLUG", "TITLE"}, rows)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	return cmd
+}
+
+func newDashboardsShowCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "show <slug>",
+		Short: "Show a dashboard's datasets and widgets",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, _, err := newDashboardService(cmd)
+			if err != nil {
+				return err
+			}
+			d, err := svc.GetDashboard(cmd.Context(), args[0])
+			if err != nil {
+				return dashboardNotFoundHint(err, args[0])
+			}
+			if jsonOut {
+				return printJSON(os.Stdout, d)
+			}
+			fmt.Printf("%s  (%s)\n", d.Title, d.Slug)
+			if len(d.Datasets) > 0 {
+				fmt.Println("\nDatasets:")
+				rows := make([][]string, len(d.Datasets))
+				for i, ds := range d.Datasets {
+					rows[i] = []string{ds.Name, ds.Dir, oneLine(ds.SQL)}
+				}
+				printTable(os.Stdout, []string{"NAME", "DIR", "SQL"}, rows)
+			}
+			if len(d.Widgets) > 0 {
+				fmt.Println("\nWidgets:")
+				rows := make([][]string, len(d.Widgets))
+				for i, w := range d.Widgets {
+					rows[i] = []string{w.ID, w.Type, w.Title, w.Dataset}
+				}
+				printTable(os.Stdout, []string{"ID", "TYPE", "TITLE", "DATASET"}, rows)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	return cmd
+}
+
+func newDashboardsRenderCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "render <slug>",
+		Short: "Execute every widget's dataset and print the results",
+		Long: `Execute a dashboard — runs each widget's bound dataset SQL and
+prints the results. Datasets shared by multiple widgets execute once.
+
+Useful for cron / CI smoke tests: a non-zero exit means at least one
+widget's query failed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, _, err := newDashboardService(cmd)
+			if err != nil {
+				return err
+			}
+			render, err := svc.RenderDashboard(cmd.Context(), args[0])
+			if err != nil {
+				return dashboardNotFoundHint(err, args[0])
+			}
+			if jsonOut {
+				if err := printJSON(os.Stdout, render); err != nil {
+					return err
+				}
+			} else {
+				fmt.Printf("%s  (%s)\n", render.Title, render.Slug)
+				for _, w := range render.Widgets {
+					fmt.Printf("\n• %s  [%s]\n", w.Title, w.Type)
+					if w.Error != "" {
+						fmt.Printf("  error: %s\n", w.Error)
+						continue
+					}
+					printTable(os.Stdout, w.Columns, w.Rows)
+				}
+			}
+			// Non-zero exit when any widget errored — the CI smoke-test signal.
+			for _, w := range render.Widgets {
+				if w.Error != "" {
+					return fmt.Errorf("%d widget(s) failed to render", countErrors(render))
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	return cmd
+}
+
+func newDashboardsApplyCmd() *cobra.Command {
+	var slug string
+	cmd := &cobra.Command{
+		Use:   "apply <file.json>",
+		Short: "Create or replace a dashboard from a JSON spec file",
+		Long: `Create or replace a dashboard from a JSON file. The file is the
+datasets-shaped spec (a title, datasets, widgets); the legacy
+per-widget-SQL shape is accepted and migrated automatically.
+
+The slug defaults to the file's base name; override with --slug.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := os.ReadFile(args[0])
+			if err != nil {
+				return fmt.Errorf("read %s: %w", args[0], err)
+			}
+			if slug == "" {
+				slug = strings.TrimSuffix(filepath.Base(args[0]), ".json")
+			}
+			svc, _, err := newDashboardService(cmd)
+			if err != nil {
+				return err
+			}
+			d, err := svc.ApplyDashboardFile(cmd.Context(), slug, data)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Applied dashboard %s (%d dataset(s), %d widget(s))\n",
+				d.Slug, len(d.Datasets), len(d.Widgets))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&slug, "slug", "", "dashboard slug (default: file base name)")
+	return cmd
+}
+
+func newDashboardsDeleteCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "delete <slug>",
+		Short: "Delete a dashboard",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, _, err := newDashboardService(cmd)
+			if err != nil {
+				return err
+			}
+			if err := svc.DeleteDashboard(cmd.Context(), args[0]); err != nil {
+				return dashboardNotFoundHint(err, args[0])
+			}
+			fmt.Printf("Deleted dashboard %s\n", args[0])
+			return nil
+		},
+	}
+	return cmd
+}
+
+// dashboardNotFoundHint turns the service's wrapped os.ErrNotExist into a
+// terse "no such dashboard" message instead of leaking the wrapped text.
+func dashboardNotFoundHint(err error, slug string) error {
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("no dashboard named %q (try `clavesa dashboards list`)", slug)
+	}
+	return err
+}
+
+// oneLine collapses whitespace so multi-line widget SQL fits one table cell.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func countErrors(r service.DashboardRender) int {
+	n := 0
+	for _, w := range r.Widgets {
+		if w.Error != "" {
+			n++
+		}
+	}
+	return n
+}

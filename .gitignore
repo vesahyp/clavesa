@@ -1,0 +1,17 @@
+.vscode
+.claude/worktrees/
+.claude/settings.local.json
+.playwright-mcp
+.playwright-cli
+node_modules
+ui/dist/
+ui/.vite/
+e2e/test-results
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+modules/**/*.zip
+bin/
+e2e/.e2e-workspace
+clavesa

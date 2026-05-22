@@ -1,0 +1,110 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ---------------------------------------------------------------------------
+   Design tokens
+   ---------------------------------------------------------------------------
+   Single dark theme for now. CSS-vars-based so a light mode is a swap of
+   :root values away. Color palette derived from the slate/zinc scales the
+   pre-rewrite UI was hand-rolling inline.
+*/
+
+:root {
+  --radius: 0.5rem;
+
+  --background: oklch(0.183 0.021 252);  /* slate-900-ish */
+  --foreground: oklch(0.961 0.005 248);  /* slate-50 */
+
+  --card: oklch(0.226 0.024 252);        /* slate-800 */
+  --card-foreground: oklch(0.961 0.005 248);
+
+  --popover: oklch(0.226 0.024 252);
+  --popover-foreground: oklch(0.961 0.005 248);
+
+  --primary: oklch(0.546 0.222 264);     /* blue-600 */
+  --primary-foreground: oklch(0.984 0.003 248);
+
+  --secondary: oklch(0.282 0.027 252);   /* slate-700 */
+  --secondary-foreground: oklch(0.961 0.005 248);
+
+  --muted: oklch(0.282 0.027 252);
+  --muted-foreground: oklch(0.652 0.019 252); /* slate-400 */
+
+  --accent: oklch(0.282 0.027 252);
+  --accent-foreground: oklch(0.961 0.005 248);
+
+  --destructive: oklch(0.575 0.226 27);  /* red-600 */
+  --destructive-foreground: oklch(0.984 0.003 248);
+
+  --border: oklch(0.305 0.029 252);      /* slate-700/600 */
+  --input: oklch(0.305 0.029 252);
+  --ring: oklch(0.546 0.222 264);
+
+  /* Status palette — used for run states, table freshness, etc. */
+  --status-success: oklch(0.696 0.161 145); /* green-500 */
+  --status-running: oklch(0.770 0.169 80);  /* amber-500 */
+  --status-failed: oklch(0.628 0.226 27);   /* red-500 */
+  --status-pending: oklch(0.652 0.019 252); /* slate-400 */
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-status-success: var(--status-success);
+  --color-status-running: var(--status-running);
+  --color-status-failed: var(--status-failed);
+  --color-status-pending: var(--status-pending);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/*
+ * React Flow <Controls> — dark-theme the zoom buttons to match the editor
+ * canvas. The library's default stylesheet (@xyflow/react/dist/style.css)
+ * paints them white, which reads as a stray white box bottom-left against
+ * the dark canvas. The <MiniMap> is already dark-themed via inline props;
+ * Controls has no prop seam, so it's overridden here. Scoped under the
+ * graph wrapper for specificity over the imported stylesheet.
+ */
+[data-testid="pipeline-graph"] .react-flow__controls-button {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  fill: var(--foreground);
+}
+[data-testid="pipeline-graph"] .react-flow__controls-button:hover {
+  background: var(--muted);
+}

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+# Debug: Print environment variables
+echo "JAVA_HOME: $JAVA_HOME" >&2
+echo "PATH: $PATH" >&2
+
+# Hard-code the Java executable path for maximum reliability
+JAVA_EXECUTABLE="/usr/bin/java"
+
+# Fallback options if the hard-coded path doesn't work
+if [ ! -f "$JAVA_EXECUTABLE" ]; then
+  echo "Primary Java path not found, trying alternatives..." >&2
+  
+  # Try using JAVA_HOME
+  if [ -n "$JAVA_HOME" ] && [ -f "$JAVA_HOME/bin/java" ]; then
+    JAVA_EXECUTABLE="$JAVA_HOME/bin/java"
+    echo "Using Java from JAVA_HOME: $JAVA_EXECUTABLE" >&2
+  # Try Java 11 Amazon Corretto path
+  elif [ -f "/usr/lib/jvm/java-11-amazon-corretto/bin/java" ]; then
+    JAVA_EXECUTABLE="/usr/lib/jvm/java-11-amazon-corretto/bin/java"
+    echo "Using Java from Amazon Corretto path: $JAVA_EXECUTABLE" >&2
+  # Try common JRE path (for compatibility)
+  elif [ -f "/usr/lib/jvm/jre/bin/java" ]; then
+    JAVA_EXECUTABLE="/usr/lib/jvm/jre/bin/java"
+    echo "Using Java from JRE path: $JAVA_EXECUTABLE" >&2
+  else
+    # Last resort: search for any java executable
+    echo "Searching for Java executable..." >&2
+    java_path=$(find /usr -name java -type f -executable 2>/dev/null | head -1)
+    if [ -n "$java_path" ]; then
+      JAVA_EXECUTABLE="$java_path"
+      echo "Found Java at: $java_path" >&2
+    else
+      echo "Error: Java executable not found" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# Verify Java executable exists and is executable
+if [ ! -f "$JAVA_EXECUTABLE" ] || [ ! -x "$JAVA_EXECUTABLE" ]; then
+  echo "Error: Java executable not found or not executable at $JAVA_EXECUTABLE" >&2
+  exit 1
+fi
+
+# Print Java version for debugging
+echo "Using Java executable: $JAVA_EXECUTABLE" >&2
+$JAVA_EXECUTABLE -version >&2 2>&1
+
+# Use Python 3.12 paths for PySpark
+exec "$JAVA_EXECUTABLE" -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx1g "$@"

@@ -1,0 +1,1390 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/vesahyp/clavesa/internal/graph"
+	"github.com/vesahyp/clavesa/internal/hclparser"
+	"github.com/vesahyp/clavesa/internal/identutil"
+	"github.com/vesahyp/clavesa/internal/credentials"
+	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/runner"
+	"github.com/vesahyp/clavesa/internal/sources"
+	"github.com/vesahyp/clavesa/internal/workspace"
+)
+
+// RunResult summarises a `pipeline run` invocation.
+type RunResult struct {
+	Workdir string          `json:"workdir"`
+	RunID   string          `json:"run_id"`
+	Nodes   []NodeRunStatus `json:"nodes"`
+}
+
+// NodeRunStatus is the per-node outcome of RunPipeline.
+type NodeRunStatus struct {
+	NodeID string `json:"node_id"`
+	Type   string `json:"type"`
+	Status string `json:"status"`           // ok | skipped | failed
+	Output string `json:"output,omitempty"` // path to the data this node produced
+	Note   string `json:"note,omitempty"`   // human-readable detail
+}
+
+// runPrep is the synchronous setup for a pipeline run — everything that
+// must happen before the run id is meaningful (parse, topo-sort, the
+// initial RUNNING progress channel). StartRun returns the run id right
+// after prepareRun so the UI can navigate to the run page instantly;
+// executeRun then walks the DAG (synchronously for the CLI, in a
+// background goroutine for the UI).
+type runPrep struct {
+	abs           string
+	graph         graph.PipelineGraph
+	order         []string
+	workdir       string
+	image         string
+	catalog       string
+	systemCatalog string
+	schema        string
+	runID         string
+	channel       *runChannel
+}
+
+// ErrRunInFlight is returned by StartRun when the pipeline already has a
+// run executing. The synchronous RunPipeline naturally serialized runs
+// because the HTTP request blocked; async dispatch needs this explicit
+// guard against a double-click / concurrent run of the same pipeline.
+var ErrRunInFlight = errors.New("a run is already in progress for this pipeline")
+
+// RunPipeline executes every transform node in `dir` in topological order,
+// using the same handler() that Lambda invokes. Source nodes contribute
+// their configured local-FS paths; destination nodes are reported but not
+// written to in this v1. Synchronous — blocks until the run finishes;
+// used by `clavesa pipeline run`. The UI uses StartRun instead.
+//
+// During execution the runner writes a filesystem progress channel under
+// <pipelineDir>/.clavesa/runs/<runID>/ so observability.LocalProvider can
+// surface the same live state + per-node logs the cloud provider sources from
+// SFN + CloudWatch (ADR-014).
+//
+// Local FS only — S3-style source paths return an error. Remote S3 sources
+// will land when scheduled-remote support is wired.
+func (s *Service) RunPipeline(ctx context.Context, dir string) (*RunResult, error) {
+	prep, err := s.prepareRun(dir)
+	if err != nil {
+		return nil, err
+	}
+	return s.executeRun(ctx, prep)
+}
+
+// StartRun begins a local pipeline run asynchronously. It prepares the
+// run synchronously — so the run id is immediately meaningful and the
+// RUNNING progress channel exists — then walks the DAG in a background
+// goroutine and returns the run id. The UI navigates to the run page
+// with this id instead of blocking for the whole run. Returns
+// ErrRunInFlight if the pipeline already has a run executing.
+func (s *Service) StartRun(dir string) (string, error) {
+	abs := s.resolveDir(dir)
+	s.runsMu.Lock()
+	if s.runsInFlight[abs] {
+		s.runsMu.Unlock()
+		return "", ErrRunInFlight
+	}
+	// Reserve before prepareRun so two racing callers can't both prepare.
+	s.runsInFlight[abs] = true
+	s.runsMu.Unlock()
+
+	clear := func() {
+		s.runsMu.Lock()
+		delete(s.runsInFlight, abs)
+		s.runsMu.Unlock()
+	}
+
+	prep, err := s.prepareRun(dir)
+	if err != nil {
+		clear()
+		return "", err
+	}
+	go func() {
+		defer clear()
+		// context.Background(): the run outlives the HTTP request that
+		// dispatched it (and any browser tab that closes).
+		_, _ = s.executeRun(context.Background(), prep)
+	}()
+	return prep.runID, nil
+}
+
+// prepareRun does the synchronous setup: parse + validate, topo-sort,
+// evict the warm worker, resolve the runner image + ADR-016 (catalog,
+// schema), generate the run id, and write the initial RUNNING progress
+// channel. After it returns, GET /pipeline/execution/states reports the
+// run as RUNNING with every node PENDING.
+func (s *Service) prepareRun(dir string) (*runPrep, error) {
+	abs := s.resolveDir(dir)
+	g, err := hclparser.Parse(abs)
+	if err != nil {
+		return nil, fmt.Errorf("parse pipeline: %w", err)
+	}
+	if len(g.Validation.Errors) > 0 {
+		return nil, fmt.Errorf("pipeline has validation errors: %s", g.Validation.Errors[0].Message)
+	}
+
+	order, err := topoSort(&g)
+	if err != nil {
+		return nil, err
+	}
+
+	// Release the Catalog/dashboard warm-Spark container so the per-run
+	// transform runner has the Docker memory budget to itself. Without
+	// this, on a Docker Desktop with the default 7-8GB memory, the warm
+	// worker (3GB) + transform runner (3GB) + record-run runner (3GB)
+	// race and the kernel OOM-kills one of them mid-Spark-boot. The
+	// next Catalog/dashboard query re-spawns the warm worker on demand.
+	// nil-safe — CLI-only invocations don't have a warm worker.
+	if s.evictor != nil {
+		s.evictor.EvictWarehouse(workspace.LocalWarehouseDir(s.workspace))
+	}
+
+	workdir, err := os.MkdirTemp("", "clavesa-run-")
+	if err != nil {
+		return nil, fmt.Errorf("create workdir: %w", err)
+	}
+
+	// Resolve the workspace-scoped runner image name and the ADR-016
+	// (catalog, schema) pair for this pipeline run. Catalog comes from
+	// the workspace manifest (empty for legacy / pre-ADR workspaces);
+	// schema is read from the pipeline's variables.tf default with
+	// terraform.tfvars override applied. Both flow into the runner via
+	// CLAVESA_CATALOG / CLAVESA_SCHEMA env vars and end up
+	// encoded as the Glue DB name `_glue_db()` writes to — keeps local
+	// runs writing to the same backend names as their cloud twin.
+	image := runner.LocalImageName("") + ":latest"
+	pipelineName := filepath.Base(abs)
+	catalog := ""
+	systemCatalog := ""
+	if m, _ := workspace.Load(filepath.Dir(abs)); m != nil {
+		image = runner.LocalImageName(m.Name) + ":latest"
+		catalog = m.CatalogIdentifier()
+		systemCatalog = m.SystemCatalogIdentifier()
+	}
+	schema := resolvePipelineSchema(abs, pipelineName)
+
+	runID := newRunID()
+	channel := newRunChannel(abs, runID, pipelineName)
+	if err := channel.start(order, &g); err != nil {
+		return nil, fmt.Errorf("init run channel: %w", err)
+	}
+
+	return &runPrep{
+		abs: abs, graph: g, order: order, workdir: workdir,
+		image: image, catalog: catalog, systemCatalog: systemCatalog,
+		schema: schema, runID: runID, channel: channel,
+	}, nil
+}
+
+// executeRun walks the prepared DAG, invoking the runner per transform.
+// Shared by RunPipeline (synchronous) and StartRun (background goroutine).
+func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, error) {
+	g := prep.graph
+	abs := prep.abs
+	workdir := prep.workdir
+	image := prep.image
+	catalog := prep.catalog
+	systemCatalog := prep.systemCatalog
+	schema := prep.schema
+	runID := prep.runID
+	channel := prep.channel
+
+	result := &RunResult{Workdir: workdir, RunID: runID}
+	outputPath := map[string]string{}   // nodeID -> path containing this node's output data
+	outputFormat := map[string]string{} // nodeID -> format for downstream readers ("parquet" for transforms; source-declared otherwise)
+	nodeByID := map[string]*graph.Node{}
+	for i := range g.Nodes {
+		nodeByID[g.Nodes[i].ID] = &g.Nodes[i]
+	}
+
+	finalErr := error(nil)
+	for _, nodeID := range prep.order {
+		node := nodeByID[nodeID]
+		if node == nil {
+			continue
+		}
+		status := NodeRunStatus{NodeID: nodeID, Type: node.Type}
+
+		switch node.Type {
+		case "source":
+			path, perr := localSourcePath(node)
+			if perr != nil {
+				status.Status = "failed"
+				status.Note = perr.Error()
+				channel.nodeFailed(nodeID, "source_error", perr.Error())
+				result.Nodes = append(result.Nodes, status)
+				finalErr = fmt.Errorf("source %s: %w", nodeID, perr)
+				goto done
+			}
+			outputPath[nodeID] = path
+			outputFormat[nodeID] = sourceFormat(node)
+			status.Status = "ok"
+			status.Output = path
+			channel.nodeSucceeded(nodeID)
+
+		case "transform":
+			channel.nodeEntered(nodeID)
+			inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
+			if ierr != nil {
+				status.Status = "failed"
+				status.Note = ierr.Error()
+				channel.nodeFailed(nodeID, "input_error", ierr.Error())
+				result.Nodes = append(result.Nodes, status)
+				finalErr = fmt.Errorf("transform %s inputs: %w", nodeID, ierr)
+				goto done
+			}
+			// Auto-generated Iceberg table id matches the runner's
+			// _table_id_for() — empty `target` triggers auto-table mode in
+			// the runner, and we mirror its derivation here so downstream
+			// transforms can read via spark.table(...). Iceberg in local
+			// matches CLAUDE.md's "Iceberg is the default output" rule and
+			// closes the catalog/observability parity gap with cloud.
+			tableID := autoIcebergTableID(catalog, schema, nodeID)
+
+			rerr := s.runTransform(ctx, image, abs, workdir, node, inputs, tableID, channel.logPathFor(nodeID), runID, catalog, schema, systemCatalog)
+			if rerr != nil {
+				status.Status = "failed"
+				status.Note = rerr.Error()
+				channel.nodeFailed(nodeID, "runner_error", rerr.Error())
+				result.Nodes = append(result.Nodes, status)
+				finalErr = fmt.Errorf("transform %s: %w", nodeID, rerr)
+				goto done
+			}
+			outputPath[nodeID] = tableID
+			outputFormat[nodeID] = "iceberg" // upstream-of-transform descriptor: bare string → spark.table()
+			status.Status = "ok"
+			status.Output = tableID
+			channel.nodeSucceeded(nodeID)
+
+		case "destination":
+			// V1: report the upstream output that would be written.
+			upstream := upstreamOutput(&g, nodeID, outputPath)
+			status.Status = "skipped"
+			status.Output = upstream
+			status.Note = "destinations not executed in v1; data left at upstream output path"
+			channel.nodeSkipped(nodeID, status.Note)
+
+		default:
+			status.Status = "skipped"
+			status.Note = fmt.Sprintf("unknown node type %q", node.Type)
+			channel.nodeSkipped(nodeID, status.Note)
+		}
+
+		result.Nodes = append(result.Nodes, status)
+	}
+
+done:
+	channel.finish(finalErr)
+	// Append the run-level rollup row to <pipeline>.runs so the dashboard's
+	// "Run history" panel works for local pipelines (cloud uses an EventBridge
+	// → runs-writer Lambda that does the same write through Athena). Best-effort:
+	// a failure here logs to stderr but doesn't change the run's outcome — the
+	// data the user cares about already landed via runTransform.
+	recordLocalRun(ctx, image, abs, channel)
+	if finalErr != nil {
+		return result, finalErr
+	}
+	return result, nil
+}
+
+// topoSort returns node IDs in dependency order (sources first, destinations last).
+// Errors on a cycle.
+func topoSort(g *graph.PipelineGraph) ([]string, error) {
+	indegree := map[string]int{}
+	children := map[string][]string{}
+	for _, n := range g.Nodes {
+		indegree[n.ID] = 0
+	}
+	for _, e := range g.Edges {
+		indegree[e.ToNode]++
+		children[e.FromNode] = append(children[e.FromNode], e.ToNode)
+	}
+
+	var queue []string
+	for id, d := range indegree {
+		if d == 0 {
+			queue = append(queue, id)
+		}
+	}
+
+	order := make([]string, 0, len(g.Nodes))
+	for len(queue) > 0 {
+		// Stable order: pop smallest ID for determinism across runs.
+		// Tiny graphs — bubble down isn't a problem.
+		minIdx := 0
+		for i, id := range queue {
+			if id < queue[minIdx] {
+				minIdx = i
+			}
+		}
+		curr := queue[minIdx]
+		queue = append(queue[:minIdx], queue[minIdx+1:]...)
+		order = append(order, curr)
+
+		for _, child := range children[curr] {
+			indegree[child]--
+			if indegree[child] == 0 {
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	if len(order) != len(g.Nodes) {
+		return nil, fmt.Errorf("pipeline has a cycle (visited %d/%d nodes)", len(order), len(g.Nodes))
+	}
+	return order, nil
+}
+
+// localSourcePath returns the local filesystem path for a source node, or an
+// error if the configured `bucket` isn't a local path.
+func localSourcePath(node *graph.Node) (string, error) {
+	bucket, _ := node.Config["bucket"].(string)
+	prefix, _ := node.Config["prefix"].(string)
+	if bucket == "" {
+		return "", fmt.Errorf("source has no `bucket` config")
+	}
+	// Mirror the rule used in service/preview: anything not starting with
+	// /, ./, or ../ is treated as an S3 bucket name.
+	if !strings.HasPrefix(bucket, "/") && !strings.HasPrefix(bucket, "./") && !strings.HasPrefix(bucket, "../") {
+		return "", fmt.Errorf("source bucket %q looks like S3; v1 of `pipeline run` is local-only", bucket)
+	}
+	return filepath.Join(bucket, prefix), nil
+}
+
+// buildInputs resolves each parent edge to a descriptor the runner can read.
+//
+// String form (back-compat) is emitted whenever the upstream output is plain
+// Parquet — covers every transform→transform edge plus source→transform edges
+// where the source declared `format = "parquet"` (or left it unset). Anything
+// else (csv, json, …) emits the `{"kind":"path","path":...,"format":...}` dict
+// form so the runner can branch its `spark.read.<fmt>(...)` call accordingly.
+// The dict form deliberately does not collide with the existing
+// `{"kind":"partitioned_path", ...}` shape used for v0.12.0 incremental S3
+// sources — those still go through their own path.
+//
+// ADR-017 slice 1: also resolves workspace-registry `sources.<name>`
+// references on the target transform into kind-discriminated descriptors
+// (currently `{"kind":"http","url":...,"format":...}`). Workspace-level
+// registry lookup is the reason this is a method on Service.
+//
+// ADR-016: cross-pipeline `external_inputs` (`<schema>.<table>` references
+// authored via `node connect --from-table`) resolve to the bare-string
+// catalog identifier `clavesa.<catalog>__<schema>.<table>` — the same
+// translation the cloud orchestration emitter applies, shared via
+// identutil.EncodeExternalTableRef so the two surfaces can't drift. `catalog`
+// is the workspace catalog identifier.
+func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath, outputFormat map[string]string, catalog string) (map[string]any, error) {
+	inputs := map[string]any{}
+	// Workspace-source references first.
+	for _, n := range g.Nodes {
+		if n.ID != nodeID {
+			continue
+		}
+		if srcInputs, ok := n.Config["source_inputs"].(map[string]interface{}); ok {
+			store := sources.New(s.workspace)
+			credStore := credentials.New(s.workspace)
+			for alias, raw := range srcInputs {
+				name := ""
+				switch v := raw.(type) {
+				case string:
+					name = strings.TrimPrefix(v, "sources.")
+				case map[string]interface{}:
+					if sn, ok := v["spec_name"].(string); ok {
+						name = sn
+					}
+				}
+				if name == "" {
+					return nil, fmt.Errorf("input %q: malformed source_inputs entry %v", alias, raw)
+				}
+				spec, err := store.Get(name)
+				if err != nil {
+					return nil, fmt.Errorf("input %q references source %q which is not registered: %w", alias, name, err)
+				}
+				var credDescriptor map[string]any
+				if spec.Credentials != "" {
+					cred, err := credStore.Get(spec.Credentials)
+					if err != nil {
+						return nil, fmt.Errorf("source %q references credential %q which is not registered", name, spec.Credentials)
+					}
+					credDescriptor = map[string]any{
+						"kind":         cred.Kind,
+						"header_name":  cred.HeaderName,
+						"value_prefix": cred.ValuePrefix,
+						"secret":       cred.Secret,
+					}
+				}
+				switch spec.Kind {
+				case "http":
+					descriptor := map[string]any{
+						"kind":   "http",
+						"url":    spec.URL,
+						"format": spec.Format,
+					}
+					if credDescriptor != nil {
+						descriptor["credentials"] = credDescriptor
+					}
+					inputs[alias] = descriptor
+				case "s3":
+					if len(spec.Partitions) > 0 {
+						// Incremental read — runner walks the partition
+						// tree under the prefix, advances a watermark on
+						// each run. partitioned_path expects an s3://
+						// path; bucket+prefix → "s3://<bucket>/<prefix>".
+						parts := make([]any, len(spec.Partitions))
+						for i, p := range spec.Partitions {
+							parts[i] = p
+						}
+						startFrom := spec.StartFrom
+						if startFrom == "" {
+							startFrom = "all"
+						}
+						inputs[alias] = map[string]any{
+							"kind":       "partitioned_path",
+							"path":       "s3://" + spec.Bucket + "/" + spec.Prefix,
+							"partitions": parts,
+							"start_from": startFrom,
+						}
+						break
+					}
+					descriptor := map[string]any{
+						"kind":   "s3",
+						"bucket": spec.Bucket,
+						"prefix": spec.Prefix,
+						"format": spec.Format,
+					}
+					if credDescriptor != nil {
+						descriptor["credentials"] = credDescriptor
+					}
+					inputs[alias] = descriptor
+				default:
+					return nil, fmt.Errorf("source %q kind %q not supported", name, spec.Kind)
+				}
+			}
+		}
+		// Cross-pipeline reads (ADR-016). `external_inputs` holds
+		// `alias -> "<schema>.<table>"`; resolve each to the runner catalog
+		// identifier `clavesa.<catalog>__<schema>.<table>`. The runner
+		// reads a slashless bare string via `spark.table()`, and the
+		// workspace-shared local warehouse means the producing pipeline's
+		// table is in the same Hadoop catalog the consumer's Spark sees.
+		if extInputs, ok := n.Config["external_inputs"].(map[string]interface{}); ok {
+			for alias, raw := range extInputs {
+				ref, _ := raw.(string)
+				id, err := identutil.EncodeExternalTableRef(catalog, ref)
+				if err != nil {
+					return nil, fmt.Errorf("input %q: %w", alias, err)
+				}
+				inputs[alias] = id
+			}
+		}
+		break
+	}
+	var consumer *graph.Node
+	for i := range g.Nodes {
+		if g.Nodes[i].ID == nodeID {
+			consumer = &g.Nodes[i]
+			break
+		}
+	}
+	incremental := map[string]bool{}
+	if consumer != nil {
+		incremental = incrementalInputAliases(*consumer)
+	}
+	for _, e := range g.Edges {
+		if e.ToNode != nodeID {
+			continue
+		}
+		alias := e.ToInput
+		if alias == "" || alias == "default" {
+			alias = e.FromNode
+		}
+		path, ok := outputPath[e.FromNode]
+		if !ok {
+			return nil, fmt.Errorf("upstream node %s has not produced output yet", e.FromNode)
+		}
+		format := outputFormat[e.FromNode]
+		if format == "iceberg" && incremental[alias] {
+			// v0.24.0: snapshot-bounded read on a transform upstream.
+			// Runner discovers the current snapshot id at execution
+			// time, compares against a stored watermark, reads the
+			// committed-since range. Local watermarks live under the
+			// pipeline's `.clavesa/watermarks/` (mounted into the
+			// container by runTransform); cloud uses the pipeline's
+			// S3 bucket.
+			inputs[alias] = map[string]any{
+				"kind":  "iceberg_table_incremental",
+				"table": path,
+				"alias": nodeID + "__" + alias,
+			}
+			continue
+		}
+		// Bare-string descriptor handles two cases the runner already
+		// dispatches correctly: parquet paths (slash → spark.read.parquet)
+		// and iceberg table ids (no slash → spark.table). The dict-form
+		// descriptor is reserved for non-Parquet path-form sources.
+		if format == "" || format == "parquet" || format == "iceberg" {
+			inputs[alias] = path
+			continue
+		}
+		inputs[alias] = map[string]any{
+			"kind":   "path",
+			"path":   path,
+			"format": format,
+		}
+	}
+	return inputs, nil
+}
+
+// resolvePipelineSchema returns the effective ADR-016 schema identifier
+// for a pipeline, with the same precedence Terraform applies at apply
+// time: terraform.tfvars / *.auto.tfvars overrides take priority over
+// the variable's default in variables.tf. Falls back to the sanitized
+// pipeline name when neither exists — matches the legacy
+// `clavesa_<pipeline>` Glue DB naming used before ADR-016.
+//
+// Returning the same value Terraform would resolve at apply time keeps
+// local runs writing to the same Glue DB as their cloud twin
+// (ADR-014 parity).
+func resolvePipelineSchema(pipelineDir, pipelineName string) string {
+	if v, ok := readSchemaFromTFVars(pipelineDir); ok && v != "" {
+		return v
+	}
+	if v := readSchemaDefault(pipelineDir); v != "" {
+		return v
+	}
+	return identutil.Sanitize(pipelineName)
+}
+
+// readSchemaFromTFVars looks for a `schema = "..."` assignment in any
+// tfvars file (terraform.tfvars or *.auto.tfvars) and returns it.
+// Conservative implementation: line-prefix match, no full HCL parse —
+// matches the readVariableDecls pattern used elsewhere.
+func readSchemaFromTFVars(dir string) (string, bool) {
+	for _, name := range tfvarsCandidates(dir) {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			t := strings.TrimSpace(line)
+			if !strings.HasPrefix(t, "schema") {
+				continue
+			}
+			_, val, ok := strings.Cut(t, "=")
+			if !ok {
+				continue
+			}
+			v := strings.TrimSpace(val)
+			if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+				return v[1 : len(v)-1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// readSchemaDefault returns the default value of `variable "schema"`
+// in variables.tf, or "" if the variable isn't declared / has no
+// default. Pipelines created post-ADR-016 always declare it; legacy
+// pipelines don't and fall through to the sanitize(pipeline_name)
+// fallback in resolvePipelineSchema.
+func readSchemaDefault(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "variables.tf"))
+	if err != nil {
+		return ""
+	}
+	inSchemaBlock := false
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, `variable "schema"`) {
+			inSchemaBlock = true
+			continue
+		}
+		if inSchemaBlock {
+			if strings.HasPrefix(t, "}") {
+				inSchemaBlock = false
+				continue
+			}
+			if strings.HasPrefix(t, "default") {
+				_, val, ok := strings.Cut(t, "=")
+				if !ok {
+					continue
+				}
+				v := strings.TrimSpace(val)
+				if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+					return v[1 : len(v)-1]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// tfvarsCandidates returns the tfvars filenames Terraform consumes,
+// in precedence order (terraform.tfvars, then *.auto.tfvars sorted).
+func tfvarsCandidates(dir string) []string {
+	out := []string{"terraform.tfvars"}
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.auto.tfvars"))
+	sort.Strings(matches)
+	for _, m := range matches {
+		out = append(out, filepath.Base(m))
+	}
+	return out
+}
+
+// autoIcebergTableID mirrors runner.py::_table_id_for so Go can pass an
+// explicit Iceberg table id into the runner's `outputs.default` field
+// (instead of letting the runner auto-generate, which Go can't observe
+// for downstream-input wiring). Same ADR-016 encoding as the runner's
+// `_glue_db()` and `internal/identutil.EncodeGlueDatabase`. Empty
+// catalog signals legacy pre-ADR-016 mode.
+func autoIcebergTableID(catalog, schema, nodeID string) string {
+	nodeSafe := identutil.Sanitize(nodeID)
+	return fmt.Sprintf("clavesa.%s.%s__default",
+		identutil.EncodeGlueDatabase(catalog, schema), nodeSafe)
+}
+
+// sourceFormat returns the source node's declared `format` attribute,
+// defaulting to "parquet" when unset (matches the runner's historical
+// assumption — and what most produced-by-an-upstream-transform sources are).
+func sourceFormat(node *graph.Node) string {
+	if v, ok := node.Config["format"].(string); ok && v != "" {
+		return v
+	}
+	return "parquet"
+}
+
+// upstreamOutput finds the first connected upstream node's output, used by
+// destination reporting.
+func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string]string) string {
+	for _, e := range g.Edges {
+		if e.ToNode == nodeID {
+			if p, ok := outputPath[e.FromNode]; ok {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// runTransform writes the node's logic to disk, builds the docker-run argv,
+// pipes the event JSON via stdin, and waits for completion. logPath, when
+// non-empty, receives a copy of stdout+stderr so the local progress channel
+// can surface per-node logs to the UI (mirrors CloudWatch in cloud).
+//
+// outputTarget is passed straight through to the runner as `outputs.default`.
+// An empty string triggers auto-Iceberg-table mode (the runner generates
+// `clavesa.clavesa_<pipeline>.<node>__default`); a path-form string
+// would route plain-Parquet output (reserved for destination overrides; not
+// emitted by the local pipeline-run flow today).
+func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, logPath, pipelineRunID, catalog, schema, systemCatalog string) error {
+	language, _ := node.Config["language"].(string)
+	if language == "" {
+		language = "sql"
+	}
+
+	logic, lerr := readNodeLogic(node, language, pipelineDir)
+	if lerr != nil {
+		return lerr
+	}
+
+	logicPath := filepath.Join(workdir, node.ID, "logic.txt")
+	if err := os.MkdirAll(filepath.Dir(logicPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(logicPath, []byte(logic), 0o644); err != nil {
+		return err
+	}
+
+	// Pass the explicit table_id through. The runner's _resolve_output sees
+	// a non-path-form string and treats it as an Iceberg table id (the same
+	// string the runner would have auto-generated from CLAVESA_PIPELINE +
+	// CLAVESA_NODE). Single source of truth lives Go-side now so
+	// downstream transforms in this run see the exact same table id when
+	// they spark.table() against it.
+	//
+	// `_sf_execution_arn` carries the pipeline-run id into the runner so
+	// every node_runs row stamps the same value the runs writer puts on
+	// `runs.sf_execution_arn`. Without this, node_runs.run_id (per-runner-
+	// invocation uuid) and runs.run_id (per-pipeline-execution uuid) drift
+	// apart and the join breaks. Cloud uses the literal SFN ARN; local
+	// uses the pipeline-run uuid — semantically identical for the join.
+	//
+	// `_trigger` mirrors the value the cloud start paths stamp into the SFN
+	// execution input. A local `pipeline run` is always operator-initiated,
+	// so it stamps `manual` — the runner copies it into each Iceberg
+	// snapshot's summary so the table timeline shows where the rows came from.
+	event := map[string]any{
+		"inputs":            inputs,
+		"outputs":           buildLocalOutputs(node, outputTarget),
+		"_sf_execution_arn": pipelineRunID,
+		"_trigger":          "manual",
+	}
+	eventJSON, _ := json.Marshal(event)
+
+	// Workspace-shared Hadoop-catalog warehouse holds every local pipeline's
+	// Iceberg tables under separate `<catalog>__<schema>` namespaces. One
+	// warehouse per workspace is what lets a consumer transform read a
+	// sibling pipeline's table (cross-pipeline reads on `compute = "local"`);
+	// it mirrors the cloud model where one S3 bucket holds every pipeline's
+	// tables under DB-per-schema namespaces.
+	pipelineName := filepath.Base(pipelineDir)
+	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	if err := os.MkdirAll(warehouse, 0o755); err != nil {
+		return fmt.Errorf("create warehouse: %w", err)
+	}
+	// Local-side watermark directory for v0.24.0's iceberg_table_incremental
+	// kind (and any future watermark-tracking inputs). The runner reads / writes
+	// `<watermarks>/<consumer>__<alias>.json`; cloud uses `s3://<bucket>/<pipeline>/_watermarks/`
+	// for the same purpose. ADR-014 local-cloud parity.
+	watermarks := filepath.Join(pipelineDir, ".clavesa", "watermarks")
+	if err := os.MkdirAll(watermarks, 0o755); err != nil {
+		return fmt.Errorf("create watermarks dir: %w", err)
+	}
+
+	args := []string{"run", "--rm", "-i"}
+	args = append(args, "-e", "CLAVESA_RUN=1")
+	args = append(args, "-e", "CLAVESA_LOGIC_S3_PATH="+logicPath)
+	args = append(args, "-e", "CLAVESA_LANGUAGE="+language)
+	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	args = append(args, "-e", "CLAVESA_WATERMARKS="+watermarks)
+	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
+	args = append(args, "-e", "CLAVESA_NODE="+node.ID)
+	// Three-level namespace (ADR-016). Empty catalog passes through as
+	// the legacy signal — the runner's _glue_db() falls back to today's
+	// `clavesa_<schema>` literal so pre-ADR pipelines keep finding
+	// their data without migration.
+	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
+	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
+	// Workspace system catalog (ADR-016 v0.20.0). Runner writes
+	// node_runs / runs / tables here regardless of the pipeline schema.
+	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
+	// ADR-017 slice 2: forward env vars referenced by env:-backend
+	// credentials so the runner's _resolve_secret can read them. We only
+	// forward names referenced by inputs on this transform — no
+	// indiscriminate env passthrough. file:-backed credentials need the
+	// path mounted (see input mount loop below); arn: backends fetch via
+	// boto3 and need AWS creds (out-of-scope, the user's docker AWS env
+	// covers that if any).
+	for _, name := range envVarsForCredentials(inputs) {
+		v, present := os.LookupEnv(name)
+		if !present {
+			return fmt.Errorf("credential references env var %q which is not set in the current shell", name)
+		}
+		args = append(args, "-e", name+"="+v)
+	}
+	// ADR-017 slice 3: forward AWS credentials when any input on this
+	// transform is kind=s3. Spark's S3A reads use the
+	// DefaultAWSCredentialsProviderChain, which checks env vars first;
+	// pass through whatever the host shell has so `compute=local`
+	// pipelines work against same-account S3 sources without extra
+	// configuration. No-op for transforms with no s3 inputs.
+	if hasS3Input(inputs) {
+		for _, name := range []string{
+			"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+			"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE",
+			// Test-infra: lets users point S3A at moto/MinIO without
+			// rebuilding the runner image.
+			"CLAVESA_S3_ENDPOINT",
+		} {
+			if v, ok := os.LookupEnv(name); ok {
+				args = append(args, "-e", name+"="+v)
+			}
+		}
+		// Mount ~/.aws read-only so AWS_PROFILE-driven credentials
+		// (the common dev shape — `aws configure sso`, named
+		// profiles in ~/.aws/config) resolve inside the container.
+		// boto3 / hadoop-aws's profile chain needs the actual file.
+		if home, err := os.UserHomeDir(); err == nil {
+			awsDir := filepath.Join(home, ".aws")
+			if st, err := os.Stat(awsDir); err == nil && st.IsDir() {
+				args = append(args, "-v", awsDir+":/root/.aws:ro")
+			}
+		}
+	}
+	// Triage-column env: which exact image and module version produced this
+	// row. Module version is baked into the image at build time as an ENV;
+	// the digest comes from `docker image inspect` and changes every time the
+	// runner is rebuilt. Failures here are non-fatal — passing empty strings
+	// degrades to the older runner behavior of leaving the columns blank.
+	if digest := dockerImageDigest(image); digest != "" {
+		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
+	}
+
+	// Mount the workdir so logic + outputs are accessible.
+	args = append(args, "-v", workdir+":"+workdir)
+	// Mount the per-pipeline warehouse so Iceberg metadata + data files
+	// persist across runs. Same path inside and outside the container so
+	// table identifiers remain stable.
+	args = append(args, "-v", warehouse+":"+warehouse)
+	// Mount the per-pipeline watermarks dir for v0.24.0's
+	// iceberg_table_incremental kind. Runner reads/writes
+	// `<watermarks>/<consumer>__<alias>.json` to track the last-seen
+	// upstream snapshot id.
+	args = append(args, "-v", watermarks+":"+watermarks)
+	// ADR-017 slice 2: file:-backed credential payloads live in the
+	// workspace credentials dir; mount read-only so the runner's
+	// _resolve_secret can open them at the host-absolute path the
+	// orchestration emitter inlined into the descriptor. No-op cost
+	// when no file: backends are used; the dir always exists once
+	// `workspace init` has run.
+	credsDir := filepath.Join(s.workspace, ".clavesa", "credentials")
+	if st, err := os.Stat(credsDir); err == nil && st.IsDir() {
+		args = append(args, "-v", credsDir+":"+credsDir+":ro")
+	}
+	// Mount each input path so the runner can read it. Sources may live
+	// outside the workdir. Inputs may be string-form (back-compat: parquet) or
+	// dict-form (`{"kind":"path","path":...,"format":...}`) once we threaded
+	// source format through buildInputs.
+	mounted := map[string]bool{workdir: true, warehouse: true}
+	for _, v := range inputs {
+		p := inputLocalPath(v)
+		if p == "" {
+			continue
+		}
+		root := mountRoot(p)
+		if !mounted[root] {
+			args = append(args, "-v", root+":"+root+":ro")
+			mounted[root] = true
+		}
+	}
+
+	args = append(args, image)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdin = bytes.NewReader(eventJSON)
+	var stdout, stderr bytes.Buffer
+	// Tee to the per-node log file when requested. The runner's JSON result
+	// is the last stdout line; multiwriter doesn't reorder bytes so the JSON
+	// parse below still works against the in-memory buffer.
+	var stdoutWriters []io.Writer = []io.Writer{&stdout}
+	var stderrWriters []io.Writer = []io.Writer{&stderr}
+	var logFile *os.File
+	var logTS io.WriteCloser
+	if logPath != "" {
+		if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err == nil {
+			f, ferr := os.Create(logPath)
+			if ferr == nil {
+				logFile = f
+				// Wrap once so stdout and stderr lines share a single
+				// timestamping writer with line buffering — interleaved
+				// writes are split at newline boundaries and each
+				// completed line gets its own ISO timestamp at write
+				// time. ExecutionLogs splits the prefix back off when
+				// reading so the response carries real per-line
+				// timestamps (ADR-014 parity with cloud's CloudWatch).
+				logTS = observability.NewTimestampedLogWriter(f)
+				stdoutWriters = append(stdoutWriters, logTS)
+				stderrWriters = append(stderrWriters, logTS)
+			}
+		}
+	}
+	cmd.Stdout = io.MultiWriter(stdoutWriters...)
+	cmd.Stderr = io.MultiWriter(stderrWriters...)
+
+	runErr := cmd.Run()
+	if logTS != nil {
+		_ = logTS.Close()
+	}
+	if logFile != nil {
+		_ = logFile.Close()
+	}
+	if runErr != nil {
+		return fmt.Errorf("docker run: %w\nstderr: %s", runErr, stderr.String())
+	}
+
+	// Runner writes a single JSON object to stdout. Parse to surface errors.
+	resp := map[string]any{}
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); err != nil {
+		return fmt.Errorf("parse runner output: %w\nstdout: %s\nstderr: %s",
+			err, stdout.String(), stderr.String())
+	}
+	if errMsg, _ := resp["error"].(string); errMsg != "" {
+		return fmt.Errorf("runner error: %s", errMsg)
+	}
+	if status, _ := resp["status"].(string); status != "ok" {
+		return fmt.Errorf("runner status: %v\nstdout: %s", resp["status"], stdout.String())
+	}
+	return nil
+}
+
+// recordLocalRun invokes the runner image once with CLAVESA_RECORD_RUN=1
+// to append a row to <pipeline>.runs in the local Hadoop-catalog warehouse.
+// Mirrors the EventBridge-driven runs_writer Lambda used by the cloud path —
+// same Iceberg schema, same column order, so observability.LocalProvider.Runs()
+// projects identically against both warehouses.
+//
+// Best-effort: any failure (image missing, container exec error, Spark crash)
+// logs to stderr and returns nil. The run already finished and its data is
+// already on disk; failing here would punish the user for an observability
+// concern they didn't ask for.
+func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *runChannel) {
+	pipelineName := filepath.Base(pipelineDir)
+	// Resolve ADR-016 (catalog, schema) the same way RunPipeline does so
+	// the runs row lands in the same Glue DB as the node_runs row this
+	// pipeline just produced. Catalog from workspace manifest (empty for
+	// legacy); schema from pipeline variables.tf with tfvars override.
+	catalog := ""
+	systemCatalog := ""
+	if m, _ := workspace.Load(filepath.Dir(pipelineDir)); m != nil {
+		catalog = m.CatalogIdentifier()
+		systemCatalog = m.SystemCatalogIdentifier()
+	}
+	schema := resolvePipelineSchema(pipelineDir, pipelineName)
+	warehouse := workspace.LocalWarehouseDir(filepath.Dir(pipelineDir))
+	if err := os.MkdirAll(warehouse, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "[clavesa] runs row: create warehouse: %v\n", err)
+		return
+	}
+
+	channel.mu.Lock()
+	payload := map[string]any{
+		"run_id":   channel.state.RunID,
+		"pipeline": channel.state.Pipeline,
+		// Same value lives on every node_runs row this run produced (via
+		// the runner's `_sf_execution_arn` thread-through). The join key
+		// is `runs.sf_execution_arn = node_runs.sf_execution_arn`,
+		// uniform across local and cloud.
+		"sf_execution_arn": channel.state.RunID,
+		"status":           channel.state.Status,
+		"trigger":          channel.state.Trigger,
+		"started_at_ms":    channel.startMs,
+		"ended_at_ms":      channel.endedMs,
+		"failed_step":      channel.state.FailedStep,
+		"error_class":      channel.state.ErrorClass,
+		"error_msg":        channel.state.ErrorMsg,
+	}
+	if channel.state.DurationMs != nil {
+		payload["duration_ms"] = *channel.state.DurationMs
+	} else {
+		payload["duration_ms"] = channel.endedMs - channel.startMs
+	}
+	channel.mu.Unlock()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[clavesa] runs row: marshal payload: %v\n", err)
+		return
+	}
+
+	args := []string{"run", "--rm", "-i"}
+	args = append(args, "-e", "CLAVESA_RECORD_RUN=1")
+	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
+	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
+	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
+	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
+	if digest := dockerImageDigest(image); digest != "" {
+		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
+	}
+	args = append(args, "-v", warehouse+":"+warehouse)
+	args = append(args, image)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdin = bytes.NewReader(body)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		fmt.Fprintf(os.Stderr, "[clavesa] runs row write failed: %v\nstderr: %s\n",
+			runErr, stderr.String())
+	}
+}
+
+// readNodeLogic returns the SQL or Python source for a transform node, with
+// file("...") references resolved against the pipeline directory.
+func readNodeLogic(node *graph.Node, language, pipelineDir string) (string, error) {
+	var raw string
+	if language == "python" {
+		raw, _ = node.Config["python"].(string)
+	} else {
+		// Mirror preview.extractSQL — node.PreviewSQL is set by the parser.
+		if node.PreviewSQL != "" {
+			raw = node.PreviewSQL
+		} else {
+			raw, _ = node.Config["sql"].(string)
+		}
+	}
+	if raw == "" {
+		return "", fmt.Errorf("node has no %s configuration", language)
+	}
+	if path, ok := parseFileRef(raw); ok {
+		data, err := os.ReadFile(filepath.Join(pipelineDir, path))
+		if err != nil {
+			return "", fmt.Errorf("read %s file %s: %w", language, path, err)
+		}
+		return string(data), nil
+	}
+	return raw, nil
+}
+
+// parseFileRef recognises `file("relative/path")` HCL idiom.
+func parseFileRef(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if !strings.HasPrefix(expr, "file(") || !strings.HasSuffix(expr, ")") {
+		return "", false
+	}
+	inner := strings.TrimSpace(expr[len("file(") : len(expr)-1])
+	inner = strings.Trim(inner, `"`)
+	return inner, true
+}
+
+// dockerImageDigest returns the local docker image's content-addressable ID
+// (`sha256:<hex>`) for `ref`, or "" if the image isn't present or docker
+// isn't reachable. Used to stamp every node_runs / runs row with the exact
+// image build that produced it — same intent as the cloud Lambda's
+// data.aws_ecr_image.runner.image_digest, just sourced from the local daemon
+// instead of ECR.
+func dockerImageDigest(ref string) string {
+	out, err := exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", ref).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// hasS3Input reports whether any descriptor in inputs reads from S3 — the
+// signal for forwarding AWS credentials into the runner container. Covers
+// both `kind=s3` (raw s3 source) and `kind=partitioned_path` whose path is
+// s3:// (the v0.12.0 incremental shape registered s3 sources resolve to).
+func hasS3Input(inputs map[string]any) bool {
+	for _, v := range inputs {
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		k, _ := m["kind"].(string)
+		if k == "s3" {
+			return true
+		}
+		if k == "partitioned_path" {
+			if p, _ := m["path"].(string); strings.HasPrefix(p, "s3://") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// envVarsForCredentials walks an inputs map looking for env:-backed
+// credential references and returns the variable names. Used by the
+// docker-exec arg builder to forward only the variables that are
+// actually needed (no indiscriminate env passthrough).
+func envVarsForCredentials(inputs map[string]any) []string {
+	var out []string
+	for _, v := range inputs {
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		cred, ok := m["credentials"].(map[string]any)
+		if !ok {
+			continue
+		}
+		secret, _ := cred["secret"].(string)
+		if strings.HasPrefix(secret, "env:") {
+			out = append(out, strings.TrimPrefix(secret, "env:"))
+		}
+	}
+	return out
+}
+
+// inputLocalPath extracts the local-FS path from an input descriptor, returning
+// "" for descriptors that don't carry one (e.g. Iceberg-table id strings, S3
+// paths, partitioned_path dicts — those resolve inside the runner). Used for
+// deciding what bind-mounts the runner container needs.
+func inputLocalPath(v any) string {
+	switch x := v.(type) {
+	case string:
+		if strings.HasPrefix(x, "/") || strings.HasPrefix(x, "./") || strings.HasPrefix(x, "../") {
+			return x
+		}
+		return ""
+	case map[string]any:
+		if x["kind"] != "path" {
+			return ""
+		}
+		p, _ := x["path"].(string)
+		return p
+	}
+	return ""
+}
+
+// mountRoot returns the deepest directory we can mount that contains `path`.
+// Files: parent dir. Directories: the directory itself.
+func mountRoot(path string) string {
+	st, err := os.Stat(path)
+	if err == nil && st.IsDir() {
+		return path
+	}
+	return filepath.Dir(path)
+}
+
+// ---------------------------------------------------------------------------
+// Local progress channel
+// ---------------------------------------------------------------------------
+
+// runChannel writes the on-disk progress state observability.LocalProvider
+// reads from. One per pipeline run; methods are safe to call from a single
+// goroutine (RunPipeline is sequential).
+type runChannel struct {
+	pipelineDir string
+	state       *observability.RunStateFile
+	startMs     int64
+	endedMs     int64            // set in finish() — drives the runs row's ended_at_ms
+	nodeStarts  map[string]int64 // nodeID → entered_at unix-millis (for duration calc)
+	mu          sync.Mutex       // guards state writes against concurrent reads
+}
+
+func newRunChannel(pipelineDir, runID, pipelineName string) *runChannel {
+	now := time.Now().UTC()
+	return &runChannel{
+		pipelineDir: pipelineDir,
+		startMs:     now.UnixMilli(),
+		state: &observability.RunStateFile{
+			RunID:     runID,
+			Pipeline:  pipelineName,
+			Status:    "RUNNING",
+			StartedAt: now.Format(time.RFC3339Nano),
+			Trigger:   "manual",
+			States:    map[string]observability.NodeRunState{},
+		},
+		nodeStarts: map[string]int64{},
+	}
+}
+
+// start writes the initial state.json with one map entry per ordered node.
+// Sources/destinations get marked SUCCEEDED/SKIPPED inline below; this just
+// surfaces the topology before execution begins.
+func (c *runChannel) start(order []string, _ *graph.PipelineGraph) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range order {
+		c.state.States[id] = observability.NodeRunState{Status: "PENDING"}
+	}
+	return observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+func (c *runChannel) logPathFor(nodeID string) string {
+	return observability.RunLogPath(c.pipelineDir, c.state.RunID, nodeID)
+}
+
+func (c *runChannel) nodeEntered(nodeID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now().UTC()
+	c.nodeStarts[nodeID] = now.UnixMilli()
+	c.state.States[nodeID] = observability.NodeRunState{
+		Status:    "RUNNING",
+		EnteredAt: now.Format(time.RFC3339Nano),
+	}
+	_ = observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+func (c *runChannel) nodeSucceeded(nodeID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev := c.state.States[nodeID]
+	now := time.Now().UTC()
+	if prev.EnteredAt == "" {
+		prev.EnteredAt = now.Format(time.RFC3339Nano)
+	}
+	dur := c.durationFor(nodeID, now)
+	c.state.States[nodeID] = observability.NodeRunState{
+		Status:     "SUCCEEDED",
+		EnteredAt:  prev.EnteredAt,
+		ExitedAt:   now.Format(time.RFC3339Nano),
+		DurationMs: dur,
+	}
+	_ = observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+func (c *runChannel) nodeFailed(nodeID, errClass, errMsg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev := c.state.States[nodeID]
+	now := time.Now().UTC()
+	if prev.EnteredAt == "" {
+		prev.EnteredAt = now.Format(time.RFC3339Nano)
+	}
+	dur := c.durationFor(nodeID, now)
+	c.state.States[nodeID] = observability.NodeRunState{
+		Status:     "FAILED",
+		EnteredAt:  prev.EnteredAt,
+		ExitedAt:   now.Format(time.RFC3339Nano),
+		DurationMs: dur,
+		ErrorClass: errClass,
+		ErrorMsg:   truncate(errMsg, 4096),
+	}
+	if c.state.FailedStep == "" {
+		c.state.FailedStep = nodeID
+	}
+	_ = observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+func (c *runChannel) nodeSkipped(nodeID, note string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.state.States[nodeID] = observability.NodeRunState{
+		Status:   "SKIPPED",
+		ErrorMsg: note,
+	}
+	_ = observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+func (c *runChannel) finish(finalErr error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now().UTC()
+	c.endedMs = now.UnixMilli()
+	c.state.EndedAt = now.Format(time.RFC3339Nano)
+	dur := c.endedMs - c.startMs
+	c.state.DurationMs = &dur
+	if finalErr != nil {
+		c.state.Status = "FAILED"
+		if c.state.ErrorClass == "" {
+			c.state.ErrorClass = "PipelineFailed"
+		}
+		if c.state.ErrorMsg == "" {
+			c.state.ErrorMsg = truncate(finalErr.Error(), 4096)
+		}
+	} else {
+		c.state.Status = "SUCCEEDED"
+	}
+	_ = observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+// durationFor returns the millisecond duration since the node entered, or
+// nil when no entered_at was recorded (source/destination shortcuts).
+func (c *runChannel) durationFor(nodeID string, now time.Time) *int64 {
+	startedMs, ok := c.nodeStarts[nodeID]
+	if !ok {
+		return nil
+	}
+	d := now.UnixMilli() - startedMs
+	return &d
+}
+
+// truncate caps a string to maxLen, appending an ellipsis to signal cut.
+// Matches the runner's 4 KB error-message cap so cloud and local errors
+// surface uniformly bounded.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
+
+// buildLocalOutputs builds the runner-event outputs map for `pipeline run`.
+// Default key gets the caller-resolved target (auto-Iceberg table id);
+// any additional keys declared in output_definitions go in as empty
+// strings so the runner falls back to its auto-table derivation
+// (`clavesa.<db>.<node>__<key>`). Per-key mode + merge_keys flow
+// through as dict descriptors when the user declared them. This mirrors
+// the cloud-side orchestration emit, so local and cloud carry the same
+// payload shape for multi-output transforms (ADR-014).
+func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
+	out := map[string]any{"default": defaultTarget}
+	defs, _ := node.Config["output_definitions"].(map[string]interface{})
+	if len(defs) == 0 {
+		return out
+	}
+	for key, raw := range defs {
+		def, _ := raw.(map[string]interface{})
+		mode, _ := def["mode"].(string)
+		stats, _ := def["stats"].(bool)
+		var mergeKeys []string
+		if mk, ok := def["merge_keys"].([]interface{}); ok {
+			for _, v := range mk {
+				if s, ok := v.(string); ok {
+					mergeKeys = append(mergeKeys, s)
+				}
+			}
+		}
+		if mode == "" && len(mergeKeys) == 0 && !stats {
+			// Replace + no merge keys + stats off: leave bare string.
+			// "default" carries the caller's explicit target;
+			// everything else gets "" → runner auto-table.
+			if _, ok := out[key]; !ok {
+				out[key] = ""
+			}
+			continue
+		}
+		target := ""
+		if key == "default" {
+			target = defaultTarget
+		}
+		// Match the runner's _resolve_output default (runner/runner.py
+		// L775) AND the cloud-side `outputMode` resolution in
+		// orchestration.go: merge_keys present + mode unset → "merge".
+		// Without this, the recipe shape `--output-merge-keys customer_id`
+		// (without an explicit --output-mode) silently falls back to
+		// "replace" on local pipelines — keeping the row count flat but
+		// running full-table createOrReplace instead of MERGE INTO, so
+		// snapshot history shows append+full-replace ops instead of the
+		// COW-merge overwrites the recipe documents.
+		resolvedMode := mode
+		if resolvedMode == "" {
+			if len(mergeKeys) > 0 {
+				resolvedMode = "merge"
+			} else {
+				resolvedMode = "replace"
+			}
+		}
+		desc := map[string]any{
+			"kind":       "iceberg_table",
+			"table_id":   target,
+			"mode":       resolvedMode,
+			"merge_keys": mergeKeys,
+		}
+		if stats {
+			desc["stats"] = true
+		}
+		out[key] = desc
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// newRunID returns a 32-char hex run identifier matching the runner's
+// uuid.uuid4().hex shape — keeps both halves of the system speaking the
+// same identifier vocabulary.
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure on Linux/macOS would be exceptional; fall back
+		// to time-based bits rather than panic during a user pipeline run.
+		t := time.Now().UnixNano()
+		for i := 0; i < 16; i++ {
+			b[i] = byte(t >> (8 * (i % 8)))
+		}
+	}
+	return hex.EncodeToString(b[:])
+}
+
