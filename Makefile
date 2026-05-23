@@ -41,6 +41,7 @@ ui/node_modules: ui/package.json ui/package-lock.json
 
 build-ui: ui/node_modules ## Build the React frontend → internal/ui/dist/
 	cd ui && npm run build
+	@touch internal/ui/dist/.gitkeep
 
 build: build-ui sync-modules ## Build everything → bin/clavesa (UI + modules embedded)
 	go build -o bin/clavesa ./cmd/clavesa

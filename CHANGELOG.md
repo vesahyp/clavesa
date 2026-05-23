@@ -12,6 +12,17 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.0.2] — 2026-05-23
+
+### Changed
+
+- **Homebrew install is now a cask, not a formula.** New invocation:
+  `brew install --cask vesahyp/clavesa/clavesa`. Existing formula
+  installs are migrated to the cask transparently on `brew upgrade`
+  via the tap's `tap_migrations.json`. Driven by GoReleaser's
+  deprecation of `brews:` in favor of `homebrew_casks:` (removal
+  scheduled for GoReleaser v2.16).
+
 ## [v1.0.1] — 2026-05-22
 
 ### Added

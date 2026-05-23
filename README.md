@@ -51,10 +51,10 @@ Clavesa is a fourth shape: a lakehouse platform you own, with the authoring ergo
 
 ### Install
 
-**macOS (recommended):** install via Homebrew tap, picks up updates with `brew upgrade`.
+**macOS (recommended):** install via Homebrew tap as a cask, picks up updates with `brew upgrade`.
 
 ```bash
-brew install vesahyp/clavesa/clavesa
+brew install --cask vesahyp/clavesa/clavesa
 clavesa version
 ```
 
@@ -66,7 +66,7 @@ curl -L https://github.com/vesahyp/clavesa/releases/latest/download/clavesa_$(cu
 ./clavesa version
 ```
 
-Direct macOS downloads from the Releases page are **unsigned**, so Gatekeeper will refuse to run them. Use `brew install` on macOS — Homebrew strips the quarantine attribute on install.
+Direct macOS downloads from the Releases page are **unsigned**, so Gatekeeper will refuse to run them. Use `brew install --cask` on macOS — Homebrew strips the quarantine attribute on cask install.
 
 **From source** (if you'd rather build locally — see [Development](#development) for toolchain notes):
 

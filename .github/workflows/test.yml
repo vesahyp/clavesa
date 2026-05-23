@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # CI runs the non-docker suites only. test-cli and test-runner dispatch
+      # the runner container as root (the image is built on top of the AWS
+      # Lambda Python base which runs as root). On Linux that leaves
+      # root-owned files in t.TempDir(), which Go's automatic cleanup can't
+      # remove and bubbles up as a test failure. The fix is product-side
+      # (pass --user to docker run, drop privs in the runner) and worth a
+      # dedicated slice. Until then, docker-gated tests are part of the
+      # local pre-release gate (`make test` on the dev machine) but not CI.
+      - name: Run non-docker tests
+        run: |
+          make test-go
+          make test-runner-py

@@ -40,10 +40,12 @@ release:
   footer: |
     Full changes: [CHANGELOG.md](https://github.com/vesahyp/clavesa/blob/main/CHANGELOG.md)
 
-    macOS direct downloads are unsigned — `brew install vesahyp/clavesa/clavesa` is the recommended path on macOS.
+    macOS direct downloads are unsigned — `brew install --cask vesahyp/clavesa/clavesa` is the recommended path on macOS.
 
-brews:
+homebrew_casks:
   - name: clavesa
+    binaries:
+      - clavesa
     repository:
       owner: vesahyp
       name: homebrew-clavesa
@@ -54,9 +56,3 @@ brews:
       email: noreply@clavesa.dev
     homepage: https://github.com/vesahyp/clavesa
     description: "Visual ETL tool where pipelines are Terraform"
-    license: MIT
-    directory: Formula
-    test: |
-      system "#{bin}/clavesa", "version"
-    install: |
-      bin.install "clavesa"
