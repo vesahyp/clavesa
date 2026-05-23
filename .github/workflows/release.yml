@@ -41,23 +41,31 @@ jobs:
           cache: true
 
       - name: Extract release notes
-        # Pull the CHANGELOG section for this tag into a file GoReleaser
-        # uses as the release body. Same awk shape release-public.sh uses
-        # for the commit message body — single source of truth.
+        # Pull the CHANGELOG section for this tag into a multiline env var
+        # that .goreleaser.yaml templates into `release.header`. Same awk
+        # shape release-public.sh uses for the commit message body.
+        # `--release-notes <file>` was tried first and silently produced
+        # an empty body (likely conflicts with `changelog.disable: true`);
+        # threading via env var + header template is bulletproof.
         run: |
-          awk -v ver="${GITHUB_REF_NAME}" '
+          NOTES=$(awk -v ver="${GITHUB_REF_NAME}" '
               $0 ~ "^## \\[" ver "\\]" { in_section = 1; next }
               in_section && /^## \[/    { in_section = 0 }
               in_section                 { print }
-          ' CHANGELOG.md | sed '/./,$!d' > /tmp/release-notes.md
+          ' CHANGELOG.md | sed '/./,$!d')
           echo "--- Extracted release notes for ${GITHUB_REF_NAME} ---"
-          cat /tmp/release-notes.md
+          echo "$NOTES"
+          {
+            echo "CLAVESA_RELEASE_NOTES<<CLAVESA_RELEASE_NOTES_EOF"
+            echo "$NOTES"
+            echo "CLAVESA_RELEASE_NOTES_EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: release --clean --release-notes /tmp/release-notes.md
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

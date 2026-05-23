@@ -12,6 +12,19 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.3] — 2026-05-23
+
+### Fixed
+
+- **GitHub Release pages actually carry the CHANGELOG section now.**
+  v1.1.2 tried to wire this via `goreleaser release --release-notes
+  <file>`, but the body came out empty above the footer — most likely
+  a silent conflict with `changelog.disable: true`. The release
+  workflow now exports the extracted CHANGELOG section as a multiline
+  `$GITHUB_ENV` variable, and `.goreleaser.yaml`'s `release.header`
+  templates it in via `{{ .Env.CLAVESA_RELEASE_NOTES }}`. Bulletproof,
+  doesn't depend on flag-vs-config precedence in GoReleaser.
+
 ## [v1.1.2] — 2026-05-23
 
 ### Fixed

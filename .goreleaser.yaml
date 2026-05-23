@@ -37,6 +37,11 @@ release:
     owner: vesahyp
     name: clavesa
   prerelease: auto
+  # Per-version CHANGELOG section, extracted in the release workflow's
+  # "Extract release notes" step and exposed via env var. See the
+  # release workflow for the awk that fills CLAVESA_RELEASE_NOTES.
+  header: |
+    {{ .Env.CLAVESA_RELEASE_NOTES }}
   footer: |
     See [CHANGELOG.md](https://github.com/vesahyp/clavesa/blob/main/CHANGELOG.md) for prior versions.
 
