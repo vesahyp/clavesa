@@ -56,3 +56,9 @@ homebrew_casks:
       email: noreply@clavesa.dev
     homepage: https://github.com/vesahyp/clavesa
     description: "Visual ETL tool where pipelines are Terraform"
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/clavesa"]
+          end

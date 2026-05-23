@@ -12,6 +12,16 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.0.3] — 2026-05-23
+
+### Fixed
+
+- **`brew install --cask` no longer leaves the binary Gatekeeper-quarantined.**
+  v1.0.2's cask was missing a post-install hook to strip
+  `com.apple.quarantine`, so running `clavesa` after a fresh
+  `brew install --cask` got SIGKILL'd. The cask now strips the attr
+  via a `postflight` xattr call.
+
 ## [v1.0.2] — 2026-05-23
 
 ### Changed
