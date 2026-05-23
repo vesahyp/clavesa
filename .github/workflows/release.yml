@@ -28,6 +28,11 @@ jobs:
         run: |
           npm ci --prefix ui
           npm run build --prefix ui
+          # Vite is configured with emptyOutDir=true, which wipes the
+          # tracked .gitkeep placeholder. GoReleaser would then see git
+          # in a dirty state (deleted file) and refuse to release.
+          # Re-create the placeholder so the working tree matches HEAD.
+          touch internal/ui/dist/.gitkeep
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -35,11 +40,24 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Extract release notes
+        # Pull the CHANGELOG section for this tag into a file GoReleaser
+        # uses as the release body. Same awk shape release-public.sh uses
+        # for the commit message body — single source of truth.
+        run: |
+          awk -v ver="${GITHUB_REF_NAME}" '
+              $0 ~ "^## \\[" ver "\\]" { in_section = 1; next }
+              in_section && /^## \[/    { in_section = 0 }
+              in_section                 { print }
+          ' CHANGELOG.md | sed '/./,$!d' > /tmp/release-notes.md
+          echo "--- Extracted release notes for ${GITHUB_REF_NAME} ---"
+          cat /tmp/release-notes.md
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --clean --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

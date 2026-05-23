@@ -38,7 +38,7 @@ release:
     name: clavesa
   prerelease: auto
   footer: |
-    Full changes: [CHANGELOG.md](https://github.com/vesahyp/clavesa/blob/main/CHANGELOG.md)
+    See [CHANGELOG.md](https://github.com/vesahyp/clavesa/blob/main/CHANGELOG.md) for prior versions.
 
     macOS direct downloads are unsigned — `brew install --cask vesahyp/clavesa/clavesa` is the recommended path on macOS.
 

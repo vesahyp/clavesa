@@ -12,6 +12,27 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.2] — 2026-05-23
+
+### Fixed
+
+- **`release` GitHub Action no longer trips GoReleaser's dirty-tree check.**
+  The workflow's `Build UI` step ran `vite build` directly — and Vite's
+  `emptyOutDir: true` wipes the tracked `internal/ui/dist/.gitkeep`
+  placeholder. GoReleaser then refused with `git is in a dirty state`
+  and no binaries shipped. The workflow now re-touches the placeholder
+  after the Vite build, matching what `make build-ui` does locally. The
+  v1.1.1 release tag exists but had no binaries attached because of
+  this; v1.1.2 is the first tag to actually publish on the new
+  `release` workflow path.
+- **GitHub Release pages now show the per-version CHANGELOG section.**
+  GoReleaser was configured with `changelog.disable: true` and only a
+  static footer, so every release page said the same thing — two
+  boilerplate lines. The workflow now extracts the `## [vX.Y.Z]`
+  section out of `CHANGELOG.md` and passes it to GoReleaser as
+  `--release-notes`, so what users see on the Release page matches
+  what shipped.
+
 ## [v1.1.1] — 2026-05-23
 
 ### Fixed
