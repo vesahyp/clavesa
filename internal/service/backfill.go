@@ -162,6 +162,10 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
 	runID := newBackfillRunID()
 
+	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+		return s.backfillStageLocal(ctx, req, &g, node, abs, pipelineName, runID)
+	}
+
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
@@ -263,12 +267,8 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 // under the pipeline's database. The Glue tags carry the originating
 // run_id, window, node — no separate registry needed.
 func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, error) {
-	// Backfill staging tables are a cloud/Glue concept. Under the local
-	// environment mode there is no Glue catalog to list — return an
-	// empty set rather than 502-ing on an AWS call against a workspace
-	// with no deployed resources.
 	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
-		return []BackfillRun{}, nil
+		return s.backfillListLocal(dir)
 	}
 	abs := s.resolveDir(dir)
 	g, err := hclparser.Parse(abs)
@@ -320,6 +320,9 @@ func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, 
 // row count, schema, and (when merge_keys are declared) per-key match count.
 // Athena queries; no spark.
 func (s *Service) BackfillDiff(ctx context.Context, dir, runID string) (*BackfillDiff, error) {
+	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+		return s.backfillDiffLocal(ctx, dir, runID)
+	}
 	runs, err := s.BackfillList(ctx, dir)
 	if err != nil {
 		return nil, err
@@ -460,6 +463,31 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 		return fmt.Errorf("promote: unsupported output mode %q", mode)
 	}
 
+	payload := map[string]any{
+		"_operation":       "backfill_promote",
+		"staging":          run.TargetTable,
+		"target":           run.CanonicalTable,
+		"mode":             mode,
+		"merge_keys":       mergeKeys,
+		"force_dedup":      opts.ForceDedup,
+		"allow_duplicates": opts.AllowDuplicates,
+	}
+
+	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+		if _, err := s.runOperation(ctx, payload); err != nil {
+			return err
+		}
+		// Runner drops the staging table on success; we drop the sidecar
+		// so BackfillList stops surfacing this promoted run as "still
+		// pending."
+		if node := findGraphNode(&g, run.Node); node != nil {
+			if _, glueDB, _, err := s.canonicalTargetFor(node, abs, strings.TrimSuffix(filepathBase(abs), "/")); err == nil {
+				_ = s.deleteStagingSidecar(glueDB, lastSegment(run.TargetTable))
+			}
+		}
+		return nil
+	}
+
 	// Spark-side MERGE via the runner Lambda. Same engine + IAM scope
 	// that wrote the staging table — SparkSQL's MERGE INTO accepts
 	// `UPDATE SET *` and `INSERT *`, no column enumeration needed.
@@ -470,15 +498,6 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
 	functionName := fmt.Sprintf("%s-%s", pipelineName, run.Node)
-	payload := map[string]any{
-		"_operation":       "backfill_promote",
-		"staging":          run.TargetTable,
-		"target":           run.CanonicalTable,
-		"mode":             mode,
-		"merge_keys":       mergeKeys,
-		"force_dedup":      opts.ForceDedup,
-		"allow_duplicates": opts.AllowDuplicates,
-	}
 	body, _ := json.Marshal(payload)
 	out2, err := lc.Invoke(ctx, &lambda.InvokeInput{
 		FunctionName: aws.String(functionName),
@@ -516,6 +535,9 @@ func (s *Service) BackfillDedupCheck(ctx context.Context, dir, runID, col string
 	}
 	if run == nil {
 		return nil, fmt.Errorf("backfill: run_id %q not found", runID)
+	}
+	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+		return s.backfillDedupCheckLocal(ctx, dir, run, col)
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -585,17 +607,34 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error 
 	if run == nil {
 		return fmt.Errorf("backfill: run_id %q not found", runID)
 	}
+	payload := map[string]any{
+		"_operation": "backfill_discard",
+		"staging":    run.TargetTable,
+	}
+	abs := s.resolveDir(dir)
+
+	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+		if _, err := s.runOperation(ctx, payload); err != nil {
+			return err
+		}
+		g, err := hclparser.Parse(abs)
+		if err == nil {
+			if node := findGraphNode(&g, run.Node); node != nil {
+				if _, glueDB, _, err := s.canonicalTargetFor(node, abs, strings.TrimSuffix(filepathBase(abs), "/")); err == nil {
+					_ = s.deleteStagingSidecar(glueDB, lastSegment(run.TargetTable))
+				}
+			}
+		}
+		return nil
+	}
+
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return err
 	}
 	lc := lambda.NewFromConfig(cfg)
-	pipelineName := strings.TrimSuffix(filepathBase(s.resolveDir(dir)), "/")
+	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
 	functionName := fmt.Sprintf("%s-%s", pipelineName, run.Node)
-	payload := map[string]any{
-		"_operation": "backfill_discard",
-		"staging":    run.TargetTable,
-	}
 	body, _ := json.Marshal(payload)
 	out, err := lc.Invoke(ctx, &lambda.InvokeInput{
 		FunctionName: aws.String(functionName),
@@ -606,6 +645,18 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error 
 	}
 	if out.FunctionError != nil && *out.FunctionError != "" {
 		return fmt.Errorf("Lambda %q returned error: %s", functionName, string(out.Payload))
+	}
+	return nil
+}
+
+// findGraphNode returns the node with the given ID from the parsed graph,
+// or nil if not present. Used by the local promote/discard branches to look
+// up the producing node's config when wiping the sidecar.
+func findGraphNode(g *graph.PipelineGraph, nodeID string) *graph.Node {
+	for i := range g.Nodes {
+		if g.Nodes[i].ID == nodeID {
+			return &g.Nodes[i]
+		}
 	}
 	return nil
 }
@@ -682,18 +733,28 @@ func canonicalFromLambdaEnv(ctx context.Context, lc *lambda.Client, functionName
 //
 // Used by List/Diff/Promote/Discard paths that don't have a single Lambda
 // to query — they fall back to the workspace manifest + pipeline name.
-func (s *Service) canonicalTargetFor(node *graph.Node, pipelineName string) (string, string, string, error) {
+//
+// pipelineDir gives the path to the pipeline so that an unresolved
+// `schema = var.schema` reference in the node config can be resolved the
+// same way `pipeline run --env local` resolves it: terraform.tfvars first,
+// then variables.tf default, then sanitized pipeline name. Without that
+// resolution the literal string "var.schema" leaks into the Glue DB name.
+func (s *Service) canonicalTargetFor(node *graph.Node, pipelineDir, pipelineName string) (string, string, string, error) {
 	ws, _ := workspace.Load(s.workspace)
 	catalog := "clavesa"
 	if ws != nil {
 		catalog = ws.CatalogIdentifier()
 	}
 	schema, _ := node.Config["schema"].(string)
-	if schema == "" {
-		// Look up the schema variable's default from the pipeline. Sanitized
-		// pipeline name is the fallback per ADR-016 — matches how the
-		// emitter resolves an unset schema.
-		schema = identutil.Sanitize(pipelineName)
+	if schema == "" || strings.HasPrefix(schema, "var.") {
+		// The .tf carries `schema = var.schema` — same shape every
+		// pipeline emitter produces — which the HCL parser preserves as
+		// a literal string. Re-run the local-mode schema resolver instead.
+		if pipelineDir != "" {
+			schema = resolvePipelineSchema(pipelineDir, pipelineName)
+		} else {
+			schema = identutil.Sanitize(pipelineName)
+		}
 	}
 	db := identutil.EncodeGlueDatabase(catalog, schema)
 	outputKey := "default"

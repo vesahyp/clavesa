@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/observability"
@@ -40,7 +42,17 @@ var dashboardWidgetTypes = map[string]bool{
 	"bar":         true,
 	"stacked_bar": true,
 	"bar_line":    true,
+	"pie":         true,
+	"donut":       true,
 	"table":       true,
+}
+
+// dashboardControlTypes is the set of dashboard-level control types the
+// editor and renderer know how to handle. Mirrors the widget enum —
+// unknown types fail validation at save.
+var dashboardControlTypes = map[string]bool{
+	"time_range": true,
+	"select":     true,
 }
 
 // DashboardWidgetLayout positions a widget on the 12-column grid.
@@ -83,12 +95,35 @@ type DashboardWidget struct {
 	SQL string `json:"sql,omitempty"`
 }
 
+// DashboardControl is a dashboard-level filter the viewer sets at the
+// top of the page. Its current value is substituted into dataset SQL as
+// the named placeholder `{{<name>}}` (or, for `time_range`,
+// `{{<name>.start}}` and `{{<name>.end}}`). URL-syncable so a filtered
+// view is shareable.
+//
+// - `time_range`: `Default` is a preset key (`last_24h` / `last_7d` /
+//   `last_30d` / `last_90d`) resolved to a start/end ISO timestamp at
+//   render time.
+// - `select`: options come from running `SQL` against `Dir` (first
+//   column used); a non-empty `Options` slice is a static fallback when
+//   no SQL is set.
+type DashboardControl struct {
+	Name    string   `json:"name"`
+	Type    string   `json:"type"`
+	Label   string   `json:"label,omitempty"`
+	Default string   `json:"default,omitempty"`
+	Dir     string   `json:"dir,omitempty"`
+	SQL     string   `json:"sql,omitempty"`
+	Options []string `json:"options,omitempty"`
+}
+
 // Dashboard is the full spec returned by GetDashboard.
 type Dashboard struct {
 	Slug      string             `json:"slug"`
 	Title     string             `json:"title"`
 	Datasets  []DashboardDataset `json:"datasets"`
 	Widgets   []DashboardWidget  `json:"widgets"`
+	Controls  []DashboardControl `json:"controls,omitempty"`
 	UpdatedAt string             `json:"updated_at,omitempty"`
 }
 
@@ -106,12 +141,14 @@ type dashboardFile struct {
 	DefaultPipelineDir string             `json:"default_pipeline_dir,omitempty"`
 	Datasets           []DashboardDataset `json:"datasets,omitempty"`
 	Widgets            []DashboardWidget  `json:"widgets"`
+	Controls           []DashboardControl `json:"controls,omitempty"`
 }
 
 // dashboardSpecJSON is the document stored in the `spec` column.
 type dashboardSpecJSON struct {
 	Datasets []DashboardDataset `json:"datasets"`
 	Widgets  []DashboardWidget  `json:"widgets"`
+	Controls []DashboardControl `json:"controls,omitempty"`
 }
 
 // WithResolver wires the observability resolver the dashboards store
@@ -190,6 +227,7 @@ func (s *Service) GetDashboard(ctx context.Context, slug string) (Dashboard, err
 		Title:    row[1],
 		Datasets: spec.Datasets,
 		Widgets:  spec.Widgets,
+		Controls: spec.Controls,
 	}
 	if len(row) > 3 {
 		d.UpdatedAt = row[3]
@@ -278,7 +316,14 @@ type DashboardRender struct {
 // cache. Used by `clavesa dashboards render` for cron / CI smoke
 // tests; a widget whose dataset errors carries the error inline rather
 // than failing the whole render.
-func (s *Service) RenderDashboard(ctx context.Context, slug string) (DashboardRender, error) {
+//
+// `params` are substituted into dataset SQL via {{name}} placeholders.
+// Keys not provided are filled from the dashboard's declared control
+// defaults (e.g. a `last_30d` time_range expands to {start, end} at
+// now); explicit caller values always win. A dataset whose SQL
+// references an unknown placeholder fails with a clear error inline,
+// same as a query failure.
+func (s *Service) RenderDashboard(ctx context.Context, slug string, params map[string]string) (DashboardRender, error) {
 	d, err := s.GetDashboard(ctx, slug)
 	if err != nil {
 		return DashboardRender{}, err
@@ -287,6 +332,14 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string) (DashboardRe
 	if err != nil {
 		return DashboardRender{}, err
 	}
+	// Fill declared-control defaults for any param the caller did not
+	// set, so `clavesa dashboards render <slug>` with no flags Just
+	// Works against a dashboard with controls.
+	effective := map[string]string{}
+	for k, v := range params {
+		effective[k] = v
+	}
+	resolveControlDefaults(d.Controls, effective, time.Now())
 	datasets := map[string]DashboardDataset{}
 	for _, ds := range d.Datasets {
 		datasets[ds.Name] = ds
@@ -309,19 +362,24 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string) (DashboardRe
 		}
 		r, done := results[w.Dataset]
 		if !done {
-			res, qErr := prov.Query(ctx, observability.QueryQuery{
-				SQL:         ds.SQL,
-				PipelineDir: ds.Dir,
-				MaxRows:     10_000,
-			})
-			if qErr != nil {
-				r = execd{err: qErr}
+			expanded, expErr := expandPlaceholders(ds.SQL, effective)
+			if expErr != nil {
+				r = execd{err: expErr}
 			} else {
-				cols := make([]string, len(res.Columns))
-				for i, c := range res.Columns {
-					cols[i] = c.Name
+				res, qErr := prov.Query(ctx, observability.QueryQuery{
+					SQL:         expanded,
+					PipelineDir: ds.Dir,
+					MaxRows:     10_000,
+				})
+				if qErr != nil {
+					r = execd{err: qErr}
+				} else {
+					cols := make([]string, len(res.Columns))
+					for i, c := range res.Columns {
+						cols[i] = c.Name
+					}
+					r = execd{cols: cols, rows: res.Rows}
 				}
-				r = execd{cols: cols, rows: res.Rows}
 			}
 			results[w.Dataset] = r
 		}
@@ -340,7 +398,7 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string) (DashboardRe
 // is supported by both Athena Iceberg and Spark Iceberg, so create and
 // replace are one atomic statement on either backend.
 func (s *Service) writeDashboard(ctx context.Context, prov observability.Provider, d Dashboard) error {
-	specBytes, err := json.Marshal(dashboardSpecJSON{Datasets: d.Datasets, Widgets: d.Widgets})
+	specBytes, err := json.Marshal(dashboardSpecJSON{Datasets: d.Datasets, Widgets: d.Widgets, Controls: d.Controls})
 	if err != nil {
 		return fmt.Errorf("encode dashboard spec: %w", err)
 	}
@@ -543,6 +601,7 @@ func normalizeDashboardFile(slug string, f dashboardFile) Dashboard {
 		Title:    f.Title,
 		Datasets: f.Datasets,
 		Widgets:  f.Widgets,
+		Controls: f.Controls,
 	}
 	if d.Title == "" {
 		d.Title = slug
@@ -623,6 +682,30 @@ func validateDashboard(d Dashboard) error {
 			return fmt.Errorf("widget %q: layout out of the 12-column grid", w.ID)
 		}
 	}
+	ctlNames := map[string]bool{}
+	for _, c := range d.Controls {
+		if !validDatasetName(c.Name) {
+			return fmt.Errorf("invalid control name %q (lowercase letters, digits, dash, underscore)", c.Name)
+		}
+		if ctlNames[c.Name] {
+			return fmt.Errorf("duplicate control name %q", c.Name)
+		}
+		ctlNames[c.Name] = true
+		if !dashboardControlTypes[c.Type] {
+			return fmt.Errorf("control %q: unknown type %q", c.Name, c.Type)
+		}
+		if c.Type == "select" {
+			// A `select` control needs either an inline options list or a
+			// SQL query (with its pipeline dir) to populate the dropdown —
+			// otherwise the viewer can't pick anything.
+			if len(c.Options) == 0 && strings.TrimSpace(c.SQL) == "" {
+				return fmt.Errorf("control %q: select needs sql or options", c.Name)
+			}
+			if strings.TrimSpace(c.SQL) != "" && strings.TrimSpace(c.Dir) == "" {
+				return fmt.Errorf("control %q: dir is required when sql is set", c.Name)
+			}
+		}
+	}
 	return nil
 }
 
@@ -671,6 +754,115 @@ func (s *Service) sqlString(v string) string {
 		return "'" + v + "'"
 	}
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+}
+
+// placeholderRE matches `{{name}}` tokens in dataset SQL. The capture
+// allows dotted names so `time_range` controls can write
+// `{{<name>.start}}` / `{{<name>.end}}` without a special-case parser,
+// and hyphens because control names share the dataset-name character
+// class (lowercase letters, digits, dash, underscore).
+var placeholderRE = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*\}\}`)
+
+// safeParamValue restricts substituted values to a safe character class.
+// The goal is "no SQL injection via param" without imposing a full SQL
+// dialect — ISO timestamps, identifiers, hyphens, and slashes cover the
+// real cases (time presets, dropdowns from `SELECT DISTINCT site`).
+// Quotes and semicolons are rejected, so a value can never close the
+// surrounding string literal or chain a statement.
+var safeParamValue = regexp.MustCompile(`^[A-Za-z0-9 _.:+\-T/]*$`)
+
+// expandPlaceholders substitutes `{{name}}` tokens in sql with quoted
+// values from params. Missing keys are an error — a typo in a dataset's
+// SQL should fail loud rather than silently produce an empty WHERE.
+// Substituted values are inserted as single-quoted SQL string literals
+// (e.g. `WHERE ts >= {{start}}` becomes `WHERE ts >= '2026-05-01T00:00:00Z'`);
+// authors do NOT wrap placeholders in quotes themselves.
+func expandPlaceholders(sql string, params map[string]string) (string, error) {
+	var firstErr error
+	expanded := placeholderRE.ReplaceAllStringFunc(sql, func(match string) string {
+		if firstErr != nil {
+			return match
+		}
+		m := placeholderRE.FindStringSubmatch(match)
+		name := m[1]
+		val, ok := params[name]
+		if !ok {
+			firstErr = fmt.Errorf("dataset SQL references {{%s}} but no control or --param sets it", name)
+			return match
+		}
+		if !safeParamValue.MatchString(val) {
+			firstErr = fmt.Errorf("param %q value %q contains characters outside [A-Za-z0-9 _.:+\\-T/]", name, val)
+			return match
+		}
+		// Single-quote the literal. The charset already excludes ' and \
+		// so no escaping is needed and both Spark and Athena read the
+		// result identically.
+		return "'" + val + "'"
+	})
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return expanded, nil
+}
+
+// resolveControlDefaults expands a dashboard's declared control
+// defaults into a param map. Already-set keys in `out` are kept (an
+// explicit --param or URL value wins over the dashboard's default).
+// `time_range` controls produce two params (`<name>.start` and
+// `<name>.end`); the preset key is interpreted at `now`.
+func resolveControlDefaults(controls []DashboardControl, out map[string]string, now time.Time) {
+	for _, c := range controls {
+		switch c.Type {
+		case "time_range":
+			startKey := c.Name + ".start"
+			endKey := c.Name + ".end"
+			_, hasStart := out[startKey]
+			_, hasEnd := out[endKey]
+			if hasStart && hasEnd {
+				continue
+			}
+			start, end := resolveTimePreset(c.Default, now)
+			if !hasStart {
+				out[startKey] = start
+			}
+			if !hasEnd {
+				out[endKey] = end
+			}
+		case "select":
+			if _, ok := out[c.Name]; ok {
+				continue
+			}
+			if c.Default != "" {
+				out[c.Name] = c.Default
+			} else if len(c.Options) > 0 {
+				out[c.Name] = c.Options[0]
+			}
+		}
+	}
+}
+
+// resolveTimePreset turns a preset key (`last_24h` / `last_7d` /
+// `last_30d` / `last_90d`) into a {start, end} pair of ISO timestamps
+// at `now`. Unknown values default to `last_30d` — that keeps a
+// freshly-added time_range control workable even before the author
+// touches the default.
+func resolveTimePreset(preset string, now time.Time) (start, end string) {
+	end = now.UTC().Format(time.RFC3339)
+	var d time.Duration
+	switch preset {
+	case "last_24h":
+		d = 24 * time.Hour
+	case "last_7d":
+		d = 7 * 24 * time.Hour
+	case "last_90d":
+		d = 90 * 24 * time.Hour
+	case "last_30d":
+		d = 30 * 24 * time.Hour
+	default:
+		d = 30 * 24 * time.Hour
+	}
+	start = now.UTC().Add(-d).Format(time.RFC3339)
+	return start, end
 }
 
 // isMissingDashboardsTable classifies a query error as "the dashboards

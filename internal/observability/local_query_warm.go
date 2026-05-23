@@ -127,10 +127,12 @@ func (p *persistentDockerQueryRunner) Run(ctx context.Context, warehouse, sql st
 		return nil, err
 	}
 	res, err := p.query(ctx, w, sql)
-	if err != nil && isConnRefused(err) {
-		// Container died (docker daemon restart, OOM, manual `docker stop`).
-		// Drop it and try once more — but only once, so we don't loop on a
-		// genuinely broken image.
+	if err != nil && shouldRespawn(err) {
+		// Worker is unrecoverable: either the container died (socket
+		// refused / EOF) or the JVM inside died while the HTTP server
+		// still answers (py4j gateway gone, Spark context shut down).
+		// Drop it and try once more — but only once, so we don't loop on
+		// a genuinely broken image.
 		p.evict(warehouse, w)
 		w2, err2 := p.getOrSpawn(ctx, warehouse)
 		if err2 != nil {
@@ -139,6 +141,21 @@ func (p *persistentDockerQueryRunner) Run(ctx context.Context, warehouse, sql st
 		return p.query(ctx, w2, sql)
 	}
 	return res, err
+}
+
+// Warmup spawns the warm worker for `warehouse` in the background, without
+// running a query. Used by `clavesa ui` startup so the ~30s Spark cold boot
+// runs while the user is still orienting on the landing page, instead of
+// the lazy "first table click pays for it" path that left the runtime
+// indicator stuck at "idle" for an unhelpful stretch.
+//
+// Errors are logged to stderr and swallowed — there's no caller waiting on
+// the result, and the next user-triggered query will surface a real spawn
+// failure in-context anyway.
+func (p *persistentDockerQueryRunner) Warmup(ctx context.Context, warehouse string) {
+	if _, err := p.getOrSpawn(ctx, warehouse); err != nil {
+		fmt.Fprintf(os.Stderr, "clavesa: warm Spark spawn failed (will retry on first query): %v\n", err)
+	}
 }
 
 // Close stops every tracked container. Idempotent — second call is a no-op.
@@ -405,4 +422,41 @@ func isConnRefused(err error) bool {
 	}
 	s := err.Error()
 	return strings.Contains(s, "connection refused") || strings.Contains(s, "EOF")
+}
+
+// shouldRespawn decides whether a /query error means the worker is
+// unrecoverable and should be evicted + respawned. Covers two failure
+// shapes: (a) socket-level — container gone (isConnRefused); (b)
+// container alive but Spark dead — the runner's /healthz now returns 503
+// when SELECT 1 fails, and a /query against a dead JVM surfaces py4j
+// "Java gateway process exited" / "Py4JNetworkError" / "SparkContext
+// has been shut down" inside the error envelope. False positives cost
+// one extra cold start; missing a real dead JVM hangs the UI on every
+// subsequent query, so err on the side of respawning.
+func shouldRespawn(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isConnRefused(err) {
+		return true
+	}
+	s := err.Error()
+	// The /healthz 503 surfaces as "warm worker HTTP 503:" — but that
+	// only fires when Go itself polls /healthz mid-query, which we
+	// don't do today. The realistic signal is a /query that round-trips
+	// to a still-alive HTTP server whose Spark gateway is gone.
+	patterns := []string{
+		"Py4JNetworkError",
+		"Py4JJavaError",
+		"Java gateway process exited",
+		"SparkContext has been shut down",
+		"SparkContext was shut down",
+		"py4j.protocol",
+	}
+	for _, p := range patterns {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
 }

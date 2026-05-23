@@ -6,7 +6,16 @@
  * sensibly-sized widget of that type.
  */
 
-import { Activity, BarChart3, Hash, Layers, LineChart, Table } from "lucide-react";
+import {
+  Activity,
+  BarChart3,
+  CircleSlash,
+  Hash,
+  Layers,
+  LineChart,
+  PieChart,
+  Table,
+} from "lucide-react";
 
 import {
   Dialog,
@@ -22,6 +31,8 @@ export type WidgetType =
   | "bar"
   | "stacked_bar"
   | "bar_line"
+  | "pie"
+  | "donut"
   | "table";
 
 const TYPES: {
@@ -59,6 +70,18 @@ const TYPES: {
     label: "Bar + line",
     hint: "A bar metric and a line metric, dual axis.",
     Icon: Activity,
+  },
+  {
+    type: "pie",
+    label: "Pie chart",
+    hint: "Share of total across categories.",
+    Icon: PieChart,
+  },
+  {
+    type: "donut",
+    label: "Donut chart",
+    hint: "Pie with a hollow center.",
+    Icon: CircleSlash,
   },
   {
     type: "table",

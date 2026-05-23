@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
@@ -50,12 +52,26 @@ type DashboardWidget struct {
 	Layout       DashboardWidgetLayout `json:"layout"`
 }
 
+// DashboardControl is a dashboard-level filter substituted into dataset
+// SQL as the placeholder `{{<name>}}` (or `{{<name>.start}}` /
+// `{{<name>.end}}` for `time_range`).
+type DashboardControl struct {
+	Name    string   `json:"name"`
+	Type    string   `json:"type"`
+	Label   string   `json:"label,omitempty"`
+	Default string   `json:"default,omitempty"`
+	Dir     string   `json:"dir,omitempty"`
+	SQL     string   `json:"sql,omitempty"`
+	Options []string `json:"options,omitempty"`
+}
+
 // Dashboard is the full spec — body of GET/PUT/POST /api/dashboards{,/slug}.
 type Dashboard struct {
 	Slug      string             `json:"slug"`
 	Title     string             `json:"title"`
 	Datasets  []DashboardDataset `json:"datasets"`
 	Widgets   []DashboardWidget  `json:"widgets"`
+	Controls  []DashboardControl `json:"controls,omitempty"`
 	UpdatedAt string             `json:"updated_at,omitempty"`
 }
 
@@ -84,9 +100,15 @@ type DashboardsListResponse struct {
 // scopes the Provider dispatch — it is the pipeline dir of the dataset the
 // widget is bound to. The UI resolves widget → dataset → {dir, sql} and
 // posts that here, so cross-pipeline datasets just work.
+//
+// `Params` carries the current dashboard control values. The handler
+// substitutes `{{name}}` tokens in `SQL` against this map before
+// dispatching to the Provider; unknown placeholders fail with a clear
+// 400 so a typo in dataset SQL surfaces in the UI.
 type DashboardQueryRequest struct {
-	Dir string `json:"dir"`
-	SQL string `json:"sql"`
+	Dir    string            `json:"dir"`
+	SQL    string            `json:"sql"`
+	Params map[string]string `json:"params,omitempty"`
 }
 
 // DashboardsHandler serves the dashboards endpoints. CRUD goes through the
@@ -231,8 +253,17 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	expanded, err := expandDashboardPlaceholders(req.SQL, req.Params)
+	if err != nil {
+		// A typo in a dataset's {{name}} is the common case — 400 with
+		// the placeholder name so the UI can surface it inline rather
+		// than failing the whole dashboard.
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	res, err := provider.Query(r.Context(), observability.QueryQuery{
-		SQL:         req.SQL,
+		SQL:         expanded,
 		PipelineDir: req.Dir,
 		MaxRows:     queryMaxRowsCap,
 	})
@@ -241,6 +272,39 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
+}
+
+// placeholderRE / safeParamValueRE / expandDashboardPlaceholders mirror
+// the service-layer helpers (internal/service/dashboard.go). Duplicated
+// here rather than imported because internal/api keeps its dashboards
+// handler free of an internal/service dependency (the bridge in
+// internal/cli/ui.go translates the spec). Keep both copies in sync.
+var placeholderRE = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*\}\}`)
+var safeParamValueRE = regexp.MustCompile(`^[A-Za-z0-9 _.:+\-T/]*$`)
+
+func expandDashboardPlaceholders(sql string, params map[string]string) (string, error) {
+	var firstErr error
+	out := placeholderRE.ReplaceAllStringFunc(sql, func(match string) string {
+		if firstErr != nil {
+			return match
+		}
+		m := placeholderRE.FindStringSubmatch(match)
+		name := m[1]
+		val, ok := params[name]
+		if !ok {
+			firstErr = fmt.Errorf("dataset SQL references {{%s}} but no control or param sets it", name)
+			return match
+		}
+		if !safeParamValueRE.MatchString(val) {
+			firstErr = fmt.Errorf("param %q value %q contains characters outside [A-Za-z0-9 _.:+\\-T/]", name, val)
+			return match
+		}
+		return "'" + val + "'"
+	})
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return out, nil
 }
 
 // providerFor dispatches the query through the resolver (cloud or local

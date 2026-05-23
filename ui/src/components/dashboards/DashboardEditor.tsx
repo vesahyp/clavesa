@@ -7,7 +7,7 @@
  * replace) so it is immediately shared with everyone on the workspace.
  */
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -24,15 +24,18 @@ import {
 } from "@/components/ui/tabs";
 import {
   createDashboard,
+  resolveControlDefaults,
   saveDashboard,
   usePipelines,
   type Dashboard,
+  type DashboardControl,
   type DashboardDataset,
   type DashboardWidget,
 } from "@/lib/queries";
 
 import { useDatasetColumns } from "@/hooks/useDatasetColumns";
 
+import { ControlsPanel } from "./ControlsPanel";
 import { DatasetPanel } from "./DatasetPanel";
 import { EditorGrid } from "./EditorGrid";
 import { WidgetEditor } from "./WidgetEditor";
@@ -58,6 +61,7 @@ export function DashboardEditor({
   const [title, setTitle] = useState(initial.title);
   const [datasets, setDatasets] = useState<DashboardDataset[]>(initial.datasets);
   const [widgets, setWidgets] = useState<DashboardWidget[]>(initial.widgets);
+  const [controls, setControls] = useState<DashboardControl[]>(initial.controls);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scrollToId, setScrollToId] = useState<string | undefined>();
@@ -66,12 +70,20 @@ export function DashboardEditor({
   // open across saves, so this can't stay tied to the `isNew` prop.
   const [creating, setCreating] = useState(isNew);
 
-  const columnsByDataset = useDatasetColumns(datasets);
+  // Datasets that reference `{{name}}` placeholders need substituted
+  // values for the column probe; synthesize them from the current
+  // controls' defaults so the editor's field pickers populate without
+  // a 400 from /api/dashboards/query.
+  const datasetProbeParams = useMemo(
+    () => resolveControlDefaults(controls),
+    [controls],
+  );
+  const columnsByDataset = useDatasetColumns(datasets, datasetProbeParams);
 
   async function save() {
     setSaving(true);
     setError(null);
-    const input = { slug: initial.slug, title, datasets, widgets };
+    const input = { slug: initial.slug, title, datasets, widgets, controls };
     try {
       if (creating) {
         await createDashboard(input);
@@ -122,12 +134,15 @@ export function DashboardEditor({
         </Card>
       )}
 
-      {/* Datasets and widgets are separate tabs — a dashboard with many
-          widgets is a long scroll otherwise. */}
+      {/* Datasets, controls, and widgets are separate tabs — a
+          dashboard with many widgets is a long scroll otherwise. */}
       <Tabs defaultValue="datasets">
         <TabsList>
           <TabsTrigger value="datasets">
             Datasets · {datasets.length}
+          </TabsTrigger>
+          <TabsTrigger value="controls">
+            Controls · {controls.length}
           </TabsTrigger>
           <TabsTrigger value="widgets">
             Widgets · {widgets.length}
@@ -139,6 +154,14 @@ export function DashboardEditor({
             datasets={datasets}
             pipelines={pipelines.data ?? []}
             onChange={setDatasets}
+          />
+        </TabsContent>
+
+        <TabsContent value="controls" className="mt-4">
+          <ControlsPanel
+            controls={controls}
+            pipelines={pipelines.data ?? []}
+            onChange={setControls}
           />
         </TabsContent>
 

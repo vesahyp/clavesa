@@ -2065,9 +2065,10 @@ def run_query_server() -> None:
     nothing.
 
     Routes:
-      GET  /healthz  → 200 once Spark is warm (the server starts AFTER
-                       _spark() returns, so any successful response implies
-                       Spark is ready).
+      GET  /healthz  → 200 once Spark is warm AND a probe SQL still
+                       succeeds. 503 if Spark is gone (JVM crash, gateway
+                       disconnect, OOM); Go-side persistent runner evicts
+                       and respawns on 503.
       POST /query    → body: {"sql": "..."}. Returns the same JSON shape
                        CLAVESA_QUERY=1 emits, or {"error": "..."} on
                        failure (still 200 — the client checks the envelope,
@@ -2086,6 +2087,16 @@ def run_query_server() -> None:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/healthz":
+                # Touch Spark for real — a SELECT 1 is cheap (~ms on a
+                # warm JVM) but catches "container up, JVM dead" cases
+                # where the HTTP server is alive but py4j has lost the
+                # gateway. Without this probe Go never evicts because
+                # the socket stays open.
+                try:
+                    _spark().sql("SELECT 1").collect()
+                except Exception as exc:  # noqa: BLE001
+                    self._json(503, {"error": f"spark dead: {exc}"})
+                    return
                 self._respond(200, b"ok", content_type="text/plain")
                 return
             self._respond(404, b"", content_type="text/plain")

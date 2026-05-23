@@ -12,7 +12,7 @@ Backfill stages the historical window into a parallel Iceberg table, lets you re
 
 ## Prerequisites
 
-- A deployed cloud pipeline (`compute = "lambda"` / `fargate` / `emr-serverless`). Backfill goes through Step Functions; `compute = "local"` pipelines have no SFN and can't be backfilled today.
+- Works against both `compute = "local"` (runs the same image directly against the workspace warehouse) and the cloud computes (`lambda` / `fargate` / `emr-serverless`, which invoke the deployed transform Lambda). The CLI is identical in both modes — workspace env mode picks the backend.
 - A transform with at least one partitioned input — backfill needs cursors to range over. The cursor format matches the source's `partitions = [...]` declaration: `year,month,day,hour` cursors look like `2026/01/01/00`; `dt` cursors look like `2026-01-01`.
 - Recommended: `mode = "merge"` + `merge_keys` on the output. Promote semantics depend on mode (see below); merge is the only mode that's safe by default.
 
@@ -85,7 +85,7 @@ Unpromoted staging tables get swept by the Iceberg-maintenance slice after `back
 
 **Diff shows zero rows in staging.** The cursor format doesn't match the source's `partitions` declaration, or the window predates any data in the source bucket. Check `clavesa source show <name>` for the declared partition keys and start-from baseline.
 
-**State machine not found.** Backfill requires a deployed cloud pipeline. Run `clavesa pipeline deploy <pipeline>` first, then re-run the backfill command.
+**State machine not found.** Cloud-mode backfill needs the SFN deployed. Run `clavesa pipeline deploy <pipeline>` first, then re-run the backfill command. (Not applicable to `compute = "local"` — local mode resolves catalog/schema from workspace + pipeline config and invokes the runner image directly; nothing to deploy.)
 
 ## See also
 

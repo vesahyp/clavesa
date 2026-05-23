@@ -13,6 +13,10 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Pencil } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import {
+  ControlStrip,
+  useDashboardParams,
+} from "@/components/dashboards/ControlStrip";
 import { DashboardEditor } from "@/components/dashboards/DashboardEditor";
 import { Widget } from "@/components/dashboards/Widget";
 import { Button } from "@/components/ui/button";
@@ -49,9 +53,21 @@ export function Dashboard() {
   // re-fetch (e.g. after Save strips `?new=1`) can't yank it away.
   const [editorInitial, setEditorInitial] = useState<DashboardSpec | null>(
     isNew
-      ? { slug, title: newTitle, datasets: [], widgets: [], updated_at: "" }
+      ? {
+          slug,
+          title: newTitle,
+          datasets: [],
+          widgets: [],
+          controls: [],
+          updated_at: "",
+        }
       : null,
   );
+  // Resolved param map (URL state + declared control defaults).
+  // Computed on every render so the first paint of a widget already
+  // has the right values — no useEffect race that fires a query with
+  // an empty param map and 400s on the missing placeholder.
+  const controlParams = useDashboardParams(dashboard.data?.controls ?? []);
 
   // Resolve widget.dataset → {sql, dir} once per spec change.
   const datasetMap = useMemo(() => {
@@ -146,6 +162,13 @@ export function Dashboard() {
                 </Button>
               </div>
 
+              {dashboard.data.controls.length > 0 && (
+                <ControlStrip
+                  controls={dashboard.data.controls}
+                  params={controlParams}
+                />
+              )}
+
               {dashboard.data.widgets.length === 0 ? (
                 <Card>
                   <CardContent className="p-6 text-sm text-muted-foreground">
@@ -168,6 +191,11 @@ export function Dashboard() {
                         widget={w}
                         sql={ds?.sql ?? ""}
                         dir={ds?.dir ?? ""}
+                        params={
+                          dashboard.data?.controls.length
+                            ? controlParams
+                            : undefined
+                        }
                       />
                     );
                   })}

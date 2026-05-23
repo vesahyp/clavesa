@@ -12,6 +12,53 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.0] — 2026-05-23
+
+### Added
+
+- **`pipeline backfill` works on `compute = "local"` pipelines.** `stage`,
+  `list`, `diff`, `promote`, `discard`, and `dedup-check` all now route
+  through the runner image directly against the workspace warehouse when
+  the workspace env mode is local, mirroring the cloud (Lambda + Athena +
+  Glue) path. Sidecar JSON next to each staging Iceberg dir replaces the
+  Glue table tagging the cloud uses, so `list` finds the same metadata
+  without a catalog roundtrip.
+- **Dashboard controls.** Dashboards can declare top-of-page filter
+  controls — a time-range picker (presets `last_24h` / `last_7d` /
+  `last_30d` / `last_90d` / custom) and a select dropdown populated by
+  a SQL query or static options. Values bind to dataset SQL via
+  `{{name}}` placeholders (`{{name.start}}` / `{{name.end}}` for time
+  ranges) and round-trip through URL search params so a filtered view
+  is shareable. CLI: `clavesa dashboards render <slug> --param key=value`.
+- **Pie and donut widgets.** Two new widget types for share-of-total
+  categoricals; long-tail categories beyond the top 7 collapse into
+  one "Other" slice so the chart stays legible.
+
+### Changed
+
+- **Eager Spark warmup on `clavesa ui`.** The warm Spark worker now starts
+  in the background the moment the UI server boots, so the header
+  indicator flips to "Starting Spark…" on the first poll and is
+  "Spark ready" by the time you click into a table — instead of staying
+  stuck on "Spark idle" until a Spark-backed page triggers the lazy
+  cold-boot. Skipped in uninitialized workspaces.
+- **Airflow-style runtime bars on the pipeline Runs grid.** Each run's
+  column header now carries a vertical bar whose height encodes its
+  duration and whose color encodes its status, replacing the small
+  duration text. Slow runs jump out at a glance.
+- **Sticky Node / output-table column reads as a distinct band.** The
+  edge-fade gradients on the Runs grid are gone; the sticky left column
+  now carries a different background to the scrollable run matrix, so
+  it's obvious which side is fixed and which scrolls.
+
+### Fixed
+
+- **Warm Spark worker detects "container up, JVM dead".** `/healthz` now
+  runs a probe SQL against the Spark gateway, and the UI server evicts +
+  respawns the worker on the next query when py4j surfaces a
+  gateway-shutdown error — instead of every dashboard query hanging on a
+  dead JVM until you manually restart `clavesa ui`.
+
 ## [v1.0.3] — 2026-05-23
 
 ### Fixed

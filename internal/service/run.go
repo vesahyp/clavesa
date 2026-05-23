@@ -303,7 +303,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 				goto done
 			}
 
-			skipReason, outputRows, rerr := s.runTransform(ctx, image, abs, workdir, node, inputs, tableID, channel.logPathFor(nodeID), runID, catalog, schema, systemCatalog)
+			skipReason, outputRows, rerr := s.runTransform(ctx, image, abs, workdir, node, inputs, tableID, channel.logPathFor(nodeID), runID, catalog, schema, systemCatalog, nil)
 			if rerr != nil {
 				status.Status = "failed"
 				status.Note = rerr.Error()
@@ -769,7 +769,13 @@ func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string
 // output and reported the added-records sum across them; the caller
 // stamps it onto state.json so the dashboard's node-detail drawer can
 // show "Rows written" without a Spark roundtrip.
-func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, logPath, pipelineRunID, catalog, schema, systemCatalog string) (string, *int64, error) {
+//
+// extraEvent, when non-nil, gets shallow-merged into the runner event after
+// the standard inputs/outputs/_sf_execution_arn/_trigger keys are set. This
+// is the seam BackfillStage uses to thread its `_backfill` block (and to
+// override `_trigger` from "manual" to "backfill"/"backfill-direct") without
+// `pipeline run --env local` having to know anything about backfill.
+func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, logPath, pipelineRunID, catalog, schema, systemCatalog string, extraEvent map[string]any) (string, *int64, error) {
 	language, _ := node.Config["language"].(string)
 	if language == "" {
 		language = "sql"
@@ -811,6 +817,9 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		"outputs":           buildLocalOutputs(node, outputTarget),
 		"_sf_execution_arn": pipelineRunID,
 		"_trigger":          "manual",
+	}
+	for k, v := range extraEvent {
+		event[k] = v
 	}
 	eventJSON, _ := json.Marshal(event)
 
@@ -1488,6 +1497,61 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// runOperation invokes the runner image with an `_operation` event — the
+// non-transform control-plane path the runner exposes for backfill promote /
+// discard. Cloud uses `lambda.Invoke` with the same payload; local mode has
+// no Lambda, so we run the same image directly against the workspace's
+// Hadoop catalog. The container reads its event from stdin (CLAVESA_RUN=1)
+// and the operation handler routes on the `_operation` key.
+//
+// Returns the parsed runner response map (keys vary by operation; the caller
+// reads what it needs). An error covers both transport failures and runner-
+// reported `{"error": "..."}` envelopes — the caller treats both the same.
+func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[string]any, error) {
+	image := runner.LocalImageName("") + ":latest"
+	if m, _ := workspace.Load(s.workspace); m != nil {
+		image = runner.LocalImageName(m.Name) + ":latest"
+	}
+
+	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	if err := os.MkdirAll(warehouse, 0o755); err != nil {
+		return nil, fmt.Errorf("create warehouse: %w", err)
+	}
+
+	body, err := json.Marshal(op)
+	if err != nil {
+		return nil, err
+	}
+
+	args := []string{"run", "--rm", "-i"}
+	args = append(args, "-e", "CLAVESA_RUN=1")
+	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	args = append(args, "-v", warehouse+":"+warehouse)
+	args = append(args, image)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdin = bytes.NewReader(body)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
+	out := bytes.TrimSpace(stdout.Bytes())
+	if len(out) > 0 {
+		var resp map[string]any
+		if err := json.Unmarshal(out, &resp); err == nil {
+			if msg, _ := resp["error"].(string); msg != "" {
+				return nil, fmt.Errorf("runner operation %v: %s", op["_operation"], msg)
+			}
+			return resp, nil
+		}
+	}
+	if runErr != nil {
+		return nil, fmt.Errorf("docker run operation: %w\nstdout: %s\nstderr: %s", runErr, stdout.String(), stderr.String())
+	}
+	return nil, fmt.Errorf("runner operation %v: no parseable output\nstdout: %s\nstderr: %s", op["_operation"], stdout.String(), stderr.String())
 }
 
 // newRunID returns a 32-char hex run identifier matching the runner's

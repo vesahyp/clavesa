@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vesahyp/clavesa/internal/observability"
 )
@@ -152,7 +153,7 @@ func TestValidateDashboard(t *testing.T) {
 		}},
 		{"dataset empty sql", func(d *Dashboard) { d.Datasets[0].SQL = "  " }},
 		{"dataset empty dir", func(d *Dashboard) { d.Datasets[0].Dir = "" }},
-		{"unknown widget type", func(d *Dashboard) { d.Widgets[0].Type = "pie" }},
+		{"unknown widget type", func(d *Dashboard) { d.Widgets[0].Type = "sankey" }},
 		{"dangling dataset ref", func(d *Dashboard) { d.Widgets[0].Dataset = "nope" }},
 		{"widget no id", func(d *Dashboard) { d.Widgets[0].ID = "" }},
 		{"layout off grid", func(d *Dashboard) { d.Widgets[0].Layout = DashboardWidgetLayout{X: 8, W: 6, H: 2} }},
@@ -265,6 +266,210 @@ func TestListDashboardsMissingTableIsEmpty(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("want empty list, got %+v", got)
+	}
+}
+
+func TestExpandPlaceholders(t *testing.T) {
+	t.Run("substitutes named placeholders as quoted literals", func(t *testing.T) {
+		out, err := expandPlaceholders(
+			`SELECT * FROM t WHERE ts BETWEEN {{start}} AND {{end}} AND site = {{site}}`,
+			map[string]string{
+				"start": "2026-05-01T00:00:00Z",
+				"end":   "2026-05-08T00:00:00Z",
+				"site":  "acme",
+			})
+		if err != nil {
+			t.Fatalf("expandPlaceholders: %v", err)
+		}
+		want := `SELECT * FROM t WHERE ts BETWEEN '2026-05-01T00:00:00Z' AND '2026-05-08T00:00:00Z' AND site = 'acme'`
+		if out != want {
+			t.Errorf("\n got: %s\nwant: %s", out, want)
+		}
+	})
+
+	t.Run("dotted names work for time_range start/end", func(t *testing.T) {
+		out, err := expandPlaceholders(
+			`WHERE ts >= {{tr.start}} AND ts <= {{tr.end}}`,
+			map[string]string{"tr.start": "2026-01-01T00:00:00Z", "tr.end": "2026-02-01T00:00:00Z"},
+		)
+		if err != nil {
+			t.Fatalf("expandPlaceholders: %v", err)
+		}
+		if !strings.Contains(out, "'2026-01-01T00:00:00Z'") || !strings.Contains(out, "'2026-02-01T00:00:00Z'") {
+			t.Errorf("dotted placeholders not substituted: %s", out)
+		}
+	})
+
+	t.Run("missing key fails loud with the name", func(t *testing.T) {
+		_, err := expandPlaceholders(`SELECT {{unknown}}`, map[string]string{})
+		if err == nil {
+			t.Fatal("expected error for missing placeholder")
+		}
+		if !strings.Contains(err.Error(), "unknown") {
+			t.Errorf("error should name the placeholder: %v", err)
+		}
+	})
+
+	t.Run("unsafe characters in value are rejected", func(t *testing.T) {
+		for _, bad := range []string{
+			`x'; DROP TABLE t;--`,
+			`a"b`,
+			`a;b`,
+			"a\nb",
+		} {
+			_, err := expandPlaceholders(`SELECT {{x}}`, map[string]string{"x": bad})
+			if err == nil {
+				t.Errorf("expected rejection for %q", bad)
+			}
+		}
+	})
+
+	t.Run("sql without placeholders passes through unchanged", func(t *testing.T) {
+		sql := `SELECT COUNT(*) FROM t WHERE active = true`
+		out, err := expandPlaceholders(sql, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out != sql {
+			t.Errorf("sql changed unexpectedly: %s", out)
+		}
+	})
+}
+
+func TestResolveTimePreset(t *testing.T) {
+	now := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		preset   string
+		wantSpan time.Duration
+	}{
+		{"last_24h", 24 * time.Hour},
+		{"last_7d", 7 * 24 * time.Hour},
+		{"last_30d", 30 * 24 * time.Hour},
+		{"last_90d", 90 * 24 * time.Hour},
+		{"", 30 * 24 * time.Hour}, // default
+		{"bogus", 30 * 24 * time.Hour},
+	} {
+		t.Run(c.preset, func(t *testing.T) {
+			start, end := resolveTimePreset(c.preset, now)
+			s, _ := time.Parse(time.RFC3339, start)
+			e, _ := time.Parse(time.RFC3339, end)
+			if got := e.Sub(s); got != c.wantSpan {
+				t.Errorf("span: got %v, want %v", got, c.wantSpan)
+			}
+			if !e.Equal(now) {
+				t.Errorf("end should equal now, got %v", e)
+			}
+		})
+	}
+}
+
+func TestResolveControlDefaults(t *testing.T) {
+	now := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	controls := []DashboardControl{
+		{Name: "tr", Type: "time_range", Default: "last_7d"},
+		{Name: "site", Type: "select", Default: "acme", Options: []string{"acme", "globex"}},
+		{Name: "region", Type: "select", Options: []string{"eu", "us"}},
+	}
+	t.Run("fills declared defaults when params are empty", func(t *testing.T) {
+		out := map[string]string{}
+		resolveControlDefaults(controls, out, now)
+		if _, ok := out["tr.start"]; !ok {
+			t.Error("tr.start should be filled")
+		}
+		if _, ok := out["tr.end"]; !ok {
+			t.Error("tr.end should be filled")
+		}
+		if out["site"] != "acme" {
+			t.Errorf("site default: got %q, want acme", out["site"])
+		}
+		if out["region"] != "eu" {
+			t.Errorf("region with no Default should use first option, got %q", out["region"])
+		}
+	})
+
+	t.Run("explicit params win over declared defaults", func(t *testing.T) {
+		out := map[string]string{
+			"tr.start": "2025-01-01T00:00:00Z",
+			"tr.end":   "2025-02-01T00:00:00Z",
+			"site":     "globex",
+		}
+		resolveControlDefaults(controls, out, now)
+		if out["tr.start"] != "2025-01-01T00:00:00Z" {
+			t.Errorf("explicit start overwritten: %q", out["tr.start"])
+		}
+		if out["site"] != "globex" {
+			t.Errorf("explicit site overwritten: %q", out["site"])
+		}
+	})
+}
+
+func TestValidateDashboardControls(t *testing.T) {
+	base := Dashboard{
+		Slug:     "demo",
+		Title:    "Demo",
+		Datasets: []DashboardDataset{{Name: "rev", Dir: "demo", SQL: "SELECT 1"}},
+		Widgets: []DashboardWidget{
+			{ID: "w1", Type: "table", Dataset: "rev", Layout: DashboardWidgetLayout{W: 6, H: 4}},
+		},
+	}
+
+	for _, c := range []struct {
+		name     string
+		controls []DashboardControl
+		ok       bool
+	}{
+		{"time_range valid", []DashboardControl{{Name: "tr", Type: "time_range", Default: "last_7d"}}, true},
+		{"select with options valid", []DashboardControl{{Name: "s", Type: "select", Options: []string{"a", "b"}}}, true},
+		{"select with sql valid", []DashboardControl{{Name: "s", Type: "select", SQL: "SELECT DISTINCT site FROM t", Dir: "demo"}}, true},
+		{"select without sql or options rejected", []DashboardControl{{Name: "s", Type: "select"}}, false},
+		{"select with sql but no dir rejected", []DashboardControl{{Name: "s", Type: "select", SQL: "SELECT 1"}}, false},
+		{"unknown type rejected", []DashboardControl{{Name: "s", Type: "slider"}}, false},
+		{"duplicate name rejected", []DashboardControl{{Name: "x", Type: "time_range"}, {Name: "x", Type: "select", Options: []string{"a"}}}, false},
+		{"invalid name rejected", []DashboardControl{{Name: "Bad Name", Type: "time_range"}}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := base
+			d.Controls = c.controls
+			err := validateDashboard(d)
+			if c.ok && err != nil {
+				t.Errorf("expected ok, got %v", err)
+			}
+			if !c.ok && err == nil {
+				t.Error("expected validation error, got nil")
+			}
+		})
+	}
+}
+
+func TestRenderDashboardSubstitutes(t *testing.T) {
+	f := &fakeProvider{}
+	s := dashService(t, f)
+
+	// Seed GetDashboard's read-back with a dashboard that has a control
+	// and a dataset referencing its placeholder.
+	spec := `{"datasets":[{"name":"rev","dir":"demo","sql":"SELECT * FROM t WHERE ts >= {{tr.start}}"}],` +
+		`"widgets":[{"id":"w1","type":"table","title":"","dataset":"rev","layout":{"x":0,"y":0,"w":6,"h":4}}],` +
+		`"controls":[{"name":"tr","type":"time_range","default":"last_7d"}]}`
+	f.queryRes = &observability.QueryResult{
+		Columns: []observability.SampleTableColumn{{Name: "slug"}, {Name: "title"}, {Name: "spec"}, {Name: "updated_at"}},
+		Rows:    [][]string{{"demo", "Demo", spec, "2026-05-23 00:00:00"}},
+	}
+
+	if _, err := s.RenderDashboard(context.Background(), "demo", nil); err != nil {
+		t.Fatalf("RenderDashboard: %v", err)
+	}
+
+	var sawSubstituted bool
+	for _, q := range f.querySQLs {
+		if strings.Contains(q, "{{") {
+			t.Errorf("query still contains a {{placeholder}}: %s", q)
+		}
+		if strings.Contains(q, "WHERE ts >= '20") {
+			sawSubstituted = true
+		}
+	}
+	if !sawSubstituted {
+		t.Errorf("expected an expanded WHERE ts >= '<timestamp>', got: %v", f.querySQLs)
 	}
 }
 

@@ -144,6 +144,20 @@ func newDashboardsShowCmd() *cobra.Command {
 				}
 				printTable(os.Stdout, []string{"ID", "TYPE", "TITLE", "DATASET"}, rows)
 			}
+			if len(d.Controls) > 0 {
+				fmt.Println("\nControls:")
+				rows := make([][]string, len(d.Controls))
+				for i, c := range d.Controls {
+					detail := c.Default
+					if c.Type == "select" && c.SQL != "" {
+						detail = fmt.Sprintf("sql @ %s", c.Dir)
+					} else if c.Type == "select" && len(c.Options) > 0 && detail == "" {
+						detail = fmt.Sprintf("%d option(s)", len(c.Options))
+					}
+					rows[i] = []string{c.Name, c.Type, c.Label, detail}
+				}
+				printTable(os.Stdout, []string{"NAME", "TYPE", "LABEL", "DEFAULT/SOURCE"}, rows)
+			}
 			return nil
 		},
 	}
@@ -153,6 +167,7 @@ func newDashboardsShowCmd() *cobra.Command {
 
 func newDashboardsRenderCmd() *cobra.Command {
 	var jsonOut bool
+	var paramFlags []string
 	cmd := &cobra.Command{
 		Use:   "render <slug>",
 		Short: "Execute every widget's dataset and print the results",
@@ -160,14 +175,24 @@ func newDashboardsRenderCmd() *cobra.Command {
 prints the results. Datasets shared by multiple widgets execute once.
 
 Useful for cron / CI smoke tests: a non-zero exit means at least one
-widget's query failed.`,
+widget's query failed.
+
+Pass dashboard control values with --param key=value (repeatable). Keys
+not provided fall back to each control's declared default — a
+time_range with default "last_30d" expands to {start, end} at "now".
+For a time_range control named "tr", the two keys are "tr.start" and
+"tr.end"; for a select control, the key is the control name.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			params, err := parseParamFlags(paramFlags)
+			if err != nil {
+				return err
+			}
 			svc, _, err := newDashboardService(cmd)
 			if err != nil {
 				return err
 			}
-			render, err := svc.RenderDashboard(cmd.Context(), args[0])
+			render, err := svc.RenderDashboard(cmd.Context(), args[0], params)
 			if err != nil {
 				return dashboardNotFoundHint(err, args[0])
 			}
@@ -196,7 +221,27 @@ widget's query failed.`,
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	cmd.Flags().StringArrayVar(&paramFlags, "param", nil, "control value as key=value (repeatable; e.g. --param tr.start=2026-01-01)")
 	return cmd
+}
+
+// parseParamFlags collects --param key=value flags into a map. An empty
+// value is allowed (`--param region=`); a flag without `=` is rejected
+// rather than silently treated as `key=""`.
+func parseParamFlags(flags []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, f := range flags {
+		i := strings.Index(f, "=")
+		if i < 0 {
+			return nil, fmt.Errorf("--param %q: expected key=value", f)
+		}
+		key := strings.TrimSpace(f[:i])
+		if key == "" {
+			return nil, fmt.Errorf("--param %q: key is empty", f)
+		}
+		out[key] = f[i+1:]
+	}
+	return out, nil
 }
 
 func newDashboardsApplyCmd() *cobra.Command {

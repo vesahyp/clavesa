@@ -204,7 +204,14 @@ func toServiceDashboard(d api.Dashboard) tuiservice.Dashboard {
 			Layout: tuiservice.DashboardWidgetLayout{X: x.Layout.X, Y: x.Layout.Y, W: x.Layout.W, H: x.Layout.H},
 		}
 	}
-	return tuiservice.Dashboard{Slug: d.Slug, Title: d.Title, Datasets: ds, Widgets: ws}
+	cs := make([]tuiservice.DashboardControl, len(d.Controls))
+	for i, x := range d.Controls {
+		cs[i] = tuiservice.DashboardControl{
+			Name: x.Name, Type: x.Type, Label: x.Label, Default: x.Default,
+			Dir: x.Dir, SQL: x.SQL, Options: x.Options,
+		}
+	}
+	return tuiservice.Dashboard{Slug: d.Slug, Title: d.Title, Datasets: ds, Widgets: ws, Controls: cs}
 }
 
 func toAPIDashboard(d tuiservice.Dashboard) api.Dashboard {
@@ -221,7 +228,14 @@ func toAPIDashboard(d tuiservice.Dashboard) api.Dashboard {
 			Layout: api.DashboardWidgetLayout{X: x.Layout.X, Y: x.Layout.Y, W: x.Layout.W, H: x.Layout.H},
 		}
 	}
-	return api.Dashboard{Slug: d.Slug, Title: d.Title, Datasets: ds, Widgets: ws, UpdatedAt: d.UpdatedAt}
+	cs := make([]api.DashboardControl, len(d.Controls))
+	for i, x := range d.Controls {
+		cs[i] = api.DashboardControl{
+			Name: x.Name, Type: x.Type, Label: x.Label, Default: x.Default,
+			Dir: x.Dir, SQL: x.SQL, Options: x.Options,
+		}
+	}
+	return api.Dashboard{Slug: d.Slug, Title: d.Title, Datasets: ds, Widgets: ws, Controls: cs, UpdatedAt: d.UpdatedAt}
 }
 
 func (b dashboardStoreBridge) ListDashboards(ctx context.Context) ([]api.DashboardSummary, error) {
@@ -563,6 +577,21 @@ Examples:
 			// prior SIGKILL'd session before we spawn fresh.
 			observability.SweepWarmWorkers(workspace)
 			warmQuery := observability.NewPersistentQueryRunner(workspace)
+
+			// Eager Spark warmup: the Catalog landing page itself doesn't
+			// fire a Spark query (it reads from Glue + filesystem state),
+			// so without this the runtime indicator stays "idle" until the
+			// user clicks into a table — at which point Spark suddenly
+			// starts a ~30s cold boot exactly when they wanted data.
+			// Spawning here in the background flips the indicator to
+			// "Starting Spark…" on the next 3s poll and is "Spark ready"
+			// by the time the user navigates anywhere Spark-backed.
+			// Gated on the workspace being initialized; otherwise the
+			// runner image doesn't exist and `docker run` would fail
+			// against the empty-name fallback tag.
+			if m, _ := wspkg.Load(workspace); m != nil {
+				go warmQuery.Warmup(context.Background(), wspkg.LocalWarehouseDir(workspace))
+			}
 
 			localProv := observability.NewLocalProvider(workspace).WithQueryRunner(warmQuery)
 			resolver := observability.NewResolver(workspace, cloudProv, localProv)

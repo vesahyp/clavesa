@@ -18,7 +18,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Check, ChevronLeft, ChevronRight, Loader2, Play, SkipForward, X } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Loader2, SkipForward, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { formatDuration, formatRelative } from "@/lib/format";
@@ -40,13 +40,21 @@ import type { NodeRun, Run } from "@/lib/queries";
 // from `skipped` so absence never reads as failure.
 type CellState = "ok" | "failed" | "running" | "skipped" | "pending" | "missing";
 
-// Run status → play-icon tint for the column headers.
-const VARIANT_TEXT: Record<StatusVariant, string> = {
-  success: "text-status-success",
-  failed: "text-status-failed",
-  running: "text-status-running animate-pulse",
-  outline: "text-muted-foreground",
+// Run status → bar fill for the Airflow-style duration bar in column headers.
+const VARIANT_BAR_BG: Record<StatusVariant, string> = {
+  success: "bg-status-success",
+  failed: "bg-status-failed",
+  running: "bg-status-running animate-pulse",
+  outline: "bg-muted-foreground/40",
 };
+
+// Bar geometry — fits inside the column header without pushing the
+// day-group band.
+const BAR_MIN_PX = 3;
+const BAR_MAX_PX = 32;
+// Mid-height for in-flight runs (no duration_ms yet) and any zero-duration
+// edge case, so the bar is still visible.
+const BAR_MID_PX = 16;
 
 /** Per-node output-table state for the left panel. */
 export interface NodeInfo {
@@ -198,6 +206,17 @@ export function NodesGrid({
     [runs],
   );
 
+  // Max duration across the visible runs; used to normalize the
+  // Airflow-style runtime bars in the column header. Excludes nulls
+  // (in-flight) and non-positives (shouldn't happen but defensive).
+  const maxDurationMs = useMemo(() => {
+    let m = 0;
+    for (const r of cols) {
+      if (r.duration_ms != null && r.duration_ms > m) m = r.duration_ms;
+    }
+    return m;
+  }, [cols]);
+
   // Consecutive runs on the same calendar day, for the grouped header and
   // the day-divider border on the first column of each group.
   const dayGroups = useMemo(() => {
@@ -341,35 +360,17 @@ export function NodesGrid({
         </div>
       )}
       <div className="relative">
-        {/* Edge fades — purely visual cue that more cells scroll past
-            the right side. They sit only on the data band's vertical
-            extent (top of the day-group header to the bottom of the
-            last row) and start AFTER the sticky node-name column
-            ends, so they don't darken node names. Z-30 to stay above
-            the data cells; pointer-events-none so they never eat
-            wheel / click events. The hard-coded 360px matches the
-            sticky panel: w-36 (node name) + gap + w-44 (table name) +
-            padding, computed once in the grid's td/th. Recompute if
-            those widths change. */}
-        {scrollState.canLeft && (
-          <div
-            aria-hidden
-            className="pointer-events-none absolute top-0 z-30 h-full w-8 bg-gradient-to-r from-card to-transparent"
-            style={{ left: 360 }}
-          />
-        )}
-        {scrollState.canRight && (
-          <div
-            aria-hidden
-            className="pointer-events-none absolute right-0 top-0 z-30 h-full w-8 bg-gradient-to-l from-card to-transparent"
-          />
-        )}
+        {/* The sticky node-name column carries a distinct background
+            (bg-muted/30) — that contrast is the affordance that signals
+            "this side is fixed; everything right of it scrolls." The
+            "N older / N newer" pills above handle the overflow count;
+            no gradient fades needed. */}
         <div ref={scrollRef} className="overflow-x-auto">
           <table className="border-separate border-spacing-0">
           <thead>
             {/* Day-group band */}
             <tr>
-              <th className="sticky left-0 z-20 bg-card pb-1 text-left">
+              <th className="sticky left-0 z-20 bg-muted/30 pb-1 text-left">
                 <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Node · output table
                 </span>
@@ -389,9 +390,9 @@ export function NodesGrid({
                 </th>
               ))}
             </tr>
-            {/* Per-run header — play icon + time */}
+            {/* Per-run header — runtime bar + time */}
             <tr>
-              <th className="sticky left-0 z-20 bg-card" />
+              <th className="sticky left-0 z-20 bg-muted/30" />
               {cols.map((r) => (
                 <th
                   key={r.run_id}
@@ -403,20 +404,40 @@ export function NodesGrid({
                   <button
                     onClick={() => onRunSelect(r.run_id)}
                     title={`${r.status} · ${runWhen(r.started_at)} · ${formatDuration(r.duration_ms)}`}
-                    aria-label={`Run ${r.run_id}`}
-                    className="flex w-14 flex-col items-center gap-0.5 rounded-md pb-1 pt-1.5 transition-colors hover:bg-muted/60"
+                    aria-label={`Run ${r.run_id} · ${r.status} · ${formatDuration(r.duration_ms)}`}
+                    className="flex w-14 flex-col items-center gap-1 rounded-md pb-1 pt-1.5 transition-colors hover:bg-muted/60"
                   >
-                    <Play
-                      className={cn(
-                        "h-3 w-3 fill-current",
-                        VARIANT_TEXT[runVariant(r.status)],
-                      )}
-                    />
+                    {/* Airflow-style runtime bar — height ∝ duration_ms,
+                        normalized against the longest run on screen.
+                        Sits in a fixed-height shell so all columns align
+                        at the bottom (long bars grow up, short ones stay
+                        a sliver) and the HH:mm label below stays on the
+                        same baseline. */}
+                    <div
+                      className="flex h-8 w-full items-end justify-center"
+                      aria-hidden
+                    >
+                      <div
+                        className={cn(
+                          "w-1.5 rounded-sm",
+                          VARIANT_BAR_BG[runVariant(r.status)],
+                        )}
+                        style={{
+                          height:
+                            r.duration_ms == null || maxDurationMs <= 0
+                              ? BAR_MID_PX
+                              : Math.max(
+                                  BAR_MIN_PX,
+                                  Math.round(
+                                    (r.duration_ms / maxDurationMs) *
+                                      BAR_MAX_PX,
+                                  ),
+                                ),
+                        }}
+                      />
+                    </div>
                     <span className="font-mono text-[10px] leading-none text-foreground">
                       {runTime(r.started_at)}
-                    </span>
-                    <span className="font-mono text-[9px] leading-none text-muted-foreground">
-                      {formatDuration(r.duration_ms)}
                     </span>
                   </button>
                 </th>
@@ -431,8 +452,8 @@ export function NodesGrid({
                 <tr key={node} className="group">
                   <td
                     className={cn(
-                      "sticky left-0 z-20 bg-card group-hover:bg-muted/40",
-                      isSelectedNode && "bg-muted/50",
+                      "sticky left-0 z-20 bg-muted/30 group-hover:bg-muted/50",
+                      isSelectedNode && "bg-muted/60",
                     )}
                   >
                     <div className="flex items-center gap-3 py-1.5 pr-6">

@@ -32,6 +32,8 @@ const WIDGET_TYPES = [
   "bar",
   "stacked_bar",
   "bar_line",
+  "pie",
+  "donut",
   "table",
 ] as const;
 
@@ -42,6 +44,8 @@ const DEFAULT_SIZE: Record<WidgetType, { w: number; h: number }> = {
   bar: { w: 6, h: 4 },
   stacked_bar: { w: 6, h: 4 },
   bar_line: { w: 6, h: 4 },
+  pie: { w: 4, h: 4 },
+  donut: { w: 4, h: 4 },
   table: { w: 6, h: 5 },
 };
 
@@ -81,6 +85,7 @@ export function WidgetEditor({
     const size = DEFAULT_SIZE[type];
     // Pre-fill the type's fields from the first columns the dataset returns.
     const charty = type === "line" || type === "bar" || type === "bar_line";
+    const pieLike = type === "pie" || type === "donut";
     onChange([
       ...widgets,
       {
@@ -88,8 +93,10 @@ export function WidgetEditor({
         type,
         title: "New widget",
         dataset,
-        value_field: type === "big_number" ? (cols[0] ?? "") : "",
-        x_field: charty || type === "stacked_bar" ? (cols[0] ?? "") : "",
+        value_field:
+          type === "big_number" || pieLike ? (cols[pieLike ? 1 : 0] ?? "") : "",
+        x_field:
+          charty || type === "stacked_bar" || pieLike ? (cols[0] ?? "") : "",
         y_field: charty ? (cols[1] ?? "") : "",
         series_fields: type === "stacked_bar" ? cols.slice(1) : [],
         line_field: type === "bar_line" ? (cols[2] ?? "") : "",
@@ -242,6 +249,22 @@ export function WidgetEditor({
                     value={w.line_field}
                     columns={columnsByDataset.get(w.dataset)}
                     onChange={(v) => update(i, { line_field: v })}
+                  />
+                </>
+              )}
+              {(w.type === "pie" || w.type === "donut") && (
+                <>
+                  <ColumnSelect
+                    label="Category field"
+                    value={w.x_field}
+                    columns={columnsByDataset.get(w.dataset)}
+                    onChange={(v) => update(i, { x_field: v })}
+                  />
+                  <ColumnSelect
+                    label="Value field"
+                    value={w.value_field}
+                    columns={columnsByDataset.get(w.dataset)}
+                    onChange={(v) => update(i, { value_field: v })}
                   />
                 </>
               )}

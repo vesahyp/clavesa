@@ -757,14 +757,83 @@ const DashboardWidget = z.object({
 });
 export type DashboardWidget = z.infer<typeof DashboardWidget>;
 
+// DashboardControl is a dashboard-level filter substituted into dataset
+// SQL at render time. `time_range` writes `{{<name>.start}}` and
+// `{{<name>.end}}`; `select` writes `{{<name>}}`. Backend tolerates
+// unknown control types (renders nothing) so future control kinds don't
+// break old builds.
+const DashboardControl = z.object({
+  name: z.string(),
+  type: z.string(),
+  label: z.string().optional().default(""),
+  default: z.string().optional().default(""),
+  dir: z.string().optional().default(""),
+  sql: z.string().optional().default(""),
+  options: z.array(z.string()).optional().default([]),
+});
+export type DashboardControl = z.infer<typeof DashboardControl>;
+
 const Dashboard = z.object({
   slug: z.string(),
   title: z.string(),
   datasets: z.array(DashboardDataset).default([]),
   widgets: z.array(DashboardWidget).default([]),
+  controls: z.array(DashboardControl).default([]),
   updated_at: z.string().optional().default(""),
 });
 export type Dashboard = z.infer<typeof Dashboard>;
+
+/**
+ * resolveControlDefaults — synthesize a params map from a dashboard's
+ * declared control defaults. Mirrors the Go resolveControlDefaults
+ * helper. Used by the editor when probing dataset columns — without
+ * substituted values, a dataset referencing `{{name}}` would 400 on
+ * the column-fetch call before the editor can even render its field
+ * pickers.
+ */
+export function resolveControlDefaults(
+  controls: DashboardControl[],
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const now = new Date();
+  for (const c of controls) {
+    if (c.type === "time_range") {
+      const { start, end } = resolveTimePreset(c.default || "last_30d", now);
+      out[`${c.name}.start`] = start;
+      out[`${c.name}.end`] = end;
+    } else if (c.type === "select") {
+      if (c.default) {
+        out[c.name] = c.default;
+      } else if (c.options.length > 0) {
+        out[c.name] = c.options[0];
+      }
+    }
+  }
+  return out;
+}
+
+function resolveTimePreset(
+  preset: string,
+  now: Date,
+): { start: string; end: string } {
+  const end = now.toISOString();
+  let ms = 30 * 24 * 60 * 60 * 1000;
+  switch (preset) {
+    case "last_24h":
+      ms = 24 * 60 * 60 * 1000;
+      break;
+    case "last_7d":
+      ms = 7 * 24 * 60 * 60 * 1000;
+      break;
+    case "last_90d":
+      ms = 90 * 24 * 60 * 60 * 1000;
+      break;
+    case "last_30d":
+    default:
+      ms = 30 * 24 * 60 * 60 * 1000;
+  }
+  return { start: new Date(now.getTime() - ms).toISOString(), end };
+}
 
 const DashboardQueryColumn = z.object({
   name: z.string(),
@@ -1233,14 +1302,33 @@ export function useDashboard(slug: string) {
  * doesn't re-hit Athena every time. Refresh on demand by invalidating
  * the query.
  */
-export function useDashboardQuery(sql: string, dir: string) {
+export function useDashboardQuery(
+  sql: string,
+  dir: string,
+  params?: Record<string, string>,
+) {
+  // Cache key includes a stable string of the params so distinct
+  // control selections cache distinctly. Object identity would defeat
+  // the cache; sorted JSON gives a deterministic key. Empty/undefined
+  // params collapse to "" so dashboards without controls keep the same
+  // cache key shape they had before.
+  const paramsKey = paramsCacheKey(params);
   return useQuery({
-    queryKey: ["dashboards", "query", dir, sql],
+    queryKey: ["dashboards", "query", dir, sql, paramsKey],
     enabled: Boolean(sql) && Boolean(dir),
     staleTime: 5 * 60_000,
     retry: false,
-    queryFn: () => runDashboardQuery(dir, sql),
+    queryFn: () => runDashboardQuery(dir, sql, params),
   });
+}
+
+function paramsCacheKey(
+  params: Record<string, string> | undefined,
+): string {
+  if (!params) return "";
+  const keys = Object.keys(params).sort();
+  if (keys.length === 0) return "";
+  return keys.map((k) => `${k}=${params[k]}`).join("&");
 }
 
 /**
@@ -1248,17 +1336,25 @@ export function useDashboardQuery(sql: string, dir: string) {
  *
  * Same request as `useDashboardQuery`'s queryFn, factored out so
  * button-driven callers (the dataset SQL preview) and `useQueries`-based
- * callers can share it. Reuse the `["dashboards","query",dir,sql]` query
- * key when caching so all three paths hit one cache entry.
+ * callers can share it. Reuse the `["dashboards","query",dir,sql,params]`
+ * query key when caching so all three paths hit one cache entry.
  */
 export async function runDashboardQuery(
   dir: string,
   sql: string,
+  params?: Record<string, string>,
 ): Promise<DashboardQueryResult> {
+  const body: { dir: string; sql: string; params?: Record<string, string> } = {
+    dir,
+    sql,
+  };
+  if (params && Object.keys(params).length > 0) {
+    body.params = params;
+  }
   const res = await fetch(`${BASE_URL}/dashboards/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dir, sql }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
@@ -1274,6 +1370,7 @@ export interface DashboardInput {
   title: string;
   datasets: DashboardDataset[];
   widgets: DashboardWidget[];
+  controls: DashboardControl[];
 }
 
 /** POST /api/dashboards — create a dashboard (409 if the slug is taken). */

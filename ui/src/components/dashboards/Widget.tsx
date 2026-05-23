@@ -12,10 +12,13 @@ import {
   BarChart,
   Bar,
   CartesianGrid,
+  Cell,
   ComposedChart,
   Legend,
   Line,
   LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -52,10 +55,16 @@ interface WidgetProps {
    * dashboard — the widget renders a "dataset not found" hint. The dir
    * scopes the Provider dispatch (ADR-014 parity); two widgets bound to
    * the same dataset share one query execution (the hook's cache key is
-   * `[dir, sql]`).
+   * `[dir, sql, params]`).
    */
   sql: string;
   dir: string;
+  /**
+   * Current dashboard control values, substituted into `{{name}}`
+   * placeholders in the dataset SQL on the backend. Undefined for
+   * dashboards without controls — keeps the cache key shape unchanged.
+   */
+  params?: Record<string, string>;
   /** Rendered inside the editor's drag/resize grid — fills the cell. */
   inGrid?: boolean;
 }
@@ -68,10 +77,12 @@ const KNOWN_TYPES = new Set([
   "bar",
   "stacked_bar",
   "bar_line",
+  "pie",
+  "donut",
   "table",
 ]);
 
-export function Widget({ widget, sql, dir, inGrid = false }: WidgetProps) {
+export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps) {
   const known = KNOWN_TYPES.has(widget.type);
   // A widget whose `dataset` doesn't resolve gets no SQL — surface that
   // as its own hint rather than firing an empty query.
@@ -79,7 +90,7 @@ export function Widget({ widget, sql, dir, inGrid = false }: WidgetProps) {
   // useDashboardQuery's `enabled` gate keeps the request from firing for
   // unknown types / unresolved datasets. The hook still returns
   // `data === undefined` so the shell renders the hint.
-  const query = useDashboardQuery(known && sql ? sql : "", dir);
+  const query = useDashboardQuery(known && sql ? sql : "", dir, params);
   const data = query.data;
   const isEmpty = !!data && data.rows.length === 0;
   // For unknown types we skip the loading/empty states and go straight
@@ -154,6 +165,10 @@ function WidgetBody({ widget, data }: WidgetBodyProps) {
       return <StackedBarBody widget={widget} data={data} />;
     case "bar_line":
       return <BarLineBody widget={widget} data={data} />;
+    case "pie":
+      return <PieBody widget={widget} data={data} variant="pie" />;
+    case "donut":
+      return <PieBody widget={widget} data={data} variant="donut" />;
     case "table":
       return <TableBody2 data={data} />;
     default:
@@ -418,6 +433,98 @@ function StackedBarBody({ widget, data }: WidgetBodyProps) {
           />
         ))}
       </BarChart>
+    </ChartFrame>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// pie / donut — categorical share-of-total
+// ---------------------------------------------------------------------------
+
+// PIE_MAX_SLICES caps how many distinct categories render as their own
+// slice; the rest collapse into a single "Other" so a long-tail pie
+// stays legible. Picked at 7 so an 8th category triggers the rollup —
+// any more than that is unreadable anyway.
+const PIE_MAX_SLICES = 7;
+
+interface PieBodyProps extends WidgetBodyProps {
+  variant: "pie" | "donut";
+}
+
+function PieBody({ widget, data, variant }: PieBodyProps) {
+  const nameIdx = pickColumn(data, widget.x_field, 0);
+  const valueIdx = pickColumn(data, widget.value_field, 1);
+  if (nameIdx < 0 || valueIdx < 0) {
+    return (
+      <div className="flex flex-1 items-center justify-center p-4 text-xs text-muted-foreground">
+        Pie needs `x_field` (category) and `value_field` (numeric) to render
+      </div>
+    );
+  }
+
+  // Numeric-coerce values; drop rows whose value isn't a number (Recharts
+  // would draw zero-sized slices for them).
+  const all = data.rows
+    .map((row) => ({
+      name: String(row[nameIdx] ?? ""),
+      value: Number(row[valueIdx]),
+    }))
+    .filter((p) => Number.isFinite(p.value) && p.value > 0);
+  if (all.length === 0) {
+    return (
+      <div className="flex flex-1 items-center justify-center p-4 text-xs text-muted-foreground">
+        No positive values to chart
+      </div>
+    );
+  }
+
+  // Top-N by value; collapse the long tail into "Other" so the chart
+  // stays legible. The "Other" slice is rendered in muted gray so the
+  // eye treats it as a residual, not another category.
+  const sorted = [...all].sort((a, b) => b.value - a.value);
+  let slices = sorted;
+  if (sorted.length > PIE_MAX_SLICES) {
+    const top = sorted.slice(0, PIE_MAX_SLICES);
+    const otherValue = sorted
+      .slice(PIE_MAX_SLICES)
+      .reduce((s, p) => s + p.value, 0);
+    slices = [...top, { name: "Other", value: otherValue }];
+  }
+
+  const innerRadius = variant === "donut" ? "55%" : 0;
+  const outerRadius = "80%";
+  const OTHER_COLOR = "rgb(120 120 120)";
+
+  return (
+    <ChartFrame>
+      <PieChart>
+        <Pie
+          data={slices}
+          dataKey="value"
+          nameKey="name"
+          innerRadius={innerRadius}
+          outerRadius={outerRadius}
+          isAnimationActive={false}
+          stroke="rgb(20 20 22)"
+          strokeWidth={1}
+        >
+          {slices.map((s, i) => (
+            <Cell
+              key={`${s.name}-${i}`}
+              fill={
+                s.name === "Other"
+                  ? OTHER_COLOR
+                  : SERIES_PALETTE[i % SERIES_PALETTE.length]
+              }
+            />
+          ))}
+        </Pie>
+        <Tooltip
+          {...tooltipBase}
+          formatter={(v: unknown) => formatNumber(v)}
+        />
+        <Legend wrapperStyle={{ fontSize: 11 }} />
+      </PieChart>
     </ChartFrame>
   );
 }
