@@ -12,6 +12,19 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.1] — 2026-05-23
+
+### Fixed
+
+- **Release snapshot no longer strips `internal/ui/dist/.gitkeep`.** The
+  rsync exclude that drops the root-level GoReleaser `dist/` directory
+  was unanchored, so it also stripped the nested
+  `internal/ui/dist/.gitkeep` placeholder — leaving `go test ./...` to
+  blow up on `//go:embed all:dist` until a UI build regenerated the
+  directory. v1.0.3 and v1.1.0 both shipped with a red `test` CI
+  workflow because of this; the actual binary releases were unaffected
+  (their workflow runs a UI build before the embed).
+
 ## [v1.1.0] — 2026-05-23
 
 ### Added

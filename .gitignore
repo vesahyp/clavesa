@@ -4,7 +4,11 @@
 .playwright-mcp
 .playwright-cli
 node_modules
-ui/dist/
+# Root-anchored: with no leading slash, git matched ALL paths ending in
+# `ui/dist/` — including `internal/ui/dist/`, which carries `.gitkeep` so
+# `//go:embed all:dist` resolves without a UI build. Twin of the same trap
+# on `dist/` below.
+/ui/dist/
 ui/.vite/
 e2e/test-results
 **/.terraform/
@@ -13,6 +17,9 @@ e2e/test-results
 *.tfstate.*
 modules/**/*.zip
 bin/
-dist/
+# Root-anchored: the top-level GoReleaser output. Without the leading slash,
+# this ignored `internal/ui/dist/.gitkeep` too, defeating the placeholder
+# whose whole job is to keep `//go:embed all:dist` happy on a fresh checkout.
+/dist/
 e2e/.e2e-workspace
 /clavesa
