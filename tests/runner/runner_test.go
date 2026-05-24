@@ -281,3 +281,207 @@ def transform(spark, inputs):
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Operation-mode tests (the path UI's promote / discard buttons exercise)
+// ---------------------------------------------------------------------------
+
+// promoteDriverScript creates a Hadoop-catalog Iceberg canonical + staging
+// table with the given column schemas, invokes runner._run_operation with
+// _operation=backfill_promote, and prints {"result": ..., "target_schema":
+// [...], "target_rows": [...]} so the test asserts both the operation
+// response and the resulting table state.
+func promoteDriverScript(canonicalCols, stagingCols, canonicalRows, stagingRows, mode, mergeKeys, forceDedup string, allowDupes bool) string {
+	return fmt.Sprintf(`
+import json, os, sys, shutil
+
+shutil.rmtree("/work/warehouse", ignore_errors=True)
+os.makedirs("/work/warehouse", exist_ok=True)
+os.environ["CLAVESA_WAREHOUSE"] = "/work/warehouse"
+os.environ["CLAVESA_PIPELINE"] = "p"
+os.environ["CLAVESA_NODE"] = "n"
+
+sys.path.insert(0, "/var/task")
+from runner import _spark, _run_operation
+
+spark = _spark()
+spark.sql("CREATE NAMESPACE IF NOT EXISTS clavesa.itest")
+
+# Canonical table — created via writeTo so it's a real Iceberg table.
+spark.createDataFrame(%s, %q).writeTo("clavesa.itest.canon").createOrReplace()
+# Staging table — column set may differ from canonical.
+spark.createDataFrame(%s, %q).writeTo("clavesa.itest.canon__backfill__rid").createOrReplace()
+
+event = {
+    "_operation": "backfill_promote",
+    "staging": "clavesa.itest.canon__backfill__rid",
+    "target": "clavesa.itest.canon",
+    "mode": %q,
+    "merge_keys": %s,
+    "force_dedup": %q,
+    "allow_duplicates": %s,
+}
+result = _run_operation(event)
+
+target_schema = [(f.name, f.dataType.simpleString()) for f in spark.table("clavesa.itest.canon").schema]
+target_rows = sorted(
+    (r.asDict() for r in spark.table("clavesa.itest.canon").collect()),
+    key=lambda r: tuple((k, v) for k, v in sorted(r.items()) if v is not None),
+)
+staging_exists = spark.catalog.tableExists("clavesa.itest.canon__backfill__rid")
+print("RESULT_LINE:" + json.dumps({
+    "result": result,
+    "target_schema": target_schema,
+    "target_rows": target_rows,
+    "staging_exists": staging_exists,
+}))
+`, canonicalRows, canonicalCols, stagingRows, stagingCols,
+		mode, mergeKeys, forceDedup, pyBool(allowDupes))
+}
+
+func pyBool(b bool) string {
+	if b {
+		return "True"
+	}
+	return "False"
+}
+
+type promoteResult struct {
+	Result struct {
+		Status        string   `json:"status"`
+		Operation     string   `json:"operation"`
+		Target        string   `json:"target"`
+		StagingDropped string  `json:"staging_dropped"`
+		ColumnsAdded  []string `json:"columns_added"`
+	} `json:"result"`
+	TargetSchema  [][]string       `json:"target_schema"`
+	TargetRows    []map[string]any `json:"target_rows"`
+	StagingExists bool             `json:"staging_exists"`
+}
+
+func runPromoteDriver(t *testing.T, script string) promoteResult {
+	t.Helper()
+	work := t.TempDir()
+	scriptPath := filepath.Join(work, "driver.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := dockerRun(t, dockerOpts{
+		mountSrc:   work,
+		mountDst:   "/work",
+		entrypoint: "python",
+		cmd:        []string{"/work/driver.py"},
+	})
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "RESULT_LINE:") {
+			var r promoteResult
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "RESULT_LINE:")), &r); err != nil {
+				t.Fatalf("parse RESULT_LINE: %v\nline: %s", err, line)
+			}
+			return r
+		}
+	}
+	t.Fatalf("RESULT_LINE not found in output:\n%s", out)
+	return promoteResult{}
+}
+
+// Baseline: schemas match by name → MERGE updates existing keys, inserts
+// new ones, columns_added is empty.
+func TestRunner_PromoteMerge_SchemaMatch(t *testing.T) {
+	r := runPromoteDriver(t, promoteDriverScript(
+		"id long, amount long",
+		"id long, amount long",
+		`[{"id":1,"amount":10},{"id":2,"amount":20}]`,
+		`[{"id":2,"amount":99},{"id":3,"amount":30}]`,
+		"merge", `["id"]`, "", false,
+	))
+	if r.Result.Status != "ok" {
+		t.Fatalf("status: want ok, got %q", r.Result.Status)
+	}
+	if len(r.Result.ColumnsAdded) != 0 {
+		t.Errorf("columns_added: want empty, got %v", r.Result.ColumnsAdded)
+	}
+	if r.StagingExists {
+		t.Errorf("staging table should be dropped after promote")
+	}
+	wantRows := map[float64]float64{1: 10, 2: 99, 3: 30}
+	if len(r.TargetRows) != len(wantRows) {
+		t.Fatalf("rows: want %d, got %d (%v)", len(wantRows), len(r.TargetRows), r.TargetRows)
+	}
+	for _, row := range r.TargetRows {
+		id := row["id"].(float64)
+		if got := row["amount"].(float64); got != wantRows[id] {
+			t.Errorf("id=%v: want amount=%v, got %v", id, wantRows[id], got)
+		}
+	}
+}
+
+// Schema-evolving MERGE: staging has an extra `processed_at` column the
+// canonical doesn't. Before the fix this silently dropped the column.
+// After the fix the runner ALTERs canonical to add the column, then the
+// MERGE populates it for matched / inserted rows; the original canonical
+// row reads back NULL on that column.
+func TestRunner_PromoteMerge_SchemaEvolution(t *testing.T) {
+	r := runPromoteDriver(t, promoteDriverScript(
+		"id long, amount long",
+		"id long, amount long, processed_at string",
+		`[{"id":1,"amount":10},{"id":2,"amount":20}]`,
+		`[{"id":2,"amount":99,"processed_at":"2026-05-24T00:00:00Z"},{"id":3,"amount":30,"processed_at":"2026-05-24T00:00:01Z"}]`,
+		"merge", `["id"]`, "", false,
+	))
+	if r.Result.Status != "ok" {
+		t.Fatalf("status: want ok, got %q", r.Result.Status)
+	}
+	if len(r.Result.ColumnsAdded) != 1 || r.Result.ColumnsAdded[0] != "processed_at" {
+		t.Errorf("columns_added: want [processed_at], got %v", r.Result.ColumnsAdded)
+	}
+	// Canonical schema must include processed_at after promote.
+	cols := map[string]string{}
+	for _, fld := range r.TargetSchema {
+		cols[fld[0]] = fld[1]
+	}
+	if cols["processed_at"] == "" {
+		t.Fatalf("processed_at column missing from canonical after promote: %v", r.TargetSchema)
+	}
+	// Row 1: unchanged canonical row, processed_at must read back NULL.
+	// Rows 2 and 3: from staging, processed_at must be populated.
+	for _, row := range r.TargetRows {
+		id := row["id"].(float64)
+		pAt, ok := row["processed_at"]
+		switch id {
+		case 1:
+			if ok && pAt != nil {
+				t.Errorf("id=1: processed_at should be NULL (canonical row pre-evolution), got %v", pAt)
+			}
+		case 2, 3:
+			if !ok || pAt == nil || pAt == "" {
+				t.Errorf("id=%v: processed_at should be populated from staging, got %v", id, pAt)
+			}
+		}
+	}
+}
+
+// Append-mode + allow_duplicates path used to be `INSERT INTO target
+// SELECT * FROM staging` — positional, errors on arity mismatch. The fix
+// switches to DataFrameWriter.append() with mergeSchema=true so a new
+// column lands cleanly. Asserts both that no error is raised and that
+// the new column appears in canonical with populated values for staging
+// rows + NULL for the pre-evolution canonical row.
+func TestRunner_PromoteAppendAllowDupes_SchemaEvolution(t *testing.T) {
+	r := runPromoteDriver(t, promoteDriverScript(
+		"id long, amount long",
+		"id long, amount long, processed_at string",
+		`[{"id":1,"amount":10}]`,
+		`[{"id":2,"amount":20,"processed_at":"2026-05-24T00:00:00Z"}]`,
+		"append", `[]`, "", true,
+	))
+	if r.Result.Status != "ok" {
+		t.Fatalf("status: want ok, got %q", r.Result.Status)
+	}
+	if len(r.Result.ColumnsAdded) != 1 || r.Result.ColumnsAdded[0] != "processed_at" {
+		t.Errorf("columns_added: want [processed_at], got %v", r.Result.ColumnsAdded)
+	}
+	if len(r.TargetRows) != 2 {
+		t.Fatalf("rows: want 2 (original + appended), got %d (%v)", len(r.TargetRows), r.TargetRows)
+	}
+}

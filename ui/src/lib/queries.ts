@@ -1125,10 +1125,11 @@ export type BackfillDedupCheckResult = z.infer<typeof BackfillDedupCheckResult>;
 
 /**
  * GET /api/backfills?dir=… — open (un-promoted/un-discarded) staging
- * tables for the pipeline. The backend scans Glue tags so this is cheap
- * but cloud-only; local pipelines surface an empty list. Errors are
- * non-fatal — the dashboard card swallows them and renders the empty
- * state so an undeployed pipeline doesn't break the page.
+ * tables for the pipeline. Cloud backend scans Glue tags; local backend
+ * scans the workspace warehouse for staging-table sidecar files
+ * (ADR-014). Same response shape. Errors are non-fatal — the dashboard
+ * card swallows them and renders the empty state so an undeployed
+ * pipeline doesn't break the page.
  */
 export function useBackfills(dir: string) {
   return useQuery({
@@ -1225,11 +1226,23 @@ export async function stageBackfill(body: {
   return BackfillRun.parse(parsed);
 }
 
-/** POST /api/backfills/{run_id}/promote. */
+const BackfillPromoteResult = z.object({
+  columns_added: z.array(z.string()),
+});
+export type BackfillPromoteResult = z.infer<typeof BackfillPromoteResult>;
+
+/**
+ * POST /api/backfills/{run_id}/promote.
+ *
+ * Returns `columns_added` so the UI can surface schema evolution that
+ * happened during the promote — the runner ALTER-TABLE-ADD-COLUMNs any
+ * staging-only columns into the target before the MERGE so they don't
+ * get silently dropped (Iceberg schema evolution).
+ */
 export async function promoteBackfill(
   runID: string,
   body: { dir: string; force_dedup?: string; allow_duplicates?: boolean },
-): Promise<void> {
+): Promise<BackfillPromoteResult> {
   const res = await fetch(
     `${BASE_URL}/backfills/${encodeURIComponent(runID)}/promote`,
     {
@@ -1238,9 +1251,11 @@ export async function promoteBackfill(
       body: JSON.stringify(body),
     },
   );
-  if (res.status === 204) return;
-  const text = await res.text().catch(() => res.statusText);
-  throw new Error(`POST /backfills/${runID}/promote → ${res.status}: ${text}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`POST /backfills/${runID}/promote → ${res.status}: ${text}`);
+  }
+  return BackfillPromoteResult.parse(await res.json());
 }
 
 /** POST /api/backfills/{run_id}/discard. */

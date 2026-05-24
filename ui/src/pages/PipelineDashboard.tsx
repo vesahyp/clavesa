@@ -331,10 +331,10 @@ export function PipelineDashboard() {
     return [...rows, synthetic];
   }, [runs.data, states.data, pipelineName]);
 
-  // Backfills (Gate 1). Cloud-only today — the service invokes Lambda + Glue
-  // directly so local pipelines surface an empty list. Errors are non-fatal
-  // (an un-deployed pipeline returns 502); the card swallows them.
-  const backfills = useBackfills(!isLocalEnv && hasNodes ? dir : "");
+  // Backfills (Gate 1). Service layer dispatches on env mode — cloud goes
+  // through Lambda + Glue, local replays through the workspace runner
+  // (ADR-014 parity). Errors are non-fatal; the card swallows them.
+  const backfills = useBackfills(hasNodes ? dir : "");
   const transformNodeIds = useMemo(
     () =>
       (graph?.nodes ?? [])
@@ -772,53 +772,52 @@ export function PipelineDashboard() {
               </Card>
             )}
 
-            {/* Backfills (Gate 1) — cloud-only, workspace-env gated. */}
-            {!isLocalEnv && (
-              <Card>
-                <CardHeader className="flex-row items-center justify-between pb-3">
-                  <CardTitle className="flex items-center gap-2">
-                    <History className="h-4 w-4 text-muted-foreground" />
-                    Backfills
-                  </CardTitle>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setBfDialogOpen(true)}
-                    disabled={transformNodeIds.length === 0}
-                  >
-                    Stage backfill
-                  </Button>
-                </CardHeader>
-                <CardContent className="p-0">
-                  {backfills.isLoading && (
-                    <div className="space-y-2 p-6">
-                      <Skeleton className="h-4 w-2/3" />
-                      <Skeleton className="h-4 w-1/2" />
+            {/* Backfills (Gate 1) — local + cloud (ADR-014). */}
+            <Card>
+              <CardHeader className="flex-row items-center justify-between pb-3">
+                <CardTitle className="flex items-center gap-2">
+                  <History className="h-4 w-4 text-muted-foreground" />
+                  Backfills
+                </CardTitle>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setBfDialogOpen(true)}
+                  disabled={transformNodeIds.length === 0}
+                >
+                  Stage backfill
+                </Button>
+              </CardHeader>
+              <CardContent className="p-0">
+                {backfills.isLoading && (
+                  <div className="space-y-2 p-6">
+                    <Skeleton className="h-4 w-2/3" />
+                    <Skeleton className="h-4 w-1/2" />
+                  </div>
+                )}
+                {Boolean(backfills.error) && (
+                  <div className="p-6 text-xs text-muted-foreground">
+                    {isLocalEnv
+                      ? "Couldn't list backfills for this local pipeline. Run the pipeline at least once so the warehouse has a canonical target."
+                      : "Backfills require a deployed pipeline (Lambda + Glue). Apply the pipeline first, then stage a backfill here."}
+                  </div>
+                )}
+                {backfills.data &&
+                  backfills.data.backfills.length === 0 && (
+                    <div className="p-6 text-sm text-muted-foreground">
+                      No open backfills. Stage one to replay a transform
+                      over a historical partition window.
                     </div>
                   )}
-                  {Boolean(backfills.error) && (
-                    <div className="p-6 text-xs text-muted-foreground">
-                      Backfills require a deployed pipeline (Lambda + Glue).
-                      Apply the pipeline first, then stage a backfill here.
-                    </div>
-                  )}
-                  {backfills.data &&
-                    backfills.data.backfills.length === 0 && (
-                      <div className="p-6 text-sm text-muted-foreground">
-                        No open backfills. Stage one to replay a transform
-                        over a historical partition window.
-                      </div>
-                    )}
-                  {backfills.data && backfills.data.backfills.length > 0 && (
-                    <ul className="divide-y divide-border">
-                      {backfills.data.backfills.map((b) => (
-                        <BackfillRow key={b.run_id} bf={b} dir={dir} />
-                      ))}
-                    </ul>
-                  )}
-                </CardContent>
-              </Card>
-            )}
+                {backfills.data && backfills.data.backfills.length > 0 && (
+                  <ul className="divide-y divide-border">
+                    {backfills.data.backfills.map((b) => (
+                      <BackfillRow key={b.run_id} bf={b} dir={dir} />
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
           </TabsContent>
 
           {/* Graph — editable canvas with right-edge ConfigPanel drawer
@@ -984,21 +983,19 @@ export function PipelineDashboard() {
         <PipelineSettings dir={dir} onClose={() => setSettingsOpen(false)} />
       )}
 
-      {!isLocalEnv && (
-        <BackfillStageDialog
-          open={bfDialogOpen}
-          onOpenChange={setBfDialogOpen}
-          dir={dir}
-          transformNodes={transformNodeIds}
-          onStaged={(run) => {
-            void qc.invalidateQueries({ queryKey: ["backfills"] });
-            void qc.invalidateQueries({ queryKey: ["catalog"] });
-            navigate(
-              `/backfills?dir=${encodeURIComponent(dir)}&run=${encodeURIComponent(run.run_id)}`,
-            );
-          }}
-        />
-      )}
+      <BackfillStageDialog
+        open={bfDialogOpen}
+        onOpenChange={setBfDialogOpen}
+        dir={dir}
+        transformNodes={transformNodeIds}
+        onStaged={(run) => {
+          void qc.invalidateQueries({ queryKey: ["backfills"] });
+          void qc.invalidateQueries({ queryKey: ["catalog"] });
+          navigate(
+            `/backfills?dir=${encodeURIComponent(dir)}&run=${encodeURIComponent(run.run_id)}`,
+          );
+        }}
+      />
 
       {/* Per-run drill-down opens via `?run=…` from the NodesGrid header. */}
       <RunDetailSheet

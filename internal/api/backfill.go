@@ -17,8 +17,13 @@ type Backfiller interface {
 	BackfillList(ctx context.Context, dir string) ([]BackfillRun, error)
 	BackfillDiff(ctx context.Context, dir, runID string) (*BackfillDiff, error)
 	BackfillDedupCheck(ctx context.Context, dir, runID, col string) (*BackfillDedupCheckResult, error)
-	BackfillPromote(ctx context.Context, dir, runID string, opts BackfillPromoteOpts) error
+	BackfillPromote(ctx context.Context, dir, runID string, opts BackfillPromoteOpts) (*BackfillPromoteResult, error)
 	BackfillDiscard(ctx context.Context, dir, runID string) error
+}
+
+// BackfillPromoteResult mirrors service.BackfillPromoteResult.
+type BackfillPromoteResult struct {
+	ColumnsAdded []string `json:"columns_added"`
 }
 
 // BackfillColumnInfo mirrors service.BackfillColumnInfo. Surfaced inside
@@ -212,14 +217,21 @@ func (h *BackfillHandler) promote(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusBadRequest, "dir and run_id are required")
 		return
 	}
-	if err := h.svc.BackfillPromote(r.Context(), body.Dir, runID, BackfillPromoteOpts{
+	res, err := h.svc.BackfillPromote(r.Context(), body.Dir, runID, BackfillPromoteOpts{
 		ForceDedup:      body.ForceDedup,
 		AllowDuplicates: body.AllowDuplicates,
-	}); err != nil {
+	})
+	if err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	if res == nil {
+		res = &BackfillPromoteResult{ColumnsAdded: []string{}}
+	}
+	if res.ColumnsAdded == nil {
+		res.ColumnsAdded = []string{}
+	}
+	httputil.WriteJSON(w, http.StatusOK, res)
 }
 
 type discardBody struct {

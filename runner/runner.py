@@ -882,12 +882,43 @@ def _table_id_for(output_key: str) -> str:
     return f"clavesa.{_glue_db()}.{node}__{output_key}"
 
 
+def _evolve_target_schema(spark, target: str, staging: str) -> list[str]:
+    """ALTER TABLE target ADD COLUMN for every column in staging missing
+    from target. Returns the list of added column names (empty when the
+    schemas already match by name).
+
+    Iceberg supports schema evolution natively — added columns read back
+    NULL on existing target rows, populate from the staging values on
+    matched / inserted rows. Type widening and column drops are NOT
+    handled here; those surface loudly from the downstream MERGE / INSERT
+    instead of silently corrupting data.
+    """
+    target_fields = {f.name: f.dataType for f in spark.table(target).schema}
+    staging_schema = spark.table(staging).schema
+    added: list[str] = []
+    for field in staging_schema:
+        if field.name in target_fields:
+            continue
+        spark.sql(
+            f"ALTER TABLE {target} ADD COLUMN {field.name} {field.dataType.simpleString()}"
+        )
+        added.append(field.name)
+    if added:
+        print(
+            f"[clavesa] backfill_promote: evolved {target} with {len(added)} new column(s): {added}",
+            file=sys.stderr,
+        )
+    return added
+
+
 def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
     """Execute a non-transform control-plane operation against Iceberg.
 
     Operations:
       backfill_promote: MERGE INTO target USING staging ON <merge_keys> ...
                        (mode=merge|append + opts.{force_dedup,allow_duplicates})
+                       ALTER TABLE target ADD COLUMN for any staging-only
+                       columns before the merge — Iceberg schema evolution.
                        Drops staging on success.
       backfill_discard: DROP TABLE staging.
 
@@ -911,6 +942,15 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
         force_dedup = event.get("force_dedup", "")
         allow_dupes = bool(event.get("allow_duplicates"))
 
+        # Evolve the target schema to absorb any new columns the user added
+        # to the transform between the canonical run and the backfill —
+        # otherwise SparkSQL's `MERGE … UPDATE SET *` silently drops
+        # columns it can't resolve on the target side, and positional
+        # `INSERT INTO target SELECT *` errors with arity mismatch.
+        # Iceberg supports `ALTER TABLE … ADD COLUMN` natively; existing
+        # rows in target read back NULL for the added columns.
+        columns_added = _evolve_target_schema(spark, target, staging)
+
         if mode == "merge":
             if not merge_keys:
                 raise RuntimeError("backfill_promote merge: merge_keys required")
@@ -920,6 +960,7 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
                 f"WHEN MATCHED THEN UPDATE SET * "
                 f"WHEN NOT MATCHED THEN INSERT *"
             )
+            spark.sql(sql)
         elif mode == "append":
             if force_dedup:
                 on = f"t.{force_dedup} = s.{force_dedup}"
@@ -928,8 +969,13 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
                     f"WHEN MATCHED THEN UPDATE SET * "
                     f"WHEN NOT MATCHED THEN INSERT *"
                 )
+                spark.sql(sql)
             elif allow_dupes:
-                sql = f"INSERT INTO {target} SELECT * FROM {staging}"
+                # DataFrame writer with mergeSchema=true so name-based
+                # column resolution holds even when the schemas drifted
+                # in either direction — positional `INSERT INTO target
+                # SELECT *` would error on arity mismatch.
+                spark.table(staging).writeTo(target).option("mergeSchema", "true").append()
             else:
                 raise RuntimeError(
                     "backfill_promote append: append-mode targets need force_dedup or allow_duplicates"
@@ -937,11 +983,16 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
         else:
             raise RuntimeError(f"backfill_promote: unsupported mode {mode!r}")
 
-        spark.sql(sql)
         # Promotion succeeded — drop the staging table so the next backfill
         # for the same node doesn't accumulate stale staging artifacts.
         spark.sql(f"DROP TABLE IF EXISTS {staging}")
-        return {"status": "ok", "operation": op, "target": target, "staging_dropped": staging}
+        return {
+            "status": "ok",
+            "operation": op,
+            "target": target,
+            "staging_dropped": staging,
+            "columns_added": columns_added,
+        }
 
     raise RuntimeError(f"unknown _operation: {op!r}")
 

@@ -414,11 +414,15 @@ func (b backfillBridge) BackfillDedupCheck(ctx context.Context, dir, runID, col 
 	return &api.BackfillDedupCheckResult{MatchingRows: r.MatchingRows, NewRows: r.NewRows}, nil
 }
 
-func (b backfillBridge) BackfillPromote(ctx context.Context, dir, runID string, opts api.BackfillPromoteOpts) error {
-	return b.svc.BackfillPromote(ctx, dir, runID, tuiservice.BackfillPromoteOpts{
+func (b backfillBridge) BackfillPromote(ctx context.Context, dir, runID string, opts api.BackfillPromoteOpts) (*api.BackfillPromoteResult, error) {
+	r, err := b.svc.BackfillPromote(ctx, dir, runID, tuiservice.BackfillPromoteOpts{
 		ForceDedup:      opts.ForceDedup,
 		AllowDuplicates: opts.AllowDuplicates,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &api.BackfillPromoteResult{ColumnsAdded: r.ColumnsAdded}, nil
 }
 
 func (b backfillBridge) BackfillDiscard(ctx context.Context, dir, runID string) error {

@@ -210,7 +210,7 @@ func newBackfillPromoteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			err = svc.BackfillPromote(cmd.Context(), dir, runID, service.BackfillPromoteOpts{
+			res, err := svc.BackfillPromote(cmd.Context(), dir, runID, service.BackfillPromoteOpts{
 				ForceDedup:      forceDedup,
 				AllowDuplicates: allowDuplicates,
 			})
@@ -218,6 +218,9 @@ func newBackfillPromoteCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("Promoted %s into canonical target. Staging table dropped.\n", runID)
+			if res != nil && len(res.ColumnsAdded) > 0 {
+				fmt.Printf("Schema evolved: added %d column(s) to target — %s\n", len(res.ColumnsAdded), strings.Join(res.ColumnsAdded, ", "))
+			}
 			return nil
 		},
 	}

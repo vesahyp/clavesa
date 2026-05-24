@@ -111,6 +111,14 @@ type BackfillPromoteOpts struct {
 	AllowDuplicates bool   // append: accept dupes, plain INSERT INTO
 }
 
+// BackfillPromoteResult is the per-promote summary the runner returns —
+// surfaced through CLI / API / UI so users see whether the target's
+// schema evolved during the merge. Empty ColumnsAdded means the staging
+// and canonical schemas already matched by name.
+type BackfillPromoteResult struct {
+	ColumnsAdded []string `json:"columns_added"`
+}
+
 // stagingSuffix is appended to the canonical table id to form the parallel
 // staging table id: `<canonical>__backfill__<run_id>`.
 const stagingSuffix = "__backfill__"
@@ -424,10 +432,10 @@ func (s *Service) BackfillDiff(ctx context.Context, dir, runID string) (*Backfil
 //
 // On success drops the staging table. On error leaves it in place so the
 // user can fix the underlying issue and re-promote.
-func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts BackfillPromoteOpts) error {
+func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts BackfillPromoteOpts) (*BackfillPromoteResult, error) {
 	runs, err := s.BackfillList(ctx, dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var run *BackfillRun
 	for i := range runs {
@@ -437,13 +445,13 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 		}
 	}
 	if run == nil {
-		return fmt.Errorf("backfill: run_id %q not found", runID)
+		return nil, fmt.Errorf("backfill: run_id %q not found", runID)
 	}
 
 	abs := s.resolveDir(dir)
 	g, err := hclparser.Parse(abs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mode, mergeKeys := outputModeAndKeys(&g, run.Node, run.OutputKey)
 
@@ -451,16 +459,16 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	switch mode {
 	case "merge":
 		if len(mergeKeys) == 0 {
-			return fmt.Errorf("promote: target output declares mode=merge with no merge_keys")
+			return nil, fmt.Errorf("promote: target output declares mode=merge with no merge_keys")
 		}
 	case "append":
 		if opts.ForceDedup == "" && !opts.AllowDuplicates {
-			return fmt.Errorf("promote: append-mode targets need --force-dedup <col> or --allow-duplicates; window overlap with target would dupe")
+			return nil, fmt.Errorf("promote: append-mode targets need --force-dedup <col> or --allow-duplicates; window overlap with target would dupe")
 		}
 	case "replace":
-		return fmt.Errorf("promote: replace-mode targets need replace_partitions support (not in this version) — use --direct to recompute the target in place")
+		return nil, fmt.Errorf("promote: replace-mode targets need replace_partitions support (not in this version) — use --direct to recompute the target in place")
 	default:
-		return fmt.Errorf("promote: unsupported output mode %q", mode)
+		return nil, fmt.Errorf("promote: unsupported output mode %q", mode)
 	}
 
 	payload := map[string]any{
@@ -474,8 +482,9 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	}
 
 	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
-		if _, err := s.runOperation(ctx, payload); err != nil {
-			return err
+		resp, err := s.runOperation(ctx, payload)
+		if err != nil {
+			return nil, err
 		}
 		// Runner drops the staging table on success; we drop the sidecar
 		// so BackfillList stops surfacing this promoted run as "still
@@ -485,7 +494,7 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 				_ = s.deleteStagingSidecar(glueDB, lastSegment(run.TargetTable))
 			}
 		}
-		return nil
+		return &BackfillPromoteResult{ColumnsAdded: parseColumnsAdded(resp)}, nil
 	}
 
 	// Spark-side MERGE via the runner Lambda. Same engine + IAM scope
@@ -493,7 +502,7 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	// `UPDATE SET *` and `INSERT *`, no column enumeration needed.
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
@@ -504,12 +513,34 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 		Payload:      body,
 	})
 	if err != nil {
-		return fmt.Errorf("invoke %q: %w", functionName, err)
+		return nil, fmt.Errorf("invoke %q: %w", functionName, err)
 	}
 	if out2.FunctionError != nil && *out2.FunctionError != "" {
-		return fmt.Errorf("Lambda %q returned error: %s", functionName, string(out2.Payload))
+		return nil, fmt.Errorf("Lambda %q returned error: %s", functionName, string(out2.Payload))
 	}
-	return nil
+	var resp map[string]any
+	if len(out2.Payload) > 0 {
+		_ = json.Unmarshal(out2.Payload, &resp)
+	}
+	return &BackfillPromoteResult{ColumnsAdded: parseColumnsAdded(resp)}, nil
+}
+
+// parseColumnsAdded extracts the `columns_added` list from a runner
+// operation response. The runner returns `[]` when schemas already
+// matched; an absent key (older runner image) collapses to the same
+// empty slice so the UI doesn't need to special-case nil.
+func parseColumnsAdded(resp map[string]any) []string {
+	raw, ok := resp["columns_added"].([]any)
+	if !ok {
+		return []string{}
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // BackfillDedupCheck runs the same matching/new-key counts BackfillDiff

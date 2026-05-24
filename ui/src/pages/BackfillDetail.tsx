@@ -9,10 +9,10 @@
  * Discard actions the CLI exposes as subcommands. Same service layer
  * underneath; ADR-015 parity.
  *
- * Backfill is cloud-only today (the service invokes the deployed Lambda
- * directly and reads Glue + Athena). For local pipelines the parent
- * Dashboard card hides the affordance entirely, so users only land here
- * with a real cloud run_id.
+ * Service layer dispatches on workspace env: cloud goes through the
+ * deployed Lambda + Glue + Athena, local replays through the workspace
+ * runner and reads from the Hadoop catalog warehouse (ADR-014). Same
+ * response shape either way, so this page is environment-agnostic.
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -100,12 +100,20 @@ export function BackfillDetail() {
     if (!dir || !runID) return;
     setPromoting(true);
     try {
-      await promoteBackfill(runID, {
+      const result = await promoteBackfill(runID, {
         dir,
         force_dedup: appendAnyway ? undefined : forceDedup || undefined,
         allow_duplicates: appendAnyway || undefined,
       });
-      toast.success("Promoted to canonical. Staging table dropped.");
+      if (result.columns_added.length > 0) {
+        toast.success(
+          `Promoted to canonical. Schema evolved: added ${result.columns_added.length} column${
+            result.columns_added.length === 1 ? "" : "s"
+          } — ${result.columns_added.join(", ")}.`,
+        );
+      } else {
+        toast.success("Promoted to canonical. Staging table dropped.");
+      }
       // Navigate away first: unmounting this page drops the diff /
       // dedup-check query observers, so they can't refetch against the
       // now-dropped staging table (a 502). Do NOT removeQueries here —

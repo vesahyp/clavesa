@@ -12,6 +12,27 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.4] — 2026-05-24
+
+### Fixed
+
+- **`backfill promote` evolves the target schema instead of silently
+  dropping new columns.** Adding a column to a transform between the
+  canonical run and the backfill used to silently drop the new column
+  on MERGE (`UPDATE SET *` / `INSERT *` resolved against the target
+  schema, then ignored unresolved staging columns), or error with
+  `INSERT_COLUMN_ARITY_MISMATCH` on append+allow_duplicates. Promote
+  now `ALTER TABLE … ADD COLUMN`s any staging-only columns before the
+  merge (Iceberg schema evolution); existing canonical rows read back
+  NULL for the added columns. CLI prints the evolved columns; UI
+  surfaces them in the promote-success toast; the promote API now
+  returns `{"columns_added": [...]}` instead of 204.
+- **Backfills card now shows for local pipelines.** The pipeline
+  dashboard previously hid the card and stage dialog whenever the
+  workspace env was local, even though `backfill_local.go` was fully
+  wired. Local pipelines now stage/diff/promote/discard through the
+  same UI as cloud (ADR-014).
+
 ## [v1.1.3] — 2026-05-23
 
 ### Fixed
