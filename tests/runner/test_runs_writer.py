@@ -3,9 +3,9 @@
 Run with: python3 tests/runner/test_runs_writer.py
 
 Exercises the row construction + cause parsing + Athena value rendering
-for modules/orchestration/aws/runs_writer/index.py. The Athena round-trip
-(StartQueryExecution/GetQueryExecution polling) needs real AWS or a
-moto-server stub; cover that in cloud validation, not here.
+for internal/orchestration/sidecar/runs_writer/index.py. The Athena
+round-trip (StartQueryExecution/GetQueryExecution polling) needs real
+AWS or a moto-server stub; cover that in cloud validation, not here.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-WRITER = REPO / "modules" / "orchestration" / "aws" / "runs_writer" / "index.py"
+# v1.1.5: sidecar Python moved into internal/orchestration/sidecar/ so
+# it can be embedded with go:embed and materialised into pipeline dirs.
+WRITER = REPO / "internal" / "orchestration" / "sidecar" / "runs_writer" / "index.py"
 
 
 def _load_writer():

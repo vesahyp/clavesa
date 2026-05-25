@@ -150,7 +150,12 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 module "workspace" {
-  source         = ".clavesa/modules/%s/workspace/aws"
+  # Terraform 1.x rejects bare module paths without a leading "./"
+  # prefix as "ambiguous registry / local" — v1.1.6 fix. Older
+  # workspaces still parse the bare form via the embedded-form
+  # heuristic in hclparser, and clavesa workspace upgrade rewrites it
+  # on next run.
+  source         = "./.clavesa/modules/%s/workspace/aws"
   workspace_name = var.workspace_name
   system_catalog = var.system_catalog
 }

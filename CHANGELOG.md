@@ -12,6 +12,37 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.6] — 2026-05-25
+
+### Fixed
+
+- **Orchestration: ASL Catch.Next no longer references PipelineFailed
+  from inside a Parallel branch.** v1.1.5's tfgen emitted
+  `Catch = [{ Next = "PipelineFailed" }]` on every Task — including
+  those nested inside Parallel branches. AWS rejected the state
+  machine with `MISSING_TRANSITION_TARGET` because a branch's States
+  map is its own scope; PipelineFailed only exists at the top level.
+  Inner Tasks and inner Parallels now omit the Catch — errors
+  propagate up to the enclosing Parallel state, whose own Catch (in
+  top-level scope) sends control to PipelineFailed. Same semantic
+  behaviour, valid ASL.
+- **`workspace init` writes `source = "./.clavesa/modules/…"` with the
+  required `./` prefix.** Terraform 1.x rejects the bare form as
+  "ambiguous registry / local". Existing workspaces parse the bare
+  form via hclparser's embedded-form heuristic and get rewritten on
+  next `clavesa workspace upgrade`.
+- **`pipeline upgrade` strips deprecated `incremental_inputs = [...]`
+  from `main.tf`.** The transform module dropped the variable in
+  v0.19.0 but `pipeline upgrade` left old declarations in place;
+  affected pipelines failed `terraform validate` with "Unsupported
+  argument". The upgrade migration now removes the line alongside
+  the existing `compute = "local"` cleanup.
+- **`tests/runner/test_runs_writer.py` references the new sidecar
+  path.** v1.1.5 moved `runs_writer/index.py` to
+  `internal/orchestration/sidecar/runs_writer/` but the Python test
+  file kept the deleted path, leaving the v1.1.5 release commit
+  test-red.
+
 ## [v1.1.5] — 2026-05-25
 
 ### Added

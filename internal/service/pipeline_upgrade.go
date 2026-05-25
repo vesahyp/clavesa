@@ -96,6 +96,15 @@ func (s *Service) PipelineModuleVersion(dir string) (*ModuleVersionInfo, error) 
 // CRLF line ending.
 var localComputeRE = regexp.MustCompile(`(?m)^[ \t]*compute[ \t]*=[ \t]*"local"[ \t]*\r?\n`)
 
+// incrementalInputsRE matches a standalone `incremental_inputs = [...]`
+// attribute line inside a transform module block. The transform module
+// dropped this variable; the orchestration emitter still reads it from
+// the parsed graph for the incremental-read descriptor, but `terraform
+// validate` rejects passing it as a module argument. `pipeline upgrade`
+// strips the line so deploys stop failing — does NOT touch the
+// incremental behaviour itself (the emitter falls back to full reads).
+var incrementalInputsRE = regexp.MustCompile(`(?m)^[ \t]*incremental_inputs[ \t]*=[ \t]*\[[^\]\n]*\][ \t]*\r?\n`)
+
 // UpgradePipeline rewrites every Clavesa module `source = "..."`
 // in a pipeline's .tf files to the embedded-modules form at targetRef
 // (defaults to the binary's ModuleVersion when empty), strips the
@@ -140,6 +149,20 @@ func (s *Service) UpgradePipeline(dir, targetRef string) (currentRef, finalRef s
 	// is where it gets cleaned up.
 	for _, f := range tfFiles {
 		n, merr := stripLocalCompute(f)
+		if merr != nil {
+			return currentRef, finalRef, updated, migrated, merr
+		}
+		migrated += n
+	}
+
+	// One-shot migration: strip `incremental_inputs = [...]`. The
+	// transform module dropped the variable (last seen at v0.19.0); a
+	// pipeline carrying it now fails `terraform validate` with
+	// "Unsupported argument: incremental_inputs". The orchestration
+	// emitter no longer reads it either — the snapshot-bounded read
+	// descriptor moved to a different authoring shape (TODO line item).
+	for _, f := range tfFiles {
+		n, merr := stripIncrementalInputs(f)
 		if merr != nil {
 			return currentRef, finalRef, updated, migrated, merr
 		}
@@ -309,15 +332,26 @@ func rewriteModuleRefs(path, newRef string) (int, error) {
 // tf file and returns the number of lines removed. A file with no match
 // is left untouched.
 func stripLocalCompute(path string) (int, error) {
+	return stripLines(path, localComputeRE)
+}
+
+// stripIncrementalInputs removes every `incremental_inputs = [...]`
+// line from a single tf file. The transform module no longer declares
+// this variable; carrying it makes deploys fail at validate-time.
+func stripIncrementalInputs(path string) (int, error) {
+	return stripLines(path, incrementalInputsRE)
+}
+
+func stripLines(path string, re *regexp.Regexp) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	matches := localComputeRE.FindAll(data, -1)
+	matches := re.FindAll(data, -1)
 	if len(matches) == 0 {
 		return 0, nil
 	}
-	out := localComputeRE.ReplaceAll(data, nil)
+	out := re.ReplaceAll(data, nil)
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		return 0, err
 	}

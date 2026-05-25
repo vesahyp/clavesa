@@ -108,6 +108,79 @@ func TestEmit_PollerEnabled(t *testing.T) {
 	}
 }
 
+// TestEmit_CatchOnlyAtTopLevel is the v1.1.5→v1.1.6 regression pin.
+// AWS Step Functions rejects a Catch.Next that targets a state outside
+// the same States map (MISSING_TRANSITION_TARGET). Tasks and Parallels
+// nested inside a Parallel branch must NOT emit a Catch — errors
+// propagate up to the enclosing Parallel's Catch, which sits at the top
+// level where PipelineFailed is in scope.
+func TestEmit_CatchOnlyAtTopLevel(t *testing.T) {
+	t.Parallel()
+	// Same nested-fanout shape that tripped the validator on
+	// cloudfront-analytics: a → b → {c → d, e}, with b a fanout.
+	sm, err := aslgen.Build([]string{"a", "b", "c", "d", "e"},
+		[]aslgen.Edge{{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "b", To: "e"}, {From: "c", To: "d"}})
+	if err != nil {
+		t.Fatalf("aslgen.Build: %v", err)
+	}
+	meta := map[string]NodeMeta{}
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		meta[n] = NodeMeta{LambdaARNExpr: "module." + n + ".lambda_function_arn", InputsExpr: "{}", OutputsExpr: "{}", TimeoutSeconds: 300}
+	}
+	out, err := Emit(Pipeline{
+		PipelineNameExpr: "var.pipeline_name",
+		Catalog:          "c", SchemaExpr: "var.schema", SystemCatalog: "c_system",
+		BucketExpr:   "data.x.outputs.b",
+		StateMachine: sm, NodeMeta: meta,
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	// Extract just the SFN definition jsonencode({...}) block so we don't
+	// match Catch occurrences inside IAM jsonencode policies (which have
+	// nothing to do with ASL Catch semantics).
+	defStart := strings.Index(out, "definition = jsonencode({")
+	if defStart == -1 {
+		t.Fatal("definition block not found")
+	}
+	defEnd := strings.Index(out[defStart:], "  })\n\n  logging_configuration")
+	if defEnd == -1 {
+		t.Fatal("definition block end not found")
+	}
+	asl := out[defStart : defStart+defEnd]
+
+	catchCount := strings.Count(asl, `Catch = [{ ErrorEquals = ["States.ALL"], Next = "PipelineFailed" }]`)
+	// Top-level states for this shape: a (Task), b (Task), b_Branches
+	// (Parallel). Each gets one Catch. Inner Tasks (c, d, e) and the
+	// implicit nested Parallel — none of those get Catches.
+	wantCatch := 3
+	if catchCount != wantCatch {
+		t.Errorf("Catch count = %d, want %d (one per top-level state, none inside Parallel branches)\nASL:\n%s",
+			catchCount, wantCatch, asl)
+	}
+
+	// Belt-and-suspenders: assert the inner Task `d` does NOT carry a
+	// Catch. Use ResultPath as the anchor — `d = {` would also match
+	// inside `Payloa[d = {]`, the false positive that bit the first
+	// version of this test.
+	anchor := `ResultPath = "$.runner_results.d"`
+	dStart := strings.Index(asl, anchor)
+	if dStart == -1 {
+		t.Fatal("inner state d not found via ResultPath anchor")
+	}
+	// d's block from ResultPath onward ends at the first End=true (d is
+	// always terminal in this shape — leaf of the c branch).
+	dEnd := strings.Index(asl[dStart:], "End = true")
+	if dEnd == -1 {
+		t.Fatal("d's End=true not found")
+	}
+	dTail := asl[dStart : dStart+dEnd]
+	if strings.Contains(dTail, "Catch =") {
+		t.Errorf("inner Task d carries a Catch — would fail AWS validator (MISSING_TRANSITION_TARGET):\n--- d's tail ---\n%s\n--- end ---", dTail)
+	}
+}
+
 func TestEmit_NestedFanout(t *testing.T) {
 	t.Parallel()
 	// a → b → {c → d, e} — the nested-fanout case that v1.1.4 mangled.

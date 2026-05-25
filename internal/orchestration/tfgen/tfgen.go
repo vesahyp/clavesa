@@ -248,7 +248,7 @@ func emitStateMachine(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "    Comment = \"Clavesa pipeline: ${%s}\"\n", p.PipelineNameExpr)
 	fmt.Fprintf(b, "    StartAt = %q\n", p.StateMachine.StartAt)
 	fmt.Fprintf(b, "    States = {\n")
-	emitStates(b, p.StateMachine.States, p.NodeMeta, "      ")
+	emitStates(b, p.StateMachine.States, p.NodeMeta, "      ", true)
 	// Plus the terminal Fail state every pipeline shares.
 	fmt.Fprintf(b, "      PipelineFailed = {\n")
 	fmt.Fprintf(b, "        Type  = \"Fail\"\n")
@@ -268,10 +268,13 @@ func emitStateMachine(b *strings.Builder, p Pipeline) {
 }
 
 // emitStates recursively writes the `key = { … }` entries for an ASL
-// States map. Each Task carries the standard Retry / Catch policies; each
-// Parallel inlines its branches with the same recursion. The indent
-// argument is the current map-key column for clean output.
-func emitStates(b *strings.Builder, states []aslgen.State, meta map[string]NodeMeta, indent string) {
+// States map. atTopLevel is true only for the outermost States map (the
+// one containing PipelineFailed); inside a Parallel branch's States map
+// it's false so the inner Tasks and Parallels skip the Catch — ASL
+// rejects a Catch.Next that targets a state outside the same States map.
+// Errors from inner Tasks propagate up to the enclosing Parallel state,
+// which carries the Catch in scope of PipelineFailed (v1.1.5 bug fix).
+func emitStates(b *strings.Builder, states []aslgen.State, meta map[string]NodeMeta, indent string, atTopLevel bool) {
 	// Sort states alphabetically so emit is byte-stable across runs.
 	sorted := make([]aslgen.State, len(states))
 	copy(sorted, states)
@@ -279,14 +282,14 @@ func emitStates(b *strings.Builder, states []aslgen.State, meta map[string]NodeM
 	for _, s := range sorted {
 		switch s.Type {
 		case aslgen.Task:
-			emitTask(b, s, meta[s.Name], indent)
+			emitTask(b, s, meta[s.Name], indent, atTopLevel)
 		case aslgen.Parallel:
-			emitParallel(b, s, meta, indent)
+			emitParallel(b, s, meta, indent, atTopLevel)
 		}
 	}
 }
 
-func emitTask(b *strings.Builder, s aslgen.State, m NodeMeta, indent string) {
+func emitTask(b *strings.Builder, s aslgen.State, m NodeMeta, indent string, atTopLevel bool) {
 	fmt.Fprintf(b, "%s%s = {\n", indent, s.Name)
 	fmt.Fprintf(b, "%s  Type           = \"Task\"\n", indent)
 	fmt.Fprintf(b, "%s  Resource       = \"arn:aws:states:::lambda:invoke\"\n", indent)
@@ -305,7 +308,7 @@ func emitTask(b *strings.Builder, s aslgen.State, m NodeMeta, indent string) {
 	fmt.Fprintf(b, "%s    }\n", indent)
 	fmt.Fprintf(b, "%s  }\n", indent)
 	fmt.Fprintf(b, "%s  ResultPath = \"$.runner_results.%s\"\n", indent, s.Name)
-	emitRetryCatch(b, indent+"  ")
+	emitRetryCatch(b, indent+"  ", atTopLevel)
 	if s.End {
 		fmt.Fprintf(b, "%s  End = true\n", indent)
 	} else {
@@ -314,7 +317,7 @@ func emitTask(b *strings.Builder, s aslgen.State, m NodeMeta, indent string) {
 	fmt.Fprintf(b, "%s}\n", indent)
 }
 
-func emitParallel(b *strings.Builder, s aslgen.State, meta map[string]NodeMeta, indent string) {
+func emitParallel(b *strings.Builder, s aslgen.State, meta map[string]NodeMeta, indent string, atTopLevel bool) {
 	fmt.Fprintf(b, "%s%s = {\n", indent, s.Name)
 	fmt.Fprintf(b, "%s  Type = \"Parallel\"\n", indent)
 	fmt.Fprintf(b, "%s  Branches = [\n", indent)
@@ -322,12 +325,13 @@ func emitParallel(b *strings.Builder, s aslgen.State, meta map[string]NodeMeta, 
 		fmt.Fprintf(b, "%s    {\n", indent)
 		fmt.Fprintf(b, "%s      StartAt = %q\n", indent, br.StartAt)
 		fmt.Fprintf(b, "%s      States = {\n", indent)
-		emitStates(b, br.States, meta, indent+"        ")
+		// Branch's States map is always its own ASL scope — not top-level.
+		emitStates(b, br.States, meta, indent+"        ", false)
 		fmt.Fprintf(b, "%s      }\n", indent)
 		fmt.Fprintf(b, "%s    },\n", indent)
 	}
 	fmt.Fprintf(b, "%s  ]\n", indent)
-	emitRetryCatch(b, indent+"  ")
+	emitRetryCatch(b, indent+"  ", atTopLevel)
 	if s.End {
 		fmt.Fprintf(b, "%s  End = true\n", indent)
 	} else {
@@ -336,9 +340,17 @@ func emitParallel(b *strings.Builder, s aslgen.State, meta map[string]NodeMeta, 
 	fmt.Fprintf(b, "%s}\n", indent)
 }
 
-func emitRetryCatch(b *strings.Builder, indent string) {
+// emitRetryCatch writes the Retry policy unconditionally and the Catch
+// only when the surrounding state lives at the top-level States map
+// (where PipelineFailed is in scope). Inside a Parallel branch the Catch
+// is intentionally omitted — branch-internal errors propagate up to the
+// enclosing Parallel state, whose own Catch (also at the top level) sends
+// control to PipelineFailed.
+func emitRetryCatch(b *strings.Builder, indent string, atTopLevel bool) {
 	fmt.Fprintf(b, "%sRetry = [{ ErrorEquals = [\"States.TaskFailed\"], IntervalSeconds = 5, MaxAttempts = 3, BackoffRate = 2.0, MaxDelaySeconds = 60 }]\n", indent)
-	fmt.Fprintf(b, "%sCatch = [{ ErrorEquals = [\"States.ALL\"], Next = \"PipelineFailed\" }]\n", indent)
+	if atTopLevel {
+		fmt.Fprintf(b, "%sCatch = [{ ErrorEquals = [\"States.ALL\"], Next = \"PipelineFailed\" }]\n", indent)
+	}
 }
 
 // ---------------------------------------------------------------------------
