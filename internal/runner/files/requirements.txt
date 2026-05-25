@@ -1,4 +1,4 @@
-pyspark==3.5.3
+pyspark[connect]==3.5.3
 pandas>=2.0
 setuptools>=68  # provides distutils on Python 3.12 for pyspark 3.5.x
 boto3>=1.34

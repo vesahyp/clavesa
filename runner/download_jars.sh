@@ -25,5 +25,51 @@ AWS_SDK_V1_VERSION=1.12.262
 wget -q "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" -P "${JARS_DIR}/"
 wget -q "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_V1_VERSION}/aws-java-sdk-bundle-${AWS_SDK_V1_VERSION}.jar" -P "${JARS_DIR}/"
 
+# Spark Connect server — long-lived gRPC driver that the warm worker hosts so
+# notebook REPL subprocesses (Slice 1) and the catalog query client share one
+# JVM with per-session isolation. Stable in Spark 3.5. Only loaded when the
+# CLAVESA_CONNECT_SERVER entry mode runs; Lambda transform-runner invocations
+# never instantiate the Connect plugin.
+#
+# We let Ivy (via spark-submit --packages) resolve the full dep tree instead
+# of hand-picking JARs — Spark Connect ships with non-trivial shaded gRPC/
+# protobuf companions whose exact set is version-sensitive. Trusting Spark's
+# own resolver keeps us future-proof across patch releases. Network access
+# is required at IMAGE BUILD TIME only (same as the wgets above); runtime
+# uses the cached JARs and stays fully offline.
+#
+# Ordering note: this runs BEFORE Dockerfile's COPY runner/spark-class step,
+# so spark-submit still has upstream `spark-class` underneath it, which knows
+# how to do --packages resolution. Our stripped replacement (needed for the
+# Lambda runtime) gets layered on top after.
+SPARK_VERSION=3.5.3
+echo "Resolving Spark Connect transitive deps via Ivy..."
+mkdir -p /tmp/clavesa-ivy
+# Spark-submit with --packages resolves the Ivy dep tree before launching the
+# driver. We pass a no-op script so the driver starts, runs in ~2s, and exits;
+# every transitive Connect JAR lands in /tmp/clavesa-ivy/jars as a side effect.
+# (--version alone won't work — it short-circuits before --packages is parsed.)
+echo 'print("ivy resolution complete")' > /tmp/clavesa-noop.py
+"${SPARK_HOME}/bin/spark-submit" \
+    --packages "org.apache.spark:spark-connect_2.12:${SPARK_VERSION}" \
+    --conf "spark.jars.ivy=/tmp/clavesa-ivy" \
+    --master "local[1]" \
+    /tmp/clavesa-noop.py
+rm /tmp/clavesa-noop.py
+
+# Copy resolved JARs into the Spark classpath, skipping anything pyspark
+# already bundles (avoids duplicate-class headaches).
+copied=0
+for jar in /tmp/clavesa-ivy/jars/*.jar; do
+    [ -f "$jar" ] || continue
+    name="$(basename "$jar")"
+    if [ ! -f "${JARS_DIR}/${name}" ]; then
+        cp "$jar" "${JARS_DIR}/"
+        copied=$((copied + 1))
+    fi
+done
+echo "Added ${copied} Spark Connect JAR(s) from Ivy resolution."
+rm -rf /tmp/clavesa-ivy
+
 echo "Installed JARs:"
-ls -1 "${JARS_DIR}/" | grep -E "iceberg|hadoop-aws|aws-java-sdk-bundle"
+ls -1 "${JARS_DIR}/" | grep -E "iceberg|hadoop-aws|aws-java-sdk-bundle|connect|grpc|protobuf" | sort

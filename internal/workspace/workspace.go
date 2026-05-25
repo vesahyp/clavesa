@@ -17,6 +17,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/modules"
 	"github.com/vesahyp/clavesa/internal/runner"
+	"github.com/vesahyp/clavesa/internal/version"
 )
 
 const manifestFile = "clavesa.json"
@@ -272,53 +273,107 @@ output "system_catalog" {
 		return fmt.Errorf("extract modules: %w", err)
 	}
 
-	// Build the local Docker image for preview — skip only when the cached
-	// image was built from byte-identical embedded runner source (matched via
-	// the clavesa.runner_sha label). Without the label match, edits to
-	// runner.py would silently continue serving stale images.
-	localTag := runner.LocalImageName(name)
-	imageTag := localTag + ":" + moduleVersion
-	wantSHA, shaErr := runner.EmbeddedSHA()
-	if shaErr != nil {
-		return fmt.Errorf("compute embedded runner sha: %w", shaErr)
-	}
-	if !imageMatchesSHA(imageTag, wantSHA) {
-		// Try to retag from any image whose runner_sha label already matches
-		// — the typical case is the user's own previously-built fresh image
-		// at `clavesa/transform-runner:latest` (from `make build-runner`)
-		// or this same workspace's `:latest` from a prior init. Old/unlabeled
-		// images are rejected so stale code never gets re-tagged forward.
-		retagSources := []string{
-			"clavesa/transform-runner:" + moduleVersion,
-			"clavesa/transform-runner:latest",
-			localTag + ":latest",
-		}
-		retagged := false
-		for _, src := range retagSources {
-			if !imageMatchesSHA(src, wantSHA) {
-				continue
-			}
-			if err := exec.Command("docker", "tag", src, imageTag).Run(); err != nil {
-				continue
-			}
-			_ = exec.Command("docker", "tag", src, localTag+":latest").Run()
-			retagged = true
-			break
-		}
-		if !retagged {
-			cmd := exec.Command("docker", "build",
-				"--label", runner.SHALabel+"="+wantSHA,
-				"--build-arg", "CLAVESA_MODULE_VERSION="+moduleVersion,
-				"-t", imageTag, "-t", localTag+":latest", runnerDir)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("build runner image: %w", err)
-			}
-		}
+	// Build (or retag) the local Docker image for preview so the workspace
+	// has the image its first `pipeline run` will use.
+	if _, err := ensureLocalRunnerImageAt(root, moduleVersion); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// EnsureLocalRunnerImage guarantees the workspace at `root` has a local
+// Docker runner image whose `clavesa.runner_sha` label matches the
+// runner files embedded in this binary, then returns the `:latest` tag
+// callers should pass to `docker run`.
+//
+// On match: returns instantly (one `docker image inspect`, ~5ms). Most
+// invocations land here.
+//
+// On mismatch: emits a one-line progress message on stderr, then either
+// retags from a candidate image whose label already matches (cheap,
+// <1s) or falls back to `docker build` from the embedded runner files
+// (1-3 min on a cold Docker cache, typical first-run-after-brew-upgrade
+// case). Subsequent calls are back on the fast path.
+//
+// This is the entry every local docker-spawning code path should use
+// instead of composing `runner.LocalImageName(...)+":latest"` directly,
+// so that a CLI upgrade carrying new runner code doesn't silently keep
+// serving the pre-upgrade runner image (the regression that bit users
+// going from v1.0.x to v1.1.4).
+//
+// The version this binary tags new images with comes from
+// `internal/version.Module`. The `Init` flow uses its own
+// caller-supplied version via the unexported `ensureLocalRunnerImageAt`
+// helper — tests rely on injecting a specific version there.
+func EnsureLocalRunnerImage(root string) (string, error) {
+	return ensureLocalRunnerImageAt(root, version.Module)
+}
+
+func ensureLocalRunnerImageAt(root, moduleVersion string) (string, error) {
+	m, err := Load(root)
+	if err != nil {
+		return "", fmt.Errorf("load workspace at %s: %w — run `clavesa workspace init` first", root, err)
+	}
+	localTag := runner.LocalImageName(m.Name)
+	latest := localTag + ":latest"
+
+	wantSHA, err := runner.EmbeddedSHA()
+	if err != nil {
+		return "", fmt.Errorf("compute embedded runner sha: %w", err)
+	}
+	if imageMatchesSHA(latest, wantSHA) {
+		return latest, nil
+	}
+
+	versioned := localTag + ":" + moduleVersion
+	// Retag candidates — cheap path. Walk in order; first match wins.
+	// `clavesa/transform-runner:<version>` and `:latest` come from
+	// `make build-runner` in the dev tree; the workspace's own
+	// `:<version>` (from a prior init at the same CLI version) is the
+	// third fallback. Brew-installed users typically won't have any
+	// of these, so the loop short-circuits to the build path.
+	retagSources := []string{
+		"clavesa/transform-runner:" + moduleVersion,
+		"clavesa/transform-runner:latest",
+		versioned,
+	}
+	for _, src := range retagSources {
+		if !imageMatchesSHA(src, wantSHA) {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "[clavesa] workspace runner image stale; retagging from %s…\n", src)
+		if err := exec.Command("docker", "tag", src, versioned).Run(); err != nil {
+			continue
+		}
+		if err := exec.Command("docker", "tag", src, latest).Run(); err != nil {
+			return "", fmt.Errorf("retag %s -> %s: %w", src, latest, err)
+		}
+		return latest, nil
+	}
+
+	// Full rebuild — slow. Re-extract embedded runner files first so a
+	// CLI carrying updated runner code writes them to <root>/runner/
+	// before `docker build` reads from there. Init already does this
+	// for the first-init path; the re-extract here covers the
+	// upgrade-after-init case where the on-disk copy is from an older
+	// CLI version.
+	fmt.Fprintln(os.Stderr, "[clavesa] workspace runner image stale; rebuilding from embedded files — first run after a CLI upgrade can take 1–3 min on a cold Docker cache…")
+	runnerDir := filepath.Join(root, "runner")
+	if err := extractRunnerFiles(runnerDir); err != nil {
+		return "", fmt.Errorf("extract runner source: %w", err)
+	}
+	cmd := exec.Command("docker", "build",
+		"--label", runner.SHALabel+"="+wantSHA,
+		"--build-arg", "CLAVESA_MODULE_VERSION="+moduleVersion,
+		"-t", versioned, "-t", latest, runnerDir)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("build runner image: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "[clavesa] runner image ready.")
+	return latest, nil
 }
 
 // VerifyRunnerImage checks that the local runner image for `workspaceName`

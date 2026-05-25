@@ -6,25 +6,19 @@
  * are subsequent slices once the observability tables exist.
  */
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Navigate, useParams, NavLink } from "react-router-dom";
 import { formatDistanceToNow } from "date-fns";
-import { Database, FileWarning } from "lucide-react";
+import { ChevronDown, ChevronRight, FileWarning, Terminal } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { AdhocQuery } from "@/components/AdhocQuery";
 import { CopyButton } from "@/components/CopyButton";
 import { LineagePanel } from "@/components/LineagePanel";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   useCatalogTables,
   useColumnStats,
@@ -172,94 +166,43 @@ export function TableDetail() {
           )}
         </div>
 
-        <div className="grid gap-6 lg:grid-cols-3">
-          {/* Schema */}
-          <Card className="lg:col-span-1">
-            <CardHeader className="pb-3">
-              <CardTitle>Schema</CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              {catalog.isLoading && (
-                <div className="space-y-2 p-6">
-                  <Skeleton className="h-4 w-full" />
-                  <Skeleton className="h-4 w-3/4" />
-                  <Skeleton className="h-4 w-2/3" />
-                </div>
-              )}
-              {tableMeta && tableMeta.columns.length === 0 && (
-                <div className="p-6 text-sm text-muted-foreground">
-                  No columns reported.
-                </div>
-              )}
-              {tableMeta && tableMeta.columns.length > 0 && (
-                <Table>
-                  <TableBody>
-                    {tableMeta.columns.map((c) => (
-                      <TableRow key={c.name} className="hover:bg-transparent">
-                        <TableCell className="font-mono text-xs">{c.name}</TableCell>
-                        <TableCell className="text-right font-mono text-xs text-muted-foreground">
-                          {c.type}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Sample rows */}
-          <Card className="lg:col-span-2">
-            <CardHeader className="flex-row items-center justify-between pb-3">
-              <CardTitle>Sample</CardTitle>
-              {sample.data && (
-                <span className="text-xs text-muted-foreground">
-                  {sample.data.row_count}
-                  {sample.data.truncated ? "+" : ""} row
-                  {sample.data.row_count === 1 ? "" : "s"}
-                </span>
-              )}
-            </CardHeader>
-            <CardContent className="p-0">
-              {sample.isLoading && (
-                <div className="space-y-2 p-6">
-                  <Skeleton className="h-4 w-full" />
-                  <Skeleton className="h-4 w-full" />
-                  <Skeleton className="h-4 w-full" />
-                  <Skeleton className="h-4 w-full" />
-                </div>
-              )}
-              {sample.error && (
-                <div className="m-6 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm">
-                  <FileWarning className="mt-0.5 h-4 w-4 flex-shrink-0 text-destructive" />
-                  <div className="min-w-0">
-                    <div className="font-medium text-destructive">Query failed</div>
-                    <p className="mt-1 break-words text-xs text-muted-foreground">
-                      {sample.error instanceof Error
-                        ? sample.error.message
-                        : String(sample.error)}
-                    </p>
-                  </div>
-                </div>
-              )}
-              {sample.data && sample.data.rows.length === 0 && (
-                <div className="flex flex-col items-center gap-2 p-12 text-center">
-                  <Database className="h-6 w-6 text-muted-foreground" />
-                  <div className="text-sm text-muted-foreground">
-                    Table is empty.
-                  </div>
-                </div>
-              )}
-              {sample.data && sample.data.rows.length > 0 && (
-                <SampleTable data={sample.data} />
-              )}
-            </CardContent>
-          </Card>
+        {/* Columns — one column-oriented overview. Rich mode (null %,
+            distinct, top-K, percentiles) when the transform opted into
+            stats=true; lite mode (name + type + first few example values
+            from the sample) otherwise. Either way, this replaces the
+            Schema-on-left / Sample-on-right grid — row data lives in the
+            Query pane below now. */}
+        <div>
+          {isIceberg && columnStats.data && columnStats.data.stats.length > 0 ? (
+            <ColumnStatsCard data={columnStats.data} />
+          ) : (
+            <LiteColumnsCard
+              tableMeta={tableMeta}
+              sample={sample.data ?? null}
+              isLoading={catalog.isLoading || sample.isLoading}
+            />
+          )}
         </div>
 
-        {isIceberg && columnStats.data && columnStats.data.stats.length > 0 && (
-          <div className="mt-6">
-            <ColumnStatsCard data={columnStats.data} />
+        <div className="mt-6">
+          <TableQueryPane
+            sql={`SELECT * FROM clavesa.${ident(database)}.${ident(tableName)} LIMIT 100`}
+            defaultOpen
+            autoRun
+          />
+        </div>
+
+        {sample.error && (
+          <div className="mt-4 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm">
+            <FileWarning className="mt-0.5 h-4 w-4 flex-shrink-0 text-destructive" />
+            <div className="min-w-0">
+              <div className="font-medium text-destructive">Sample query failed</div>
+              <p className="mt-1 break-words text-xs text-muted-foreground">
+                {sample.error instanceof Error
+                  ? sample.error.message
+                  : String(sample.error)}
+              </p>
+            </div>
           </div>
         )}
 
@@ -287,51 +230,6 @@ export function TableDetail() {
             />
           </div>
         )}
-    </div>
-  );
-}
-
-interface SampleTableProps {
-  data: NonNullable<ReturnType<typeof useTableSample>["data"]>;
-}
-
-function SampleTable({ data }: SampleTableProps) {
-  return (
-    <div className="max-h-[60vh] overflow-auto">
-      <Table>
-        <TableHeader className="sticky top-0 z-10 bg-card">
-          <TableRow className="hover:bg-transparent">
-            {data.columns.map((c) => (
-              <TableHead key={c.name} className="whitespace-nowrap">
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-mono text-xs text-foreground">{c.name}</span>
-                  <span className="font-mono text-[10px] font-normal normal-case text-muted-foreground">
-                    {c.type}
-                  </span>
-                </div>
-              </TableHead>
-            ))}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {data.rows.map((row, i) => (
-            <TableRow key={i}>
-              {row.map((cell, j) => (
-                <TableCell
-                  key={j}
-                  className="whitespace-nowrap font-mono text-xs"
-                >
-                  {cell === "" || cell == null ? (
-                    <span className="text-muted-foreground/50">—</span>
-                  ) : (
-                    cell
-                  )}
-                </TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
     </div>
   );
 }
@@ -690,4 +588,179 @@ export function LegacyTableDetailRedirect() {
   const schema = i >= 0 ? database.slice(i + 2) : "";
   const to = `/tables/${encodeURIComponent(catalog)}/${encodeURIComponent(schema)}/${encodeURIComponent(tableName)}`;
   return <Navigate to={to} replace />;
+}
+
+// TableQueryPane wraps the AdhocQuery component for the table-detail page.
+// defaultOpen + autoRun together give the user the LIMIT 100 result on
+// page load without an extra click — moving what the old Sample card used
+// to show into the same surface where they can edit the SQL.
+function TableQueryPane({
+  sql,
+  defaultOpen,
+  autoRun,
+}: {
+  sql: string;
+  defaultOpen?: boolean;
+  autoRun?: boolean;
+}) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between pb-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex items-center gap-2 text-left"
+        >
+          {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          <Terminal className="h-4 w-4 text-muted-foreground" />
+          <CardTitle className="text-base">Query this table</CardTitle>
+        </button>
+        {open && (
+          <Button asChild size="sm" variant="ghost">
+            <a href={`/query?sql=${encodeURIComponent(sql)}`}>Open in /query</a>
+          </Button>
+        )}
+      </CardHeader>
+      {open && (
+        <CardContent className="pt-0">
+          <AdhocQuery initialSql={sql} bare autoRun={autoRun} />
+        </CardContent>
+      )}
+    </Card>
+  );
+}
+
+// LiteColumnsCard is the column-oriented overview for tables that didn't
+// opt into stats=true. Each row: column name + type + a few example values
+// pulled from the sample query + a non-null-count derived from the sample.
+// Degrades gracefully to "name + type" while the sample is still loading.
+function LiteColumnsCard({
+  tableMeta,
+  sample,
+  isLoading,
+}: {
+  tableMeta: CatalogTable | undefined;
+  /** Row data only — we read by column index. Falsy = sample not yet loaded. */
+  sample: { rows: string[][]; row_count: number } | null;
+  isLoading: boolean;
+}) {
+  if (isLoading && !tableMeta) {
+    return (
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle>Columns</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2 p-6">
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-3/4" />
+          <Skeleton className="h-4 w-2/3" />
+        </CardContent>
+      </Card>
+    );
+  }
+  if (!tableMeta || tableMeta.columns.length === 0) {
+    return (
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle>Columns</CardTitle>
+        </CardHeader>
+        <CardContent className="p-6 text-sm text-muted-foreground">
+          No columns reported.
+        </CardContent>
+      </Card>
+    );
+  }
+  const sampleRows = sample?.rows ?? [];
+  const sampleN = sampleRows.length;
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between pb-3">
+        <CardTitle>Columns</CardTitle>
+        <span className="text-xs text-muted-foreground">
+          {tableMeta.columns.length} column{tableMeta.columns.length === 1 ? "" : "s"}
+          {sampleN > 0 && <> · examples from first {sampleN} rows</>}
+        </span>
+      </CardHeader>
+      <CardContent className="p-0">
+        <ol className="divide-y divide-border">
+          {tableMeta.columns.map((c, colIdx) => {
+            const colValues = sampleRows.map((row) => row[colIdx] ?? "");
+            const nonEmpty = colValues.filter((v) => v !== "");
+            const nullCount = colValues.length - nonEmpty.length;
+            // first 3 unique example values, preserve sample order
+            const seen = new Set<string>();
+            const examples: string[] = [];
+            for (const v of nonEmpty) {
+              if (!seen.has(v)) {
+                seen.add(v);
+                examples.push(v);
+                if (examples.length === 3) break;
+              }
+            }
+            const nullPct = sampleN > 0 ? nullCount / sampleN : null;
+            return (
+              <li key={c.name} className="grid grid-cols-12 items-start gap-3 px-6 py-3 text-xs">
+                <div className="col-span-3 min-w-0">
+                  <div className="truncate font-mono text-foreground">{c.name}</div>
+                  <div className="truncate font-mono text-[10px] text-muted-foreground">
+                    {c.type}
+                  </div>
+                </div>
+                <div className="col-span-2 flex flex-col gap-1">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Null
+                  </span>
+                  {nullPct == null ? (
+                    <span className="text-muted-foreground">—</span>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                        <div
+                          className="absolute inset-y-0 left-0 bg-amber-500/70"
+                          style={{ width: `${Math.min(100, nullPct * 100)}%` }}
+                        />
+                      </div>
+                      <span className="font-mono text-foreground">
+                        {(nullPct * 100).toFixed(nullPct >= 0.1 ? 0 : 1)}%
+                      </span>
+                    </div>
+                  )}
+                </div>
+                <div className="col-span-7 flex flex-col gap-1">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Examples
+                  </span>
+                  {examples.length === 0 ? (
+                    <span className="text-muted-foreground">
+                      {sampleN === 0 ? "—" : "(all null in sample)"}
+                    </span>
+                  ) : (
+                    <div className="flex flex-wrap gap-1">
+                      {examples.map((v, i) => (
+                        <code
+                          key={i}
+                          className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground"
+                          title={v}
+                        >
+                          {v.length > 60 ? v.slice(0, 57) + "…" : v}
+                        </code>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ident quotes a SQL identifier with backticks. Catalog/schema/table parts
+// can include digits or other characters Spark needs quoted; backticks are
+// the Iceberg-on-Spark idiom.
+function ident(s: string): string {
+  return "`" + s.replace(/`/g, "``") + "`";
 }

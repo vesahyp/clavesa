@@ -61,11 +61,16 @@ type NodeTypeDef struct {
 // Module-relative paths under the extracted modules tree. Service.ModuleSource
 // converts these into the depth-aware relative `source = "..."` string a
 // pipeline .tf file gets written with.
+//
+// v1.1.5+ dropped OrchestrationModuleRel — the orchestration module was
+// folded into Go-side TF emission (internal/orchestration/tfgen) so the
+// generated orchestration.tf is self-contained standard Terraform with no
+// module dependency. The bug forcing this was nested-fanout / multi-hop
+// branch states going unreachable in the HCL-side ASL builder.
 const (
-	OrchestrationModuleRel = "orchestration/aws"
-	SourceModuleRel        = "source/aws"
-	TransformModuleRel     = "transform/aws"
-	DestinationModuleRel   = "destination/aws"
+	SourceModuleRel      = "source/aws"
+	TransformModuleRel   = "transform/aws"
+	DestinationModuleRel = "destination/aws"
 )
 
 // NodeTypes is the catalogue of supported node types.
@@ -170,6 +175,13 @@ type Service struct {
 	dashMu         sync.Mutex
 	dashTableReady bool
 	dashImported   bool
+
+	// notebookRunner is the REPL pool for notebook cell execution
+	// (Slice 1). nil for CLI-only invocations that don't run cells;
+	// `clavesa ui` wires the real per-workspace runner via
+	// WithNotebookRunner. RunCell / CancelCell / StopNotebookSession
+	// all early-return when this is nil.
+	notebookRunner NotebookRunner
 }
 
 // Ref wraps a bare HCL expression (e.g. file("path"), var.x) as a reference

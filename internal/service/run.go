@@ -174,8 +174,16 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	pipelineName := filepath.Base(abs)
 	catalog := ""
 	systemCatalog := ""
-	if m, _ := workspace.Load(filepath.Dir(abs)); m != nil {
-		image = runner.LocalImageName(m.Name) + ":latest"
+	workspaceRoot := filepath.Dir(abs)
+	if m, _ := workspace.Load(workspaceRoot); m != nil {
+		// Auto-refresh the workspace runner image if a CLI upgrade
+		// shipped new runner code — bypasses the silent-stale-image
+		// trap users would otherwise hit after `brew upgrade`.
+		ensured, err := workspace.EnsureLocalRunnerImage(workspaceRoot)
+		if err != nil {
+			return nil, fmt.Errorf("ensure runner image: %w", err)
+		}
+		image = ensured
 		catalog = m.CatalogIdentifier()
 		systemCatalog = m.SystemCatalogIdentifier()
 	}
@@ -904,10 +912,19 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		}
 	}
 	// Triage-column env: which exact image and module version produced this
-	// row. Module version is baked into the image at build time as an ENV;
-	// the digest comes from `docker image inspect` and changes every time the
-	// runner is rebuilt. Failures here are non-fatal — passing empty strings
-	// degrades to the older runner behavior of leaving the columns blank.
+	// row. The digest comes from `docker image inspect` and changes every
+	// time the runner is rebuilt. Failures here are non-fatal — passing empty
+	// strings degrades to the older runner behavior of leaving the columns
+	// blank.
+	//
+	// CLAVESA_MODULE_VERSION is baked as an ENV inside the image at build
+	// time, but the cache-retag path in `workspace.EnsureLocalRunnerImage`
+	// can rebrand an image built at a different version (same runner SHA,
+	// different `--build-arg CLAVESA_MODULE_VERSION`). Override at run-time
+	// so `node_runs.module_version` always reflects the CLI version that
+	// orchestrated the run, regardless of what the image was originally
+	// built with.
+	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
 	if digest := dockerImageDigest(image); digest != "" {
 		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
 	}
@@ -1118,6 +1135,8 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *run
 	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
 	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
 	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
+	// Override the baked-in version — see runTransform for the rationale.
+	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
 	if digest := dockerImageDigest(image); digest != "" {
 		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
 	}
@@ -1511,8 +1530,14 @@ func firstNonEmpty(values ...string) string {
 // reported `{"error": "..."}` envelopes — the caller treats both the same.
 func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[string]any, error) {
 	image := runner.LocalImageName("") + ":latest"
-	if m, _ := workspace.Load(s.workspace); m != nil {
-		image = runner.LocalImageName(m.Name) + ":latest"
+	if _, err := workspace.Load(s.workspace); err == nil {
+		// Auto-refresh the workspace runner image if a CLI upgrade
+		// shipped new runner code (see EnsureLocalRunnerImage).
+		ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
+		if err != nil {
+			return nil, fmt.Errorf("ensure runner image: %w", err)
+		}
+		image = ensured
 	}
 
 	warehouse := workspace.LocalWarehouseDir(s.workspace)
@@ -1528,6 +1553,8 @@ func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[stri
 	args := []string{"run", "--rm", "-i"}
 	args = append(args, "-e", "CLAVESA_RUN=1")
 	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	// Override the baked-in version — see runTransform for the rationale.
+	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
 	args = append(args, "-v", warehouse+":"+warehouse)
 	args = append(args, image)
 

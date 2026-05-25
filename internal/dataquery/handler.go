@@ -1,9 +1,11 @@
 package dataquery
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/httputil"
@@ -74,6 +76,17 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 	})
 	mux.HandleFunc("GET /data/tables-state", func(w http.ResponseWriter, r *http.Request) {
 		handleTables(w, r, h.providerFor(r), h.systemGlueDBFor(r))
+	})
+
+	// POST /data/query — workspace-level ad-hoc SQL editor. Body shape:
+	//   { "sql": "SELECT …", "dir": "<pipeline-dir>" }
+	// `dir` scopes the provider dispatch (local-warehouse vs Athena);
+	// any pipeline dir in the workspace will route to the same local
+	// Hadoop catalog so the UI just picks the first pipeline it knows
+	// about. The /query page and the per-table SQL pane on
+	// /tables/:db/:table both call this endpoint.
+	mux.HandleFunc("POST /data/query", func(w http.ResponseWriter, r *http.Request) {
+		handleAdhocQuery(w, r, h.providerFor(r))
 	})
 
 	h.mux = mux
@@ -237,6 +250,57 @@ func handleTable(w http.ResponseWriter, r *http.Request, p observability.Provide
 		})
 	}
 	httputil.WriteJSON(w, http.StatusOK, result)
+}
+
+// handleAdhocQuery serves POST /data/query?dir=<pipeline-dir> with body
+// {"sql": "..."}. Executes free-form SparkSQL through the resolved provider
+// (local Hadoop catalog or Athena) and returns the legacy QueryResult shape
+// so the UI's existing data-grid renderer parses without changes.
+//
+// `dir` selects the provider (compute=local vs cloud); the SQL itself is
+// against the workspace catalog. Any pipeline dir in the workspace routes
+// to the same local warehouse, so the UI sends whichever pipeline dir it
+// can see — the /query page picks the first one it knows about.
+func handleAdhocQuery(w http.ResponseWriter, r *http.Request, p observability.Provider) {
+	var body struct {
+		SQL string `json:"sql"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	sql := strings.TrimSpace(body.SQL)
+	if sql == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "sql is required")
+		return
+	}
+
+	res, err := p.Query(r.Context(), observability.QueryQuery{
+		SQL:         sql,
+		PipelineDir: r.URL.Query().Get("dir"),
+		MaxRows:     1000,
+	})
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Same legacy QueryResult shape /data/table returns — the UI grid
+	// parses both with the same hook.
+	out := &QueryResult{
+		Columns:   make([]graph.Column, 0, len(res.Columns)),
+		Rows:      res.Rows,
+		RowCount:  res.RowCount,
+		Truncated: res.Truncated,
+	}
+	for _, c := range res.Columns {
+		out.Columns = append(out.Columns, graph.Column{
+			Name:     c.Name,
+			Type:     c.Type,
+			Nullable: true,
+		})
+	}
+	httputil.WriteJSON(w, http.StatusOK, out)
 }
 
 // parseLimit parses the limit query parameter. Returns (defaultLimit, true) if

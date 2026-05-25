@@ -44,94 +44,36 @@ from typing import Any
 # container, Lambda warm invocations) skip the ~3-5s JVM boot.
 _SPARK = None
 
+# Module-level Spark Connect client used by the warm-worker query server
+# (CLAVESA_QUERY_SERVER mode). Lazily built once the embedded Connect plugin
+# is up; reused for every /query request. Independent of _SPARK — the two
+# sessions can coexist in the same process (one py4j driver hosting the
+# plugin, one Connect client talking to it over localhost gRPC).
+_CONNECT = None
+
 
 def _spark():
-    """Lazy SparkSession with Iceberg + catalog + S3 config baked in.
+    """Lazy py4j SparkSession used by Lambda / preview / run / one-shot query.
 
-    Iceberg catalog naming (per ADR-013):
-      catalog name (Spark side) = "clavesa"
-      catalog impl              = GlueCatalog when CLAVESA_WAREHOUSE is set
-                                  to s3://...; HadoopCatalog otherwise (local
-                                  dev / preview)
-      warehouse path            = CLAVESA_WAREHOUSE env, defaulting to
-                                  /tmp/clavesa-warehouse for local runs
+    The warm-worker mode (CLAVESA_QUERY_SERVER) does NOT use this anymore —
+    it goes through a Spark Connect client in run_query_server(). All other
+    modes still use the in-process py4j driver: they're one-shot, single-tenant
+    container invocations where Connect would buy us nothing.
 
-    Lambda-specific knobs (driver.bindAddress, ui.enabled) match SoAL —
-    Lambda's hostname doesn't resolve to a bindable interface.
+    Config is shared via spark_conf.clavesa_spark_conf so the py4j path here
+    and the Connect-server launch (CLAVESA_CONNECT_SERVER=1) pin the same
+    Iceberg catalog + S3A wiring.
     """
     global _SPARK
     if _SPARK is None:
         from pyspark.sql import SparkSession  # noqa: PLC0415
-
-        warehouse = os.environ.get("CLAVESA_WAREHOUSE", "/tmp/clavesa-warehouse")
-        is_s3 = warehouse.startswith("s3://")
+        from spark_conf import clavesa_spark_conf, spark_master  # noqa: PLC0415
 
         builder = (
-            SparkSession.builder.appName("clavesa-runner")
-            .master(os.environ.get("CLAVESA_SPARK_MASTER", "local[*]"))
-            .config("spark.driver.bindAddress", "127.0.0.1")
-            .config("spark.driver.host", "127.0.0.1")
-            .config("spark.ui.enabled", "false")
-            .config("spark.sql.session.timeZone", "UTC")
-            .config("spark.ui.showConsoleProgress", "false")
-            # Iceberg session extensions — enables CALL syntax, MERGE INTO, etc.
-            .config(
-                "spark.sql.extensions",
-                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-            )
-            .config("spark.sql.catalog.clavesa", "org.apache.iceberg.spark.SparkCatalog")
-            .config("spark.sql.catalog.clavesa.warehouse", warehouse)
+            SparkSession.builder.appName("clavesa-runner").master(spark_master())
         )
-
-        if is_s3:
-            # Cloud: Glue Data Catalog as the metastore so Athena can query
-            # tables natively (ADR-013). S3FileIO is Iceberg-AWS's S3 client.
-            builder = (
-                builder.config(
-                    "spark.sql.catalog.clavesa.catalog-impl",
-                    "org.apache.iceberg.aws.glue.GlueCatalog",
-                ).config(
-                    "spark.sql.catalog.clavesa.io-impl",
-                    "org.apache.iceberg.aws.s3.S3FileIO",
-                )
-            )
-        else:
-            # Local dev / preview: Hadoop catalog — file-based, no metastore.
-            # Tables live as directories under the warehouse path.
-            builder = builder.config(
-                "spark.sql.catalog.clavesa.type", "hadoop"
-            )
-
-        # Plain spark.read.parquet("s3://...") uses hadoop-aws regardless
-        # of where the Iceberg warehouse lives. ADR-017 slice 3 made
-        # local pipelines able to read s3:// sources, so this scheme
-        # mapping has to apply unconditionally — not gated on `is_s3`,
-        # which only describes the warehouse target.
-        builder = (
-            builder.config(
-                "spark.hadoop.fs.s3a.aws.credentials.provider",
-                "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
-            ).config(
-                "spark.hadoop.fs.s3.impl",
-                "org.apache.hadoop.fs.s3a.S3AFileSystem",
-            ).config(
-                "spark.hadoop.fs.s3n.impl",
-                "org.apache.hadoop.fs.s3a.S3AFileSystem",
-            )
-        )
-        # Test-infra override: point S3A at a custom endpoint (moto,
-        # MinIO) when CLAVESA_S3_ENDPOINT is set. Wires path-style
-        # addressing too — virtual-host buckets don't work against
-        # arbitrary localhost endpoints.
-        s3_endpoint = os.environ.get("CLAVESA_S3_ENDPOINT")
-        if s3_endpoint:
-            builder = (
-                builder.config("spark.hadoop.fs.s3a.endpoint", s3_endpoint)
-                .config("spark.hadoop.fs.s3a.path.style.access", "true")
-                .config("spark.hadoop.fs.s3a.connection.ssl.enabled",
-                        "true" if s3_endpoint.startswith("https://") else "false")
-            )
-
+        for k, v in clavesa_spark_conf().items():
+            builder = builder.config(k, v)
         _SPARK = builder.getOrCreate()
         _SPARK.sparkContext.setLogLevel("ERROR")
     return _SPARK
@@ -2092,13 +2034,66 @@ def run_query() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Query-server mode (CLAVESA_QUERY_SERVER=1) — long-lived warm Spark
+# Query-server mode (CLAVESA_QUERY_SERVER=1) — long-lived warm Spark Connect
 # ---------------------------------------------------------------------------
 
 
+def _start_connect_plugin() -> None:
+    """Start the Spark Connect gRPC server inside this Python's py4j JVM.
+
+    Uses the SparkConnectPlugin mechanism (stable in Spark 3.5) — same JVM
+    that hosts our Iceberg catalog also exposes a Connect endpoint on the
+    configured port. Notebook REPL subprocesses (Slice 1) and the warm
+    worker's own /query handler both talk to it via gRPC, getting
+    per-session SparkSession isolation without separate driver JVMs.
+
+    Builds via the same py4j SparkSession.builder as _spark() so the
+    Iceberg catalog + S3A config from spark_conf is applied to the JVM
+    that serves Connect clients.
+    """
+    from pyspark.sql import SparkSession  # noqa: PLC0415
+    from spark_conf import clavesa_spark_conf, spark_master  # noqa: PLC0415
+
+    port = os.environ.get("CLAVESA_CONNECT_PORT", "15002")
+    builder = (
+        SparkSession.builder.appName("clavesa-connect-host")
+        .master(spark_master())
+        .config("spark.plugins", "org.apache.spark.sql.connect.SparkConnectPlugin")
+        .config("spark.connect.grpc.binding.port", port)
+    )
+    for k, v in clavesa_spark_conf().items():
+        builder = builder.config(k, v)
+    session = builder.getOrCreate()
+    session.sparkContext.setLogLevel("ERROR")
+
+
+def _connect_session():
+    """Lazy Spark Connect client session, pinned to the in-container plugin.
+
+    Each call returns the same module-level session. session_id is a
+    stable UUID derived from the literal "_clavesa_catalog" (Spark Connect
+    requires UUID format) so reconnects after a Connect-server respawn hit
+    the same logical session and notebook REPLs (Slice 1) can rely on
+    catalog state being disjoint from theirs.
+    """
+    global _CONNECT
+    if _CONNECT is None:
+        import uuid  # noqa: PLC0415
+        from pyspark.sql.connect.session import SparkSession  # noqa: PLC0415
+
+        port = os.environ.get("CLAVESA_CONNECT_PORT", "15002")
+        session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, "_clavesa_catalog"))
+        _CONNECT = (
+            SparkSession.builder
+            .remote(f"sc://localhost:{port}/;session_id={session_id}")
+            .getOrCreate()
+        )
+    return _CONNECT
+
+
 def _query_to_payload(sql: str) -> dict:
-    """Run one SparkSQL statement, return the same shape CLAVESA_QUERY=1 emits."""
-    df = _spark().sql(sql)
+    """Run one SparkSQL statement via Connect, return the warm-worker shape."""
+    df = _connect_session().sql(sql)
     columns = list(df.columns)
     column_types = [f.dataType.simpleString() for f in df.schema.fields]
     pdf = df.toPandas()
@@ -2108,51 +2103,80 @@ def _query_to_payload(sql: str) -> dict:
 
 
 def run_query_server() -> None:
-    """CLAVESA_QUERY_SERVER=1 mode — long-lived warm Spark served over HTTP.
+    """CLAVESA_QUERY_SERVER=1 mode — warm Spark Connect server + HTTP query proxy.
 
     Wired by `clavesa ui` so the Catalog/dashboard/TableDetail surfaces share
     one warm JVM instead of paying the ~18-30s cold start on every read.
-    Single-threaded handler — Spark SQL is the bottleneck, threading buys
-    nothing.
+
+    Hosts two endpoints, sequentially: first starts the Spark Connect plugin
+    (long-lived gRPC server inside this Python's JVM, bound on port 15002),
+    then serves the legacy HTTP /healthz + /query interface by acting as a
+    Connect client to localhost:15002.
+
+    Why route /query through Connect rather than the local py4j session: we
+    dogfood the same path notebook REPLs will use in Slice 1; if Iceberg-
+    through-Connect has gaps, we find them here, not deep in notebook work.
 
     Routes:
-      GET  /healthz  → 200 once Spark is warm AND a probe SQL still
-                       succeeds. 503 if Spark is gone (JVM crash, gateway
-                       disconnect, OOM); Go-side persistent runner evicts
-                       and respawns on 503.
-      POST /query    → body: {"sql": "..."}. Returns the same JSON shape
-                       CLAVESA_QUERY=1 emits, or {"error": "..."} on
-                       failure (still 200 — the client checks the envelope,
-                       matching CLAVESA_QUERY=1's behavior).
+      GET  /healthz  → 200 once Connect is warm AND `SELECT 1` round-trips.
+                       503 if Spark/Connect is gone (JVM crash, gRPC dead);
+                       Go-side persistent runner evicts and respawns.
+      POST /query    → body: {"sql": "..."}. Returns {columns, column_types,
+                       rows} or {"error": "..."} on failure (200 either way —
+                       client inspects envelope).
     """
-    from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: PLC0415
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: PLC0415
+    import notebook_supervisor  # noqa: PLC0415
 
     port = int(os.environ.get("CLAVESA_QUERY_SERVER_PORT", "8765"))
 
-    # Eager warm — /healthz returning 200 implies the next /query call
-    # won't pay JVM startup. The Go-side persistent runner polls /healthz
-    # for up to 60s; once it sees 200 the warehouse is queryable at warm
-    # speed.
-    _spark()
+    # Start the embedded Connect plugin (long-lived). The plugin's gRPC
+    # server lives in JVM threads — it stays up as long as this Python
+    # process holds the SparkSession.
+    _start_connect_plugin()
+    # Force the Connect client to connect now so /healthz returning 200
+    # implies the next /query won't pay any handshake cost.
+    _connect_session().sql("SELECT 1").collect()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/healthz":
-                # Touch Spark for real — a SELECT 1 is cheap (~ms on a
-                # warm JVM) but catches "container up, JVM dead" cases
-                # where the HTTP server is alive but py4j has lost the
-                # gateway. Without this probe Go never evicts because
-                # the socket stays open.
+                # Round-trip a trivial query through Connect — catches both
+                # "container up, JVM dead" and "JVM up, Connect gRPC dead".
+                # Without this probe Go never evicts because the HTTP socket
+                # stays open.
                 try:
-                    _spark().sql("SELECT 1").collect()
+                    _connect_session().sql("SELECT 1").collect()
                 except Exception as exc:  # noqa: BLE001
-                    self._json(503, {"error": f"spark dead: {exc}"})
+                    self._json(503, {"error": f"spark connect dead: {exc}"})
                     return
                 self._respond(200, b"ok", content_type="text/plain")
                 return
+            if self.path == "/repls" or self.path.startswith("/repl/"):
+                self._proxy_supervisor("GET")
+                return
             self._respond(404, b"", content_type="text/plain")
 
+        def do_DELETE(self) -> None:  # noqa: N802
+            if self.path.startswith("/repl/"):
+                self._proxy_supervisor("DELETE")
+                return
+            self._respond(404, b"", content_type="text/plain")
+
+        def _proxy_supervisor(self, method: str) -> None:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(length) if length else b""
+            try:
+                status, payload = notebook_supervisor.handle_repl_request(method, self.path, body)
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": f"supervisor: {exc}"})
+                return
+            self._json(status, payload)
+
         def do_POST(self) -> None:  # noqa: N802
+            if self.path.startswith("/repl/") or self.path == "/repls":
+                self._proxy_supervisor("POST")
+                return
             if self.path != "/query":
                 self._respond(404, b"", content_type="text/plain")
                 return
@@ -2193,7 +2217,29 @@ def run_query_server() -> None:
             # Quiet — match the rest of the runner's stdout discipline.
             return
 
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    # ThreadingHTTPServer so a /repl/<id>/cancel request can land while a
+    # /repl/<id>/cell is still mid-execution on a separate thread (Slice 1).
+    # The /query path remains effectively single-threaded by virtue of the
+    # Spark Connect catalog session being one logical client; concurrent
+    # /query calls just serialize at the Connect layer.
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
+def run_connect_server() -> None:
+    """CLAVESA_CONNECT_SERVER=1 mode — Spark Connect server only, no HTTP proxy.
+
+    Reserved for the Slice 1 architecture where the in-container Python
+    supervisor for notebook REPLs runs as a separate process from the Connect
+    server. Slice 0's query-server mode embeds the plugin and the HTTP server
+    in the same process, so this entry isn't wired by Go yet — but exists for
+    standalone testing (`docker run -e CLAVESA_CONNECT_SERVER=1 ... clavesa-runner`).
+    """
+    import signal  # noqa: PLC0415
+
+    _start_connect_plugin()
+    port = os.environ.get("CLAVESA_CONNECT_PORT", "15002")
+    print(f"clavesa connect server listening on :{port}", flush=True)
+    signal.pause()  # block until SIGTERM/SIGINT — clean `docker stop`
 
 
 if os.environ.get("CLAVESA_PREVIEW") == "1":
@@ -2217,6 +2263,12 @@ elif os.environ.get("CLAVESA_QUERY") == "1":
 elif os.environ.get("CLAVESA_QUERY_SERVER") == "1":
     try:
         run_query_server()
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+        sys.exit(1)
+elif os.environ.get("CLAVESA_CONNECT_SERVER") == "1":
+    try:
+        run_connect_server()
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
         sys.exit(1)

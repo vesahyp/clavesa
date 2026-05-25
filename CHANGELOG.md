@@ -12,6 +12,74 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v1.1.5] — 2026-05-25
+
+### Added
+
+- **Notebooks.** Multi-cell SQL + PySpark notebooks (Jupyter `.ipynb`)
+  at `<workspace>/notebooks/<name>.ipynb`. Cells share one SparkSession
+  via per-notebook Spark Connect session_id; Python globals persist
+  across cells. `%%sql` / `%%python` magic for per-cell language.
+  Local-only in v1. CLI parity: `clavesa notebook
+  create|list|show|run|delete|clear-outputs`.
+- **Query.** Ad-hoc SparkSQL surface — top-level `/query` page and
+  a collapsible "Query this table" pane on `/tables/:db/:table`
+  pre-filled with `SELECT * FROM <table> LIMIT 100`. CLI peer:
+  `clavesa query "<SQL>"` (or stdin) with `--json`.
+- **Graduate cell → transform.** Per-cell `Graduate` button (and
+  `clavesa notebook graduate <nb> --cell <id> --to <pipeline> --as
+  <name>`) writes the cell source to
+  `<pipeline>/transforms/<name>.{sql,py}` and registers a new
+  transform node. Closes the explore → productionize loop.
+- **Catalog browser sidebar on `/query` and in the notebook editor.**
+  Click any workspace table to insert its fully-qualified name at the
+  cursor; expand a table to insert column names.
+- **Local commands auto-refresh the workspace runner image after a CLI
+  upgrade.** CLI now checks the workspace image's `clavesa.runner_sha`
+  label against the SHA of the runner files embedded in the binary at
+  every local docker entry point; on mismatch it auto-retags from a
+  candidate image (cheap) or rebuilds from embedded files (one-time
+  per CLI upgrade that touches runner code). Lifts the
+  `workspace.EnsureLocalRunnerImage` helper out of `workspace init`
+  for reuse by `pipeline run`, `pipeline backfill`, and preview.
+
+### Changed
+
+- **Orchestration is now plain Terraform, not a clavesa module.**
+  Generated `orchestration.tf` contains the Step Functions state
+  machine, IAM roles, log group, Glue DB, runs_writer Lambda, and
+  optional schedule / poller wiring as direct resources. Detaching from
+  clavesa now means deleting one header comment and editing standard
+  Terraform — no module dependency to vendor. Existing pipelines pinned
+  at older versions keep working until re-deployed.
+- `/tables/:db/:table` collapses the old Schema-on-left / Sample-on-
+  right grid into a single column-oriented "Columns" card (per-column
+  name + type + null % + example values, or the rich profile when
+  `stats=true`). "Query this table" pane is open and auto-running
+  `SELECT * … LIMIT 100` on page load; the separate Sample card is gone.
+- Dashboards `CatalogBrowser` lifted to a shared
+  `components/CatalogBrowser` with a new `scope="workspace"` mode;
+  existing `scope="pipeline"` behaviour unchanged.
+- Warm Spark worker now runs Spark Connect (Spark 3.5). Internal
+  prep for Spark 4 and per-session isolation; no user-visible change.
+- `pipeline run` no longer tears down the warm Spark container —
+  Catalog and dashboards stay responsive throughout a transform run.
+
+### Fixed
+
+- **Orchestration: nested fanouts + multi-hop branch states no longer
+  unreachable.** v1.1.4 emitted top-level orphan states for any branch
+  whose work continued past one Lambda invocation — AWS rejected the
+  state machine with `MISSING_TRANSITION_TARGET`. The ASL builder moved
+  from HCL (which can't recurse) into Go.
+- **`node_runs.module_version` now tracks the CLI version, not the
+  image's baked-in build-arg.** Cache retags share an image digest
+  across multiple version tags, so the runner's `CLAVESA_MODULE_VERSION`
+  ENV (set at image-build time from the Dockerfile ARG) could lag the
+  CLI version and the run-detail triage strip would show the stale
+  value. Every local `docker run` now passes
+  `-e CLAVESA_MODULE_VERSION=<current>`.
+
 ## [v1.1.4] — 2026-05-24
 
 ### Fixed

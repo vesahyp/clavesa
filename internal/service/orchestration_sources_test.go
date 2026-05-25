@@ -164,7 +164,9 @@ func TestSyncOrchestrationMaterialisesS3SourceModule(t *testing.T) {
 		`partitions    = ["year", "month"]`,
 		`start_from    = "now"`,
 		`manage_bucket_notifications = true`,
-		`trigger_queue_arns   = [module.src_events.trigger_queue_arn]`,
+		// v1.1.5+: trigger queue ARNs flow into the poller's local._poller_queue_arns
+		// list rather than a module variable (orchestration is now inline TF).
+		`_poller_queue_arns = [module.src_events.trigger_queue_arn]`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("orchestration.tf missing %q\ngot:\n%s", want, got)
@@ -194,8 +196,11 @@ func TestSyncOrchestrationOmitsSourceModuleForHTTP(t *testing.T) {
 	if strings.Contains(got, `module "src_trips"`) {
 		t.Errorf("orchestration.tf materialised a source module for kind=http:\n%s", got)
 	}
-	if !strings.Contains(got, `trigger_queue_arns   = []`) {
-		t.Errorf("orchestration.tf should have empty trigger_queue_arns for http-only pipeline; got:\n%s", got)
+	// v1.1.5+: with no source-triggered queues the poller block is omitted
+	// entirely (no Lambda, no event rule). Asserts no poller resource was
+	// emitted — equivalent to the prior `trigger_queue_arns = []` check.
+	if strings.Contains(got, `aws_lambda_function" "poller"`) {
+		t.Errorf("orchestration.tf emitted a poller for an http-only pipeline; got:\n%s", got)
 	}
 }
 
@@ -247,8 +252,11 @@ func TestSyncOrchestrationKeepsLegacyBareStringForDefaultReplace(t *testing.T) {
 		t.Fatalf("SyncOrchestration: %v", err)
 	}
 	got, _ := os.ReadFile(filepath.Join(ws, dir, "orchestration.tf"))
-	if !strings.Contains(string(got), `outputs             = { default = "" }`) {
-		t.Errorf("legacy single-default emit shape regressed:\n%s", got)
+	// v1.1.5+: outputs live inside the SFN Payload (no column alignment).
+	// The bare-string compact form for single-default-replace is preserved
+	// — the test is that the dict shape isn't gratuitously emitted.
+	if !strings.Contains(string(got), `outputs = { default = "" }`) {
+		t.Errorf("compact single-default-replace emit shape regressed:\n%s", got)
 	}
 }
 

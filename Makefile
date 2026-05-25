@@ -1,13 +1,13 @@
 .PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py release-check release-public validate-examples
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
-RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/service/version.go | head -1)
+RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
 
 dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
 
 sync-runner: ## Copy runner/ → internal/runner/files/ so the embedded copy used by `clavesa workspace init` stays in sync
-	cp runner/Dockerfile runner/runner.py runner/requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	cp runner/Dockerfile runner/runner.py runner/spark_conf.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
 
 sync-modules: ## Copy modules/ → internal/modules/files/ (tracked .tf/.py/.md/.hcl files only) so `terraform init` resolves embedded modules locally
 	@rm -rf internal/modules/files
@@ -77,7 +77,7 @@ validate-examples: ## terraform validate every modules/*/aws/examples/* (catches
 	 exit $$status
 
 release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, examples validate, tag not yet created
-	@VERSION=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/service/version.go | head -1); \
+	@VERSION=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
 	 echo "→ ModuleVersion: $$VERSION"; \
 	 grep -qE "^## \[$$VERSION\]" CHANGELOG.md || { \
 	   echo "✗ CHANGELOG.md is missing a section for $$VERSION."; \

@@ -29,6 +29,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/fileops"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
+	"github.com/vesahyp/clavesa/internal/notebooks"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/pipelinestatus"
 	"github.com/vesahyp/clavesa/internal/preview"
@@ -349,6 +350,59 @@ func (b credentialRegistryBridge) DeleteCredential(name string, force bool) erro
 	return err
 }
 
+// notebookRegistryBridge adapts service.Service onto api.NotebookRegistry.
+// The service returns *service.CellRunResult; api expects *api.CellRunResult.
+// Both share the same field shape (cell + result) but the Go type system
+// requires the bridge translation.
+type notebookRegistryBridge struct {
+	svc *tuiservice.Service
+}
+
+func (b notebookRegistryBridge) ListNotebooks() ([]notebooks.Summary, error) {
+	return b.svc.ListNotebooks()
+}
+
+func (b notebookRegistryBridge) GetNotebook(name string) (*notebooks.Notebook, error) {
+	return b.svc.GetNotebook(name)
+}
+
+func (b notebookRegistryBridge) CreateNotebook(name string) (*notebooks.Notebook, error) {
+	return b.svc.CreateNotebook(name)
+}
+
+func (b notebookRegistryBridge) SaveNotebook(nb *notebooks.Notebook) (*notebooks.Notebook, error) {
+	return b.svc.SaveNotebook(nb)
+}
+
+func (b notebookRegistryBridge) DeleteNotebook(name string) error {
+	return b.svc.DeleteNotebook(name)
+}
+
+func (b notebookRegistryBridge) ClearOutputs(name string) (*notebooks.Notebook, error) {
+	return b.svc.ClearOutputs(name)
+}
+
+func (b notebookRegistryBridge) RunCell(ctx context.Context, name, cellID string) (*api.CellRunResult, error) {
+	res, err := b.svc.RunCell(ctx, name, cellID)
+	if err != nil {
+		return nil, err
+	}
+	return &api.CellRunResult{Cell: res.Cell, Result: res.Result}, nil
+}
+
+func (b notebookRegistryBridge) CancelCell(ctx context.Context, name, cellRunID string) error {
+	return b.svc.CancelCell(ctx, name, cellRunID)
+}
+
+func (b notebookRegistryBridge) StopNotebookSession(ctx context.Context, name string) error {
+	return b.svc.StopNotebookSession(ctx, name)
+}
+
+func (b notebookRegistryBridge) GraduateCell(notebookName, cellID, pipelineDir, transformName string) error {
+	_, err := b.svc.GraduateCell(notebookName, cellID, pipelineDir, transformName)
+	return err
+}
+
 // backfillBridge adapts service.Service onto api.Backfiller. The service
 // types and API types mirror each other field-for-field; this bridge is
 // the seam that keeps internal/api free of an internal/service import.
@@ -600,8 +654,17 @@ Examples:
 			localProv := observability.NewLocalProvider(workspace).WithQueryRunner(warmQuery)
 			resolver := observability.NewResolver(workspace, cloudProv, localProv)
 
+			// Per-notebook REPL pool — shares the warm container's Spark
+			// Connect plugin via per-notebook session_ids. Evict-on-pipeline-
+			// run targets only notebook REPLs (not the warm container itself)
+			// so catalog rendering stays alive during a `pipeline run`.
+			nbRunner := observability.NewNotebookSessionRunner(warmQuery)
+
 			fo := fileops.New()
-			svc := tuiservice.New(workspace).WithEvictor(warmQuery).WithResolver(resolver)
+			svc := tuiservice.New(workspace).
+				WithEvictor(nbRunner).
+				WithResolver(resolver).
+				WithNotebookRunner(nbRunner)
 			// lineageAdapter shims the JSON shape the api package owns onto the
 			// derivation owned by service. Two shapes mirror each other field-
 			// for-field; the adapter is the seam keeping api.Handler from
@@ -647,6 +710,7 @@ Examples:
 			dashboardsHandler := api.NewDashboardsHandler(dashboardStoreBridge{svc: svc}, cloudProv).WithResolver(resolver)
 			sourcesHandler := api.NewSourcesHandler(sourceRegistryBridge{svc: svc})
 			credentialsHandler := api.NewCredentialsHandler(credentialRegistryBridge{svc: svc})
+			notebooksHandler := api.NewNotebooksHandler(notebookRegistryBridge{svc: svc})
 			backfillHandler := api.NewBackfillHandler(backfillBridge{svc: svc})
 			runtimeHandler := api.NewRuntimeHandler(warmQuery, awsIdentity)
 
@@ -675,6 +739,7 @@ Examples:
 			dashboardsHandler.RegisterRoutes(apiMux)
 			sourcesHandler.RegisterRoutes(apiMux)
 			credentialsHandler.RegisterRoutes(apiMux)
+			notebooksHandler.RegisterRoutes(apiMux)
 			backfillHandler.RegisterRoutes(apiMux)
 			runtimeHandler.RegisterRoutes(apiMux)
 			apiMux.Handle("/data/", dataHandler)

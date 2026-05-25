@@ -70,16 +70,24 @@ func ResolveUpstreamFromSnapshot(
 		return nil, false, nil
 	}
 
-	localImage := runner.LocalImageName("")
-	if m, _ := workspace.Load(root); m != nil {
-		localImage = runner.LocalImageName(m.Name)
+	localTag := runner.LocalImageName("") + ":latest"
+	if _, err := workspace.Load(root); err == nil {
+		ensured, err := workspace.EnsureLocalRunnerImage(root)
+		if err != nil {
+			// Snapshot path is best-effort fallback to re-execute — don't
+			// surface a docker rebuild failure here; let the caller's
+			// re-exec path try (and likely fail with the same error,
+			// loudly). Matches the surrounding error-swallowing style.
+			return nil, false, nil
+		}
+		localTag = ensured
 	}
 	image, _ := parent.Config["runner_image"].(string)
 	sql := fmt.Sprintf(
 		"SELECT * FROM clavesa.%s.%s LIMIT %d",
 		glueDB, table, rowCount,
 	)
-	rows, err := QueryWarehouseTable(ctx, localImage, image, warehouse, sql)
+	rows, err := QueryWarehouseTable(ctx, localTag, image, warehouse, sql)
 	if err != nil {
 		// The runner can fail for many reasons (missing image, Docker
 		// not running). None of these should sink the preview — the

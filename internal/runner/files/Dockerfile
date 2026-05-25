@@ -32,8 +32,16 @@ COPY spark-class ${SPARK_HOME}/bin/spark-class
 RUN chmod +x ${SPARK_HOME}/bin/spark-class
 
 COPY runner.py ${LAMBDA_TASK_ROOT}/
+COPY spark_conf.py ${LAMBDA_TASK_ROOT}/
+COPY notebook_supervisor.py ${LAMBDA_TASK_ROOT}/
+COPY notebook_repl.py ${LAMBDA_TASK_ROOT}/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Spark Connect server port — bound only when the warm-worker container runs
+# in CLAVESA_CONNECT_SERVER mode (see entrypoint.sh). Lambda invocations
+# ignore EXPOSE; this is documentation + a hint to `docker run -P`.
+EXPOSE 15002
 
 # Stamp the clavesa module version into the image so the runner can
 # self-report it on every node_runs / runs row without the orchestrator

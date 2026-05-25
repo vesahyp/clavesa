@@ -6,27 +6,42 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/vesahyp/clavesa/internal/version"
 )
 
 // RunPreview executes a transform inside the Clavesa runner container and
 // returns a map of output key → rows. Exactly one of sql or python should be
 // non-empty.
 //
+// `localTag` is the full `<repo>:<tag>` reference for the workspace's
+// local runner image; used when `image` is a Terraform interpolation
+// (cloud authoring) instead of a concrete reference. Callers should
+// pass `workspace.EnsureLocalRunnerImage(root, ModuleVersion)`'s
+// return value so a stale local image gets refreshed automatically
+// after a CLI upgrade.
+//
 // Calls dispatch through a package-level var so tests can swap in a stub via
 // SetRunnerForTest, avoiding a Docker dependency in unit tests.
-func RunPreview(ctx context.Context, localImage, image string, inputs map[string][]map[string]interface{}, sql, python string) (map[string][]map[string]interface{}, error) {
-	return previewRunner(ctx, localImage, image, inputs, sql, python)
+func RunPreview(ctx context.Context, localTag, image string, inputs map[string][]map[string]interface{}, sql, python string) (map[string][]map[string]interface{}, error) {
+	return previewRunner(ctx, localTag, image, inputs, sql, python)
 }
 
 // runPreviewDocker is the production runner. Builds a `docker run` command
 // against the Clavesa runner image with inputs/sql/python forwarded as env
 // vars. The container must write a JSON object {"key": [...rows...]} to stdout.
-func runPreviewDocker(ctx context.Context, localImage, image string, inputs map[string][]map[string]interface{}, sql, python string) (map[string][]map[string]interface{}, error) {
+func runPreviewDocker(ctx context.Context, localTag, image string, inputs map[string][]map[string]interface{}, sql, python string) (map[string][]map[string]interface{}, error) {
 	if image == "" || strings.Contains(image, "${") || strings.HasPrefix(image, "data.") || strings.HasPrefix(image, "var.") {
-		image = localImage + ":latest"
+		image = localTag
 	}
 
 	args := []string{"run", "--rm", "-e", "CLAVESA_PREVIEW=1"}
+	// Override the baked-in CLAVESA_MODULE_VERSION ENV — the cache-retag
+	// path in workspace.EnsureLocalRunnerImage can rebrand an image built
+	// at a different version (same runner SHA, different build-arg), and
+	// any tag-mismatched row would surface as wrong on the run-detail
+	// triage strip. See service.runTransform for the same override.
+	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+version.Module)
 
 	for alias, rows := range inputs {
 		jsonBytes, err := json.Marshal(rows)
@@ -71,18 +86,23 @@ func runPreviewDocker(ctx context.Context, localImage, image string, inputs map[
 // preview reads it rather than re-executing the producing pipeline.
 //
 // Dispatches through a package var so tests can stub out Docker.
-func QueryWarehouseTable(ctx context.Context, localImage, image, warehouse, sql string) ([]map[string]interface{}, error) {
-	return warehouseQueryRunner(ctx, localImage, image, warehouse, sql)
+//
+// `localTag` is the full `<repo>:<tag>` reference for the workspace's
+// local runner image — see RunPreview for the same convention.
+func QueryWarehouseTable(ctx context.Context, localTag, image, warehouse, sql string) ([]map[string]interface{}, error) {
+	return warehouseQueryRunner(ctx, localTag, image, warehouse, sql)
 }
 
-func queryWarehouseDocker(ctx context.Context, localImage, image, warehouse, sql string) ([]map[string]interface{}, error) {
+func queryWarehouseDocker(ctx context.Context, localTag, image, warehouse, sql string) ([]map[string]interface{}, error) {
 	if image == "" || strings.Contains(image, "${") || strings.HasPrefix(image, "data.") || strings.HasPrefix(image, "var.") {
-		image = localImage + ":latest"
+		image = localTag
 	}
 	args := []string{
 		"run", "--rm", "-i",
 		"-e", "CLAVESA_QUERY=1",
 		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
+		// Override the baked-in version — see runPreviewDocker for rationale.
+		"-e", "CLAVESA_MODULE_VERSION=" + version.Module,
 		"-v", warehouse + ":" + warehouse,
 		image,
 	}
@@ -126,7 +146,7 @@ var warehouseQueryRunner = queryWarehouseDocker
 
 // SetWarehouseQueryRunnerForTest swaps the warehouse-query runner and returns
 // a restore function. Use only from tests.
-func SetWarehouseQueryRunnerForTest(fn func(ctx context.Context, localImage, image, warehouse, sql string) ([]map[string]interface{}, error)) func() {
+func SetWarehouseQueryRunnerForTest(fn func(ctx context.Context, localTag, image, warehouse, sql string) ([]map[string]interface{}, error)) func() {
 	prev := warehouseQueryRunner
 	warehouseQueryRunner = fn
 	return func() { warehouseQueryRunner = prev }
@@ -137,7 +157,7 @@ var previewRunner = runPreviewDocker
 
 // SetRunnerForTest swaps the active runner and returns a function that
 // restores the previous value. Use only from tests.
-func SetRunnerForTest(fn func(ctx context.Context, localImage, image string, inputs map[string][]map[string]interface{}, sql, python string) (map[string][]map[string]interface{}, error)) func() {
+func SetRunnerForTest(fn func(ctx context.Context, localTag, image string, inputs map[string][]map[string]interface{}, sql, python string) (map[string][]map[string]interface{}, error)) func() {
 	prev := previewRunner
 	previewRunner = fn
 	return func() { previewRunner = prev }

@@ -8,12 +8,14 @@
 
 import { NavLink, useLocation } from "react-router-dom";
 import {
+  BookOpen,
   Database,
   FileInput,
   KeyRound,
   LayoutDashboard,
   PanelLeftClose,
   PanelLeftOpen,
+  Terminal,
   Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -45,6 +47,8 @@ const NAV: NavItem[] = [
       p.startsWith("/pipelines") || p.startsWith("/backfills"),
   },
   { to: "/dashboards", label: "Dashboards", icon: LayoutDashboard, match: (p) => p.startsWith("/dashboards") },
+  { to: "/notebooks", label: "Notebooks", icon: BookOpen, match: (p) => p.startsWith("/notebooks") },
+  { to: "/query", label: "Query", icon: Terminal, match: (p) => p.startsWith("/query") },
   { to: "/sources", label: "Sources", icon: FileInput, match: (p) => p.startsWith("/sources") },
   { to: "/credentials", label: "Credentials", icon: KeyRound, match: (p) => p.startsWith("/credentials") },
 ];

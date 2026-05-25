@@ -131,12 +131,16 @@ func (s *Service) PreviewTransform(ctx context.Context, dir, nodeID string, rowC
 	}
 
 	image, _ := node.Config["runner_image"].(string)
-	localImage := runner.LocalImageName("")
-	if m, _ := workspace.Load(s.workspace); m != nil {
-		localImage = runner.LocalImageName(m.Name)
+	localTag := runner.LocalImageName("") + ":latest"
+	if _, err := workspace.Load(s.workspace); err == nil {
+		ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
+		if err != nil {
+			return nil, fmt.Errorf("ensure runner image: %w", err)
+		}
+		localTag = ensured
 	}
 
-	outputsByKey, err := preview.RunPreview(ctx, localImage, image, allRows, sqlStr, pythonScript)
+	outputsByKey, err := preview.RunPreview(ctx, localTag, image, allRows, sqlStr, pythonScript)
 	if err != nil {
 		return nil, err
 	}
@@ -290,10 +294,14 @@ func (s *Service) resolveInputData(ctx context.Context, g *graph.PipelineGraph, 
 		// internal/preview/resolve.go.
 		if extInputs, ok := target.Config["external_inputs"].(map[string]interface{}); ok && len(extInputs) > 0 {
 			catalog := ""
-			localImage := runner.LocalImageName("")
+			localTag := runner.LocalImageName("") + ":latest"
 			if m, _ := workspace.Load(s.workspace); m != nil {
 				catalog = m.CatalogIdentifier()
-				localImage = runner.LocalImageName(m.Name)
+				ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
+				if err != nil {
+					return nil, fmt.Errorf("ensure runner image: %w", err)
+				}
+				localTag = ensured
 			}
 			warehouse := workspace.LocalWarehouseDir(s.workspace)
 			image, _ := target.Config["runner_image"].(string)
@@ -307,7 +315,7 @@ func (s *Service) resolveInputData(ctx context.Context, g *graph.PipelineGraph, 
 					return nil, fmt.Errorf("preview input %q: %w", alias, err)
 				}
 				sql := fmt.Sprintf("SELECT * FROM %s LIMIT %d", tableID, 500)
-				rows, err := preview.QueryWarehouseTable(ctx, localImage, image, warehouse, sql)
+				rows, err := preview.QueryWarehouseTable(ctx, localTag, image, warehouse, sql)
 				if err != nil {
 					return nil, fmt.Errorf("preview input %q (cross-pipeline table %q): %w", alias, ref, err)
 				}
@@ -443,12 +451,16 @@ func (s *Service) executeTransform(ctx context.Context, g *graph.PipelineGraph, 
 	}
 
 	image, _ := node.Config["runner_image"].(string)
-	localImage := runner.LocalImageName("")
-	if m, _ := workspace.Load(s.workspace); m != nil {
-		localImage = runner.LocalImageName(m.Name)
+	localTag := runner.LocalImageName("") + ":latest"
+	if _, err := workspace.Load(s.workspace); err == nil {
+		ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
+		if err != nil {
+			return nil, fmt.Errorf("ensure runner image: %w", err)
+		}
+		localTag = ensured
 	}
 
-	outputsByKey, err := preview.RunPreview(ctx, localImage, image, inputData, sqlStr, pythonScript)
+	outputsByKey, err := preview.RunPreview(ctx, localTag, image, inputData, sqlStr, pythonScript)
 	if err != nil {
 		return nil, err
 	}

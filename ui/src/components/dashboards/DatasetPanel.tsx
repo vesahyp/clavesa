@@ -25,7 +25,7 @@ import {
 import type { DashboardDataset, PipelineInfo } from "@/lib/queries";
 
 import { CodeEditor } from "@/components/CodeEditor";
-import { CatalogBrowser } from "./CatalogBrowser";
+import { CatalogBrowser } from "@/components/CatalogBrowser";
 import { SqlPreview } from "./SqlPreview";
 
 interface DatasetPanelProps {

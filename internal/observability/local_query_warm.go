@@ -233,6 +233,23 @@ func (p *persistentDockerQueryRunner) getOrSpawn(ctx context.Context, warehouse 
 	return w, nil
 }
 
+// WarmWorkerBaseURL returns "http://127.0.0.1:<port>" for the warm worker
+// serving `warehouse`, or "" if no worker is tracked for it. Used by the
+// notebook session runner (Slice 1) to reach the /repl/* supervisor
+// endpoints that live in the same container as /query.
+//
+// Returning a base URL string (not the port) keeps callers from having to
+// know about IPv4 binding details; the warm worker spawn pins 127.0.0.1.
+func (p *persistentDockerQueryRunner) WarmWorkerBaseURL(warehouse string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w, ok := p.workers[warehouse]
+	if !ok || w.state != workerReady {
+		return ""
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", w.port)
+}
+
 // Workers reports the warm-Spark workers currently tracked and their
 // state, for the UI's runtime indicator. Safe for concurrent use;
 // returns an empty slice when none are tracked or the runner is closed.
@@ -259,8 +276,17 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		"run", "-d", "--rm",
 		"--label", p.labelKV,
 		"-p", "0:8765/tcp",
+		// Spark Connect gRPC binding. Exposed so future Slice-1 notebook
+		// REPL subprocesses (which connect via gRPC) and host-side debug
+		// tools (`grpcurl`) can reach the in-container Connect server.
+		// Slice 0's /query path goes through a Connect client inside the
+		// same container, so this port isn't strictly required today —
+		// but exposing it is free and avoids a respawn churn when Slice 1
+		// lands.
+		"-p", "0:15002/tcp",
 		"-e", "CLAVESA_QUERY_SERVER=1",
 		"-e", "CLAVESA_QUERY_SERVER_PORT=8765",
+		"-e", "CLAVESA_CONNECT_PORT=15002",
 		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
 		"-v", warehouse + ":" + warehouse,
 		p.resolveImage(),
@@ -427,12 +453,12 @@ func isConnRefused(err error) bool {
 // shouldRespawn decides whether a /query error means the worker is
 // unrecoverable and should be evicted + respawned. Covers two failure
 // shapes: (a) socket-level — container gone (isConnRefused); (b)
-// container alive but Spark dead — the runner's /healthz now returns 503
-// when SELECT 1 fails, and a /query against a dead JVM surfaces py4j
-// "Java gateway process exited" / "Py4JNetworkError" / "SparkContext
-// has been shut down" inside the error envelope. False positives cost
-// one extra cold start; missing a real dead JVM hangs the UI on every
-// subsequent query, so err on the side of respawning.
+// container alive but Spark Connect dead — the runner's /healthz returns 503
+// when its Connect-client SELECT 1 fails, and a /query against a dead
+// Connect server surfaces gRPC "UNAVAILABLE" / SparkConnectGrpcException
+// inside the error envelope. False positives cost one extra cold start;
+// missing a real dead JVM hangs the UI on every subsequent query, so err
+// on the side of respawning.
 func shouldRespawn(err error) bool {
 	if err == nil {
 		return false
@@ -444,14 +470,19 @@ func shouldRespawn(err error) bool {
 	// The /healthz 503 surfaces as "warm worker HTTP 503:" — but that
 	// only fires when Go itself polls /healthz mid-query, which we
 	// don't do today. The realistic signal is a /query that round-trips
-	// to a still-alive HTTP server whose Spark gateway is gone.
+	// to a still-alive HTTP server whose Connect server is gone.
 	patterns := []string{
-		"Py4JNetworkError",
-		"Py4JJavaError",
-		"Java gateway process exited",
+		// Spark Connect surface — what the rewritten /query handler
+		// returns when the Connect plugin's gRPC server is dead.
+		"SparkConnectGrpcException",
+		"StatusCode.UNAVAILABLE",
+		"failed to connect to all addresses",
+		"Spark Connect server is shutting down",
+		"Spark Connect session has been deleted",
+		// Generic Spark teardown — still possible since the Connect
+		// plugin runs inside a regular SparkContext.
 		"SparkContext has been shut down",
 		"SparkContext was shut down",
-		"py4j.protocol",
 	}
 	for _, p := range patterns {
 		if strings.Contains(s, p) {

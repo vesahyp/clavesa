@@ -249,10 +249,14 @@ func ResolveInputData(ctx context.Context, s3c dataquery.S3Client, g *graph.Pipe
 		if extInputs, ok := target.Config["external_inputs"].(map[string]interface{}); ok && len(extInputs) > 0 {
 			root := filepath.Dir(dir)
 			catalog := ""
-			localImage := runner.LocalImageName("")
+			localTag := runner.LocalImageName("") + ":latest"
 			if m, _ := workspace.Load(root); m != nil {
 				catalog = m.CatalogIdentifier()
-				localImage = runner.LocalImageName(m.Name)
+				ensured, err := workspace.EnsureLocalRunnerImage(root)
+				if err != nil {
+					return nil, fmt.Errorf("ensure runner image: %w", err)
+				}
+				localTag = ensured
 			}
 			warehouse := workspace.LocalWarehouseDir(root)
 			image, _ := target.Config["runner_image"].(string)
@@ -266,7 +270,7 @@ func ResolveInputData(ctx context.Context, s3c dataquery.S3Client, g *graph.Pipe
 					return nil, fmt.Errorf("preview input %q: %w", alias, err)
 				}
 				sql := fmt.Sprintf("SELECT * FROM %s LIMIT %d", tableID, previewMaxLimit)
-				rows, err := QueryWarehouseTable(ctx, localImage, image, warehouse, sql)
+				rows, err := QueryWarehouseTable(ctx, localTag, image, warehouse, sql)
 				if err != nil {
 					return nil, fmt.Errorf("preview input %q (cross-pipeline table %q): %w", alias, ref, err)
 				}
@@ -371,13 +375,18 @@ func executeTransformChain(ctx context.Context, s3c dataquery.S3Client, g *graph
 		}
 	}
 
-	localImage := runner.LocalImageName("")
-	if m, _ := workspace.Load(filepath.Dir(dir)); m != nil {
-		localImage = runner.LocalImageName(m.Name)
+	localTag := runner.LocalImageName("") + ":latest"
+	root := filepath.Dir(dir)
+	if _, err := workspace.Load(root); err == nil {
+		ensured, err := workspace.EnsureLocalRunnerImage(root)
+		if err != nil {
+			return nil, fmt.Errorf("ensure runner image: %w", err)
+		}
+		localTag = ensured
 	}
 	image, _ := node.Config["runner_image"].(string)
 
-	outputsByKey, err := RunPreview(ctx, localImage, image, inputData, sqlStr, pythonScript)
+	outputsByKey, err := RunPreview(ctx, localTag, image, inputData, sqlStr, pythonScript)
 	if err != nil {
 		return nil, err
 	}

@@ -44,6 +44,8 @@ Quick start:
 		newSourceCmd(),
 		newCredentialCmd(),
 		newDashboardsCmd(),
+		newNotebookCmd(),
+		newQueryCmd(),
 		newVersionCmd(),
 	)
 

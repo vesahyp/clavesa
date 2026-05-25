@@ -1,10 +1,17 @@
 /**
- * CatalogBrowser — pick tables and columns while writing dataset SQL.
+ * CatalogBrowser — click-to-insert table + column picker for SQL editors.
  *
- * Lists the catalog tables a pipeline can query (scoped to the dataset's
- * dir), each expandable to its columns. Clicking a table inserts its
- * fully-qualified name into the SQL editor; clicking a column inserts the
- * column name — so authoring SQL isn't blind guessing of identifiers.
+ * Shared across the dashboards dataset editor, the workspace /query page,
+ * and notebook editors. Lists tables grouped by database; clicking a table
+ * inserts its fully-qualified name (`clavesa.<db>.<table>`), clicking a
+ * column inserts the bare column name. Authoring SQL stops being blind
+ * guessing of identifiers.
+ *
+ * Two scopes:
+ *   - `pipeline`: filter to one pipeline's tables (dashboards dataset path —
+ *     a dataset is bound to one dir, this matches that scope).
+ *   - `workspace`: every table in the catalog (the /query + notebooks paths
+ *     where the user isn't pinned to a single pipeline).
  */
 
 import { useMemo, useState } from "react";
@@ -13,21 +20,36 @@ import { ChevronDown, ChevronRight, Columns3, Table2 } from "lucide-react";
 import { useCatalogTables, type CatalogTable } from "@/lib/queries";
 
 interface CatalogBrowserProps {
-  /** The dataset's pipeline dir — only that pipeline's tables are shown. */
-  dir: string;
   /** Insert text at the SQL editor's cursor. */
   onInsert: (text: string) => void;
+  /**
+   * Scope: "pipeline" filters by `dir`, "workspace" shows every table.
+   * Defaults to "pipeline" to preserve the original dashboards behavior.
+   */
+  scope?: "pipeline" | "workspace";
+  /** Pipeline dir; required when scope="pipeline", ignored otherwise. */
+  dir?: string;
+  /** Visual width tweak — "narrow" for sidebar use, "auto" for inline. */
+  width?: "narrow" | "auto";
 }
 
-export function CatalogBrowser({ dir, onInsert }: CatalogBrowserProps) {
+export function CatalogBrowser({
+  onInsert,
+  scope = "pipeline",
+  dir = "",
+  width = "narrow",
+}: CatalogBrowserProps) {
   const catalog = useCatalogTables();
   const [open, setOpen] = useState<Set<string>>(new Set());
 
-  // Group this pipeline's tables by database (catalog__schema).
+  // Group tables by database (catalog__schema). Filter scope: workspace
+  // shows everything we have, pipeline shows only this dir's tables.
   const groups = useMemo(() => {
-    const tables = (catalog.data?.tables ?? []).filter(
-      (t) => dir !== "" && t.dir === dir,
-    );
+    const all = catalog.data?.tables ?? [];
+    const tables =
+      scope === "workspace"
+        ? all
+        : all.filter((t) => dir !== "" && t.dir === dir);
     const m = new Map<string, CatalogTable[]>();
     for (const t of tables) {
       const g = m.get(t.database) ?? [];
@@ -36,7 +58,7 @@ export function CatalogBrowser({ dir, onInsert }: CatalogBrowserProps) {
     }
     for (const g of m.values()) g.sort((a, b) => a.name.localeCompare(b.name));
     return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  }, [catalog.data, dir]);
+  }, [catalog.data, dir, scope]);
 
   function toggle(key: string) {
     setOpen((prev) => {
@@ -46,26 +68,30 @@ export function CatalogBrowser({ dir, onInsert }: CatalogBrowserProps) {
     });
   }
 
+  const widthClass = width === "narrow" ? "w-64 flex-shrink-0" : "w-full";
+
   return (
-    <div className="flex w-64 flex-shrink-0 flex-col rounded-md border border-border bg-card">
+    <div className={`${widthClass} flex flex-col rounded-md border border-border bg-card`}>
       <div className="border-b border-border px-2 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         Tables
       </div>
-      <div className="max-h-56 overflow-auto p-1 text-xs">
-        {dir === "" && (
+      <div className="max-h-[60vh] overflow-auto p-1 text-xs">
+        {scope === "pipeline" && dir === "" && (
           <p className="p-2 text-muted-foreground">
             Pick a pipeline to see its tables.
           </p>
         )}
-        {dir !== "" && catalog.isLoading && (
+        {((scope === "workspace") || (scope === "pipeline" && dir !== "")) && catalog.isLoading && (
           <p className="p-2 text-muted-foreground">Loading tables…</p>
         )}
-        {dir !== "" && catalog.error != null && (
+        {catalog.error != null && (
           <p className="p-2 text-muted-foreground">Couldn't load tables.</p>
         )}
-        {dir !== "" && !catalog.isLoading && groups.length === 0 && (
+        {!catalog.isLoading && catalog.error == null && groups.length === 0 && (
           <p className="p-2 text-muted-foreground">
-            No tables yet — run the pipeline.
+            {scope === "workspace"
+              ? "No tables yet — run a pipeline first."
+              : "No tables yet — run the pipeline."}
           </p>
         )}
         {groups.map(([database, tables]) => (
