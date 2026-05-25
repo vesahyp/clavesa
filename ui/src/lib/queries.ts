@@ -403,12 +403,13 @@ export function useExecutionStates(
     queryKey: ["execution-states", arn, dir, run],
     enabled,
     retry: false,
-    refetchInterval: (query) => {
-      const data = query.state.data as ExecutionStatesResponse | undefined;
-      if (!data) return enabled ? 2_000 : false;
-      if (data.status === "RUNNING") return 2_000;
-      return false;
-    },
+    // refetchInterval fires only after a successful response — the
+    // pre-data branch was dead (G P2-8, 2026-05-24). Mirror the clean
+    // form `useRuntimeWorkers` already has.
+    refetchInterval: (query) =>
+      (query.state.data as ExecutionStatesResponse | undefined)?.status === "RUNNING"
+        ? 2_000
+        : false,
     queryFn: async () => {
       const params = new URLSearchParams();
       if (dir) {

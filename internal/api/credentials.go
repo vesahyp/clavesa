@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -92,9 +91,8 @@ func (h *CredentialsHandler) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CredentialsHandler) register(w http.ResponseWriter, r *http.Request) {
-	var req CredentialSpec
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	req, ok := httputil.DecodeJSON[CredentialSpec](w, r)
+	if !ok {
 		return
 	}
 	if req.Kind == "" {

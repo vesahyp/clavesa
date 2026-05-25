@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
@@ -40,20 +40,20 @@ type BackfillStageRequest struct {
 // staging Iceberg table is the durable artifact; this struct is just the
 // pointer back to it. List() reconstructs these from Glue tag scans.
 type BackfillRun struct {
-	RunID         string    `json:"run_id"`
-	Pipeline      string    `json:"pipeline"`
-	Node          string    `json:"node"`
-	OutputKey     string    `json:"output_key"`
-	From          []string  `json:"from_cursor"`
-	To            []string  `json:"to_cursor"`
-	Direct        bool      `json:"direct"`
-	TargetTable   string    `json:"target_table"`            // staging (or canonical, when Direct)
-	CanonicalTable string   `json:"canonical_table"`         // production target this would promote into
-	StartedAt     time.Time `json:"started_at"`
-	StoppedAt     time.Time `json:"stopped_at,omitempty"`
-	Status        string    `json:"status"`                  // ok | failed | running
-	RowsWritten   int64     `json:"rows_written,omitempty"`
-	ErrorMsg      string    `json:"error_msg,omitempty"`
+	RunID          string    `json:"run_id"`
+	Pipeline       string    `json:"pipeline"`
+	Node           string    `json:"node"`
+	OutputKey      string    `json:"output_key"`
+	From           []string  `json:"from_cursor"`
+	To             []string  `json:"to_cursor"`
+	Direct         bool      `json:"direct"`
+	TargetTable    string    `json:"target_table"`    // staging (or canonical, when Direct)
+	CanonicalTable string    `json:"canonical_table"` // production target this would promote into
+	StartedAt      time.Time `json:"started_at"`
+	StoppedAt      time.Time `json:"stopped_at,omitempty"`
+	Status         string    `json:"status"` // ok | failed | running
+	RowsWritten    int64     `json:"rows_written,omitempty"`
+	ErrorMsg       string    `json:"error_msg,omitempty"`
 }
 
 // BackfillColumnInfo names one column on a staging table. The UI uses
@@ -70,17 +70,17 @@ type BackfillColumnInfo struct {
 // can render it with simple list-of-metrics widgets; deeper analysis lives
 // in Athena queries the user can run by hand.
 type BackfillDiff struct {
-	RunID            string `json:"run_id"`
-	StagingTable     string `json:"staging_table"`
-	CanonicalTable   string `json:"canonical_table"`
-	StagingRows      int64  `json:"staging_rows"`
-	CanonicalRows    int64  `json:"canonical_rows"` // -1 when target doesn't exist yet
-	SchemaMatches    bool   `json:"schema_matches"`
-	SchemaDiff       string `json:"schema_diff,omitempty"` // empty when matches
-	OutputMode       string `json:"output_mode"`
-	MergeKeys        []string `json:"merge_keys,omitempty"`
-	MatchingKeyRows  int64  `json:"matching_key_rows,omitempty"` // only set when merge_keys declared
-	NewKeyRows       int64  `json:"new_key_rows,omitempty"`
+	RunID           string   `json:"run_id"`
+	StagingTable    string   `json:"staging_table"`
+	CanonicalTable  string   `json:"canonical_table"`
+	StagingRows     int64    `json:"staging_rows"`
+	CanonicalRows   int64    `json:"canonical_rows"` // -1 when target doesn't exist yet
+	SchemaMatches   bool     `json:"schema_matches"`
+	SchemaDiff      string   `json:"schema_diff,omitempty"` // empty when matches
+	OutputMode      string   `json:"output_mode"`
+	MergeKeys       []string `json:"merge_keys,omitempty"`
+	MatchingKeyRows int64    `json:"matching_key_rows,omitempty"` // only set when merge_keys declared
+	NewKeyRows      int64    `json:"new_key_rows,omitempty"`
 	// Staging columns are surfaced so the UI's append-mode promote screen
 	// can render a real column picker instead of a free-text input. The
 	// list is always populated when the staging table is queryable; empty
@@ -1117,7 +1117,6 @@ func athenaColumns(ctx context.Context, ac *athena.Client, wg, out, fullTableID 
 	return cols, nil
 }
 
-
 // athenaMergeKeyCounts returns (staging rows that already exist in
 // canonical on the key, staging rows that are new). Counts are over
 // distinct staging rows — matching + new always sums to staging
@@ -1165,4 +1164,3 @@ func athenaRowCount2(ctx context.Context, ac *athena.Client, wg, out, sql string
 	}
 	return n, nil
 }
-

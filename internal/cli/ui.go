@@ -24,18 +24,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
+	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/api"
 	"github.com/vesahyp/clavesa/internal/dataquery"
 	"github.com/vesahyp/clavesa/internal/fileops"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
+	"github.com/vesahyp/clavesa/internal/lineagetype"
 	"github.com/vesahyp/clavesa/internal/notebooks"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/pipelinestatus"
 	"github.com/vesahyp/clavesa/internal/preview"
 	tuiservice "github.com/vesahyp/clavesa/internal/service"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
-	"github.com/spf13/cobra"
 )
 
 // embeddedUI holds the embedded frontend filesystem, set from main.go.
@@ -46,10 +47,12 @@ func SetEmbeddedUI(f fs.FS) {
 	embeddedUI = f
 }
 
-// lineageBridge converts service.LineageEdge values to api.LineageEdge so
-// internal/api can stay free of an internal/service dependency. The two
-// shapes mirror each other field-for-field; this adapter is the only place
-// that knowledge lives.
+// lineageBridge used to convert service.LineageEdge → api.LineageEdge
+// field-for-field. Both sides now alias internal/lineagetype.Edge so the
+// adapter is structurally a no-op; the type still exists to satisfy
+// api.Lineager (service.Service can't directly because the receiver
+// returns *LineageResult, which equals *lineagetype.Response now —
+// pointer-aliasing works fine).
 type lineageBridge struct {
 	svc *tuiservice.Service
 }
@@ -71,19 +74,15 @@ func (b nodeAdderBridge) AddNode(dir, nodeType, name string) error {
 }
 
 // localPipelineRunnerBridge adapts service.Service onto
-// pipelinestatus.LocalPipelineRunner. It maps service.ErrRunInFlight
-// onto pipelinestatus.ErrRunInFlight so the handler can answer 409
-// without importing internal/service.
+// pipelinestatus.LocalPipelineRunner. Both sentinels point at the same
+// internal/errs.ErrRunInFlight value now (C10, 2026-05-24), so the
+// errors.Is mapping that used to live here is no longer needed.
 type localPipelineRunnerBridge struct {
 	svc *tuiservice.Service
 }
 
 func (b localPipelineRunnerBridge) StartRun(dir string) (string, error) {
-	id, err := b.svc.StartRun(dir)
-	if errors.Is(err, tuiservice.ErrRunInFlight) {
-		return "", pipelinestatus.ErrRunInFlight
-	}
-	return id, err
+	return b.svc.StartRun(dir)
 }
 
 // sourceRegistryBridge adapts service.Service onto api.SourceRegistry —
@@ -299,7 +298,9 @@ func toServiceCred(c api.CredentialSpec) tuiservice.CredentialSpec {
 	}
 }
 
-type credInUseError struct{ inner *tuiservice.ErrCredentialInUse }
+type credInUseError struct {
+	inner *tuiservice.ErrCredentialInUse
+}
 
 func (e *credInUseError) Error() string { return e.inner.Error() }
 func (e *credInUseError) InUseUsages() []api.CredentialUsage {
@@ -510,32 +511,8 @@ func toAPIBackfillRun(r *tuiservice.BackfillRun) *api.BackfillRun {
 	return out
 }
 
-func (b lineageBridge) Lineage(dir string) (*api.LineageResponse, error) {
-	src, err := b.svc.Lineage(dir)
-	if err != nil {
-		return nil, err
-	}
-	if src == nil {
-		return &api.LineageResponse{}, nil
-	}
-	out := make([]api.LineageEdge, len(src.Edges))
-	for i, e := range src.Edges {
-		out[i] = api.LineageEdge{
-			FromNode:     e.FromNode,
-			FromType:     e.FromType,
-			ToNode:       e.ToNode,
-			ToType:       e.ToType,
-			ViaTable:     e.ViaTable,
-			FromPipeline: e.FromPipeline,
-			ToPipeline:   e.ToPipeline,
-			ToTable:      e.ToTable,
-		}
-	}
-	return &api.LineageResponse{
-		Edges:   out,
-		Catalog: src.Catalog,
-		Schema:  src.Schema,
-	}, nil
+func (b lineageBridge) Lineage(dir string) (*lineagetype.Response, error) {
+	return b.svc.Lineage(dir)
 }
 
 func newUICmd() *cobra.Command {
@@ -671,6 +648,7 @@ Examples:
 			// importing internal/service.
 			lineageAdapter := lineageBridge{svc: svc}
 			pipelineHandler := api.New(fo, workspace).
+				WithService(svc).
 				WithSyncer(svc).
 				WithLineage(lineageAdapter).
 				WithNodeAdder(nodeAdderBridge{svc: svc}).
@@ -694,7 +672,7 @@ Examples:
 					fmt.Fprintf(os.Stderr, "clavesa: self-restart failed: %v\n", err)
 				}
 			}
-			workspaceHandler := api.NewWorkspaceHandler(workspace).WithRestart(restartFn)
+			workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithRestart(restartFn)
 			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc})
 			dataHandler := dataquery.NewHandler(s3Client, athenaClient, athenaOutputBucket).(*dataquery.Handler).WithResolver(resolver)
 			// nil-safe: catalog handler renders an empty list in local-only mode.

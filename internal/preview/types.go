@@ -8,7 +8,7 @@ import "github.com/vesahyp/clavesa/internal/graph"
 type PreviewResult struct {
 	Items     []map[string]interface{} `json:"items"`
 	Schema    []graph.Column           `json:"schema"`
-	Total     int                      `json:"total"`     // -1 if unknown
+	Total     int                      `json:"total"` // -1 if unknown
 	Truncated bool                     `json:"truncated"`
 }
 

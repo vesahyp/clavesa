@@ -321,9 +321,9 @@ type ExecQuery struct {
 type TablesQuery struct {
 	PipelineName string
 	// Database — see NodeRunsQuery.Database. Required.
-	Database     string
-	PipelineDir  string
-	Limit        int
+	Database    string
+	PipelineDir string
+	Limit       int
 }
 
 // TableInfo describes the latest snapshot of one Iceberg output table.

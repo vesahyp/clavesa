@@ -11,10 +11,10 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
+	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/vesahyp/clavesa/internal/dataquery"
 	"github.com/vesahyp/clavesa/internal/graph"
@@ -44,10 +44,10 @@ func (m *mockS3Client) GetObject(ctx context.Context, params *s3.GetObjectInput,
 // ---------------------------------------------------------------------------
 
 type mockAthenaClient struct {
-	startOutput  *athena.StartQueryExecutionOutput
-	startErr     error
-	getExecOutput *athena.GetQueryExecutionOutput
-	getExecErr    error
+	startOutput      *athena.StartQueryExecutionOutput
+	startErr         error
+	getExecOutput    *athena.GetQueryExecutionOutput
+	getExecErr       error
 	getResultsOutput *athena.GetQueryResultsOutput
 	getResultsErr    error
 	// lastStartInput is set on each StartQueryExecution call so tests can

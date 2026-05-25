@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -98,9 +97,8 @@ func (h *SourcesHandler) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *SourcesHandler) register(w http.ResponseWriter, r *http.Request) {
-	var req SourceSpec
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	req, ok := httputil.DecodeJSON[SourceSpec](w, r)
+	if !ok {
 		return
 	}
 	// Don't default Kind here — service.AddSource sniffs `s3://` URLs
@@ -142,9 +140,8 @@ func (h *SourcesHandler) preview(w http.ResponseWriter, r *http.Request) {
 // is a delete + re-register, not an edit.
 func (h *SourcesHandler) update(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	var req SourceSpec
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	req, ok := httputil.DecodeJSON[SourceSpec](w, r)
+	if !ok {
 		return
 	}
 	stored, err := h.svc.UpdateSource(name, req)
@@ -199,13 +196,11 @@ type attachRequest struct {
 
 func (h *SourcesHandler) attach(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	var req attachRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	req, ok := httputil.DecodeJSON[attachRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.To == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir and to are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "to": req.To}) {
 		return
 	}
 	if err := h.svc.AttachSource(req.Dir, name, req.To, req.Alias); err != nil {

@@ -29,9 +29,9 @@ const (
 //   - Task: Next OR End must be set (Next empty + End false is malformed).
 //   - Parallel: Branches non-nil; Next or End set on the Parallel itself.
 type State struct {
-	Name     string   // map key in the State machine States map
+	Name     string // map key in the State machine States map
 	Type     StateType
-	Next     string   // empty if End is true
+	Next     string // empty if End is true
 	End      bool
 	Branches []Branch // populated only when Type == Parallel
 }

@@ -2,14 +2,11 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
-	"regexp"
-	"strings"
 
+	"github.com/vesahyp/clavesa/internal/dashboardsql"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
 )
@@ -173,9 +170,8 @@ func (h *DashboardsHandler) get(w http.ResponseWriter, r *http.Request) {
 // "New dashboard" never silently clobbers an existing one. Replace goes
 // through PUT.
 func (h *DashboardsHandler) create(w http.ResponseWriter, r *http.Request) {
-	var d Dashboard
-	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	d, ok := httputil.DecodeJSON[Dashboard](w, r)
+	if !ok {
 		return
 	}
 	if _, err := h.store.GetDashboard(r.Context(), d.Slug); err == nil {
@@ -194,9 +190,8 @@ func (h *DashboardsHandler) create(w http.ResponseWriter, r *http.Request) {
 // authoritative; a slug in the body is overwritten so the stored row
 // always matches the URL.
 func (h *DashboardsHandler) put(w http.ResponseWriter, r *http.Request) {
-	var d Dashboard
-	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	d, ok := httputil.DecodeJSON[Dashboard](w, r)
+	if !ok {
 		return
 	}
 	d.Slug = r.PathValue("slug")
@@ -231,19 +226,13 @@ func (h *DashboardsHandler) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
-	var req DashboardQueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
-		return
-	}
-	if strings.TrimSpace(req.SQL) == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "sql is required")
+	req, ok := httputil.DecodeJSON[DashboardQueryRequest](w, r)
+	if !ok {
 		return
 	}
 	// dir is required for both backends so the request fails the same way
 	// regardless of the inspected pipeline's compute attr (ADR-014).
-	if strings.TrimSpace(req.Dir) == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required (pipeline directory whose Provider executes the query)")
+	if !httputil.RequireFields(w, map[string]string{"sql": req.SQL, "dir": req.Dir}) {
 		return
 	}
 
@@ -274,37 +263,10 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 	httputil.WriteJSON(w, http.StatusOK, res)
 }
 
-// placeholderRE / safeParamValueRE / expandDashboardPlaceholders mirror
-// the service-layer helpers (internal/service/dashboard.go). Duplicated
-// here rather than imported because internal/api keeps its dashboards
-// handler free of an internal/service dependency (the bridge in
-// internal/cli/ui.go translates the spec). Keep both copies in sync.
-var placeholderRE = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*\}\}`)
-var safeParamValueRE = regexp.MustCompile(`^[A-Za-z0-9 _.:+\-T/]*$`)
-
+// expandDashboardPlaceholders delegates to the leaf-package implementation
+// shared with internal/service/dashboard.go (C13, 2026-05-24).
 func expandDashboardPlaceholders(sql string, params map[string]string) (string, error) {
-	var firstErr error
-	out := placeholderRE.ReplaceAllStringFunc(sql, func(match string) string {
-		if firstErr != nil {
-			return match
-		}
-		m := placeholderRE.FindStringSubmatch(match)
-		name := m[1]
-		val, ok := params[name]
-		if !ok {
-			firstErr = fmt.Errorf("dataset SQL references {{%s}} but no control or param sets it", name)
-			return match
-		}
-		if !safeParamValueRE.MatchString(val) {
-			firstErr = fmt.Errorf("param %q value %q contains characters outside [A-Za-z0-9 _.:+\\-T/]", name, val)
-			return match
-		}
-		return "'" + val + "'"
-	})
-	if firstErr != nil {
-		return "", firstErr
-	}
-	return out, nil
+	return dashboardsql.ExpandPlaceholders(sql, params)
 }
 
 // providerFor dispatches the query through the resolver (cloud or local

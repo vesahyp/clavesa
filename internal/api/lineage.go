@@ -4,18 +4,12 @@ import (
 	"net/http"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
+	"github.com/vesahyp/clavesa/internal/lineagetype"
 )
 
-// LineageResponse wraps the edges array plus the queried pipeline's own
-// ADR-016 namespace (catalog + schema). The UI uses catalog/schema to
-// label a node's output table — deriving it from a `via_table` is wrong
-// for a pipeline that only reads cross-pipeline (the via_table then
-// points at the upstream pipeline's schema).
-type LineageResponse struct {
-	Edges   []LineageEdge `json:"edges"`
-	Catalog string        `json:"catalog,omitempty"`
-	Schema  string        `json:"schema,omitempty"`
-}
+// LineageResponse is an alias for the canonical leaf-package type so
+// existing call sites keep compiling. New code imports lineagetype.
+type LineageResponse = lineagetype.Response
 
 // GET /pipeline/lineage?dir=<path>
 //
@@ -39,11 +33,17 @@ func (h *Handler) GetLineage(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, parseStatus(err), err.Error())
 		return
 	}
+	// Normalise an empty graph to `{"edges":[]}` — the UI Zod schema
+	// treats null as a schema violation. service.Lineage today never
+	// returns (nil, nil), but a test-only Lineager (fakeLineager) does
+	// pass nil edges intentionally to exercise this seam, so keep the
+	// guard. (Revisit if service guarantees non-nil through the
+	// interface.)
 	if res == nil {
-		res = &LineageResponse{}
+		res = &lineagetype.Response{Edges: []lineagetype.Edge{}}
 	}
 	if res.Edges == nil {
-		res.Edges = []LineageEdge{}
+		res.Edges = []lineagetype.Edge{}
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
 }

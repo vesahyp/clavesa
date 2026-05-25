@@ -67,13 +67,13 @@ const MIMEDataFrame = "application/vnd.clavesa.dataframe+json"
 // execute_result / display_data `data` bundle. Anything else (ipywidget
 // views, custom JS, ...) is rejected on load.
 var supportedMIMEs = map[string]struct{}{
-	"text/plain":      {},
-	"text/html":       {},
-	"text/markdown":   {},
+	"text/plain":       {},
+	"text/html":        {},
+	"text/markdown":    {},
 	"application/json": {},
-	"image/png":       {},
-	"image/svg+xml":   {},
-	MIMEDataFrame:     {},
+	"image/png":        {},
+	"image/svg+xml":    {},
+	MIMEDataFrame:      {},
 }
 
 // CellStatus is the value the runner reports back per cell and we persist
@@ -174,9 +174,9 @@ type Output struct {
 	// `execute_result` / `display_data` variants. Data is a MIME bundle.
 	// Metadata is per-output metadata (we set metadata.clavesa.truncated
 	// on capped DataFrame outputs).
-	ExecutionCount *int                   `json:"execution_count,omitempty"`
-	Data           map[string]any         `json:"data,omitempty"`
-	Metadata       map[string]any         `json:"metadata,omitempty"`
+	ExecutionCount *int           `json:"execution_count,omitempty"`
+	Data           map[string]any `json:"data,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 
 // Parse decodes a .ipynb byte payload into a Notebook and runs the

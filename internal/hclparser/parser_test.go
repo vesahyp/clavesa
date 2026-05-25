@@ -567,4 +567,3 @@ func assertConfig(t *testing.T, nodeID string, got, want map[string]interface{})
 		}
 	}
 }
-

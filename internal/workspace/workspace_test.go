@@ -54,6 +54,78 @@ func TestInitAndLoad(t *testing.T) {
 	}
 }
 
+// TestUpgrade_RewritesSourceLine covers the two failure modes the v1.1.5
+// → v1.1.6 release surfaced: a workspace originally initialised on the
+// bare-source form (`source = ".clavesa/…"`, Terraform 1.x rejects),
+// and a workspace already on the prefixed form but at an older version.
+// Both should converge to `source = "./.clavesa/modules/<target>/workspace/aws"`.
+func TestUpgrade_RewritesSourceLine(t *testing.T) {
+	cases := []struct {
+		name        string
+		startLine   string
+		wantNewLine string
+		wantPrev    string
+		wantBump    int
+	}{
+		{
+			name:        "bare path (v1.1.5 and earlier)",
+			startLine:   `  source         = ".clavesa/modules/v1.1.5/workspace/aws"`,
+			wantNewLine: `  source         = "./.clavesa/modules/v1.1.6-test/workspace/aws"`,
+			wantPrev:    "v1.1.5",
+			wantBump:    1,
+		},
+		{
+			name:        "prefixed path at older version",
+			startLine:   `  source         = "./.clavesa/modules/v1.1.6/workspace/aws"`,
+			wantNewLine: `  source         = "./.clavesa/modules/v1.1.6-test/workspace/aws"`,
+			wantPrev:    "v1.1.6",
+			wantBump:    1,
+		},
+		{
+			name:        "prefixed path already at target — no-op",
+			startLine:   `  source         = "./.clavesa/modules/v1.1.6-test/workspace/aws"`,
+			wantNewLine: `  source         = "./.clavesa/modules/v1.1.6-test/workspace/aws"`,
+			wantPrev:    "v1.1.6-test",
+			wantBump:    0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// Hand-craft a minimal workspace — only what Upgrade reads.
+			if err := os.WriteFile(filepath.Join(dir, "clavesa.json"), []byte(`{"version":1}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mainTF := "terraform { required_providers { aws = { source = \"hashicorp/aws\" } } }\n\nmodule \"workspace\" {\n" + tc.startLine + "\n  workspace_name = var.workspace_name\n}\n"
+			if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(mainTF), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			prev, bump, err := workspace.Upgrade(dir, "v1.1.6-test")
+			if err != nil {
+				t.Fatalf("Upgrade: %v", err)
+			}
+			if prev != tc.wantPrev {
+				t.Errorf("prev = %q, want %q", prev, tc.wantPrev)
+			}
+			if bump != tc.wantBump {
+				t.Errorf("rewritten = %d, want %d", bump, tc.wantBump)
+			}
+			got, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
+			if !strings.Contains(string(got), tc.wantNewLine) {
+				t.Errorf("main.tf missing %q\n--- main.tf ---\n%s", tc.wantNewLine, got)
+			}
+		})
+	}
+}
+
+func TestUpgrade_RejectsNonWorkspace(t *testing.T) {
+	dir := t.TempDir() // no clavesa.json
+	if _, _, err := workspace.Upgrade(dir, "v1.1.6"); err == nil {
+		t.Fatal("expected error for non-workspace, got nil")
+	}
+}
+
 func TestInitCreatesMissingDir(t *testing.T) {
 	parent := t.TempDir()
 	target := filepath.Join(parent, "not-yet-created")

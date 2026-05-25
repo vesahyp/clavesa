@@ -62,11 +62,11 @@ type CatalogColumn struct {
 // clavesa's naming convention (`clavesa_<pipeline>.<node>__<key>`) and
 // are best-effort — caller should not rely on them being non-empty.
 type CatalogTable struct {
-	Database       string          `json:"database"`
-	Name           string          `json:"name"`
-	OwningPipeline string          `json:"owning_pipeline,omitempty"`
-	OwningNode     string          `json:"owning_node,omitempty"`
-	OutputKey      string          `json:"output_key,omitempty"`
+	Database       string `json:"database"`
+	Name           string `json:"name"`
+	OwningPipeline string `json:"owning_pipeline,omitempty"`
+	OwningNode     string `json:"owning_node,omitempty"`
+	OutputKey      string `json:"output_key,omitempty"`
 	// Dir is the on-disk pipeline directory (relative to workspace root)
 	// owning this table. Set for both cloud and local pipelines so the UI
 	// can thread `?dir=` through every per-pipeline query — the server's
@@ -94,7 +94,6 @@ type CatalogResponse struct {
 	// (local-only mode). UI uses this to render an explanatory empty state.
 	AWSAvailable bool `json:"aws_available"`
 }
-
 
 // ListTables is the HTTP wrapper over Tables — GET /workspace/tables.
 func (h *CatalogHandler) ListTables(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +203,17 @@ func (h *CatalogHandler) listClavesaDatabases(ctx context.Context, workspaceCata
 			name := aws.ToString(db.Name)
 			if dbBelongsToWorkspace(name, workspaceCatalog) || dbBelongsToWorkspace(name, systemCatalog) {
 				out = append(out, name)
+				continue
+			}
+			if isLegacyClavesaDB(name) {
+				// Pre-ADR-016 workspaces named their DB `clavesa_<pipeline>`
+				// (single underscore, no `__`). Surface them so the user
+				// isn't left with "AWS available, 0 tables" — but warn so
+				// the migration is visible.
+				fmt.Fprintf(os.Stderr,
+					"catalog: surfacing legacy single-underscore DB %s; run `clavesa pipeline upgrade <dir>` to migrate to the <catalog>__<schema> form\n",
+					name)
+				out = append(out, name)
 			}
 		}
 		if resp.NextToken == nil {
@@ -226,6 +236,22 @@ func dbBelongsToWorkspace(dbName, workspaceCatalog string) bool {
 		return false
 	}
 	return strings.HasPrefix(dbName, workspaceCatalog+"__")
+}
+
+// isLegacyClavesaDB matches the pre-ADR-016 single-underscore form
+// `clavesa_<pipeline>` (no `__` separator). Mirrors the local-side
+// fallback at catalog_local.go (TrimPrefix "clavesa_"). Without this
+// branch in listClavesaDatabases, un-migrated cloud workspaces show
+// "AWS available, 0 tables" with no diagnostic (A P1-3, 2026-05-24).
+func isLegacyClavesaDB(dbName string) bool {
+	if !strings.HasPrefix(dbName, "clavesa_") {
+		return false
+	}
+	// Skip the new <catalog>__<schema> form: by construction
+	// <workspaceCatalog> starts with "clavesa_" too, so a `__` further
+	// in the name means new form (already handled above) — only the
+	// single-underscore form lands here.
+	return !strings.Contains(strings.TrimPrefix(dbName, "clavesa_"), "__")
 }
 
 func (h *CatalogHandler) listTablesInDatabase(ctx context.Context, db string) ([]CatalogTable, error) {
@@ -314,4 +340,3 @@ func splitNodeOutput(tableName string) (node, outputKey string) {
 	}
 	return tableName[:idx], tableName[idx+2:]
 }
-

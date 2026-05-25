@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,10 +16,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/credentials"
+	"github.com/vesahyp/clavesa/internal/errs"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
-	"github.com/vesahyp/clavesa/internal/credentials"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/sources"
@@ -66,7 +66,9 @@ type runPrep struct {
 // run executing. The synchronous RunPipeline naturally serialized runs
 // because the HTTP request blocked; async dispatch needs this explicit
 // guard against a double-click / concurrent run of the same pipeline.
-var ErrRunInFlight = errors.New("a run is already in progress for this pipeline")
+// Re-exported from internal/errs so both the service and the HTTP layer
+// answer the same sentinel without bridge code (C10, 2026-05-24).
+var ErrRunInFlight = errs.ErrRunInFlight
 
 // RunPipeline executes every transform node in `dir` in topological order,
 // using the same handler() that Lambda invokes. Source nodes contribute
@@ -1509,15 +1511,6 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 	return out
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 // runOperation invokes the runner image with an `_operation` event — the
 // non-transform control-plane path the runner exposes for backfill promote /
 // discard. Cloud uses `lambda.Invoke` with the same payload; local mode has
@@ -1596,4 +1589,3 @@ func newRunID() string {
 	}
 	return hex.EncodeToString(b[:])
 }
-

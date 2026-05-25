@@ -5,6 +5,7 @@
 package workspace
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/vesahyp/clavesa/internal/identutil"
@@ -285,6 +287,73 @@ output "system_catalog" {
 	}
 
 	return nil
+}
+
+// workspaceModuleSourceRE matches the workspace's own `module "workspace"`
+// source line. Two historical forms exist:
+//
+//   1. Bare local path:     `source = ".clavesa/modules/vX/workspace/aws"`
+//      (v1.1.5 and earlier; Terraform 1.x rejects this).
+//   2. Prefixed local path: `source = "./.clavesa/modules/vX/workspace/aws"`
+//      (v1.1.6+; the valid form).
+//
+// Upgrade rewrites both to the prefixed form at the target version.
+// Group 1 = `source = "`. Group 2 = optional `./` prefix in the existing
+// line. Group 3 = current version (vX.Y.Z). Group 4 = trailing
+// `/workspace/aws"`.
+var workspaceModuleSourceRE = regexp.MustCompile(
+	`(source\s*=\s*")(\.?/?)\.clavesa/modules/(v[^/"]+)(/workspace/aws")`)
+
+// Upgrade refreshes a workspace's Terraform-side state to a target module
+// version. Pure file operations — no Docker, no network.
+//
+// Mechanics:
+//   - Re-extracts the embedded modules tree to .clavesa/modules/<targetVersion>/
+//     (idempotent — short-circuits when the SHA stamp already matches).
+//   - Rewrites `module "workspace" { source = ... }` in main.tf to point at
+//     the target version with the required `./` prefix.
+//
+// Doesn't touch clavesa.json, variables.tf, or the user-owned parts of
+// main.tf — those are the user's content from the original `init`.
+// Doesn't touch the local Docker runner image — that's a separate step,
+// called explicitly by the CLI wrapper via EnsureLocalRunnerImage so a
+// CI / pure-Go test can exercise the TF rewrite without Docker.
+//
+// Returns the previous version (empty when main.tf carries no
+// recognised source line) and the count of source lines actually
+// rewritten (zero on no-op).
+func Upgrade(root, targetVersion string) (prevVersion string, rewritten int, err error) {
+	if _, statErr := os.Stat(filepath.Join(root, manifestFile)); statErr != nil {
+		return "", 0, fmt.Errorf("%s is not a clavesa workspace (no clavesa.json)", root)
+	}
+
+	// Step 1: extract modules at targetVersion. Idempotent — skips work
+	// if the SHA stamp matches the embedded tree.
+	if err := modules.Extract(root, targetVersion); err != nil {
+		return "", 0, fmt.Errorf("extract modules: %w", err)
+	}
+
+	// Step 2: rewrite the workspace module source line. Doesn't touch
+	// the rest of main.tf — the file may carry user edits (provider
+	// blocks, extra resources) we don't want to clobber.
+	mainPath := filepath.Join(root, "main.tf")
+	data, err := os.ReadFile(mainPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("read main.tf: %w", err)
+	}
+	if m := workspaceModuleSourceRE.FindSubmatch(data); m != nil {
+		prevVersion = string(m[3])
+	}
+	newSource := []byte(fmt.Sprintf(`${1}./.clavesa/modules/%s/workspace/aws"`, targetVersion))
+	updated := workspaceModuleSourceRE.ReplaceAll(data, newSource)
+	if !bytes.Equal(updated, data) {
+		if err := os.WriteFile(mainPath, updated, 0o644); err != nil {
+			return prevVersion, 0, fmt.Errorf("write main.tf: %w", err)
+		}
+		rewritten = 1
+	}
+
+	return prevVersion, rewritten, nil
 }
 
 // EnsureLocalRunnerImage guarantees the workspace at `root` has a local

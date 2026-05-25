@@ -27,7 +27,7 @@ type NotebookSummary = notebooks.Summary
 // per-cell metadata so the UI can update the cell badge without re-fetching
 // the whole notebook.
 type CellRunResult struct {
-	Cell   notebooks.Cell       `json:"cell"`
+	Cell   notebooks.Cell           `json:"cell"`
 	Result observability.CellResult `json:"result"`
 }
 

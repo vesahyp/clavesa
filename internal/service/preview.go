@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-
 	"github.com/vesahyp/clavesa/internal/dataquery"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
@@ -402,7 +401,6 @@ func (s *Service) fetchRegistrySourceRows(ctx context.Context, spec sources.Spec
 	}
 }
 
-
 // executeTransform runs a single transform node via the runner container and
 // returns its flat output rows. Recursively resolves its own inputs.
 func (s *Service) executeTransform(ctx context.Context, g *graph.PipelineGraph, abs string, node *graph.Node, rowCount int) ([]map[string]interface{}, error) {
@@ -766,6 +764,7 @@ func parseSvcNDJSON(r io.Reader, limit int) (*dataquery.QueryResult, error) {
 //  3. Construct prefixes for today, then progressively earlier dates, and
 //     list with each until we find objects.
 //  4. Pick the newest by LastModified.
+//
 // findLatestS3Keys returns up to maxKeys S3 keys sorted newest-first by
 // LastModified. It uses date-aware probing to skip to recent data.
 func (s *Service) findLatestS3Keys(ctx context.Context, bucket, prefix string, maxKeys int) ([]string, error) {

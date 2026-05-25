@@ -4,17 +4,10 @@
 
 import { BASE_URL, request } from "./client";
 
-export interface PipelineInfo {
-  name: string;
-  dir: string;
-  node_count: number;
-  cloud?: string;
-}
-
-/** GET /pipelines — list all pipelines in the workspace */
-export function listPipelines(): Promise<PipelineInfo[]> {
-  return request<PipelineInfo[]>("/pipelines");
-}
+// PipelineInfo + listPipelines were removed in C24 (2026-05-24 review) —
+// the live versions live in lib/queries.ts and carry the full ADR-016
+// shape (compute, schema, sources). The api/workspace.ts copies were a
+// stale duplicate with no callers.
 
 /** POST /pipelines — create a new pipeline directory.
  * `schema` is the optional ADR-016 schema identifier; empty falls back to

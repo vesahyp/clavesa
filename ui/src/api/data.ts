@@ -59,8 +59,12 @@ export function getRegistrySourcePreview(
 }
 
 /**
- * GET /preview/transform — execute a transform node's SQL via DuckDB and return aligned pairs.
+ * GET /preview/transform — execute a transform node's SQL via the runner
+ * container (PySpark, ADR-012) and return aligned input/output pairs.
  * Pass `sql` to preview unsaved edits without saving to disk first.
+ *
+ * TODO: api/data.ts is the legacy editor's preview path. Once the
+ * remaining callers migrate to /sources/preview the file can be deleted.
  */
 export function getTransformPreview(
   dir: string,

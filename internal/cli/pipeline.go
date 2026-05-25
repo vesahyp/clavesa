@@ -14,10 +14,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
+	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
-	"github.com/spf13/cobra"
 )
 
 func newPipelineCmd() *cobra.Command {
@@ -658,7 +658,6 @@ func waitForExecution(ctx context.Context, client *sfn.Client, execARN string) (
 	}
 }
 
-
 func newOrchestrationCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "orchestration",
@@ -704,4 +703,3 @@ func newOrchestrationSyncCmd() *cobra.Command {
 
 	return cmd
 }
-

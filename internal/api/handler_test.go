@@ -141,17 +141,17 @@ func TestGetPipeline(t *testing.T) {
 		wantEdges  int
 	}{
 		{
-			name:  "success two-node pipeline",
-			query: "?dir=DIR",
-			setup: func(t *testing.T) string { return setupDir(t, twoNodeTF) },
+			name:       "success two-node pipeline",
+			query:      "?dir=DIR",
+			setup:      func(t *testing.T) string { return setupDir(t, twoNodeTF) },
 			wantStatus: http.StatusOK,
 			wantNodes:  2,
 			wantEdges:  1,
 		},
 		{
-			name:  "success empty directory",
-			query: "?dir=DIR",
-			setup: func(t *testing.T) string { return setupDir(t, "") },
+			name:       "success empty directory",
+			query:      "?dir=DIR",
+			setup:      func(t *testing.T) string { return setupDir(t, "") },
 			wantStatus: http.StatusOK,
 			wantNodes:  0,
 			wantEdges:  0,

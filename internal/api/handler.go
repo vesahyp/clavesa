@@ -4,7 +4,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/hclutil"
 	"github.com/vesahyp/clavesa/internal/httputil"
+	"github.com/vesahyp/clavesa/internal/lineagetype"
 	"github.com/vesahyp/clavesa/internal/pathutil"
 	"github.com/vesahyp/clavesa/internal/service"
 )
@@ -25,24 +25,15 @@ type OrchestrationSyncer interface {
 	SyncOrchestration(dir, schedule string) error
 }
 
-// LineageEdge mirrors service.LineageEdge — duplicated as a JSON shape so the
-// api package doesn't import service. Keep the field tags in sync with the
-// service-side type.
-type LineageEdge struct {
-	FromNode     string `json:"from_node"`
-	FromType     string `json:"from_type"`
-	ToNode       string `json:"to_node"`
-	ToType       string `json:"to_type"`
-	ViaTable     string `json:"via_table,omitempty"`
-	FromPipeline string `json:"from_pipeline,omitempty"`
-	ToPipeline   string `json:"to_pipeline,omitempty"`
-	ToTable      string `json:"to_table,omitempty"`
-}
+// LineageEdge is an alias for the canonical leaf-package type so existing
+// callers (cli/ui.go, tests) keep compiling without an import switch.
+// New code should import internal/lineagetype directly.
+type LineageEdge = lineagetype.Edge
 
 // Lineager exposes the per-pipeline lineage derivation. Implemented by
 // service.Service; the interface lives here so api stays leaf-y.
 type Lineager interface {
-	Lineage(dir string) (*LineageResponse, error)
+	Lineage(dir string) (*lineagetype.Response, error)
 }
 
 // NodeAdder is the typed node-creation path used by `POST /pipeline/typed-nodes`.
@@ -80,19 +71,40 @@ type InputDetacher interface {
 
 // Handler holds the dependencies for all PIPELINE-API HTTP handlers.
 type Handler struct {
-	fo              *fileops.FileOps
-	root            string // absolute workspace root; used to resolve relative dir params
-	syncer          OrchestrationSyncer
-	lineager        Lineager
-	nodeAdder       NodeAdder
+	fo               *fileops.FileOps
+	root             string // absolute workspace root; used to resolve relative dir params
+	svc              *service.Service
+	syncer           OrchestrationSyncer
+	lineager         Lineager
+	nodeAdder        NodeAdder
 	externalAttacher ExternalTableAttacher
-	inputDetacher   InputDetacher
+	inputDetacher    InputDetacher
 }
 
 // New returns a Handler that uses fo for file-level mutations.
 // root is the absolute workspace root directory.
 func New(fo *fileops.FileOps, root string) *Handler {
 	return &Handler{fo: fo, root: root}
+}
+
+// WithService attaches the canonical service.Service so handlers that
+// previously instantiated service.New(h.root) per request route through
+// the wired Service instead — picking up its WithEvictor / WithResolver
+// state. Without this, RenameNode and AddEdge silently bypass cache
+// eviction (A P1-1 / C P1-1, 2026-05-24 review).
+func (h *Handler) WithService(s *service.Service) *Handler {
+	h.svc = s
+	return h
+}
+
+// service returns the wired Service, falling back to a fresh
+// service.New(h.root) for tests that construct the Handler without
+// WithService. Production code paths always set the canonical Service.
+func (h *Handler) service() *service.Service {
+	if h.svc != nil {
+		return h.svc
+	}
+	return service.New(h.root)
 }
 
 // WithSyncer attaches an OrchestrationSyncer that is called best-effort after
@@ -135,11 +147,17 @@ func (h *Handler) WithInputDetacher(d InputDetacher) *Handler {
 	return h
 }
 
-// syncOrchestration calls the syncer if one is set. Errors are silently ignored
-// so that a sync failure never blocks the mutation response.
+// syncOrchestration calls the syncer if one is set. Errors are logged
+// but not propagated — a sync failure must not block the mutation
+// response (the .tf change already landed; orchestration.tf rebuild can
+// be re-run by hand or on the next mutation). Pre-2026-05-24 the error
+// was silently swallowed with no signal.
 func (h *Handler) syncOrchestration(dir string) {
-	if h.syncer != nil {
-		_ = h.syncer.SyncOrchestration(dir, "")
+	if h.syncer == nil {
+		return
+	}
+	if err := h.syncer.SyncOrchestration(dir, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: orchestration sync failed for %s: %v\n", dir, err)
 	}
 }
 
@@ -203,7 +221,6 @@ type addEdgeRequest struct {
 	ToInput    string `json:"to_input"`
 }
 
-
 type validateResponse struct {
 	Valid  bool     `json:"valid"`
 	Errors []string `json:"errors"`
@@ -216,11 +233,11 @@ type validateResponse struct {
 // GET /pipeline?dir=<path>
 // Returns the PipelineGraph JSON for the given Terraform directory.
 func (h *Handler) GetPipeline(w http.ResponseWriter, r *http.Request) {
-	dir := h.resolve(r.URL.Query().Get("dir"))
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+	dirParam, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
+	dir := h.resolve(dirParam)
 	g, err := hclparser.Parse(dir)
 	if err != nil {
 		httputil.WriteError(w, parseStatus(err), err.Error())
@@ -243,13 +260,11 @@ func (h *Handler) TypedAddNode(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotImplemented, "typed node-add not wired (server started without NodeAdder)")
 		return
 	}
-	var req typedAddNodeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[typedAddNodeRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.Type == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir and type are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "type": req.Type}) {
 		return
 	}
 	req.Dir = h.resolve(req.Dir)
@@ -267,25 +282,27 @@ func (h *Handler) TypedAddNode(w http.ResponseWriter, r *http.Request) {
 // POST /pipeline/node
 // Adds a new module block to the specified file, then returns the updated graph.
 func (h *Handler) AddNode(w http.ResponseWriter, r *http.Request) {
-	var req addNodeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[addNodeRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.File == "" || req.BlockName == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir, file, and block_name are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "file": req.File, "block_name": req.BlockName}) {
 		return
 	}
 	req.Dir = h.resolve(req.Dir)
 	// Resolve req.File against the workspace root the same way req.Dir is
 	// resolved. Without this, any UI session whose cwd differs from the
-	// workspace (the common case — `clavesa ui --workspace <other>`)
-	// gets a 404 because fileops opens File from cwd. UpdateNode and
-	// DeleteNode below already FindNodeFile by id; AddNode is the only
-	// caller that takes a literal file path from the request.
+	// workspace gets a 404 because fileops opens File from cwd.
+	// Containment check (A P2-6, C9): the file must end up inside the
+	// pipeline dir — a literal `/etc/hosts` request resolves there
+	// otherwise and AddBlock would happily write into it.
 	filePath := req.File
 	if !filepath.IsAbs(filePath) {
-		filePath = filepath.Join(h.root, filePath)
+		filePath = filepath.Join(req.Dir, filePath)
+	}
+	if !pathutil.IsWithin(req.Dir, filePath) {
+		httputil.WriteError(w, http.StatusBadRequest, "file must be within the pipeline directory")
+		return
 	}
 	attrs := normalizeAttributes(req.Attributes)
 	if _, err := h.fo.AddBlock(filePath, "module", req.BlockName, attrs); err != nil {
@@ -300,20 +317,18 @@ func (h *Handler) AddNode(w http.ResponseWriter, r *http.Request) {
 // Merges attributes into the named module block, then returns the updated graph.
 func (h *Handler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var req updateNodeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[updateNodeRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
 	req.Dir = h.resolve(req.Dir)
 	file := req.File
 	if file == "" {
 		var err error
-		file, err = hclutil.FindNodeFile(h.fo,req.Dir, id)
+		file, err = hclutil.FindNodeFile(h.fo, req.Dir, id)
 		if err != nil {
 			httputil.WriteError(w, http.StatusNotFound, fmt.Sprintf("node %q not found", id))
 			return
@@ -334,17 +349,15 @@ func (h *Handler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 // rename` uses (ADR-015). Returns the updated graph.
 func (h *Handler) RenameNode(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var req renameNodeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[renameNodeRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.NewID == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir and new_id are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "new_id": req.NewID}) {
 		return
 	}
 	dir := h.resolve(req.Dir)
-	if _, err := service.New(h.root).RenameNode(dir, id, req.NewID); err != nil {
+	if _, err := h.service().RenameNode(dir, id, req.NewID); err != nil {
 		msg := err.Error()
 		switch {
 		case strings.Contains(msg, "not found"):
@@ -367,20 +380,18 @@ func (h *Handler) RenameNode(w http.ResponseWriter, r *http.Request) {
 // the updated graph.
 func (h *Handler) DeleteNode(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	var req deleteNodeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[deleteNodeRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
 	req.Dir = h.resolve(req.Dir)
 	file := req.File
 	if file == "" {
 		var err error
-		file, err = hclutil.FindNodeFile(h.fo,req.Dir, id)
+		file, err = hclutil.FindNodeFile(h.fo, req.Dir, id)
 		if err != nil {
 			httputil.WriteError(w, http.StatusNotFound, fmt.Sprintf("node %q not found", id))
 			return
@@ -390,7 +401,7 @@ func (h *Handler) DeleteNode(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, fileOpsStatus(err), err.Error())
 		return
 	}
-	if err := hclutil.RemoveEdgesReferencing(h.fo,req.Dir, id); err != nil {
+	if err := hclutil.RemoveEdgesReferencing(h.fo, req.Dir, id); err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "failed to clean up edges: "+err.Error())
 		return
 	}
@@ -408,13 +419,11 @@ func (h *Handler) DeleteNode(w http.ResponseWriter, r *http.Request) {
 // instead of merging, silently dropping every other edge into the same
 // transform; service.AddEdge reconstructs and merges.
 func (h *Handler) AddEdge(w http.ResponseWriter, r *http.Request) {
-	var req addEdgeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[addEdgeRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.FromNode == "" || req.ToNode == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir, from_node, and to_node are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "from_node": req.FromNode, "to_node": req.ToNode}) {
 		return
 	}
 	dir := h.resolve(req.Dir)
@@ -430,7 +439,7 @@ func (h *Handler) AddEdge(w http.ResponseWriter, r *http.Request) {
 		toInput = req.FromNode
 	}
 
-	if _, err := service.New(h.root).AddEdge(dir, req.FromNode, req.FromOutput, req.ToNode, toInput); err != nil {
+	if _, err := h.service().AddEdge(dir, req.FromNode, req.FromOutput, req.ToNode, toInput); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			httputil.WriteError(w, http.StatusNotFound, err.Error())
 			return
@@ -461,18 +470,17 @@ func (h *Handler) AttachExternalTable(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotImplemented, "external-table attach not configured (server missing service binding)")
 		return
 	}
-	var req struct {
+	type attachExternalTableRequest struct {
 		Dir   string `json:"dir"`
 		Ref   string `json:"ref"`
 		To    string `json:"to"`
 		Alias string `json:"alias"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[attachExternalTableRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.Ref == "" || req.To == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir, ref, and to are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "ref": req.Ref, "to": req.To}) {
 		return
 	}
 	req.Dir = h.resolve(req.Dir)
@@ -501,17 +509,16 @@ func (h *Handler) DetachInput(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotImplemented, "input detach not configured (server missing service binding)")
 		return
 	}
-	var req struct {
+	type detachInputRequest struct {
 		Dir   string `json:"dir"`
 		To    string `json:"to"`
 		Alias string `json:"alias"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[detachInputRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.To == "" || req.Alias == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir, to, and alias are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "to": req.To, "alias": req.Alias}) {
 		return
 	}
 	req.Dir = h.resolve(req.Dir)
@@ -534,15 +541,14 @@ func (h *Handler) DeleteEdge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
+	type deleteEdgeRequest struct {
 		Dir string `json:"dir"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	body, ok := httputil.DecodeJSON[deleteEdgeRequest](w, r)
+	if !ok {
 		return
 	}
-	if body.Dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	if !httputil.RequireFields(w, map[string]string{"dir": body.Dir}) {
 		return
 	}
 	body.Dir = h.resolve(body.Dir)
@@ -564,11 +570,11 @@ func (h *Handler) DeleteEdge(w http.ResponseWriter, r *http.Request) {
 // GET /pipeline/validate?dir=<path>
 // Runs topology validation on the pipeline and returns { valid, errors }.
 func (h *Handler) ValidatePipeline(w http.ResponseWriter, r *http.Request) {
-	dir := h.resolve(r.URL.Query().Get("dir"))
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+	dirParam, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
+	dir := h.resolve(dirParam)
 	g, err := hclparser.Parse(dir)
 	if err != nil {
 		httputil.WriteError(w, parseStatus(err), err.Error())
@@ -591,6 +597,20 @@ func (h *Handler) ValidatePipeline(w http.ResponseWriter, r *http.Request) {
 // resolve resolves dir against the workspace root if it is relative.
 func (h *Handler) resolve(dir string) string {
 	return pathutil.ResolveDir(h.root, dir)
+}
+
+// resolveDir folds resolution + containment: returns (abs, true) when the
+// resolved path stays within h.root. On a `../escape` or absolute-outside
+// path it writes 400 and returns ("", false) so the caller can early-out.
+// Use for endpoints that take untrusted dir input; the bare h.resolve
+// pre-dates the containment rule and remains for tests + internal callers.
+func (h *Handler) resolveDir(w http.ResponseWriter, dir string) (string, bool) {
+	abs := pathutil.ResolveDir(h.root, dir)
+	if h.root != "" && !pathutil.IsWithin(h.root, abs) {
+		httputil.WriteError(w, http.StatusBadRequest, "dir must be within the workspace root")
+		return "", false
+	}
+	return abs, true
 }
 
 // parseAndRespond parses the directory and writes the PipelineGraph as JSON.
@@ -690,17 +710,15 @@ func fileOpsStatus(err error) int {
 // GetScript serves GET /pipeline/script?dir=<dir>&path=<relative-path>
 // Returns the raw text content of a script file inside the pipeline directory.
 func (h *Handler) GetScript(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	if q.Get("dir") == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	dirParam, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
-	dir := h.resolve(q.Get("dir"))
-	rel := q.Get("path")
-	if rel == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "path is required")
+	rel, ok := httputil.RequireQuery(w, r, "path")
+	if !ok {
 		return
 	}
+	dir := h.resolve(dirParam)
 	abs := filepath.Join(dir, rel)
 	// Prevent path traversal outside the pipeline directory.
 	if !pathutil.IsWithin(dir, abs) {
@@ -720,24 +738,19 @@ func (h *Handler) GetScript(w http.ResponseWriter, r *http.Request) {
 // PutScript serves PUT /pipeline/script — writes text content to a script file.
 // Body: {"dir":"...","path":"...","content":"..."}
 func (h *Handler) PutScript(w http.ResponseWriter, r *http.Request) {
-	var req struct {
+	type putScriptRequest struct {
 		Dir     string `json:"dir"`
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	req, ok := httputil.DecodeJSON[putScriptRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "path": req.Path}) {
 		return
 	}
 	dir := h.resolve(req.Dir)
-	if req.Path == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "path is required")
-		return
-	}
 	abs := filepath.Join(dir, req.Path)
 	if !pathutil.IsWithin(dir, abs) {
 		httputil.WriteError(w, http.StatusBadRequest, "path must be within the pipeline directory")

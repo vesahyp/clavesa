@@ -9,59 +9,16 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
+	"github.com/vesahyp/clavesa/internal/lineagetype"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
-// LineageEdge is one upstream→downstream relationship in a pipeline DAG,
-// derived from the .tf files in the pipeline directory. The data is purely
-// a function of the user's HCL — same on cloud and local pipelines (ADR-014
-// parity is automatic) — so we recompute on every request rather than
-// materializing into a separate table that would drift on hand edits.
-type LineageEdge struct {
-	// FromNode and ToNode are the unsanitized HCL module names. Pipelines
-	// can mix - and _ in node ids; preserve what the user wrote.
-	FromNode string `json:"from_node"`
-	FromType string `json:"from_type"` // "source" | "transform"
-	ToNode   string `json:"to_node"`
-	ToType   string `json:"to_type"` // "transform" | "destination"
+// LineageEdge / LineageResult are aliases for the canonical leaf-package
+// types in internal/lineagetype (C12, 2026-05-24). Before this, the same
+// shape lived in three places (here, api, the bridge in cli/ui.go).
+type LineageEdge = lineagetype.Edge
 
-	// ViaTable is the catalog identifier the downstream node reads —
-	// "<database>.<table>" — for transform→transform and transform→
-	// destination edges where the upstream writes an Iceberg auto-table.
-	// Empty for source→transform edges (sources stream Parquet, not a
-	// catalog table). The TableDetail page filters on this exact pair to
-	// find downstream consumers of the table being viewed.
-	ViaTable string `json:"via_table,omitempty"`
-
-	// FromPipeline / ToPipeline name the producing / consuming pipelines
-	// when the edge crosses a pipeline boundary (ADR-016 slice 2).
-	// Empty means same pipeline as the one being queried — most edges.
-	// The UI uses these to render cross-pipeline edges distinctly and
-	// to label them with the other pipeline's name.
-	FromPipeline string `json:"from_pipeline,omitempty"`
-	ToPipeline   string `json:"to_pipeline,omitempty"`
-
-	// ToTable is the consumer's own output table id —
-	// `<consumer_db>.<consumer_node>__default`. Only set when the
-	// edge crosses a pipeline boundary (downstream cross-pipeline):
-	// intra-pipeline rows derive the consumer table id client-side
-	// from the current DB, but cross-pipeline rows need the
-	// consumer's pipeline DB which the UI doesn't know without
-	// re-fetching. via_table stays the producer's table so the
-	// existing `via_table === fullTable` filter keeps matching.
-	ToTable string `json:"to_table,omitempty"`
-}
-
-// LineageResult is the lineage graph plus the queried pipeline's own
-// ADR-016 namespace. Catalog/Schema let the UI label a node's output
-// table directly instead of guessing it from a `via_table` — which, for
-// a pipeline that only reads cross-pipeline, points at the *upstream*
-// pipeline's schema, not this one's.
-type LineageResult struct {
-	Edges   []LineageEdge `json:"edges"`
-	Catalog string        `json:"catalog"`
-	Schema  string        `json:"schema"`
-}
+type LineageResult = lineagetype.Response
 
 // Lineage returns the lineage edges for one pipeline directory. Edges are
 // ordered deterministically (by FromNode, then ToNode) so the JSON response
@@ -392,4 +349,3 @@ func sourceInputName(raw interface{}) string {
 	}
 	return ""
 }
-

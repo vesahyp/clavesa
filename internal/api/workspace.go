@@ -2,7 +2,6 @@ package api
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,6 +17,7 @@ import (
 // WorkspaceHandler serves workspace-level and pipeline-lifecycle endpoints.
 type WorkspaceHandler struct {
 	root string // absolute path to workspace root
+	svc  *service.Service
 	// restart, when set, re-execs the server process. Wired by
 	// `clavesa ui`; nil in tests and CLI one-shots. PUT
 	// /workspace/aws-profile calls it so a profile change takes effect
@@ -29,6 +29,33 @@ type WorkspaceHandler struct {
 // NewWorkspaceHandler returns a handler rooted at root.
 func NewWorkspaceHandler(root string) *WorkspaceHandler {
 	return &WorkspaceHandler{root: root}
+}
+
+// WithService attaches the canonical service.Service so the pipeline-
+// lifecycle handlers route through the wired Service instead of
+// instantiating a fresh service.New(wh.root) per request (A P1-1).
+func (wh *WorkspaceHandler) WithService(s *service.Service) *WorkspaceHandler {
+	wh.svc = s
+	return wh
+}
+
+func (wh *WorkspaceHandler) service() *service.Service {
+	if wh.svc != nil {
+		return wh.svc
+	}
+	return service.New(wh.root)
+}
+
+// resolveDir folds path resolution + workspace-containment for ?dir=
+// endpoints. Writes 400 and returns ("", false) on escape attempts; the
+// caller should return early. Mirrors Handler.resolveDir (C9, A P1-2).
+func (wh *WorkspaceHandler) resolveDir(w http.ResponseWriter, dir string) (string, bool) {
+	abs := pathutil.ResolveDir(wh.root, dir)
+	if wh.root != "" && !pathutil.IsWithin(wh.root, abs) {
+		httputil.WriteError(w, http.StatusBadRequest, "dir must be within the workspace root")
+		return "", false
+	}
+	return abs, true
 }
 
 // WithRestart wires the server self-restart hook. Used by PUT
@@ -106,9 +133,8 @@ func (wh *WorkspaceHandler) GetEnvironment(w http.ResponseWriter, _ *http.Reques
 // is `clavesa workspace use --env` (ADR-015 parity); both write
 // .clavesa/environment.json via workspace.WriteEnvironmentMode.
 func (wh *WorkspaceHandler) SetEnvironment(w http.ResponseWriter, r *http.Request) {
-	var req environmentResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[environmentResponse](w, r)
+	if !ok {
 		return
 	}
 	mode, ok := workspace.ParseMode(req.Mode)
@@ -158,9 +184,8 @@ func (wh *WorkspaceHandler) GetAWSProfile(w http.ResponseWriter, _ *http.Request
 // (ADR-015 parity) — the CLI doesn't restart anything, since the next
 // `clavesa ui` start picks the file up.
 func (wh *WorkspaceHandler) SetAWSProfile(w http.ResponseWriter, r *http.Request) {
-	var req awsProfileResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[awsProfileResponse](w, r)
+	if !ok {
 		return
 	}
 	profile := strings.TrimSpace(req.Profile)
@@ -225,13 +250,11 @@ func (wh *WorkspaceHandler) InitWorkspace(w http.ResponseWriter, r *http.Request
 			fmt.Sprintf("workspace %q already exists at %s", m.Name, wh.root))
 		return
 	}
-	var req initWorkspaceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[initWorkspaceRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Name == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "name is required")
+	if !httputil.RequireFields(w, map[string]string{"name": req.Name}) {
 		return
 	}
 	if err := workspace.Init(wh.root, req.Name, "aws", req.Catalog, service.ModuleVersion); err != nil {
@@ -261,7 +284,7 @@ func (wh *WorkspaceHandler) InitWorkspace(w http.ResponseWriter, r *http.Request
 // scan + cloud/compute derivation; the service version is now the only
 // one, so any future enrichment reaches both surfaces.
 func (wh *WorkspaceHandler) ListPipelines(w http.ResponseWriter, _ *http.Request) {
-	pipelines, err := service.New(wh.root).ListPipelines()
+	pipelines, err := wh.service().ListPipelines()
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "scan pipelines: "+err.Error())
 		return
@@ -292,17 +315,15 @@ type createPipelineResponse struct {
 // .gitignore, no orchestration sync, no dashboard seed). Single body
 // per ADR-015 CLI/UI parity.
 func (wh *WorkspaceHandler) CreatePipeline(w http.ResponseWriter, r *http.Request) {
-	var req createPipelineRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[createPipelineRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Name == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "name is required")
+	if !httputil.RequireFields(w, map[string]string{"name": req.Name}) {
 		return
 	}
 
-	rel, err := service.New(wh.root).CreatePipeline(req.Name, req.Schema)
+	rel, err := wh.service().CreatePipeline(req.Name, req.Schema)
 	if err != nil {
 		// Bad-request errors: a path-escaping name, or an ADR-016 schema
 		// conflict (the requested schema is owned by another pipeline).
@@ -330,12 +351,14 @@ func (wh *WorkspaceHandler) CreatePipeline(w http.ResponseWriter, r *http.Reques
 // (`clavesa pipeline destroy`); deleting a deployed pipeline's
 // directory leaves AWS resources behind — same as the CLI today.
 func (wh *WorkspaceHandler) DeletePipeline(w http.ResponseWriter, r *http.Request) {
-	dir := r.URL.Query().Get("dir")
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
-	if err := service.New(wh.root).DeletePipeline(dir); err != nil {
+	if _, ok := wh.resolveDir(w, dir); !ok {
+		return
+	}
+	if err := wh.service().DeletePipeline(dir); err != nil {
 		if strings.Contains(err.Error(), "path escapes") {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
 			return
@@ -356,12 +379,14 @@ func (wh *WorkspaceHandler) DeletePipeline(w http.ResponseWriter, r *http.Reques
 // dashboard. The remote call (`git ls-remote`) is paid on every hit; the
 // UI caches via TanStack Query staleTime so the chip is cheap to render.
 func (wh *WorkspaceHandler) GetPipelineModuleVersion(w http.ResponseWriter, r *http.Request) {
-	dir := r.URL.Query().Get("dir")
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
-	info, err := service.New(wh.root).PipelineModuleVersion(dir)
+	if _, ok := wh.resolveDir(w, dir); !ok {
+		return
+	}
+	info, err := wh.service().PipelineModuleVersion(dir)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -388,13 +413,14 @@ type upgradePipelineResponse struct {
 // surfaces delegate to service.UpgradePipeline so the resulting .tf
 // is byte-identical regardless of caller.
 func (wh *WorkspaceHandler) UpgradePipeline(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	dir := q.Get("dir")
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
-	current, target, updated, migrated, err := service.New(wh.root).UpgradePipeline(dir, q.Get("version"))
+	if _, ok := wh.resolveDir(w, dir); !ok {
+		return
+	}
+	current, target, updated, migrated, err := wh.service().UpgradePipeline(dir, r.URL.Query().Get("version"))
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -414,9 +440,8 @@ func (wh *WorkspaceHandler) UpgradePipeline(w http.ResponseWriter, r *http.Reque
 // GetVars reads variable values from terraform.tfvars (or .auto.tfvars) in dir
 // and returns them as a flat key→value map.
 func (wh *WorkspaceHandler) GetVars(w http.ResponseWriter, r *http.Request) {
-	dir := r.URL.Query().Get("dir")
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
 
@@ -452,13 +477,11 @@ type putVarsRequest struct {
 
 // PutVars writes key/value pairs to terraform.tfvars in the pipeline directory.
 func (wh *WorkspaceHandler) PutVars(w http.ResponseWriter, r *http.Request) {
-	var req putVarsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	req, ok := httputil.DecodeJSON[putVarsRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
 
@@ -577,4 +600,3 @@ func readVariableDecls(dir string) (map[string]string, error) {
 
 	return result, nil
 }
-

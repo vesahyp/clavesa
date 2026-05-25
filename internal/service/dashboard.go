@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/dashboardsql"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -101,12 +101,12 @@ type DashboardWidget struct {
 // `{{<name>.start}}` and `{{<name>.end}}`). URL-syncable so a filtered
 // view is shareable.
 //
-// - `time_range`: `Default` is a preset key (`last_24h` / `last_7d` /
-//   `last_30d` / `last_90d`) resolved to a start/end ISO timestamp at
-//   render time.
-// - `select`: options come from running `SQL` against `Dir` (first
-//   column used); a non-empty `Options` slice is a static fallback when
-//   no SQL is set.
+//   - `time_range`: `Default` is a preset key (`last_24h` / `last_7d` /
+//     `last_30d` / `last_90d`) resolved to a start/end ISO timestamp at
+//     render time.
+//   - `select`: options come from running `SQL` against `Dir` (first
+//     column used); a non-empty `Options` slice is a static fallback when
+//     no SQL is set.
 type DashboardControl struct {
 	Name    string   `json:"name"`
 	Type    string   `json:"type"`
@@ -738,10 +738,10 @@ func validDatasetName(s string) bool {
 // backend. The two dialects escape differently and getting it wrong
 // silently corrupts the stored spec:
 //
-//   - Spark SQL (local runner) uses backslash escapes. `''` is NOT an
-//     escaped quote there — `'a''b'` lexes as two literals and yields
+//   - Spark SQL (local runner) uses backslash escapes. `”` is NOT an
+//     escaped quote there — `'a”b'` lexes as two literals and yields
 //     `ab`. Escape backslash first, then the quote.
-//   - Athena / Trino (cloud) uses ANSI doubling: `''` is the escaped
+//   - Athena / Trino (cloud) uses ANSI doubling: `”` is the escaped
 //     quote and backslash is a literal character.
 //
 // The spec JSON is the value that actually exercises this — it carries
@@ -756,51 +756,12 @@ func (s *Service) sqlString(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
-// placeholderRE matches `{{name}}` tokens in dataset SQL. The capture
-// allows dotted names so `time_range` controls can write
-// `{{<name>.start}}` / `{{<name>.end}}` without a special-case parser,
-// and hyphens because control names share the dataset-name character
-// class (lowercase letters, digits, dash, underscore).
-var placeholderRE = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_.\-]*)\s*\}\}`)
-
-// safeParamValue restricts substituted values to a safe character class.
-// The goal is "no SQL injection via param" without imposing a full SQL
-// dialect — ISO timestamps, identifiers, hyphens, and slashes cover the
-// real cases (time presets, dropdowns from `SELECT DISTINCT site`).
-// Quotes and semicolons are rejected, so a value can never close the
-// surrounding string literal or chain a statement.
-var safeParamValue = regexp.MustCompile(`^[A-Za-z0-9 _.:+\-T/]*$`)
-
-// expandPlaceholders substitutes `{{name}}` tokens in sql with quoted
-// values from params. Missing keys are an error — a typo in a dataset's
-// SQL should fail loud rather than silently produce an empty WHERE.
-// Substituted values are inserted as single-quoted SQL string literals
-// (e.g. `WHERE ts >= {{start}}` becomes `WHERE ts >= '2026-05-01T00:00:00Z'`);
-// authors do NOT wrap placeholders in quotes themselves.
+// expandPlaceholders delegates to the leaf-package implementation
+// shared with internal/api/dashboards.go (C13, 2026-05-24).
 func expandPlaceholders(sql string, params map[string]string) (string, error) {
-	var firstErr error
-	expanded := placeholderRE.ReplaceAllStringFunc(sql, func(match string) string {
-		if firstErr != nil {
-			return match
-		}
-		m := placeholderRE.FindStringSubmatch(match)
-		name := m[1]
-		val, ok := params[name]
-		if !ok {
-			firstErr = fmt.Errorf("dataset SQL references {{%s}} but no control or --param sets it", name)
-			return match
-		}
-		if !safeParamValue.MatchString(val) {
-			firstErr = fmt.Errorf("param %q value %q contains characters outside [A-Za-z0-9 _.:+\\-T/]", name, val)
-			return match
-		}
-		// Single-quote the literal. The charset already excludes ' and \
-		// so no escaping is needed and both Spark and Athena read the
-		// result identically.
-		return "'" + val + "'"
-	})
-	if firstErr != nil {
-		return "", firstErr
+	expanded, err := dashboardsql.ExpandPlaceholders(sql, params)
+	if err != nil {
+		return "", err
 	}
 	return expanded, nil
 }

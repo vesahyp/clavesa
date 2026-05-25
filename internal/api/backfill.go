@@ -2,9 +2,7 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"strings"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
 )
@@ -54,20 +52,20 @@ type BackfillStageRequest struct {
 // BackfillRun mirrors service.BackfillRun. Same field tags so the UI
 // parses the JSON straight off the wire.
 type BackfillRun struct {
-	RunID          string `json:"run_id"`
-	Pipeline       string `json:"pipeline"`
-	Node           string `json:"node"`
-	OutputKey      string `json:"output_key"`
+	RunID          string   `json:"run_id"`
+	Pipeline       string   `json:"pipeline"`
+	Node           string   `json:"node"`
+	OutputKey      string   `json:"output_key"`
 	From           []string `json:"from_cursor"`
 	To             []string `json:"to_cursor"`
-	Direct         bool   `json:"direct"`
-	TargetTable    string `json:"target_table"`
-	CanonicalTable string `json:"canonical_table"`
-	StartedAt      string `json:"started_at,omitempty"`
-	StoppedAt      string `json:"stopped_at,omitempty"`
-	Status         string `json:"status"`
-	RowsWritten    int64  `json:"rows_written,omitempty"`
-	ErrorMsg       string `json:"error_msg,omitempty"`
+	Direct         bool     `json:"direct"`
+	TargetTable    string   `json:"target_table"`
+	CanonicalTable string   `json:"canonical_table"`
+	StartedAt      string   `json:"started_at,omitempty"`
+	StoppedAt      string   `json:"stopped_at,omitempty"`
+	Status         string   `json:"status"`
+	RowsWritten    int64    `json:"rows_written,omitempty"`
+	ErrorMsg       string   `json:"error_msg,omitempty"`
 }
 
 // BackfillDiff mirrors service.BackfillDiff.
@@ -121,9 +119,8 @@ type backfillsListResponse struct {
 
 // GET /backfills?dir=<pipeline_dir>
 func (h *BackfillHandler) list(w http.ResponseWriter, r *http.Request) {
-	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
-	if dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir is required")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
 		return
 	}
 	runs, err := h.svc.BackfillList(r.Context(), dir)
@@ -137,13 +134,15 @@ func (h *BackfillHandler) list(w http.ResponseWriter, r *http.Request) {
 // POST /backfills/stage
 // Body: { dir, node, from: [cursor...], to: [cursor...], direct? }
 func (h *BackfillHandler) stage(w http.ResponseWriter, r *http.Request) {
-	var req BackfillStageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	req, ok := httputil.DecodeJSON[BackfillStageRequest](w, r)
+	if !ok {
 		return
 	}
-	if req.Dir == "" || req.Node == "" || len(req.From) == 0 || len(req.To) == 0 {
-		httputil.WriteError(w, http.StatusBadRequest, "dir, node, from, and to are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "node": req.Node}) {
+		return
+	}
+	if len(req.From) == 0 || len(req.To) == 0 {
+		httputil.WriteError(w, http.StatusBadRequest, "from and to are required")
 		return
 	}
 	run, err := h.svc.BackfillStage(r.Context(), req)
@@ -165,9 +164,11 @@ func (h *BackfillHandler) stage(w http.ResponseWriter, r *http.Request) {
 // GET /backfills/{run_id}/diff?dir=<pipeline_dir>
 func (h *BackfillHandler) diff(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
-	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
-	if runID == "" || dir == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir and run_id are required")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
+		return
+	}
+	if !httputil.RequireFields(w, map[string]string{"run_id": runID}) {
 		return
 	}
 	d, err := h.svc.BackfillDiff(r.Context(), dir, runID)
@@ -184,10 +185,15 @@ func (h *BackfillHandler) diff(w http.ResponseWriter, r *http.Request) {
 // fired live as the user picks a column on the promote screen.
 func (h *BackfillHandler) dedupCheck(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
-	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
-	col := strings.TrimSpace(r.URL.Query().Get("col"))
-	if runID == "" || dir == "" || col == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir, run_id, and col are required")
+	dir, ok := httputil.RequireQuery(w, r, "dir")
+	if !ok {
+		return
+	}
+	col, ok := httputil.RequireQuery(w, r, "col")
+	if !ok {
+		return
+	}
+	if !httputil.RequireFields(w, map[string]string{"run_id": runID}) {
 		return
 	}
 	res, err := h.svc.BackfillDedupCheck(r.Context(), dir, runID, col)
@@ -208,13 +214,11 @@ type promoteBody struct {
 // Body: { dir, force_dedup?, allow_duplicates? }
 func (h *BackfillHandler) promote(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
-	var body promoteBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	body, ok := httputil.DecodeJSON[promoteBody](w, r)
+	if !ok {
 		return
 	}
-	if body.Dir == "" || runID == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir and run_id are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": body.Dir, "run_id": runID}) {
 		return
 	}
 	res, err := h.svc.BackfillPromote(r.Context(), body.Dir, runID, BackfillPromoteOpts{
@@ -242,13 +246,11 @@ type discardBody struct {
 // Body: { dir }
 func (h *BackfillHandler) discard(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
-	var body discardBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+	body, ok := httputil.DecodeJSON[discardBody](w, r)
+	if !ok {
 		return
 	}
-	if body.Dir == "" || runID == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "dir and run_id are required")
+	if !httputil.RequireFields(w, map[string]string{"dir": body.Dir, "run_id": runID}) {
 		return
 	}
 	if err := h.svc.BackfillDiscard(r.Context(), body.Dir, runID); err != nil {

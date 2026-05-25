@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/errs"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/pathutil"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -178,11 +179,9 @@ func (p *LocalProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 // rows against the local Hadoop catalog.
 // ---------------------------------------------------------------------------
 
-// ErrLocalNotImplemented signals a LocalProvider method that requires the
-// runner-Spark bridge but has no backing implementation in this slice.
-// Reserved for future surfaces; current methods all return real results
-// (Iceberg-backed reads via CLAVESA_QUERY=1) or fail with a typed error.
-var ErrLocalNotImplemented = errors.New("local provider: not yet implemented")
+// ErrLocalNotImplemented is re-exported from internal/errs so callers in
+// pipelinestatus + dataquery answer the same sentinel (C10, 2026-05-24).
+var ErrLocalNotImplemented = errs.ErrLocalNotImplemented
 
 // NodeRuns issues the same SQL CloudProvider runs against Athena, but against
 // the local Hadoop catalog via the runner image. Same row shape; the UI sees
@@ -1102,4 +1101,3 @@ func FormatExecRef(dir, runID string) string {
 	}
 	return dir + ":" + runID
 }
-

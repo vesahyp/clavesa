@@ -12,7 +12,49 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
-## [v1.1.6] — 2026-05-25
+## [v1.1.7] — 2026-05-25
+
+### Added
+
+- **`clavesa workspace upgrade`.** Refreshes the workspace's embedded
+  modules tree and the local runner image to the running binary's
+  `ModuleVersion`, and rewrites `module "workspace" { source = … }`
+  in `main.tf` to the new version with the `./` prefix Terraform 1.x
+  requires. Per-pipeline counterpart is `pipeline upgrade <dir>`;
+  before v1.1.7 there was no discoverable workspace equivalent and
+  the workaround was re-running `workspace init` (not advertised by
+  its help text).
+
+### Fixed
+
+- **Local-mode pipelines now surface run history.** `GET /pipeline/status`
+  and `GET /pipeline/execution` were cloud-only — local pipelines
+  showed empty "Recent executions" forever. Local mode now reads from
+  the on-disk run-state files.
+- **Local-mode `/data/*` endpoints return 400 instead of 500 when `?dir`
+  is missing.** Previously fell back to the cloud provider, whose nil
+  Athena client crashed the request. Cloud mode unchanged.
+- **Pre-ADR-016 Glue DBs (`clavesa_<pipeline>`) now appear in the
+  catalog.** Un-migrated workspaces showed "AWS available, 0 tables"
+  with no signal; the catalog filter now accepts the legacy
+  single-underscore form and logs a hint to run
+  `clavesa pipeline upgrade`.
+- **`pipeline list` no longer false-positives on dirs whose .tf files
+  literally contain the substring "clavesa"** (e.g.
+  `bucket = "clavesa-prod"` in a non-pipeline sibling). The marker
+  now matches the embedded-modules path (`.clavesa/modules/`) or the
+  legacy GitHub `?ref=` form.
+- **Hyphenated pipeline names (`marketing-funnel`) now render runs in
+  PipelinesList.** UI was sanitising `-`→`_` before joining against
+  `runs.pipeline`, but the runs writer stores the literal name.
+
+### Changed
+
+- **HTTP handlers route through one canonical service.Service instead of
+  building a fresh one per request.** Two endpoints (`node rename`,
+  `node connect`) plus the workspace-level pipeline-CRUD handlers
+  previously bypassed cache eviction; the wired service is now used
+  uniformly.
 
 ### Fixed
 

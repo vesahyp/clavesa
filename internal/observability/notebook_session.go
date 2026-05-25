@@ -87,7 +87,7 @@ type CellResult struct {
 
 // CellDisplay is the rendered last-expression result.
 type CellDisplay struct {
-	Type        string  `json:"type"` // "table" | "text" | "none"
+	Type        string   `json:"type"` // "table" | "text" | "none"
 	Columns     []string `json:"columns,omitempty"`
 	ColumnTypes []string `json:"column_types,omitempty"`
 	Rows        [][]any  `json:"rows,omitempty"`

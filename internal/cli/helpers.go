@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/service"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
-	"github.com/spf13/cobra"
 )
 
 // setFlags accumulates multiple --set key=value flags.
@@ -43,11 +44,11 @@ func (f setFlags) Set(s string) error {
 // resolveWorkspace returns an absolute workspace path and applies the
 // workspace's persisted AWS profile to this process's environment.
 // Resolution order:
-//   1. --workspace flag (explicit override)
-//   2. $CLAVESA_WORKSPACE env var (per-shell selection)
-//   3. cwd-walk searching for clavesa.json
-//   4. State file written by `workspace init` / `workspace use`
-//   5. cwd as last resort
+//  1. --workspace flag (explicit override)
+//  2. $CLAVESA_WORKSPACE env var (per-shell selection)
+//  3. cwd-walk searching for clavesa.json
+//  4. State file written by `workspace init` / `workspace use`
+//  5. cwd as last resort
 //
 // The cwd-walk ranks above the state file deliberately: standing physically
 // inside a workspace means you mean *that* workspace. The state file is the
@@ -277,7 +278,7 @@ var internalKeys = map[string]bool{
 	// ADR-017: parser surfaces source-registry references as a synthetic
 	// config key (`{alias: "sources.<name>"}`); rendered separately by
 	// `node show`'s "Inputs:" block. Hide from the generic config dump.
-	"source_inputs":      true,
+	"source_inputs": true,
 }
 
 // mergeOptionalFields returns a display map that includes all existing config
@@ -334,11 +335,7 @@ func sortedKeys(m map[string]interface{}) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
-			keys[j], keys[j-1] = keys[j-1], keys[j]
-		}
-	}
+	sort.Strings(keys)
 	return keys
 }
 

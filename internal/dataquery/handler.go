@@ -56,26 +56,50 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 	})
 
 	mux.HandleFunc("GET /data/table", func(w http.ResponseWriter, r *http.Request) {
-		handleTable(w, r, h.providerFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleTable(w, r, p)
 	})
 
 	mux.HandleFunc("GET /data/tables/{database}/{table}/snapshots", func(w http.ResponseWriter, r *http.Request) {
-		handleSnapshots(w, r, h.providerFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleSnapshots(w, r, p)
 	})
 
 	mux.HandleFunc("GET /data/tables/{database}/{table}/column-stats", func(w http.ResponseWriter, r *http.Request) {
-		handleColumnStats(w, r, h.providerFor(r), h.systemGlueDBFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleColumnStats(w, r, p, h.systemGlueDBFor(r))
 	})
 
 	mux.HandleFunc("GET /data/node-runs", func(w http.ResponseWriter, r *http.Request) {
-		handleNodeRuns(w, r, h.providerFor(r), h.systemGlueDBFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleNodeRuns(w, r, p, h.systemGlueDBFor(r))
 	})
 
 	mux.HandleFunc("GET /data/runs", func(w http.ResponseWriter, r *http.Request) {
-		handleRuns(w, r, h.providerFor(r), h.systemGlueDBFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleRuns(w, r, p, h.systemGlueDBFor(r))
 	})
 	mux.HandleFunc("GET /data/tables-state", func(w http.ResponseWriter, r *http.Request) {
-		handleTables(w, r, h.providerFor(r), h.systemGlueDBFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleTables(w, r, p, h.systemGlueDBFor(r))
 	})
 
 	// POST /data/query — workspace-level ad-hoc SQL editor. Body shape:
@@ -86,7 +110,11 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 	// about. The /query page and the per-table SQL pane on
 	// /tables/:db/:table both call this endpoint.
 	mux.HandleFunc("POST /data/query", func(w http.ResponseWriter, r *http.Request) {
-		handleAdhocQuery(w, r, h.providerFor(r))
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleAdhocQuery(w, r, p)
 	})
 
 	h.mux = mux
@@ -109,25 +137,32 @@ func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 	return h
 }
 
-// providerFor picks the provider for one request: resolver dispatch when
-// `dir` is present and a resolver is configured; otherwise the legacy cloud
-// provider (which assumes Athena and Glue are reachable).
-func (h *Handler) providerFor(r *http.Request) observability.Provider {
+// providerFor picks the provider for one request. Returns (provider, true)
+// when routing succeeded; on failure writes a 400 to w and returns
+// (nil, false) so the caller can early-out.
+//
+// In local mode the cloud provider has a nil Athena client — silently
+// falling back there 500s the request when ?dir is missing (B P1-3 from
+// 2026-05-24). Local mode now requires `dir` and surfaces a 400 instead.
+// Tests without a resolver still get the legacy cloud provider.
+func (h *Handler) providerFor(w http.ResponseWriter, r *http.Request) (observability.Provider, bool) {
 	if h.resolver == nil {
-		return h.cloud
+		return h.cloud, true
 	}
-	dir := r.URL.Query().Get("dir")
+	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
 	if dir == "" {
-		return h.cloud
+		if h.resolver.IsLocal() {
+			httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir (local workspaces dispatch per-pipeline)")
+			return nil, false
+		}
+		return h.cloud, true
 	}
 	p, err := h.resolver.For(dir)
 	if err != nil {
-		// Fall through to cloud — handler will surface the error from the
-		// downstream call. Allows the legacy "no dir, cloud-only" tests to
-		// pass without a Resolver while still defaulting safely.
-		return h.cloud
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return nil, false
 	}
-	return p
+	return p, true
 }
 
 // glueDBFor resolves the encoded Glue DB / Iceberg namespace name for

@@ -211,14 +211,14 @@ func TestNodeRunsTruncated(t *testing.T) {
 func TestNodeRunsValidation(t *testing.T) {
 	h := dataquery.NewHandler(&mockS3Client{}, &mockAthenaClient{}, "out")
 	cases := []struct{ url string }{
-		{"/data/node-runs"},                              // missing pipeline
-		{"/data/node-runs?pipeline="},                    // empty pipeline
-		{"/data/node-runs?pipeline=1bad"},                // leading digit not allowed
-		{"/data/node-runs?pipeline=bad+space"},           // non-ident charset
-		{"/data/node-runs?pipeline=p&node=bad-dash"},     // node still strict (no dashes)
-		{"/data/node-runs?pipeline=p&limit=0"},           // limit=0
-		{"/data/node-runs?pipeline=p&limit=501"},         // limit>max
-		{"/data/node-runs?pipeline=p&limit=abc"},         // limit non-numeric
+		{"/data/node-runs"},                          // missing pipeline
+		{"/data/node-runs?pipeline="},                // empty pipeline
+		{"/data/node-runs?pipeline=1bad"},            // leading digit not allowed
+		{"/data/node-runs?pipeline=bad+space"},       // non-ident charset
+		{"/data/node-runs?pipeline=p&node=bad-dash"}, // node still strict (no dashes)
+		{"/data/node-runs?pipeline=p&limit=0"},       // limit=0
+		{"/data/node-runs?pipeline=p&limit=501"},     // limit>max
+		{"/data/node-runs?pipeline=p&limit=abc"},     // limit non-numeric
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, tc.url, nil)

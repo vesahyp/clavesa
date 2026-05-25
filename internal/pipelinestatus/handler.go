@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
+	"github.com/vesahyp/clavesa/internal/errs"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/pathutil"
@@ -36,11 +37,11 @@ type LocalPipelineRunner interface {
 	StartRun(dir string) (string, error)
 }
 
-// ErrRunInFlight is the sentinel a LocalPipelineRunner returns when a run
-// for the pipeline is already executing. The bridge in ui.go maps
-// service.ErrRunInFlight onto this so the handler can answer 409 without
-// importing internal/service.
-var ErrRunInFlight = errors.New("a run is already in progress for this pipeline")
+// ErrRunInFlight is re-exported from internal/errs so callers comparing
+// with errors.Is continue to work; the underlying sentinel is shared with
+// service.ErrRunInFlight, eliminating the cli/ui.go bridge (C10,
+// 2026-05-24).
+var ErrRunInFlight = errs.ErrRunInFlight
 
 // Handler serves GET /pipeline/status, /pipeline/execution, and the two
 // execution-detail endpoints (states + logs). The execution-detail endpoints
@@ -157,6 +158,45 @@ func (h *Handler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	abs := pathutil.ResolveDir(h.root, dir)
 
+	// Local-mode dispatch (ADR-014, B P1-2 from 2026-05-24): instead of
+	// hunting for terraform.tfstate we serve the run history out of
+	// LocalProvider.Runs. A local pipeline has no SFN ARN, no tfstate —
+	// it's still "deployed" in the sense that the runner image exists
+	// and the pipeline is runnable today.
+	if h.resolver != nil && h.resolver.IsLocal() {
+		p, err := h.resolver.For(abs)
+		if err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		res, err := p.Runs(r.Context(), observability.RunsQuery{
+			PipelineName: filepath.Base(abs),
+			PipelineDir:  abs,
+			Limit:        20,
+		})
+		if err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, "list local runs: "+err.Error())
+			return
+		}
+		execs := make([]executionInfo, 0, len(res.Rows))
+		for _, run := range res.Rows {
+			execs = append(execs, executionInfo{
+				Name:         run.RunID,
+				Status:       run.Status,
+				StartedAt:    run.StartedAt,
+				StoppedAt:    run.EndedAt,
+				ConsoleURL:   "",
+				ExecutionARN: formatLocalExecRef(abs, run.RunID),
+			})
+		}
+		httputil.WriteJSON(w, http.StatusOK, statusResponse{
+			Deployed:   true,
+			Cloud:      "local",
+			Executions: execs,
+		})
+		return
+	}
+
 	stateARN, err := readStateMachineARN(abs)
 	if err != nil || stateARN == "" {
 		httputil.WriteJSON(w, http.StatusOK, statusResponse{Deployed: false, Executions: []executionInfo{}})
@@ -181,6 +221,29 @@ func (h *Handler) GetStatus(w http.ResponseWriter, r *http.Request) {
 		StateMachineARN: stateARN,
 		Executions:      execs,
 	})
+}
+
+// formatLocalExecRef synthesises a recognisable execution reference for
+// a local run so the same /pipeline/execution?arn=… endpoint serves
+// both cloud and local. Prefix `local:` makes splitLocalExecRef easy;
+// `#` (vs `:`) separates dir from runID so dirs containing colons
+// round-trip (B P2-5).
+func formatLocalExecRef(dir, runID string) string {
+	return "local:" + dir + "#" + runID
+}
+
+// splitLocalExecRef is the inverse of formatLocalExecRef. Returns
+// (dir, runID, ok) — ok=false means the input is a cloud ARN.
+func splitLocalExecRef(ref string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(ref, "local:")
+	if !ok {
+		return "", "", false
+	}
+	dir, runID, ok := strings.Cut(rest, "#")
+	if !ok {
+		return "", "", false
+	}
+	return dir, runID, true
 }
 
 // readStateMachineARN reads terraform.tfstate from dir and extracts the ARN
@@ -262,6 +325,26 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 	arn := r.URL.Query().Get("arn")
 	if arn == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: arn")
+		return
+	}
+
+	// Local-mode dispatch: arn is `local:<dir>#<runID>` synthesised by
+	// GetStatus above. ReadRunState already populates failed_step +
+	// error_class + error_msg (B P1-2 from 2026-05-24).
+	if dir, runID, ok := splitLocalExecRef(arn); ok {
+		st, err := observability.ReadRunState(dir, runID)
+		if err != nil {
+			httputil.WriteError(w, http.StatusNotFound, "read run state: "+err.Error())
+			return
+		}
+		httputil.WriteJSON(w, http.StatusOK, executionDetail{
+			Status:     st.Status,
+			Error:      st.ErrorClass,
+			Cause:      st.ErrorMsg,
+			FailedStep: st.FailedStep,
+			StepError:  st.ErrorClass,
+			StepCause:  st.ErrorMsg,
+		})
 		return
 	}
 

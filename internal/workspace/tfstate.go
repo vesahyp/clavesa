@@ -42,4 +42,3 @@ func tfstateOutput(root, name string) string {
 	}
 	return ""
 }
-

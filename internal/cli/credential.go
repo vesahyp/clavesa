@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/spf13/cobra"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // newCredentialCmd implements ADR-017 slice 2's `clavesa credential`

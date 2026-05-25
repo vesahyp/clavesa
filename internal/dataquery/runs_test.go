@@ -116,13 +116,13 @@ func TestRunsBasic(t *testing.T) {
 func TestRunsValidation(t *testing.T) {
 	h := dataquery.NewHandler(&mockS3Client{}, &mockAthenaClient{}, "out")
 	cases := []struct{ url string }{
-		{"/data/runs"},                              // missing pipeline
-		{"/data/runs?pipeline="},                    // empty pipeline
-		{"/data/runs?pipeline=1bad"},                // leading digit not allowed
-		{"/data/runs?pipeline=bad+space"},           // non-ident charset
-		{"/data/runs?pipeline=p&limit=0"},           // limit=0
-		{"/data/runs?pipeline=p&limit=501"},         // limit>max
-		{"/data/runs?pipeline=p&limit=abc"},         // limit non-numeric
+		{"/data/runs"},                      // missing pipeline
+		{"/data/runs?pipeline="},            // empty pipeline
+		{"/data/runs?pipeline=1bad"},        // leading digit not allowed
+		{"/data/runs?pipeline=bad+space"},   // non-ident charset
+		{"/data/runs?pipeline=p&limit=0"},   // limit=0
+		{"/data/runs?pipeline=p&limit=501"}, // limit>max
+		{"/data/runs?pipeline=p&limit=abc"}, // limit non-numeric
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, tc.url, nil)

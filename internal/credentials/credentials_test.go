@@ -51,7 +51,7 @@ func TestSecretBackendDispatch(t *testing.T) {
 	t.Parallel()
 	cases := map[string]string{
 		"arn:aws:secretsmanager:eu-north-1:123:secret:foo": "arn",
-		"env:STRIPE_KEY":     "env",
+		"env:STRIPE_KEY":       "env",
 		"file:./stripe.secret": "file",
 		"weird:thing":          "",
 	}

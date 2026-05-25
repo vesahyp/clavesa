@@ -14,10 +14,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 
+	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/api"
 	tuiservice "github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
-	"github.com/spf13/cobra"
 )
 
 func newWorkspaceCmd() *cobra.Command {
@@ -38,6 +38,7 @@ Examples:
 
 	cmd.AddCommand(
 		newWorkspaceInitCmd(),
+		newWorkspaceUpgradeCmd(),
 		newWorkspaceUseCmd(),
 		newWorkspaceTablesCmd(),
 		newWorkspacePlanCmd(),
@@ -46,6 +47,63 @@ Examples:
 	)
 
 	return cmd
+}
+
+func newWorkspaceUpgradeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "upgrade",
+		Short: "Upgrade the workspace to the binary's module version",
+		Long: `Refresh the workspace's embedded module tree and the local runner image
+to match the running ` + "`clavesa`" + ` binary's ModuleVersion.
+
+Mechanics:
+  - Re-extracts the embedded Terraform modules to .clavesa/modules/<version>/
+    (idempotent; skips when the SHA stamp already matches).
+  - Rewrites the workspace's ` + "`module \"workspace\"`" + ` source line to
+    the new version with the leading "./" prefix Terraform 1.x requires.
+  - Refreshes the local Docker runner image (retag or rebuild from the
+    embedded runner sources).
+
+Does NOT touch clavesa.json, variables.tf, or the rest of main.tf — your
+provider blocks and any extra resources are preserved.
+
+Run this after upgrading ` + "`clavesa`" + ` itself (` + "`brew upgrade clavesa`" + ` or
+swapping the binary). The per-pipeline counterpart is
+` + "`clavesa pipeline upgrade <dir>`" + ` — it rewrites pipeline module
+sources and strips deprecated module arguments.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := resolveWorkspace(cmd)
+			if err != nil {
+				return err
+			}
+			target := tuiservice.ModuleVersion
+			prev, rewritten, err := workspace.Upgrade(root, target)
+			if err != nil {
+				return fmt.Errorf("workspace upgrade: %w", err)
+			}
+			// Image refresh is a separate step — Upgrade is pure-TF so
+			// pure-Go tests can exercise it without Docker. Surface the
+			// image refresh error but don't abort: the TF rewrite is
+			// already on disk and useful on its own.
+			if _, imgErr := workspace.EnsureLocalRunnerImage(root); imgErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: refresh local runner image: %v\n", imgErr)
+			}
+			switch {
+			case prev == "":
+				fmt.Printf("Workspace at %s: module source line not found in main.tf; modules + runner refreshed.\n", root)
+			case prev == target && rewritten == 0:
+				fmt.Printf("Workspace at %s: already on %s; modules + runner refreshed.\n", root, target)
+			default:
+				fmt.Printf("Upgraded workspace at %s: %s → %s\n", root, prev, target)
+				if rewritten > 0 {
+					fmt.Printf("  main.tf: rewrote `module \"workspace\"` source\n")
+				}
+			}
+			fmt.Println("\nNext: run `clavesa pipeline upgrade <pipeline>` on each pipeline in this workspace.")
+			return nil
+		},
+	}
 }
 
 func newWorkspaceInitCmd() *cobra.Command {
@@ -131,12 +189,12 @@ The mode is stored per-workspace in .clavesa/environment.json
 for pipeline runs and the observability surfaces.
 
 With --profile, set the AWS profile the workspace operates as — the
-profile `+"`clavesa ui`"+` resolves AWS credentials from, and forwards
+profile ` + "`clavesa ui`" + ` resolves AWS credentials from, and forwards
 into the runner for S3-source reads. Stored in
 .clavesa/aws-profile.json (gitignored). Pass an empty value
 (--profile "") to clear the override and fall back to the ambient
 AWS_PROFILE / default credential chain. The profile must exist in
-~/.aws; a running `+"`clavesa ui`"+` server picks the change up on its
+~/.aws; a running ` + "`clavesa ui`" + ` server picks the change up on its
 next start.
 
 Run with no arguments to print the current workspace, mode, and AWS profile.`,

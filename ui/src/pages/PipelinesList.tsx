@@ -52,8 +52,12 @@ function runBarColor(status: string): string {
  * pipeline runs query (Spark for local, Athena for cloud) returns.
  */
 function PipelineRuns({ name, dir }: { name: string; dir: string }) {
-  // The runs table keys on the sanitized pipeline name (see RunDetail).
-  const runs = useRuns(name.replace(/-/g, "_"), { dir, limit: RUN_BARS });
+  // Pipeline names land in node_runs/runs as the literal pipeline_name
+  // var.tf value — what `pipeline create` writes, dashes preserved.
+  // (Confirmed: runs_writer sidecar uses CLAVESA_PIPELINE verbatim, and
+  // local recordLocalRun uses filepath.Base(dir).) PipelineDashboard
+  // uses the same convention.
+  const runs = useRuns(name, { dir, limit: RUN_BARS });
 
   if (runs.isLoading) {
     return <Skeleton className="h-4 w-28" />;

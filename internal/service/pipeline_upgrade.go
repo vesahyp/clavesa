@@ -12,13 +12,11 @@ import (
 	"github.com/vesahyp/clavesa/internal/modules"
 )
 
-// githubRefRE matches the ?ref= portion of a GitHub module source string.
-// Used to rewrite module versions across a pipeline's .tf files.
-var githubRefRE = regexp.MustCompile(`(github\.com/[^"]+\?ref=)([^\s"]+)`)
-
 // githubSourceRE captures the repo path and current ref from a GitHub
-// module source. Sibling to githubRefRE — the two are intentionally
-// different shapes (capture vs whole-match rewrite).
+// module source — read-only, used by extractCurrentRef to detect a
+// pipeline's module version. The matching `rewriteModuleRefs` helper
+// was deleted (C P3-6, 2026-05-24); GitHub-ref pipelines now flow
+// through the embedded-modules path post-v0.30.0.
 var githubSourceRE = regexp.MustCompile(`github\.com/([^/]+/[^/]+)//[^?]+\?ref=([^\s"]+)`)
 
 // githubModuleSourceLineRE matches a github-form `source = "..."` attribute
@@ -308,24 +306,6 @@ func latestGitTag(repoURL string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no version tags found on %s", repoURL)
-}
-
-// rewriteModuleRefs replaces the ?ref= value in all GitHub module sources
-// in a single tf file. Returns the number of substitutions made.
-func rewriteModuleRefs(path, newRef string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	count := 0
-	updated := githubRefRE.ReplaceAllFunc(data, func(match []byte) []byte {
-		count++
-		return githubRefRE.ReplaceAll(match, []byte("${1}"+newRef))
-	})
-	if count == 0 {
-		return 0, nil
-	}
-	return count, os.WriteFile(path, updated, 0o644)
 }
 
 // stripLocalCompute removes every `compute = "local"` line from a single

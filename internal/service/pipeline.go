@@ -152,12 +152,13 @@ terraform.tfstate.backup
 // pipelineRunsDashboardJSON is the per-pipeline seed dashboard, in the
 // datasets shape: named, reusable SQL queries the widgets bind to.
 // Placeholders:
-//   %[1]s — original pipeline name (the dataset dir, and the pipeline=
-//           filter on every query — runs/node_runs are workspace-wide as
-//           of v0.20.0 so the dashboard must scope explicitly).
-//   %[2]s — Glue-encoded namespace for the workspace system catalog
-//           (`<system_catalog>__pipelines`, ADR-016). Both runs and
-//           node_runs live here, distinguished by the pipeline column.
+//
+//	%[1]s — original pipeline name (the dataset dir, and the pipeline=
+//	        filter on every query — runs/node_runs are workspace-wide as
+//	        of v0.20.0 so the dashboard must scope explicitly).
+//	%[2]s — Glue-encoded namespace for the workspace system catalog
+//	        (`<system_catalog>__pipelines`, ADR-016). Both runs and
+//	        node_runs live here, distinguished by the pipeline column.
 const pipelineRunsDashboardJSON = `{
   "title": "Pipeline runs — %[1]s",
   "datasets": [
@@ -306,10 +307,17 @@ func scanPipelines(root string) ([]PipelineInfo, error) {
 			continue
 		}
 		g, err := hclparser.Parse(dir)
-		if err != nil || len(g.Nodes) == 0 {
-			if !hasClavesaModules(dir) {
-				continue
+		if err != nil {
+			// Surface parse errors on dirs that look like pipelines (embedded
+			// clavesa module reference) — they're bugs, not "not a pipeline".
+			// Pure non-pipeline dirs (no clavesa marker) get skipped silently.
+			if hasClavesaModules(dir) {
+				fmt.Fprintf(os.Stderr, "pipeline list: parse failed in %s: %v\n", dir, err)
 			}
+			continue
+		}
+		if len(g.Nodes) == 0 && !hasClavesaModules(dir) {
+			continue
 		}
 		rel, relErr := filepath.Rel(root, dir)
 		if relErr != nil {
@@ -396,6 +404,12 @@ func IsPipelineDir(dir string) bool {
 	return true
 }
 
+// hasClavesaModules reports whether dir has any .tf file referencing a
+// clavesa module source — either the embedded form (`.clavesa/modules/`,
+// post-v0.30.0) or the legacy GitHub `?ref=` form (`clavesa//modules/`).
+// Used only as a fallback when hclparser.Parse fails or returns zero
+// nodes; the bare-substring match for "clavesa" was a false-positive
+// magnet (any `bucket = "clavesa-..."` in a non-pipeline dir tripped it).
 func hasClavesaModules(dir string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -409,7 +423,8 @@ func hasClavesaModules(dir string) bool {
 		if err != nil {
 			continue
 		}
-		if strings.Contains(string(data), "clavesa") {
+		s := string(data)
+		if strings.Contains(s, ".clavesa/modules/") || strings.Contains(s, "clavesa//modules/") {
 			return true
 		}
 	}

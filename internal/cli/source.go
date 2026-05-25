@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/spf13/cobra"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // newSourceCmd implements ADR-017's `clavesa source` noun: workspace-

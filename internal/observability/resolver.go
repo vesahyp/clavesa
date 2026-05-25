@@ -143,4 +143,3 @@ func readSchemaDefault(dir string) string {
 	}
 	return ""
 }
-

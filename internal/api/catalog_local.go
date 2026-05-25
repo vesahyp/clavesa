@@ -424,4 +424,3 @@ func typeString(t interface{}) string {
 	}
 	return "<nested>"
 }
-
