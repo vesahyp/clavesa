@@ -351,7 +351,9 @@ def test_glue_db_three_level_encoding():
     os.environ["CLAVESA_SCHEMA"] = "cloudfront"
     try:
         assert runner._glue_db() == "clavesa_demo_ws__cloudfront"
-        assert runner._table_id_for("default") == "clavesa.clavesa_demo_ws__cloudfront.node__default"
+        # ADR-018: Delta tables resolve through spark_catalog; no leading
+        # `clavesa.` catalog segment.
+        assert runner._table_id_for("default") == "clavesa_demo_ws__cloudfront.node__default"
     finally:
         for k, v in saved.items():
             if v is None:

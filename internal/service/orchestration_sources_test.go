@@ -234,7 +234,7 @@ func TestSyncOrchestrationEmitsMultipleOutputs(t *testing.T) {
 	if !strings.Contains(s, `outliers = ""`) {
 		t.Errorf("orchestration.tf missing bare-string `outliers = \"\"` entry\n%s", s)
 	}
-	if !strings.Contains(s, `default = { kind = "iceberg_table", table_id = "", mode = "append"`) {
+	if !strings.Contains(s, `default = { kind = "delta_table", table_id = "", mode = "append"`) {
 		t.Errorf("orchestration.tf missing default-append dict entry\n%s", s)
 	}
 }
@@ -260,12 +260,12 @@ func TestSyncOrchestrationKeepsLegacyBareStringForDefaultReplace(t *testing.T) {
 	}
 }
 
-// TestSyncOrchestrationEmitsIncrementalTransformInput covers v0.24.0:
-// when a downstream transform declares incremental_inputs = ["<alias>"]
-// for a transform-upstream edge, the orchestration emitter writes the
-// iceberg_table_incremental descriptor so the runner does a snapshot-
-// bounded scan plus watermark advance. Other inputs on the same node
-// keep the legacy bare-string Iceberg-table shape.
+// TestSyncOrchestrationEmitsIncrementalTransformInput covers v0.24.0
+// (ported to v2.0.0 Delta CDF): when a downstream transform declares
+// incremental_inputs = ["<alias>"] for a transform-upstream edge, the
+// orchestration emitter writes the delta_table_cdf descriptor so the
+// runner does a CDF-bounded read plus watermark advance. Other inputs
+// on the same node keep the legacy bare-string Delta-table shape.
 func TestSyncOrchestrationEmitsIncrementalTransformInput(t *testing.T) {
 	t.Parallel()
 	ws, dir := pipelineForAttachTest(t)
@@ -306,7 +306,7 @@ module "silver" {
 	s := string(got)
 
 	for _, want := range []string{
-		`kind = "iceberg_table_incremental"`,
+		`kind = "delta_table_cdf"`,
 		`alias = "silver__bronze"`,
 		`module.bronze.outputs["default"].catalog_db`,
 	} {
@@ -317,8 +317,13 @@ module "silver" {
 	// Bronze (no incremental_inputs) should keep the legacy bare-string
 	// shape against its source — but bronze here has no upstreams, so
 	// just check we haven't accidentally promoted everything to dict.
-	if strings.Count(s, "iceberg_table_incremental") != 1 {
-		t.Errorf("expected exactly one iceberg_table_incremental block; got:\n%s", s)
+	if strings.Count(s, "delta_table_cdf") != 1 {
+		t.Errorf("expected exactly one delta_table_cdf block; got:\n%s", s)
+	}
+	// v2.0.0: Delta tables live under spark_catalog, so emitted
+	// identifiers must NOT carry the "clavesa." prefix.
+	if strings.Contains(s, `"clavesa.${module.`) {
+		t.Errorf("orchestration.tf still emits legacy clavesa. prefix:\n%s", s)
 	}
 }
 

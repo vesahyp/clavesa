@@ -67,7 +67,7 @@ export function NodePalette({ dir, onGraphUpdate }: NodePaletteProps) {
   const [error, setError] = useState<string | null>(null);
   // The user can stage a name before adding. Empty = let the backend
   // auto-generate (`transform1`, `transform2`, ...). A meaningful name
-  // here flows straight through to the Iceberg table id
+  // here flows straight through to the Delta table id
   // (`<name>__default`), so the SQL alias on downstream consumers and
   // the Catalog row label both come out readable from the first edit.
   const [pendingName, setPendingName] = useState<string>("");

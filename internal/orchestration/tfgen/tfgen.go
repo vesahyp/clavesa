@@ -43,6 +43,15 @@ type Pipeline struct {
 	// has a bucket. Typically "data.terraform_remote_state.workspace.outputs.pipeline_bucket".
 	BucketExpr string
 
+	// RunnerImageExpr is the HCL expression for the workspace's runner
+	// image ECR URI (e.g.
+	// `data.terraform_remote_state.workspace.outputs.runner_image`).
+	// ADR-018: runs_writer deploys as an image-based Lambda using this
+	// same image because Athena's Delta support is read-only and the
+	// Iceberg `INSERT INTO` path is gone; Spark+Delta from inside the
+	// runner image is the proven write path. Required.
+	RunnerImageExpr string
+
 	// ScheduleExpr is the HCL expression for an EventBridge schedule
 	// (e.g. "var.trigger_schedule"). The emitter wraps in a conditional
 	// at plan time — Terraform's count = X != null ? 1 : 0 pattern.
@@ -73,8 +82,8 @@ type Pipeline struct {
 // Payload as HCL values.
 type NodeMeta struct {
 	LambdaARNExpr  string // e.g. "module.bronze.lambda_function_arn"
-	InputsExpr     string // e.g. "{ bronze = \"clavesa.…\" }"
-	OutputsExpr    string // e.g. "{ default = { kind = \"iceberg_table\", … } }"
+	InputsExpr     string // e.g. "{ bronze = \"<db>.<table>\" }"
+	OutputsExpr    string // e.g. "{ default = { kind = \"delta_table\", … } }"
 	TimeoutSeconds int    // typically 300
 }
 
@@ -124,6 +133,9 @@ func (p Pipeline) validate() error {
 	if p.BucketExpr == "" {
 		return fmt.Errorf("tfgen: BucketExpr is required (runs_writer needs a bucket)")
 	}
+	if p.RunnerImageExpr == "" {
+		return fmt.Errorf("tfgen: RunnerImageExpr is required (runs_writer deploys as the runner image since ADR-018)")
+	}
 	for _, s := range p.StateMachine.States {
 		if s.Type == aslgen.Task {
 			if _, ok := p.NodeMeta[s.Name]; !ok {
@@ -163,11 +175,16 @@ func emitGlueCatalogDB(b *strings.Builder, p Pipeline) {
 	// terraform created. Schema isn't a literal (it's var.schema), so the
 	// encoded name is itself an HCL string with an embedded replace().
 	fmt.Fprintf(b, "# Glue catalog database — per-pipeline output namespace (ADR-016).\n")
+	fmt.Fprintf(b, "# location_uri is required for Spark's Glue Hive Client to resolve\n")
+	fmt.Fprintf(b, "# the DB's warehouse path on saveAsTable. Without it Hive trips\n")
+	fmt.Fprintf(b, "# `IllegalArgumentException: Can not create a Path from an empty string`.\n")
 	fmt.Fprintf(b, "resource \"aws_glue_catalog_database\" \"pipeline\" {\n")
-	fmt.Fprintf(b, "  name        = \"%s__${replace(%s, \"-\", \"_\")}\"\n",
+	fmt.Fprintf(b, "  name         = \"%s__${replace(%s, \"-\", \"_\")}\"\n",
 		safeCatalogLiteral(p.Catalog), p.SchemaExpr)
-	fmt.Fprintf(b, "  description = \"Clavesa pipeline output tables — ${%s}\"\n", p.PipelineNameExpr)
-	fmt.Fprintf(b, "  tags        = local.clavesa_tags\n")
+	fmt.Fprintf(b, "  description  = \"Clavesa pipeline output tables — ${%s}\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  location_uri = \"s3://${%s}/${%s}/_warehouse/%s__${replace(%s, \"-\", \"_\")}.db\"\n",
+		p.BucketExpr, p.PipelineNameExpr, safeCatalogLiteral(p.Catalog), p.SchemaExpr)
+	fmt.Fprintf(b, "  tags         = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
 }
 
@@ -406,7 +423,7 @@ func emitSchedule(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  rule     = aws_cloudwatch_event_rule.schedule[0].name\n")
 	fmt.Fprintf(b, "  arn      = aws_sfn_state_machine.pipeline.arn\n")
 	fmt.Fprintf(b, "  role_arn = aws_iam_role.events_trigger[0].arn\n\n")
-	fmt.Fprintf(b, "  # _trigger gets read by runs_writer (see runs_writer/index.py:TRIGGER_VALUES)\n")
+	fmt.Fprintf(b, "  # _trigger gets read by runs_writer (see runner/runner.py:_RUNS_TRIGGER_VALUES)\n")
 	fmt.Fprintf(b, "  # to label the row in `<system_catalog>__pipelines.runs.trigger`.\n")
 	fmt.Fprintf(b, "  input = jsonencode({\n")
 	fmt.Fprintf(b, "    pipeline = %s\n", p.PipelineNameExpr)
@@ -518,14 +535,38 @@ func emitPoller(b *strings.Builder, p Pipeline) {
 // ---------------------------------------------------------------------------
 
 func emitRunsWriter(b *strings.Builder, p Pipeline) {
-	fmt.Fprintf(b, "# runs_writer — tiny Python Lambda that appends one row per terminal SFN\n")
-	fmt.Fprintf(b, "# execution to <system_catalog>__pipelines.runs (Iceberg via Athena INSERT).\n")
-	fmt.Fprintf(b, "# Pairs with the runner-populated node_runs table; joining on\n")
-	fmt.Fprintf(b, "# sf_execution_arn answers \"which nodes ran in this execution?\".\n")
-	fmt.Fprintf(b, "data \"archive_file\" \"runs_writer\" {\n")
-	fmt.Fprintf(b, "  type        = \"zip\"\n")
-	fmt.Fprintf(b, "  source_dir  = \"${path.module}/%s/runs_writer\"\n", sidecarDirName)
-	fmt.Fprintf(b, "  output_path = \"${path.module}/%s/runs_writer.zip\"\n", sidecarDirName)
+	// ADR-018 (v2.0.0): runs_writer used to be a boto3-only Python zip
+	// Lambda that did `INSERT INTO <runs>` via Athena. With the swap to
+	// Delta, Athena's INSERT path is gone (Athena's Delta support is
+	// read-only). runs_writer now deploys as the same image-based
+	// Lambda the transform nodes use — the runner image already
+	// carries Spark + Delta + the IAM scope to write the workspace's
+	// system catalog. Cold start is heavier (~5s vs ~1s for the zip),
+	// but the path is proven and adds zero new packaging
+	// infrastructure (delta-rs in a zip would require a Lambda layer
+	// or in-archive pip install). The thin Lambda handler lives in
+	// runner.py as runs_writer_handler.
+	fmt.Fprintf(b, "# runs_writer — image-based Lambda that appends one row per\n")
+	fmt.Fprintf(b, "# terminal SFN execution to <system_catalog>__pipelines.runs (Delta\n")
+	fmt.Fprintf(b, "# via the runner image's Spark session, ADR-018). Pairs with the\n")
+	fmt.Fprintf(b, "# runner-populated node_runs table; joining on sf_execution_arn\n")
+	fmt.Fprintf(b, "# answers \"which nodes ran in this execution?\".\n")
+
+	// The Lambda is pinned to the runner image digest at plan time so
+	// the function picks up a freshly-pushed runner image without an
+	// explicit `terraform apply` to the Lambda — same content-
+	// addressed pattern modules/transform/aws/main.tf uses for runner
+	// nodes (`aws_ecr_image` data source).
+	fmt.Fprintf(b, "locals {\n")
+	fmt.Fprintf(b, "  runs_writer_image_match = regex(\"^([^:]+):(.+)$\", %s)\n", p.RunnerImageExpr)
+	fmt.Fprintf(b, "  runs_writer_repo_uri    = local.runs_writer_image_match[0]\n")
+	fmt.Fprintf(b, "  runs_writer_tag         = local.runs_writer_image_match[1]\n")
+	fmt.Fprintf(b, "  runs_writer_repo_name   = regex(\"^[^/]+/(.+)$\", local.runs_writer_repo_uri)[0]\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "data \"aws_ecr_image\" \"runs_writer\" {\n")
+	fmt.Fprintf(b, "  repository_name = local.runs_writer_repo_name\n")
+	fmt.Fprintf(b, "  image_tag       = local.runs_writer_tag\n")
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "data \"aws_iam_policy_document\" \"runs_writer_assume\" {\n")
@@ -544,7 +585,11 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
 
-	// IAM scoped to the workspace system catalog DB (ADR-016).
+	// IAM scoped to the workspace system catalog DB (ADR-016). Drops
+	// the Athena permissions the v1.x runs_writer needed for its
+	// `INSERT INTO` path; keeps Glue (for CREATE DATABASE / table
+	// metadata) and S3 (Delta writes the transaction log + parquet
+	// files directly).
 	sysCatalogSafe := safeCatalogLiteral(p.SystemCatalog)
 	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"runs_writer\" {\n")
 	fmt.Fprintf(b, "  name = \"clavesa-${%s}-runs-writer\"\n", p.PipelineNameExpr)
@@ -552,8 +597,7 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
 	fmt.Fprintf(b, "    Statement = [\n")
-	fmt.Fprintf(b, "      { Sid = \"AthenaQuery\", Effect = \"Allow\", Action = [\"athena:StartQueryExecution\", \"athena:GetQueryExecution\", \"athena:GetQueryResults\", \"athena:GetWorkGroup\"], Resource = \"*\" },\n")
-	fmt.Fprintf(b, "      { Sid = \"GlueCatalog\", Effect = \"Allow\", Action = [\"glue:GetDatabase\", \"glue:GetTable\", \"glue:GetTables\", \"glue:CreateTable\", \"glue:UpdateTable\", \"glue:GetPartition\", \"glue:GetPartitions\"], Resource = [\n")
+	fmt.Fprintf(b, "      { Sid = \"GlueCatalog\", Effect = \"Allow\", Action = [\"glue:GetDatabase\", \"glue:CreateDatabase\", \"glue:GetTable\", \"glue:GetTables\", \"glue:CreateTable\", \"glue:UpdateTable\", \"glue:GetPartition\", \"glue:GetPartitions\"], Resource = [\n")
 	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:catalog\",\n")
 	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__pipelines\",\n", sysCatalogSafe)
 	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:table/%s__pipelines/*\",\n", sysCatalogSafe)
@@ -568,18 +612,24 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"runs_writer\" {\n")
-	fmt.Fprintf(b, "  function_name    = \"clavesa-${%s}-runs-writer\"\n", p.PipelineNameExpr)
-	fmt.Fprintf(b, "  role             = aws_iam_role.runs_writer.arn\n")
-	fmt.Fprintf(b, "  runtime          = \"python3.12\"\n")
-	fmt.Fprintf(b, "  handler          = \"index.handler\"\n")
-	fmt.Fprintf(b, "  filename         = data.archive_file.runs_writer.output_path\n")
-	fmt.Fprintf(b, "  source_code_hash = data.archive_file.runs_writer.output_base64sha256\n")
-	fmt.Fprintf(b, "  timeout          = 60\n\n")
+	fmt.Fprintf(b, "  function_name = \"clavesa-${%s}-runs-writer\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  role          = aws_iam_role.runs_writer.arn\n")
+	fmt.Fprintf(b, "  package_type  = \"Image\"\n")
+	fmt.Fprintf(b, "  image_uri     = \"${local.runs_writer_repo_uri}@${data.aws_ecr_image.runs_writer.image_digest}\"\n")
+	fmt.Fprintf(b, "  timeout       = 120  # cold start ~5s + first Delta write ~30s on a fresh DB\n")
+	fmt.Fprintf(b, "  memory_size   = 1536 # PySpark needs the headroom even for one-row writes\n\n")
+	fmt.Fprintf(b, "  image_config {\n")
+	fmt.Fprintf(b, "    # Lambda invokes runner.runs_writer_handler — a thin handler in\n")
+	fmt.Fprintf(b, "    # runner.py that builds a runs-table row from the EventBridge\n")
+	fmt.Fprintf(b, "    # `detail` payload and calls _record_run() (Spark + Delta append).\n")
+	fmt.Fprintf(b, "    command = [\"runner.runs_writer_handler\"]\n")
+	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  environment {\n")
 	fmt.Fprintf(b, "    variables = {\n")
 	fmt.Fprintf(b, "      CLAVESA_PIPELINE         = %s\n", p.PipelineNameExpr)
-	fmt.Fprintf(b, "      CLAVESA_DATABASE         = \"%s__pipelines\"\n", sysCatalogSafe)
-	fmt.Fprintf(b, "      CLAVESA_WAREHOUSE_BUCKET = %s\n", p.BucketExpr)
+	fmt.Fprintf(b, "      CLAVESA_SYSTEM_CATALOG   = \"%s\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "      CLAVESA_SYSTEM_WAREHOUSE = \"s3://${%s}/_system/pipelines/\"\n", p.BucketExpr)
+	fmt.Fprintf(b, "      CLAVESA_WAREHOUSE        = \"s3://${%s}/${%s}/_warehouse/\"\n", p.BucketExpr, p.PipelineNameExpr)
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  tags = local.clavesa_tags\n")
@@ -587,7 +637,7 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 
 	fmt.Fprintf(b, "resource \"aws_cloudwatch_event_rule\" \"runs\" {\n")
 	fmt.Fprintf(b, "  name        = \"clavesa-${%s}-runs\"\n", p.PipelineNameExpr)
-	fmt.Fprintf(b, "  description = \"Captures terminal Step Functions execution events for ${%s} into the runs Iceberg table\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  description = \"Captures terminal Step Functions execution events for ${%s} into the runs Delta table\"\n", p.PipelineNameExpr)
 	fmt.Fprintf(b, "  event_pattern = jsonencode({\n")
 	fmt.Fprintf(b, "    source        = [\"aws.states\"]\n")
 	fmt.Fprintf(b, "    \"detail-type\" = [\"Step Functions Execution Status Change\"]\n")

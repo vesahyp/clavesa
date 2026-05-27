@@ -103,7 +103,7 @@ resource "aws_iam_role_policy" "lambda_exec" {
       {
         # ADR-016 cross-pipeline reads: transforms can address any
         # `<catalog>.<schema>.<table>` in the workspace, not just nodes
-        # in their own pipeline. The Iceberg data behind those tables
+        # in their own pipeline. The Delta data behind those tables
         # lives under every pipeline's warehouse prefix in the shared
         # workspace bucket. Grant read access to all warehouses + the
         # workspace system warehouse so cross-pipeline `inputs` resolve
@@ -132,14 +132,14 @@ resource "aws_iam_role_policy" "lambda_exec" {
         ]
         Resource = [
           "arn:aws:s3:::${var.bucket}",
-          # Iceberg warehouse — shared by all transforms in this pipeline.
+          # Delta warehouse — shared by all transforms in this pipeline.
           "arn:aws:s3:::${var.bucket}/${var.pipeline_name}/_warehouse/*",
           # Per-node path (legacy Parquet output, kept for path-mode writes
           # when a destination override sends data outside the warehouse).
           "arn:aws:s3:::${var.bucket}/${var.pipeline_name}/${var.name}/*",
           # Pipeline-shared watermarks (incremental processing, v0.12+).
           # One JSON object per partitioned source, written by the runner
-          # after a successful Iceberg commit.
+          # after a successful Delta commit.
           "arn:aws:s3:::${var.bucket}/${var.pipeline_name}/_watermarks/*",
           # Workspace-shared system warehouse — every pipeline's runner
           # appends to `node_runs` and `tables` here, distinguished by the
@@ -159,10 +159,16 @@ resource "aws_iam_role_policy" "lambda_exec" {
         # catalog OR the workspace system catalog. Cross-pipeline
         # reads are first-class; the per-pipeline scoping the prior
         # iteration carried meant a transform addressing a sibling
-        # pipeline's Iceberg table 403'd at the catalog lookup.
+        # pipeline's Delta table 403'd at the catalog lookup.
         # Wildcard `*` (Session F P2) is gone — other workspaces in
         # the same AWS account are now out of scope.
-        Sid    = "GlueDataCatalogIcebergRead"
+        #
+        # `database/default` is in the resource list because the Hive
+        # metastore client (sub-slice 15) probes Glue for the "default"
+        # DB during session init, regardless of whether the transform
+        # ever references it. Without this the very first `spark.sql`
+        # call 403s before any user SQL runs.
+        Sid    = "GlueDataCatalogRead"
         Effect = "Allow"
         Action = [
           "glue:GetDatabase",
@@ -174,6 +180,7 @@ resource "aws_iam_role_policy" "lambda_exec" {
         ]
         Resource = [
           "arn:aws:glue:*:*:catalog",
+          "arn:aws:glue:*:*:database/default",
           "arn:aws:glue:*:*:database/${local._safe_catalog}__*",
           "arn:aws:glue:*:*:table/${local._safe_catalog}__*/*",
           "arn:aws:glue:*:*:database/${replace(var.system_catalog, "-", "_")}__*",
@@ -186,7 +193,7 @@ resource "aws_iam_role_policy" "lambda_exec" {
         # tables append from every pipeline). Schema-ownership rule
         # (§5) is enforced via Slice 4's validator; the IAM here is
         # the second line of defence.
-        Sid    = "GlueDataCatalogIcebergWrite"
+        Sid    = "GlueDataCatalogWrite"
         Effect = "Allow"
         Action = [
           "glue:CreateTable",
@@ -204,6 +211,27 @@ resource "aws_iam_role_policy" "lambda_exec" {
           "arn:aws:glue:*:*:table/${local.catalog_db}/*",
           "arn:aws:glue:*:*:database/${replace(var.system_catalog, "-", "_")}__pipelines",
           "arn:aws:glue:*:*:table/${replace(var.system_catalog, "-", "_")}__pipelines/*",
+        ]
+      },
+      {
+        # First-run database creation. The Hive-metastore-over-Glue
+        # path (sub-slice 15) goes through `CREATE DATABASE IF NOT
+        # EXISTS <catalog>__<schema>` on first transform write,
+        # which Glue serves via `glue:CreateDatabase`. The action
+        # is catalog-scoped (you cannot name an unborn database in
+        # an ARN), but the GlueDataCatalogWrite statement above
+        # still restricts every other write action to this pipeline's
+        # own DB. Without this, the first run of a freshly-deployed
+        # pipeline 403s at metastore init.
+        Sid    = "GlueDataCatalogDatabaseCreate"
+        Effect = "Allow"
+        Action = [
+          "glue:CreateDatabase",
+        ]
+        Resource = [
+          "arn:aws:glue:*:*:catalog",
+          "arn:aws:glue:*:*:database/${local.catalog_db}",
+          "arn:aws:glue:*:*:database/${replace(var.system_catalog, "-", "_")}__pipelines",
         ]
       },
     ]
@@ -263,7 +291,8 @@ resource "aws_lambda_function" "runner" {
       # node_runs / tables writes here; the `pipelines` schema is hard-
       # coded on the runner side (workspace-wide, multi-writer).
       CLAVESA_SYSTEM_CATALOG      = var.system_catalog
-      # Iceberg warehouse path — runner uses GlueCatalog when this is s3://.
+      # Delta warehouse path — runner federates against the Glue Data
+      # Catalog (Hive metastore protocol) when this is s3://.
       CLAVESA_WAREHOUSE           = "s3://${var.bucket}/${var.pipeline_name}/_warehouse/"
       # Workspace-shared system warehouse — node_runs / tables land here
       # regardless of which pipeline's runner writes them, so two pipelines

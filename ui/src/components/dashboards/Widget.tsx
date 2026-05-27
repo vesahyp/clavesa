@@ -46,6 +46,7 @@ import {
 import { formatRowCount } from "@/lib/format";
 
 import { WidgetShell } from "./WidgetShell";
+import { WorldMap } from "./WorldMap";
 
 interface WidgetProps {
   widget: DashboardWidget;
@@ -80,6 +81,7 @@ const KNOWN_TYPES = new Set([
   "pie",
   "donut",
   "table",
+  "world_map",
 ]);
 
 export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps) {
@@ -171,6 +173,15 @@ function WidgetBody({ widget, data }: WidgetBodyProps) {
       return <PieBody widget={widget} data={data} variant="donut" />;
     case "table":
       return <TableBody2 data={data} />;
+    case "world_map":
+      return (
+        <WorldMap
+          data={data}
+          regionField={widget.region_field ?? ""}
+          valueField={widget.value_field ?? ""}
+          tooltipField={widget.tooltip_field ?? ""}
+        />
+      );
     default:
       return <UnknownTypeHint type={widget.type} />;
   }

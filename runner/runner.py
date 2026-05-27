@@ -544,131 +544,125 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         fmt = str(src.get("format") or "parquet").lower()
         return _read_path_format(spark, path, fmt), None
 
-    if kind == "iceberg_table_incremental":
-        # v0.24.0: snapshot-bounded read on an Iceberg upstream. Same
-        # watermark machinery as `partitioned_path` (best-effort
-        # advance after outputs commit), keyed on a single Iceberg
-        # snapshot id instead of a partition cursor. Used when a
-        # downstream transform should process only rows committed
-        # since its last successful run, not the whole upstream table.
+    if kind == "delta_table_cdf":
+        # v2.0.0 (ADR-018): CDF-based incremental read on a Delta upstream.
+        # Same watermark machinery as `partitioned_path` (best-effort advance
+        # after outputs commit); the cursor is a Delta commit version
+        # (int, JSON-serialised as string) instead of an Iceberg snapshot id.
         #
-        # Descriptor:
-        #   {"kind": "iceberg_table_incremental",
-        #    "table": "clavesa.<db>.<table>",
-        #    "alias": "<consumer_node>__<input_alias>"}
+        # Descriptor shape:
+        #   {"kind": "delta_table_cdf",
+        #    "table": "<db>.<table>",
+        #    "alias": "<consumer_node>__<input_alias>",
+        #    "merge_keys": ["k1", "k2"]}  # optional
         #
         # alias scopes the watermark file so two consumers reading the
-        # same upstream don't share state (each advances at its own
-        # pace; producer commits land in both watermark files
-        # independently).
+        # same upstream don't share state.
+        from pyspark.sql import functions as F  # noqa: PLC0415
+
         table = src["table"]
         alias_key = str(src.get("alias") or alias)
-        # `.history` reflects the current lineage of the table; the last
-        # row (most recent made_current_at) is the head. `.snapshots`
-        # includes orphaned snapshots from prior createOrReplace cycles,
-        # so MAX(committed_at) there can return a snapshot that isn't
-        # actually the table's current root — which would then fail the
-        # incremental scan with a confusing "not a parent ancestor"
-        # error. Using `.history` is the contract-correct way to ask
-        # "what is the current head".
-        snapshots_query = (
-            f"SELECT snapshot_id FROM {table}.history "
-            f"ORDER BY made_current_at DESC LIMIT 1"
+        merge_keys = [str(k) for k in (src.get("merge_keys") or [])]
+
+        history_df = spark.sql(f"DESCRIBE HISTORY {table}")
+        head_row = (
+            history_df.orderBy(F.col("version").desc()).select("version").limit(1).first()
         )
-        current_row = spark.sql(snapshots_query).first()
-        if current_row is None:
+        if head_row is None:
             print(
-                f"[clavesa] input {alias!r}: upstream {table} has no snapshots yet; skipping run",
+                f"[clavesa] input {alias!r}: upstream {table} has no commits yet; skipping run",
                 file=sys.stderr,
             )
             return None, None
-        current_snapshot = int(current_row[0])
+        current_version = int(head_row[0])
         watermark_uri = _watermark_uri(alias_key)
         stored = _read_watermark(watermark_uri)
-        last_snapshot: int | None = None
+        last_version: int | None = None
         if stored is not None and len(stored) == 1:
             try:
-                last_snapshot = int(stored[0])
+                last_version = int(stored[0])
             except ValueError:
-                last_snapshot = None
-        if last_snapshot is None:
+                last_version = None
+        if last_version is None:
             # First run for this (consumer, upstream) pair: full read,
-            # advance watermark to the current snapshot. Same semantic
-            # as start_from="all" on a partitioned source.
+            # advance watermark to current_version.
             print(
-                f"[clavesa] input {alias!r}: first incremental run on {table}; reading full snapshot {current_snapshot}",
+                f"[clavesa] input {alias!r}: first incremental run on {table}; reading full snapshot at version {current_version}",
                 file=sys.stderr,
             )
             return spark.table(table), {
                 "uri": watermark_uri,
-                "new_cursor": (str(current_snapshot),),
+                "new_cursor": (str(current_version),),
             }
-        if last_snapshot == current_snapshot:
-            # No new commits since last run. Skip.
+        if last_version == current_version:
             print(
-                f"[clavesa] input {alias!r}: upstream {table} unchanged since snapshot {current_snapshot}; skipping run",
+                f"[clavesa] input {alias!r}: upstream {table} unchanged since version {current_version}; skipping run",
                 file=sys.stderr,
             )
             return None, None
-        # Try the snapshot-bounded read. If the watermark snapshot is no
-        # longer in the table's lineage (a `mode = "replace"` upstream
-        # rewrote the tree, garbage collection expired the old snapshot,
-        # etc.), Iceberg raises "Starting snapshot ... is not a parent
-        # ancestor of end snapshot". Fall back to a full read +
-        # watermark reset — same semantic as first-run, bounded by the
-        # upstream's current size. Done as a try/except instead of an
-        # ancestor pre-check because Iceberg's `.history` view doesn't
-        # cleanly distinguish in-lineage from orphaned snapshots after a
-        # createOrReplace rewrite; the exception is the authoritative
-        # signal.
-        # Walk the parent chain of `current_snapshot` to confirm
-        # `last_snapshot` is in lineage. A `mode = "replace"` upstream
-        # re-roots the table on every run, so the previous watermark
-        # snapshot ends up orphaned — its row still exists in
-        # `<table>.snapshots` but it isn't an ancestor of the new
-        # current. An incremental read would fail with "Starting
-        # snapshot ... is not a parent ancestor of end snapshot"; pre-
-        # detecting via the parent chain gives us a clean fallback
-        # (full read + watermark reset) instead of a confusing runtime
-        # error halfway through the transform.
-        parents_rows = spark.sql(
-            f"SELECT snapshot_id, parent_id FROM {table}.snapshots"
-        ).collect()
-        parents: dict[int, int | None] = {}
-        for row in parents_rows:
-            pid = row[1]
-            parents[int(row[0])] = int(pid) if pid is not None else None
-        cursor_node: int | None = current_snapshot
-        found = False
-        while cursor_node is not None:
-            if cursor_node == last_snapshot:
-                found = True
-                break
-            cursor_node = parents.get(cursor_node)
-        if not found:
+        if last_version > current_version:
+            # Upstream was rewritten (DROP + CREATE resets Delta's version
+            # counter to zero). Delta versions are monotonic linear
+            # integers — no parent-chain DAG to walk, just compare. Fall
+            # back to full read + watermark reset, same semantic as the
+            # Iceberg-side "orphan snapshot" fallback.
             print(
                 f"[clavesa] input {alias!r}: upstream {table} was rewritten "
-                f"(watermark snapshot {last_snapshot} is not an ancestor of current snapshot {current_snapshot}); "
+                f"(watermark version {last_version} > current {current_version}); "
                 f"falling back to full read and re-stamping watermark",
                 file=sys.stderr,
             )
             return spark.table(table), {
                 "uri": watermark_uri,
-                "new_cursor": (str(current_snapshot),),
+                "new_cursor": (str(current_version),),
             }
+        # CDF read over (last_version, current_version]. Delta's
+        # readChangeFeed `startingVersion` is INCLUSIVE; offset by +1 to
+        # get open-closed semantics that match the prior Iceberg snapshot
+        # range and don't re-emit rows already consumed at last_version.
         df = (
-            spark.read
-            .option("start-snapshot-id", str(last_snapshot))
-            .option("end-snapshot-id", str(current_snapshot))
+            spark.read.format("delta")
+            .option("readChangeFeed", "true")
+            .option("startingVersion", last_version + 1)
+            .option("endingVersion", current_version)
             .table(table)
         )
+        # Keep post-image rows only. For mode=merge upstreams, MERGE emits
+        # update_preimage + update_postimage pairs; we want the post-image.
+        # For mode=append upstreams, only `insert` rows surface. DELETE
+        # rows would surface for explicit DELETE upstreams but clavesa
+        # doesn't author those today.
+        df = df.where(F.col("_change_type").isin("insert", "update_postimage"))
+        if merge_keys:
+            # Dedupe to latest row per merge key within the CDF range. The
+            # same key may have been updated multiple times across the
+            # range (e.g. cloudfront-analytics silver re-MERGEs the same
+            # request_id when subsequent log lines mutate the row);
+            # row_number() over _commit_version DESC keeps the freshest.
+            # Delta's commit ordering is the natural tie-breaker; the
+            # v1.x `recency_column` design is obsolete under CDF.
+            from pyspark.sql import Window  # noqa: PLC0415
+
+            w = Window.partitionBy(*merge_keys).orderBy(F.col("_commit_version").desc())
+            df = (
+                df.withColumn("__clavesa_rn", F.row_number().over(w))
+                .where("__clavesa_rn = 1")
+                .drop("__clavesa_rn")
+            )
+            print(
+                f"[clavesa] input {alias!r}: deduped CDF range on {merge_keys} by _commit_version",
+                file=sys.stderr,
+            )
+        # Strip CDF metadata columns so the user transform sees the
+        # natural table shape, not the CDC envelope.
+        df = df.drop("_change_type", "_commit_version", "_commit_timestamp")
         print(
-            f"[clavesa] input {alias!r}: reading {table} snapshot range ({last_snapshot}, {current_snapshot}]",
+            f"[clavesa] input {alias!r}: reading {table} CDF range ({last_version}, {current_version}]",
             file=sys.stderr,
         )
         return df, {
             "uri": watermark_uri,
-            "new_cursor": (str(current_snapshot),),
+            "new_cursor": (str(current_version),),
         }
 
     if kind == "partitioned_path":
@@ -726,10 +720,10 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
 
 
 def _resolve_output(key: str, dest: Any) -> dict[str, Any]:
-    """Returns {kind: "path"|"iceberg_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...]}.
+    """Returns {kind: "path"|"delta_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...]}.
 
     String forms map to the existing semantics:
-      "" or "<id>" → iceberg_table, mode=replace
+      "" or "<id>" → delta_table, mode=replace
       "/path" or "s3://..." → path, mode=replace
     Dict form (v0.12+) carries an explicit mode. `mode = "merge"` requires
     a non-empty `merge_keys` list naming the columns that uniquely identify
@@ -739,12 +733,12 @@ def _resolve_output(key: str, dest: Any) -> dict[str, Any]:
         if dest and _looks_like_path(dest):
             return {"kind": "path", "target": dest, "mode": "replace", "merge_keys": []}
         target = dest if dest else _table_id_for(key)
-        return {"kind": "iceberg_table", "target": target, "mode": "replace", "merge_keys": []}
+        return {"kind": "delta_table", "target": target, "mode": "replace", "merge_keys": []}
 
     if not isinstance(dest, dict):
         raise TypeError(f"output {key!r}: unsupported descriptor type {type(dest).__name__}")
 
-    kind = dest.get("kind", "iceberg_table")
+    kind = dest.get("kind", "delta_table")
     merge_keys = list(dest.get("merge_keys") or [])
     # When merge_keys is declared and mode is unset, default to merge —
     # saves users from picking the right semantics every time.
@@ -754,7 +748,7 @@ def _resolve_output(key: str, dest: Any) -> dict[str, Any]:
     if mode == "merge" and not merge_keys:
         raise RuntimeError(f"output {key!r}: mode='merge' requires non-empty merge_keys")
     target = dest.get("target") or dest.get("table_id") or dest.get("path") or ""
-    if kind == "iceberg_table" and not target:
+    if kind == "delta_table" and not target:
         target = _table_id_for(key)
     stats = bool(dest.get("stats"))
     return {
@@ -810,18 +804,59 @@ def _system_glue_db() -> str:
     return f"{system_catalog.replace('-', '_')}__{_SYSTEM_SCHEMA}"
 
 
-def _table_id_for(output_key: str) -> str:
-    """Auto-generated Iceberg table identifier for a transform output.
+def _ensure_database(spark, db_part: str) -> None:
+    """`CREATE DATABASE IF NOT EXISTS` with the right LOCATION clause.
 
-    Three-segment Spark identifier: `clavesa.<glue_db>.<table>` —
-    first segment is the Spark catalog name (configured in `_spark()` —
-    always literal `clavesa` since Iceberg's SparkCatalog can't
-    filter Glue by namespace prefix); second is the Glue DB name from
-    `_glue_db()` which encodes ADR-016's (catalog, schema) pair; third
-    is `<node>__<output_key>`.
+    Hive metastore federation to Glue (sub-slice 15) registers a new DB
+    with an empty LOCATION when `CREATE DATABASE IF NOT EXISTS <db>`
+    runs without an explicit LOCATION; the subsequent `saveAsTable`
+    then trips ``IllegalArgumentException: Can not create a Path from
+    an empty string`` while computing the table's default path under
+    the DB's warehouse dir.
+
+    The fix is to pin the DB's LOCATION at create time. The base is:
+      - ``CLAVESA_SYSTEM_WAREHOUSE`` for the workspace system DB
+        (``<system_catalog>__pipelines``) — shared across pipelines.
+      - ``CLAVESA_WAREHOUSE`` for the per-pipeline user DB.
+      - ``spark.sql.warehouse.dir`` (set from CLAVESA_WAREHOUSE by
+        spark_conf.py) as a defensive fallback.
+    Each table inside the DB will then land at
+    ``<base>/<db_part>.db/<table>/`` — the same default the Hive
+    metastore would have computed had its own warehouse-dir been set.
+
+    Idempotent: if the DB already exists, Hive's ``IF NOT EXISTS`` skips
+    the create entirely and the LOCATION clause is ignored.
+    """
+    system_db = _system_glue_db()
+    if db_part == system_db:
+        base = os.environ.get("CLAVESA_SYSTEM_WAREHOUSE") or os.environ.get(
+            "CLAVESA_WAREHOUSE", ""
+        )
+    else:
+        base = os.environ.get("CLAVESA_WAREHOUSE", "")
+    base = base.rstrip("/")
+    if base:
+        spark.sql(
+            f"CREATE DATABASE IF NOT EXISTS {db_part} LOCATION '{base}/{db_part}.db'"
+        )
+    else:
+        # Local / preview: spark.sql.warehouse.dir is configured and
+        # Hive's local-warehouse resolution kicks in. No LOCATION needed.
+        _ensure_database(spark, db_part)
+
+
+def _table_id_for(output_key: str) -> str:
+    """Auto-generated Delta table identifier for a transform output.
+
+    Two-segment Spark identifier `<glue_db>.<table>` — the table resolves
+    through Spark's default session catalog (`spark_catalog`) which our
+    DeltaCatalog wraps. ADR-018 dropped the legacy `clavesa.` catalog
+    prefix the Iceberg SparkCatalog required. `<glue_db>` comes from
+    `_glue_db()` (ADR-016's flat-encoded catalog__schema); `<table>` is
+    `<node>__<output_key>`.
     """
     node = os.environ.get("CLAVESA_NODE", "node")
-    return f"clavesa.{_glue_db()}.{node}__{output_key}"
+    return f"{_glue_db()}.{node}__{output_key}"
 
 
 def _evolve_target_schema(spark, target: str, staging: str) -> list[str]:
@@ -877,6 +912,12 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
         return {"status": "ok", "operation": op, "staging_dropped": staging}
 
     if op == "backfill_promote":
+        backfill_props = {
+            "clavesa.trigger": "backfill",
+            "clavesa.run-id": event.get("_sf_execution_arn") or event.get("run_id") or "",
+        }
+        _apply_snapshot_props(backfill_props)
+
         staging = event["staging"]
         target = event["target"]
         mode = event.get("mode", "merge")
@@ -917,7 +958,9 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
                 # column resolution holds even when the schemas drifted
                 # in either direction — positional `INSERT INTO target
                 # SELECT *` would error on arity mismatch.
-                spark.table(staging).writeTo(target).option("mergeSchema", "true").append()
+                spark.table(staging).write.format("delta").mode("append").option(
+                    "mergeSchema", "true"
+                ).saveAsTable(target)
             else:
                 raise RuntimeError(
                     "backfill_promote append: append-mode targets need force_dedup or allow_duplicates"
@@ -939,20 +982,27 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError(f"unknown _operation: {op!r}")
 
 
-def _apply_snapshot_props(writer, props):
-    """Stamp clavesa provenance into the Iceberg snapshot summary.
+def _apply_snapshot_props(props):
+    """Stamp clavesa provenance into Delta's commit metadata for this session.
 
-    Each key becomes a `snapshot-property.<key>` write option, which Iceberg
-    copies verbatim into the snapshot's `summary` map. The table timeline then
-    shows whether an append came from a backfill, an event trigger, a
-    schedule, or a manual run. Empty values are skipped — a snapshot written
-    outside clavesa carries no `clavesa.*` keys, and that absence reads
-    as "external / manual" downstream.
+    Sets `spark.databricks.delta.commitInfo.userMetadata` to a JSON-encoded
+    copy of ``props`` on the active Spark session. Every Delta commit
+    produced after this call — DataFrame writes AND SparkSQL ``MERGE INTO``
+    statements alike — carries the same userMetadata payload, surfaced via
+    ``DESCRIBE HISTORY <table>``. The session-conf approach is preferred
+    over per-writer ``.option("userMetadata", ...)`` because the latter
+    doesn't cover MERGE (a SQL statement, not a DataFrameWriter), and we
+    want uniform provenance across all write shapes in a single run.
+
+    No-op on empty / None ``props`` — leaves any prior scope's userMetadata
+    in place rather than clearing it.
     """
-    for key, val in props.items():
-        if val:
-            writer = writer.option(f"snapshot-property.{key}", str(val))
-    return writer
+    if not props:
+        return
+    _spark().conf.set(
+        "spark.databricks.delta.commitInfo.userMetadata",
+        json.dumps(props),
+    )
 
 
 def _run_transform(event, context, run_id=""):  # noqa: ARG001
@@ -967,18 +1017,18 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
       }
 
     Each descriptor is either:
-      - string: an S3 URI / local path / Iceberg table id (existing semantics).
+      - string: an S3 URI / local path / Delta table id (existing semantics).
       - dict (input):  {"kind": "partitioned_path", "path": "s3://...",
                         "partitions": [...], "start_from": "..."}
         Runner walks the partition tree, filters by stored watermark, reads
         only new partitions, and advances the watermark on success.
-      - dict (output): {"kind": "iceberg_table", "table_id": "<id>"|"",
+      - dict (output): {"kind": "delta_table", "table_id": "<id>"|"",
                         "mode": "replace"|"append"}
         Mode "append" switches the writer from createOrReplace to append.
 
-    Output routing (per ADR-013):
+    Output routing (per ADR-018):
       - Path (contains "/"): plain Parquet at the destination.
-      - Empty / identifier:  Iceberg table at `clavesa.<glue_db>.<node>__<key>`,
+      - Empty / identifier:  Delta table at `<glue_db>.<node>__<key>`,
         where `<glue_db>` follows the ADR-016 `_glue_db()` encoding of
         the (workspace_catalog, pipeline_schema) env pair.
 
@@ -1026,6 +1076,7 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             or ""
         )
     snapshot_props = {"clavesa.trigger": trigger, "clavesa.run-id": run_id}
+    _apply_snapshot_props(snapshot_props)
 
     logic = _read_text(logic_path)
     spark = _spark()
@@ -1070,19 +1121,19 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
         if backfill and key in backfill_targets:
             # Redirect this output to its staging table; always replace so
             # backfill retries rewrite the staging cleanly.
-            spec = {**spec, "kind": "iceberg_table", "target": backfill_targets[key],
+            spec = {**spec, "kind": "delta_table", "target": backfill_targets[key],
                     "mode": "replace", "merge_keys": []}
         if spec["kind"] == "path":
             df.write.mode("overwrite").parquet(spec["target"])
         else:
             table_id = spec["target"]
             db_part = table_id.rsplit(".", 1)[0]
-            spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {db_part}")
+            _ensure_database(spark, db_part)
             if spec["mode"] == "merge":
                 # First run: no target yet, MERGE has nothing to match
                 # against. Create the table and skip MERGE for this run.
                 if not spark.catalog.tableExists(table_id):
-                    _apply_snapshot_props(df.writeTo(table_id), snapshot_props).create()
+                    df.write.format("delta").mode("overwrite").saveAsTable(table_id)
                 else:
                     staging = f"__merge_src_{key}"
                     df.createOrReplaceTempView(staging)
@@ -1095,18 +1146,12 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                         f"WHEN MATCHED THEN UPDATE SET * "
                         f"WHEN NOT MATCHED THEN INSERT *"
                     )
+            elif spec["mode"] == "append":
+                # Delta's mode("append").saveAsTable auto-creates if the
+                # table doesn't exist yet; no need to branch on tableExists.
+                df.write.format("delta").mode("append").saveAsTable(table_id)
             else:
-                writer = _apply_snapshot_props(df.writeTo(table_id), snapshot_props)
-                if spec["mode"] == "append":
-                    # Iceberg's .append() fails on a non-existent table; .create()
-                    # fails when one exists. Branch on whether the table is already
-                    # registered in the catalog.
-                    if spark.catalog.tableExists(table_id):
-                        writer.append()
-                    else:
-                        writer.create()
-                else:
-                    writer.createOrReplace()
+                df.write.format("delta").mode("overwrite").saveAsTable(table_id)
         written[key] = spec["target"]
 
         # Per-output opt-in column statistics (v0.24+). Computed off the
@@ -1114,7 +1159,7 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
         # for replace-mode outputs and the rows this run contributed for
         # append/merge — best-effort; a stats-write failure logs but does
         # not mask the transform outcome.
-        if spec.get("stats") and spec["kind"] == "iceberg_table" and not (backfill and key in backfill_targets):
+        if spec.get("stats") and spec["kind"] == "delta_table" and not (backfill and key in backfill_targets):
             try:
                 _emit_column_stats(
                     spark=spark,
@@ -1263,12 +1308,13 @@ def _system_table_location(table_name: str) -> str | None:
 
 
 def _node_runs_table_id() -> str:
-    """clavesa.<system_glue_db>.node_runs — workspace-wide observability
-    table (ADR-016 "Workspace system catalog", v0.20.0). Every pipeline
-    appends here; the `pipeline` column distinguishes rows. Pre-v0.20
-    runs landed in the per-pipeline `<glue_db>.node_runs` instead.
+    """<system_glue_db>.node_runs — workspace-wide observability table
+    (ADR-016 "Workspace system catalog", v0.20.0). Every pipeline appends
+    here; the `pipeline` column distinguishes rows. Two-segment under
+    spark_catalog (ADR-018); pre-v0.20 runs landed in the per-pipeline
+    `<glue_db>.node_runs` instead.
     """
-    return f"clavesa.{_system_glue_db()}.node_runs"
+    return f"{_system_glue_db()}.node_runs"
 
 
 def _node_runs_schema():
@@ -1327,22 +1373,23 @@ def _record_node_run(row: dict[str, Any]) -> None:
     spark = _spark()
     table_id = _node_runs_table_id()
     db_part = table_id.rsplit(".", 1)[0]
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {db_part}")
+    _ensure_database(spark, db_part)
 
     df = spark.createDataFrame([row], schema=_node_runs_schema())
-    writer = df.writeTo(table_id).option("mergeSchema", "true")
-    if spark.catalog.tableExists(table_id):
-        writer.append()
-    else:
+    writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
+    if not spark.catalog.tableExists(table_id):
         location = _system_table_location("node_runs")
         if location:
-            writer = writer.tableProperty("location", location)
-        writer.create()
+            # Delta's external-location pin: .option("path", …) at first write
+            # registers the table at the workspace-shared system prefix instead
+            # of letting the metastore default it under the invoking pipeline.
+            writer = writer.option("path", location)
+    writer.saveAsTable(table_id)
 
 
 def _runs_table_id() -> str:
-    """clavesa.<system_glue_db>.runs — workspace-wide rollup table.
-    Every pipeline's executions land here; `pipeline` column filters.
+    """<system_glue_db>.runs — workspace-wide rollup table. Every
+    pipeline's executions land here; `pipeline` column filters.
 
     Cloud writes go through the runs_writer Lambda
     (`modules/orchestration/aws/runs_writer/`), which is also pointed at
@@ -1351,13 +1398,16 @@ def _runs_table_id() -> str:
     Schema and column order must stay in lockstep with the cloud writer
     or LocalProvider.Runs() will project mismatched values.
     """
-    return f"clavesa.{_system_glue_db()}.runs"
+    return f"{_system_glue_db()}.runs"
 
 
 def _runs_schema():
-    """Explicit Iceberg schema mirroring runs_writer/index.py::_ensure_table.
-    Same NOT-NULL discipline as _node_runs_schema for the same reason: an
-    inferred void column blocks subsequent string appends.
+    """Explicit Delta schema for the workspace runs table. Same NOT-NULL
+    discipline as _node_runs_schema for the same reason: an inferred
+    void column blocks subsequent string appends. ADR-018: this is the
+    single source of truth — the v1.x mirror in runs_writer/index.py
+    is gone, runs_writer_handler below writes via _record_run which
+    consults this schema directly.
     """
     from pyspark.sql.types import (  # noqa: PLC0415
         LongType,
@@ -1391,34 +1441,30 @@ def _record_run(row: dict[str, Any]) -> None:
     spark = _spark()
     table_id = _runs_table_id()
     db_part = table_id.rsplit(".", 1)[0]
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {db_part}")
+    _ensure_database(spark, db_part)
 
     df = spark.createDataFrame([row], schema=_runs_schema())
-    writer = df.writeTo(table_id).option("mergeSchema", "true")
-    if spark.catalog.tableExists(table_id):
-        writer.append()
-    else:
-        writer.create()
+    df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
 
 
 def _tables_table_id() -> str:
-    """clavesa.<system_glue_db>.tables — workspace-wide denormalized
-    snapshot metadata across every Iceberg output produced by every
-    pipeline. Lives in the system catalog's `pipelines` schema alongside
-    runs / node_runs (ADR-016 v0.20.0); `pipeline` column filters per
-    pipeline.
+    """<system_glue_db>.tables — workspace-wide denormalized snapshot
+    metadata across every Delta output produced by every pipeline. Lives
+    in the system catalog's `pipelines` schema alongside runs / node_runs
+    (ADR-016 v0.20.0); `pipeline` column filters per pipeline.
     """
-    return f"clavesa.{_system_glue_db()}.tables"
+    return f"{_system_glue_db()}.tables"
 
 
 def _tables_schema():
-    """One row per Iceberg-output write. Append-only history — query
+    """One row per Delta-output write. Append-only history — query
     `MAX(snapshot_ts) GROUP BY table_id` for current-state.
 
-    Mirrors the shape Databricks exposes via `system.information_schema`
-    + `<table>.snapshots`, but flattened across an entire pipeline so a
-    single SELECT answers "what tables does this pipeline produce, and
-    when were they last refreshed?".
+    Schema column names retain the Iceberg-era vocabulary
+    (`snapshot_id`, `snapshot_ts`) for v2.0.0 since they're already
+    populated in existing system tables and the data-shape stability is
+    more valuable than the rename. Under Delta the values are the commit
+    version (int) and the commit timestamp respectively.
     """
     from pyspark.sql.types import (  # noqa: PLC0415
         IntegerType,
@@ -1447,17 +1493,16 @@ def _tables_schema():
 
 
 def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | None:
-    """Append one row to <pipeline>.tables describing the latest snapshot
-    of `table_id`. Called after every Iceberg-mode output write.
+    """Append one row to <pipeline>.tables describing the latest commit of
+    `table_id`. Called after every Delta-mode output write.
 
-    Reads Iceberg's metadata-only `<table>.snapshots` view to source
-    snapshot_id / committed_at / summary — no data-file scan, just a
-    manifest read. Cheap.
+    Reads Delta's `DESCRIBE HISTORY` for version + timestamp +
+    operationMetrics + userMetadata. Cheap (transaction-log read, no
+    data-file scan).
 
-    Returns the latest snapshot's added-records count (or None if
-    summary didn't carry it) so the caller can accumulate output_rows
-    across all outputs for the node_runs row. Returning None on early
-    exit (no snapshots yet) keeps the caller's accumulation simple.
+    Returns the latest commit's added-records count (or None if metrics
+    didn't carry it) so the caller can accumulate output_rows across all
+    outputs for the node_runs row.
 
     Best-effort: a write failure logs to stderr and returns. Losing a
     metadata row is strictly better than failing a transform whose data
@@ -1465,21 +1510,26 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
     """
     spark = _spark()
 
-    # Iceberg's <table>.snapshots is its own metadata namespace; quote
-    # to avoid confusion with the literal 'snapshots' table name.
-    rows = spark.sql(
-        f"SELECT snapshot_id, committed_at, summary "
-        f"FROM {table_id}.snapshots "
-        f"ORDER BY committed_at DESC LIMIT 1"
-    ).collect()
-    if not rows:
+    # Pull the latest commit row. operationMetrics + userMetadata replace
+    # Iceberg's `summary` map.
+    from pyspark.sql import functions as F  # noqa: PLC0415
+
+    table_ident = table_id
+    hist_rows = (
+        spark.sql(f"DESCRIBE HISTORY {table_ident}")
+        .orderBy(F.col("version").desc())
+        .limit(1)
+        .collect()
+    )
+    if not hist_rows:
         return
 
-    snap = rows[0]
-    summary = snap["summary"] or {}
-
-    def _int_or_none(key: str) -> int | None:
-        raw = summary.get(key)
+    snap = hist_rows[0]
+    metrics_raw = snap["operationMetrics"] or {}
+    # operationMetrics is a Spark map<string,string>; values are str-typed
+    # regardless of operation. Normalise to int-or-None.
+    def _metric(key: str) -> int | None:
+        raw = metrics_raw.get(key)
         if raw is None:
             return None
         try:
@@ -1489,57 +1539,81 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
 
     pipeline = os.environ.get("CLAVESA_PIPELINE", "default")
     node = os.environ.get("CLAVESA_NODE", "node")
-    table_name = table_id.rsplit(".", 1)[-1]
+    table_name = table_ident.rsplit(".", 1)[-1]
 
-    file_count_raw = _int_or_none("total-data-files")
+    # operationMetrics keys vary by operation:
+    #   WRITE / append / overwrite → `numOutputRows`, `numOutputBytes`,
+    #     `numFiles`.
+    #   MERGE → `numTargetRowsInserted`, `numTargetRowsUpdated`,
+    #     `numTargetRowsDeleted`, `numTargetFilesAdded`,
+    #     `numTargetFilesRemoved`, `numTargetBytesAdded` /
+    #     `numTargetBytesRemoved`. There is no single
+    #     "current row count of the table" in metrics — that's a
+    #     full-table query, not a commit metric.
+    # For the row_count column we therefore report the rows touched by
+    # the latest commit, not the table-wide count. (v1.x's Iceberg
+    # `total-records` summary key WAS a table-wide count, but the
+    # Iceberg/Delta semantics diverge here; we accept the change.)
+    operation = snap["operation"] or ""
+    if "MERGE" in operation.upper():
+        # Touched rows = inserted + updated + deleted post-image side.
+        touched = (
+            (_metric("numTargetRowsInserted") or 0)
+            + (_metric("numTargetRowsUpdated") or 0)
+        )
+        row_count_val: int | None = touched if touched else None
+    else:
+        row_count_val = _metric("numOutputRows")
+
     row = {
         "pipeline": pipeline,
         "node": node,
         "output_key": output_key,
         "table_name": table_name,
         "table_id": table_id,
-        "snapshot_id": int(snap["snapshot_id"]),
-        "snapshot_ts": snap["committed_at"],
-        "row_count": _int_or_none("total-records"),
-        "file_count": file_count_raw,
-        "total_bytes": _int_or_none("total-files-size"),
+        "snapshot_id": int(snap["version"]),
+        "snapshot_ts": snap["timestamp"],
+        "row_count": row_count_val,
+        "file_count": _metric("numFiles") or _metric("numTargetFilesAdded"),
+        "total_bytes": _metric("numOutputBytes") or _metric("numTargetBytesAdded"),
         "last_writer_run_id": run_id,
     }
 
     tables_id = _tables_table_id()
     db_part = tables_id.rsplit(".", 1)[0]
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {db_part}")
+    _ensure_database(spark, db_part)
 
     df = spark.createDataFrame([row], schema=_tables_schema())
-    writer = df.writeTo(tables_id).option("mergeSchema", "true")
-    if spark.catalog.tableExists(tables_id):
-        writer.append()
-    else:
+    writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
+    if not spark.catalog.tableExists(tables_id):
         location = _system_table_location("tables")
         if location:
-            writer = writer.tableProperty("location", location)
-        writer.create()
+            writer = writer.option("path", location)
+    writer.saveAsTable(tables_id)
 
-    # Net rows this commit contributed = added-records - deleted-records.
+    # Net rows this commit contributed.
     #
-    # Why the subtraction: Iceberg's `added-records` counts rows in the
-    # new data files. For an append that's literally "new rows". For a
-    # COW merge, Iceberg rewrites entire data files in place — so
-    # `added-records` = "rows in the rewritten files" even when none of
-    # them actually changed value. An idempotent merge over a full-read
-    # dim_* transform (read 1k rows of enriched, GROUP BY → 80 distinct
-    # keys, MERGE into a dim with the same 80 keys) reports
-    # added=80/deleted=80, which used to surface as "80 rows written"
-    # despite the table being byte-identical afterwards.
-    #
-    # `added - deleted` collapses both cases honestly: append gives
-    # N - 0 = N; pure-update merge gives N - N = 0; insert-of-K into
-    # existing-N gives (N+K) - N = K. Replace (full overwrite) can
-    # come back negative when the new snapshot has fewer rows than the
-    # old; we clamp to >= 0 there since "Rows written: -3" is more
-    # confusing than informative.
-    added = _int_or_none("added-records")
-    deleted = _int_or_none("deleted-records")
+    # Mapping under Delta (operationMetrics):
+    #   - MERGE: `numTargetRowsInserted` is the added count; we ignore
+    #     `numTargetRowsUpdated` (existing rows mutated in place are not
+    #     "new rows" for the purpose of "Rows written"). `numTargetRowsDeleted`
+    #     is the deleted count.
+    #   - append: `numOutputRows` minus 0.
+    #   - overwrite / replace: `numOutputRows` is the new row count; we
+    #     don't have the previous-version row count here without an extra
+    #     query, so we report it as added. Matches the v1.x Iceberg branch
+    #     (added-records minus deleted-records) within the limits of what
+    #     Delta exposes per-commit.
+    # If a fresh operation surfaces a new key we haven't mapped, the call
+    # returns 0 rather than guessing — the system table still gets the row
+    # via the append above, only the accumulated output_rows count loses
+    # this commit's contribution.
+    if "MERGE" in operation.upper():
+        added = _metric("numTargetRowsInserted")
+        deleted = _metric("numTargetRowsDeleted")
+    else:
+        added = _metric("numOutputRows")
+        deleted = None
     if added is None:
         return None
     net = added - (deleted or 0)
@@ -1567,13 +1641,13 @@ _COLUMN_STATS_TOPK_MAX_COLUMNS = 20
 
 
 def _column_stats_table_id() -> str:
-    """clavesa.<system_glue_db>.column_stats — workspace-wide opt-in
-    column profile table (v0.24+). Multi-writer; `pipeline` / `node` /
+    """<system_glue_db>.column_stats — workspace-wide opt-in column
+    profile table (v0.24+). Multi-writer; `pipeline` / `node` /
     `output_key` columns scope each row, and `snapshot_id` joins to the
-    Iceberg snapshot the stats describe. Lives alongside node_runs /
+    Delta commit version the stats describe. Lives alongside node_runs /
     runs / tables in the system catalog's `pipelines` schema (ADR-016).
     """
-    return f"clavesa.{_system_glue_db()}.column_stats"
+    return f"{_system_glue_db()}.column_stats"
 
 
 def _column_stats_schema():
@@ -1640,21 +1714,33 @@ def _is_numeric_type(spark_type) -> bool:
 
 
 def _read_latest_snapshot(spark, table_identifier):
-    """Latest (snapshot_id, committed_at) from <table>.snapshots, or
-    (None, None) if no snapshots are visible yet — defensive: the write
-    we just performed should always produce one, but a brand-new table
-    where the catalog hasn't refreshed gets the safe (None, None)."""
+    """Latest (version, timestamp) from Delta's DESCRIBE HISTORY for the
+    given table, or (None, None) if no commits are visible yet — defensive:
+    the write we just performed should always produce one, but a brand-new
+    table where the catalog hasn't refreshed gets the safe (None, None).
+
+    Returns the same shape as the v1.x Iceberg signature
+    (snapshot_id, committed_at); under Delta the values are commit version
+    + commit timestamp respectively. Column-name compatibility on the
+    column_stats schema is the reason for keeping the function name and
+    return shape stable.
+    """
+    from pyspark.sql import functions as F  # noqa: PLC0415
+
+    table_ident = table_identifier
     try:
-        rows = spark.sql(
-            f"SELECT snapshot_id, committed_at "
-            f"FROM {table_identifier}.snapshots "
-            f"ORDER BY committed_at DESC LIMIT 1"
-        ).collect()
+        rows = (
+            spark.sql(f"DESCRIBE HISTORY {table_ident}")
+            .orderBy(F.col("version").desc())
+            .select("version", "timestamp")
+            .limit(1)
+            .collect()
+        )
     except Exception:  # noqa: BLE001
         return None, None
     if not rows:
         return None, None
-    return int(rows[0]["snapshot_id"]), rows[0]["committed_at"]
+    return int(rows[0]["version"]), rows[0]["timestamp"]
 
 
 def _emit_column_stats(*, spark, df, run_id, output_key, table_identifier):
@@ -1776,17 +1862,15 @@ def _record_column_stats(rows):
     spark = _spark()
     table_id = _column_stats_table_id()
     db_part = table_id.rsplit(".", 1)[0]
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {db_part}")
+    _ensure_database(spark, db_part)
 
     df = spark.createDataFrame(rows, schema=_column_stats_schema())
-    writer = df.writeTo(table_id).option("mergeSchema", "true")
-    if spark.catalog.tableExists(table_id):
-        writer.append()
-    else:
+    writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
+    if not spark.catalog.tableExists(table_id):
         location = _system_table_location("column_stats")
         if location:
-            writer = writer.tableProperty("location", location)
-        writer.create()
+            writer = writer.option("path", location)
+    writer.saveAsTable(table_id)
 
 
 def run_record_run() -> None:
@@ -1867,6 +1951,179 @@ def run_record_run() -> None:
             })
 
     print(json.dumps({"status": "ok"}), flush=True)
+
+
+_RUNS_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
+
+# Allowed values for runs.trigger. Each start path stamps one of these
+# into the SFN execution input under the `_trigger` key; runs_writer
+# reads it back via _runs_writer_extract_trigger and stores it on the
+# runs row. Keep this set in sync with the orchestration emitter
+# (tfgen.go) — adding a new trigger requires bumping both sides.
+_RUNS_TRIGGER_VALUES = frozenset({
+    "manual", "scheduled", "event", "backfill", "backfill-direct",
+})
+
+
+def _runs_writer_extract_trigger(raw_input):
+    """Read `_trigger` from the SFN execution input. The orchestration
+    emitter smuggles a value into `_trigger` from each known start path
+    (scheduled via EventBridge target, event via the SQS poller); manual
+    runs via console / CLI / `clavesa pipeline run-cloud` either set it
+    explicitly or leave it absent — default the latter to "manual" so
+    the column never reads as a missing-data NULL.
+
+    SFN's EventBridge payload presents `input` as a JSON-encoded string.
+    Old runs (or runs with malformed input) gracefully fall back to
+    "manual".
+    """
+    if not raw_input:
+        return "manual"
+    try:
+        parsed = json.loads(raw_input) if isinstance(raw_input, str) else raw_input
+    except (ValueError, TypeError):
+        return "manual"
+    if not isinstance(parsed, dict):
+        return "manual"
+    trig = parsed.get("_trigger")
+    if not isinstance(trig, str) or not trig.strip():
+        return "manual"
+    value = trig.strip()
+    if value not in _RUNS_TRIGGER_VALUES:
+        return "manual"
+    return value
+
+
+def _runs_writer_extract_target_table(raw_input):
+    """Pick the staging table id out of `_backfill.target_outputs` if
+    present. Backfill runs route each output to a parallel
+    `<target>__backfill__<run_id>` table; we record the staging id on
+    the runs row so the UI/CLI can find it later. v1: single-output
+    backfills are the only shape, so we report the first staging table
+    when there are multiple."""
+    if not raw_input:
+        return None
+    try:
+        parsed = json.loads(raw_input) if isinstance(raw_input, str) else raw_input
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    bf = parsed.get("_backfill")
+    if not isinstance(bf, dict):
+        return None
+    targets = bf.get("target_outputs")
+    if isinstance(targets, dict) and targets:
+        for k in sorted(targets):
+            v = targets[k]
+            if isinstance(v, str) and v:
+                return v
+    return None
+
+
+def _runs_writer_parse_cause(cause):
+    """Best-effort extraction of (error_msg, failed_step) from an SFN
+    cause. Lambda failure causes are JSON with errorMessage; state-
+    machine-level failures may be plain text. failed_step is not in the
+    EventBridge payload — leave empty and let callers query
+    GetExecutionHistory if they need it.
+    """
+    if not cause:
+        return "", ""
+    try:
+        parsed = json.loads(cause)
+        if isinstance(parsed, dict):
+            msg = parsed.get("errorMessage") or parsed.get("Cause") or cause
+            return _runs_writer_truncate(str(msg)), ""
+    except (ValueError, TypeError):
+        pass
+    return _runs_writer_truncate(cause), ""
+
+
+def _runs_writer_truncate(s, limit=4096):
+    if len(s) <= limit:
+        return s
+    return s[: limit - 3] + "..."
+
+
+def _runs_writer_build_row(detail):
+    """Translate one EventBridge `detail` payload into the dict shape
+    `_record_run` expects. Mirrors the v1.x boto3+Athena runs_writer
+    (internal/orchestration/sidecar/runs_writer/index.py:_build_row),
+    minus the Athena value rendering — the Delta path takes typed
+    values (datetime, int, None) directly.
+    """
+    sf_execution_arn = str(detail.get("executionArn") or "")
+    run_id = sf_execution_arn.rsplit(":", 1)[-1] if sf_execution_arn else ""
+
+    started_ms = detail.get("startDate")
+    stopped_ms = detail.get("stopDate")
+    duration_ms = None
+    if isinstance(started_ms, int) and isinstance(stopped_ms, int):
+        duration_ms = max(stopped_ms - started_ms, 0)
+
+    status = str(detail.get("status") or "")
+    failed_step = ""
+    error_class = ""
+    error_msg = None
+    if status != "SUCCEEDED":
+        error_class = _runs_writer_truncate(str(detail.get("error") or ""))
+        error_msg_raw, failed_step = _runs_writer_parse_cause(str(detail.get("cause") or ""))
+        error_msg = error_msg_raw or None
+
+    started_dt = None
+    if isinstance(started_ms, int) and started_ms > 0:
+        started_dt = _dt.datetime.fromtimestamp(started_ms / 1000, tz=_dt.timezone.utc)
+    ended_dt = None
+    if isinstance(stopped_ms, int) and stopped_ms > 0:
+        ended_dt = _dt.datetime.fromtimestamp(stopped_ms / 1000, tz=_dt.timezone.utc)
+
+    return {
+        "run_id": run_id,
+        "pipeline": os.environ.get("CLAVESA_PIPELINE", ""),
+        "sf_execution_arn": sf_execution_arn,
+        "status": status,
+        "trigger": _runs_writer_extract_trigger(detail.get("input")),
+        "target_table": _runs_writer_extract_target_table(detail.get("input")),
+        "started_at": started_dt,
+        "ended_at": ended_dt,
+        "duration_ms": duration_ms,
+        "failed_step": failed_step,
+        "error_class": error_class,
+        "error_msg": error_msg,
+    }
+
+
+def runs_writer_handler(event, context):
+    """Lambda entry point for the runs_writer image (ADR-018).
+
+    Replaces the v1.x boto3 + Athena `INSERT INTO` runs_writer
+    (internal/orchestration/sidecar/runs_writer/index.py). Athena's
+    Delta support is read-only, so INSERT won't work on the new Delta
+    runs table; instead we reuse the runner image — which already
+    carries Spark + Delta + the IAM scope to write any table in the
+    workspace catalog — and call `_record_run` directly.
+
+    Cold start is heavier than the zip Lambda (~5s vs ~1s) but the path
+    is proven; delta-rs in a zip was the alternative but adds non-
+    trivial packaging infrastructure (pip-install-into-source-dir or a
+    Lambda layer) for a write that fires once per terminal SFN run.
+
+    `started_at_ms` / `ended_at_ms` in the payload are kept for
+    backward-compat with the local CLAVESA_RECORD_RUN=1 stdin shape;
+    the EventBridge `detail` carries `startDate` / `stopDate` instead
+    so this handler does its own translation.
+    """
+    detail = (event or {}).get("detail") or {}
+    status = detail.get("status")
+    if status not in _RUNS_TERMINAL_STATUSES:
+        # RUNNING events fire too — only terminal states write a row;
+        # the "currently running" view comes from SFN ListExecutions.
+        return {"skipped": "non-terminal status: " + repr(status)}
+
+    row = _runs_writer_build_row(detail)
+    _record_run(row)
+    return {"ok": True, "run_id": row["run_id"], "status": status}
 
 
 def handler(event, context):
@@ -2041,14 +2298,14 @@ def run_query() -> None:
 def _start_connect_plugin() -> None:
     """Start the Spark Connect gRPC server inside this Python's py4j JVM.
 
-    Uses the SparkConnectPlugin mechanism (stable in Spark 3.5) — same JVM
-    that hosts our Iceberg catalog also exposes a Connect endpoint on the
-    configured port. Notebook REPL subprocesses (Slice 1) and the warm
-    worker's own /query handler both talk to it via gRPC, getting
-    per-session SparkSession isolation without separate driver JVMs.
+    Uses the SparkConnectPlugin mechanism. The same JVM that hosts our
+    Delta catalog also exposes a Connect endpoint on the configured port.
+    Notebook REPL subprocesses (Slice 1) and the warm worker's own /query
+    handler both talk to it via gRPC, getting per-session SparkSession
+    isolation without separate driver JVMs.
 
     Builds via the same py4j SparkSession.builder as _spark() so the
-    Iceberg catalog + S3A config from spark_conf is applied to the JVM
+    Delta catalog + S3A config from spark_conf is applied to the JVM
     that serves Connect clients.
     """
     from pyspark.sql import SparkSession  # noqa: PLC0415

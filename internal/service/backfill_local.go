@@ -47,8 +47,10 @@ type stagingSidecar struct {
 // stagingSidecarPath returns the absolute path of the sidecar JSON for the
 // given staging table. glueDB is the encoded `<catalog>__<schema>` namespace;
 // stagingTable is just the table-name segment (no `clavesa.<db>.` prefix).
+// The on-disk DB dir carries the Hive `<db>.db` suffix (v2.0.0 persistent
+// metastore) — the sidecar sits beside the table dir under that same prefix.
 func (s *Service) stagingSidecarPath(glueDB, stagingTable string) string {
-	return filepath.Join(workspace.LocalWarehouseDir(s.workspace), glueDB, stagingTable+".backfill.json")
+	return filepath.Join(workspace.LocalWarehouseDir(s.workspace), glueDB+".db", stagingTable+".backfill.json")
 }
 
 func (s *Service) writeStagingSidecar(glueDB, stagingTable string, sc stagingSidecar) error {
@@ -90,7 +92,7 @@ func (s *Service) deleteStagingSidecar(glueDB, stagingTable string) error {
 // sidecar — and a sidecar with no staging dir — are both skipped (would never
 // pair into a usable BackfillRun, so listing them just confuses the user).
 func (s *Service) listLocalStagingTables(glueDB string) ([]localStagingEntry, error) {
-	dbDir := filepath.Join(workspace.LocalWarehouseDir(s.workspace), glueDB)
+	dbDir := filepath.Join(workspace.LocalWarehouseDir(s.workspace), glueDB+".db")
 	entries, err := os.ReadDir(dbDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -252,7 +254,7 @@ func (s *Service) localTableDir(fullTableID string) (string, bool) {
 	if len(parts) != 3 {
 		return "", false
 	}
-	return filepath.Join(workspace.LocalWarehouseDir(s.workspace), parts[1], parts[2]), true
+	return filepath.Join(workspace.LocalWarehouseDir(s.workspace), parts[1]+".db", parts[2]), true
 }
 
 // readLocalIcebergColumns parses the latest metadata.json under tableDir and
@@ -599,7 +601,7 @@ func (s *Service) backfillListLocal(dir string) ([]BackfillRun, error) {
 			OutputKey:      e.Sidecar.OutputKey,
 			From:           e.Sidecar.From,
 			To:             e.Sidecar.To,
-			TargetTable:    fmt.Sprintf("clavesa.%s.%s", glueDB, e.StagingTable),
+			TargetTable:    fmt.Sprintf("%s.%s", glueDB, e.StagingTable),
 			CanonicalTable: e.Sidecar.CanonicalTable,
 			StartedAt:      e.Sidecar.StartedAt,
 			StoppedAt:      e.Sidecar.StoppedAt,

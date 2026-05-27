@@ -24,6 +24,7 @@ func TestEmit_Linear(t *testing.T) {
 		SchemaExpr:       "var.schema",
 		SystemCatalog:    "clavesa_x_system",
 		BucketExpr:       "data.terraform_remote_state.workspace.outputs.pipeline_bucket",
+		RunnerImageExpr:  "data.terraform_remote_state.workspace.outputs.runner_image",
 		ScheduleExpr:     "var.trigger_schedule",
 		BatchWindowExpr:  "var.trigger_batch_window",
 		StateMachine:     sm,
@@ -41,7 +42,8 @@ func TestEmit_Linear(t *testing.T) {
 		// Locals + Glue + log group + IAM
 		`local.clavesa_tags`,
 		`resource "aws_glue_catalog_database" "pipeline"`,
-		`name        = "clavesa_x__${replace(var.schema, "-", "_")}"`,
+		`name         = "clavesa_x__${replace(var.schema, "-", "_")}"`,
+		`location_uri = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_warehouse/clavesa_x__${replace(var.schema, "-", "_")}.db"`,
 		`resource "aws_cloudwatch_log_group" "sfn_logs"`,
 		`resource "aws_iam_role" "sfn_exec"`,
 		`resource "aws_iam_role_policy" "sfn_exec_policy"`,
@@ -57,9 +59,13 @@ func TestEmit_Linear(t *testing.T) {
 		// Schedule wiring (gated by var.trigger_schedule)
 		`resource "aws_cloudwatch_event_rule" "schedule"`,
 		`count = var.trigger_schedule != null ? 1 : 0`,
-		// runs_writer (always emitted)
+		// runs_writer (always emitted) — ADR-018: image-based Lambda
+		// using the runner image, no more Athena INSERT path.
 		`resource "aws_lambda_function" "runs_writer"`,
-		`CLAVESA_DATABASE         = "clavesa_x_system__pipelines"`,
+		`package_type  = "Image"`,
+		`command = ["runner.runs_writer_handler"]`,
+		`CLAVESA_SYSTEM_CATALOG   = "clavesa_x_system"`,
+		`data "aws_ecr_image" "runs_writer"`,
 		// Poller is skipped because no TriggerQueueExprs
 	}
 	for _, w := range wants {
@@ -90,6 +96,7 @@ func TestEmit_PollerEnabled(t *testing.T) {
 		SchemaExpr:        "var.schema",
 		SystemCatalog:     "c_system",
 		BucketExpr:        "data.x.outputs.b",
+		RunnerImageExpr:   "data.x.outputs.r",
 		BatchWindowExpr:   "var.trigger_batch_window",
 		TriggerQueueExprs: []string{"module.src_x.trigger_queue_arn", "module.src_y.trigger_queue_arn"},
 		StateMachine:      sm,
@@ -130,7 +137,8 @@ func TestEmit_CatchOnlyAtTopLevel(t *testing.T) {
 	out, err := Emit(Pipeline{
 		PipelineNameExpr: "var.pipeline_name",
 		Catalog:          "c", SchemaExpr: "var.schema", SystemCatalog: "c_system",
-		BucketExpr:   "data.x.outputs.b",
+		BucketExpr:      "data.x.outputs.b",
+		RunnerImageExpr: "data.x.outputs.r",
 		StateMachine: sm, NodeMeta: meta,
 	})
 	if err != nil {
@@ -196,7 +204,8 @@ func TestEmit_NestedFanout(t *testing.T) {
 	out, err := Emit(Pipeline{
 		PipelineNameExpr: "var.pipeline_name",
 		Catalog:          "c", SchemaExpr: "var.schema", SystemCatalog: "c_system",
-		BucketExpr:   "data.x.outputs.b",
+		BucketExpr:      "data.x.outputs.b",
+		RunnerImageExpr: "data.x.outputs.r",
 		StateMachine: sm, NodeMeta: meta,
 	})
 	if err != nil {

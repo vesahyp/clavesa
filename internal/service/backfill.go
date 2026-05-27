@@ -315,7 +315,7 @@ func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, 
 			OutputKey:      params[glueTagBackfillOutput],
 			From:           splitCursor(params[glueTagBackfillFrom]),
 			To:             splitCursor(params[glueTagBackfillTo]),
-			TargetTable:    fmt.Sprintf("clavesa.%s.%s", glueDB, name),
+			TargetTable:    fmt.Sprintf("%s.%s", glueDB, name),
 			CanonicalTable: params[glueTagBackfillCanon],
 			Status:         "ok",
 		}
@@ -719,6 +719,21 @@ func lastSegment(tableID string) string {
 	return tableID[i+1:]
 }
 
+// splitDBTable accepts either "<db>.<table>" or the legacy
+// "clavesa.<db>.<table>" three-part form for backward compatibility on
+// pipelines that still carry a stamped catalog from before sub-slice 8.
+func splitDBTable(fullTableID string) (db, table string, err error) {
+	parts := strings.Split(fullTableID, ".")
+	switch len(parts) {
+	case 2:
+		return parts[0], parts[1], nil
+	case 3:
+		return parts[1], parts[2], nil
+	default:
+		return "", "", fmt.Errorf("expected <db>.<table>, got %q", fullTableID)
+	}
+}
+
 func filepathBase(p string) string {
 	// Avoid importing path/filepath into this file twice — small helper.
 	i := strings.LastIndexAny(p, "/\\")
@@ -753,14 +768,15 @@ func canonicalFromLambdaEnv(ctx context.Context, lc *lambda.Client, functionName
 	}
 	db := identutil.EncodeGlueDatabase(catalog, schema)
 	outputKey := "default"
-	target := fmt.Sprintf("clavesa.%s.%s__%s", db, nodeID, outputKey)
+	target := fmt.Sprintf("%s.%s__%s", db, nodeID, outputKey)
 	return target, db, outputKey, nil
 }
 
-// canonicalTargetFor computes the canonical Iceberg table id (output-key
+// canonicalTargetFor computes the canonical Delta table id (output-key
 // "default") for the named transform, plus the Glue DB it lives in.
-// Tracks the same `clavesa.<glue_db>.<node>__<output>` shape the
-// runner uses in _table_id_for(key).
+// Tracks the same `<glue_db>.<node>__<output>` shape the runner uses in
+// _table_id_for(key) — two-part under Spark's default session catalog
+// (ADR-018; the v1.x `clavesa.<db>.<table>` prefix is gone).
 //
 // Used by List/Diff/Promote/Discard paths that don't have a single Lambda
 // to query — they fall back to the workspace manifest + pipeline name.
@@ -789,7 +805,7 @@ func (s *Service) canonicalTargetFor(node *graph.Node, pipelineDir, pipelineName
 	}
 	db := identutil.EncodeGlueDatabase(catalog, schema)
 	outputKey := "default"
-	target := fmt.Sprintf("clavesa.%s.%s__%s", db, node.ID, outputKey)
+	target := fmt.Sprintf("%s.%s__%s", db, node.ID, outputKey)
 	return target, db, outputKey, nil
 }
 
@@ -1060,15 +1076,16 @@ func athenaRowCount(ctx context.Context, ac *athena.Client, wg, out, table strin
 }
 
 func athenaTableExists(ctx context.Context, ac *athena.Client, wg, out, fullTableID string) (bool, error) {
-	// fullTableID looks like "clavesa.<db>.<name>". Athena queries against
-	// <db>.<name>; the catalog prefix doesn't survive INFORMATION_SCHEMA.
-	parts := strings.SplitN(fullTableID, ".", 3)
-	if len(parts) != 3 {
-		return false, fmt.Errorf("expected clavesa.<db>.<table>, got %q", fullTableID)
+	// fullTableID is "<db>.<name>" since sub-slice 8 retired the clavesa.
+	// prefix. Athena queries against <db>.<name>; INFORMATION_SCHEMA never
+	// carried the catalog level anyway.
+	db, table, err := splitDBTable(fullTableID)
+	if err != nil {
+		return false, err
 	}
 	rows, err := athenaQueryRows(ctx, ac, wg, out, fmt.Sprintf(
 		"SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s' LIMIT 1",
-		parts[1], parts[2],
+		db, table,
 	))
 	if err != nil {
 		return false, err
@@ -1093,13 +1110,13 @@ func athenaSchema(ctx context.Context, ac *athena.Client, wg, out, fullTableID s
 // to populate a dropdown. Cheap one-query lookup against
 // information_schema.columns.
 func athenaColumns(ctx context.Context, ac *athena.Client, wg, out, fullTableID string) ([]BackfillColumnInfo, error) {
-	parts := strings.SplitN(fullTableID, ".", 3)
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("expected clavesa.<db>.<table>, got %q", fullTableID)
+	db, table, err := splitDBTable(fullTableID)
+	if err != nil {
+		return nil, err
 	}
 	rows, err := athenaQueryRows(ctx, ac, wg, out, fmt.Sprintf(
 		"SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = '%s' AND table_name = '%s' ORDER BY ordinal_position",
-		parts[1], parts[2],
+		db, table,
 	))
 	if err != nil {
 		return nil, err

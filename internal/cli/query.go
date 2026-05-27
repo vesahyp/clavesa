@@ -23,15 +23,16 @@ func newQueryCmd() *cobra.Command {
 		Use:   "query [SQL]",
 		Short: "Run an ad-hoc SparkSQL query against the workspace catalog",
 		Long: `Run a free-form SparkSQL query through the warm Spark Connect
-container. The query runs against the workspace's local Hadoop catalog
-(catalog = clavesa.<workspace>__<schema>.<table>).
+container. The query runs against the workspace's local Hive metastore
+catalog where Delta tables resolve as <workspace>__<schema>.<table>
+(ADR-018; the v1.x `+"`clavesa.`"+` Iceberg-catalog prefix is gone).
 
 Reads SQL from the first positional arg, or from STDIN when none given.
 
 Examples:
-  clavesa query "SHOW NAMESPACES IN clavesa"
-  clavesa query "SELECT * FROM clavesa.clavesa_demo__demo.trips__default LIMIT 5"
-  echo "SELECT count(*) FROM clavesa.clavesa_demo__demo.trips__default" | clavesa query --json`,
+  clavesa query "SHOW DATABASES"
+  clavesa query "SELECT * FROM clavesa_demo__demo.trips__default LIMIT 5"
+  echo "SELECT count(*) FROM clavesa_demo__demo.trips__default" | clavesa query --json`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sql := ""

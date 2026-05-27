@@ -601,7 +601,19 @@ Examples:
 			// attr. ADR-014 binds parity here.
 			var cloudProv observability.Provider
 			if athenaClient != nil {
-				cloudProv = observability.NewCloudProvider(athenaClient, athenaOutputBucket, sfnClient, cwlClient)
+				cp := observability.NewCloudProvider(athenaClient, athenaOutputBucket, sfnClient, cwlClient)
+				// ADR-018: snapshot timeline reads Delta `_delta_log/`
+				// from S3 (Athena's Delta support is read-only and
+				// can't run `DESCRIBE HISTORY`). Wire the Glue+S3
+				// clients so Snapshots() can resolve the table's S3
+				// location and read its commit log.
+				if glueClient != nil {
+					cp = cp.WithGlue(glueClient)
+				}
+				if s3Client != nil {
+					cp = cp.WithS3(s3Client)
+				}
+				cloudProv = cp
 			}
 			// Warm-Spark-per-warehouse: the Catalog / dashboards / TableDetail
 			// surfaces fire many read queries on load, each previously paying

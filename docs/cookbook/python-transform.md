@@ -7,7 +7,7 @@ Same pipeline skeleton as the SQL recipes; the transform's `language` is `"pytho
 ## What you'll end up with
 
 - A pipeline with a Python-backed transform that imports any library on the runner image (pyspark, numpy; add to `runner/requirements.txt` and rebuild for more).
-- An Iceberg output table the same shape any SQL transform produces.
+- A Delta output table the same shape any SQL transform produces.
 - A `transforms/<name>.py` file checked into your workspace alongside the `.tf`, so the logic is reviewable and version-controlled.
 
 ## Prerequisites
@@ -38,7 +38,7 @@ bucket) but a few lines of pandas-style PySpark.
 
 Clavesa's runner calls transform(spark, inputs) and expects back
 {output_key: DataFrame}. Anything you return under "default" lands as
-the Iceberg table <node>__default; multiple keys land as separate
+the Delta table <node>__default; multiple keys land as separate
 tables (see "Multiple outputs" below).
 """
 
@@ -104,13 +104,13 @@ def transform(spark, inputs: dict[str, DataFrame]) -> dict[str, DataFrame]:
 
 - `spark`: the `SparkSession` the runner already booted. Reuse it; don't `SparkSession.builder.getOrCreate()` yourself.
 - `inputs`: a dict from input alias (the `--as <alias>` you pass to `source attach`, or the `--input <alias>` from `node connect`) to a Spark `DataFrame` representing the upstream source / table. The runner has already done the format-aware reads.
-- Return: a dict from output key to `DataFrame`. The runner writes each value to the matching Iceberg table.
+- Return: a dict from output key to `DataFrame`. The runner writes each value to the matching Delta table.
 
 Anything Python you can run on the runner image works inside `transform()`. The image includes `pyspark` and `numpy` out of the box. To pull in more — pandas, scikit-learn, your own libraries — add lines to `runner/requirements.txt` and rebuild the image (`make build-runner`).
 
 ## Multiple outputs
 
-Return more than one key and each becomes its own Iceberg table. Declare every output key on the transform first so the orchestration emitter passes it through to the runner:
+Return more than one key and each becomes its own Delta table. Declare every output key on the transform first so the orchestration emitter passes it through to the runner:
 
 ```bash
 bin/clavesa node edit trip_features enrich --add-output outliers
@@ -127,7 +127,7 @@ def transform(spark, inputs):
     }
 ```
 
-`pipeline run` writes both Iceberg tables (`enrich__default`, `enrich__outliers`); both surface in `/` (Catalog) under your pipeline. The same shape deploys to Lambda or any other cloud target. To tune the write mode per-key (e.g. `outliers` as `append` instead of `replace`), edit `output_definitions` directly in the transform's `.tf`; the CLI flag seeds new entries with the default mode.
+`pipeline run` writes both Delta tables (`enrich__default`, `enrich__outliers`); both surface in `/` (Catalog) under your pipeline. The same shape deploys to Lambda or any other cloud target. To tune the write mode per-key (e.g. `outliers` as `append` instead of `replace`), edit `output_definitions` directly in the transform's `.tf`; the CLI flag seeds new entries with the default mode.
 
 The UI equivalent: select the transform in the editor, open the right-panel **Output** section, type the extra key under **Extra outputs**, click **Add output**. Same surface for adding more keys or removing them.
 
@@ -205,9 +205,9 @@ Stick with SQL when the transform is a join / filter / aggregate. SQL is shorter
 
 **`transform() missing 1 required positional argument: 'inputs'`.** Either the signature has the wrong shape (check it matches `transform(spark, inputs)`) or you accidentally defined `def transform(inputs)` without `spark`. The runner passes both positionally.
 
-**`ModuleNotFoundError: No module named 'sklearn'`.** The runner image only ships what's in `runner/requirements.txt` — pyspark, numpy, the AWS Iceberg JARs. Add `scikit-learn` (or whatever) to that file, run `make build-runner`, and re-run.
+**`ModuleNotFoundError: No module named 'sklearn'`.** The runner image only ships what's in `runner/requirements.txt` — pyspark, numpy, the AWS Delta JARs. Add `scikit-learn` (or whatever) to that file, run `make build-runner`, and re-run.
 
-**Schema-evolution surprises.** Iceberg writes infer the schema from the output DataFrame. If you rename or drop a column, the next write commits a schema-evolution snapshot — downstream readers see the new shape immediately. If that's not what you want, project to the existing schema (`enriched.select("col1", "col2", ...)`) before returning.
+**Schema-evolution surprises.** Delta writes infer the schema from the output DataFrame. If you rename or drop a column, the next write commits a schema-evolution entry to the Delta log — downstream readers see the new shape immediately. If that's not what you want, project to the existing schema (`enriched.select("col1", "col2", ...)`) before returning.
 
 **The runner crashes with an OOM.** PySpark on Lambda is memory-bound — the default of 1.5 GB is generous for one transform but tight if you're materializing a wide DataFrame to driver memory. Either avoid `.toPandas()` / `.collect()` (they pull all rows to the driver), or bump `lambda_memory_mb` on the transform module.
 

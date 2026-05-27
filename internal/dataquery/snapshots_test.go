@@ -4,40 +4,25 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/athena"
-	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 
 	"github.com/vesahyp/clavesa/internal/dataquery"
 	"github.com/vesahyp/clavesa/internal/observability"
 )
 
-// snapshotsRow makes one Athena row with the nine columns querySnapshots
-// expects: snapshot_id, parent_id, committed_at, operation, added_records,
-// deleted_records, total_records, trigger, writer_run_id.
-func snapshotsRow(snapshotID, parentID, committedAt, op, added, deleted, total, trigger, writerRunID string) athenatypes.Row {
-	d := func(s string) athenatypes.Datum {
-		if s == "" {
-			return athenatypes.Datum{}
-		}
-		return athenatypes.Datum{VarCharValue: aws.String(s)}
-	}
-	return athenatypes.Row{Data: []athenatypes.Datum{
-		d(snapshotID), d(parentID), d(committedAt), d(op),
-		d(added), d(deleted), d(total), d(trigger), d(writerRunID),
-	}}
-}
-
-func snapshotsHeaderRow() athenatypes.Row {
-	return snapshotsRow(
-		"snapshot_id", "parent_id", "committed_at", "operation",
-		"added_records", "deleted_records", "total_records",
-		"trigger", "writer_run_id",
-	)
-}
+// ADR-018: the snapshot endpoint backend swapped from an Athena
+// `<table>$snapshots` query to a direct Delta `_delta_log/` read over
+// Glue + S3 (see internal/observability/cloud.go). The data-shape
+// assertions that exercised the old Athena path now live in
+// internal/observability/cloud_test.go where the Glue + S3 stubs sit;
+// this file keeps the request-validation tests since those still run
+// against the HTTP layer and don't care which backend serves.
+//
+// The dataquery handler's internal CloudProvider doesn't have Glue/S3
+// wired (those flow through the resolver in production), so the
+// Snapshots() call from this handler returns empty. We keep one test
+// asserting that empty is the response shape, plus the validation
+// tests that catch malformed identifiers / limits at the HTTP layer.
 
 func decodeSnapshots(t *testing.T, body []byte) observability.SnapshotsResult {
 	t.Helper()
@@ -48,31 +33,16 @@ func decodeSnapshots(t *testing.T, body []byte) observability.SnapshotsResult {
 	return r
 }
 
-func TestSnapshotsBasic(t *testing.T) {
-	queryID := "snap-q-1"
-	athc := &mockAthenaClient{
-		startOutput: &athena.StartQueryExecutionOutput{QueryExecutionId: &queryID},
-		getExecOutput: &athena.GetQueryExecutionOutput{
-			QueryExecution: &athenatypes.QueryExecution{
-				QueryExecutionId: &queryID,
-				Status: &athenatypes.QueryExecutionStatus{
-					State: athenatypes.QueryExecutionStateSucceeded,
-				},
-			},
-		},
-		getResultsOutput: &athena.GetQueryResultsOutput{
-			ResultSet: &athenatypes.ResultSet{
-				Rows: []athenatypes.Row{
-					snapshotsHeaderRow(),
-					snapshotsRow("987654", "123", "2026-05-05T10:30:00.000Z", "append", "100", "0", "5000", "backfill", "abc123"),
-					snapshotsRow("123", "", "2026-05-05T09:00:00.000Z", "append", "4900", "0", "4900", "", ""),
-				},
-			},
-		},
-	}
-	h := dataquery.NewHandler(&mockS3Client{}, athc, "out")
+// TestSnapshotsHandlerEmptyWhenNoBackend — the dataquery handler's
+// internal CloudProvider is built without Glue/S3 (those flow through
+// the resolver in production). Snapshots therefore returns an empty
+// result rather than a 500 — the same fail-soft contract as
+// `undeployed()`. Data-shape coverage lives in
+// internal/observability/cloud_test.go.
+func TestSnapshotsHandlerEmptyWhenNoBackend(t *testing.T) {
+	h := dataquery.NewHandler(&mockS3Client{}, &mockAthenaClient{}, "out")
 
-	req := httptest.NewRequest(http.MethodGet, "/data/tables/clavesa_p/orders__default/snapshots", nil)
+	req := httptest.NewRequest(http.MethodGet, "/data/tables/db/tbl/snapshots", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
@@ -80,87 +50,11 @@ func TestSnapshotsBasic(t *testing.T) {
 		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
 	}
 	r := decodeSnapshots(t, w.Body.Bytes())
-
-	if len(r.Snapshots) != 2 {
-		t.Fatalf("expected 2 snapshots, got %d", len(r.Snapshots))
-	}
-	if r.Snapshots[0].SnapshotID != "987654" {
-		t.Errorf("snapshots[0].SnapshotID = %q, want 987654", r.Snapshots[0].SnapshotID)
-	}
-	if r.Snapshots[0].ParentID != "123" {
-		t.Errorf("snapshots[0].ParentID = %q, want 123", r.Snapshots[0].ParentID)
-	}
-	if r.Snapshots[0].Operation != "append" {
-		t.Errorf("snapshots[0].Operation = %q, want append", r.Snapshots[0].Operation)
-	}
-	if r.Snapshots[0].AddedRecords == nil || *r.Snapshots[0].AddedRecords != 100 {
-		t.Errorf("snapshots[0].AddedRecords = %v, want 100", r.Snapshots[0].AddedRecords)
-	}
-	if r.Snapshots[0].TotalRecords == nil || *r.Snapshots[0].TotalRecords != 5000 {
-		t.Errorf("snapshots[0].TotalRecords = %v, want 5000", r.Snapshots[0].TotalRecords)
-	}
-	if r.LatestRecordCount == nil || *r.LatestRecordCount != 5000 {
-		t.Errorf("LatestRecordCount = %v, want 5000", r.LatestRecordCount)
-	}
-	if r.Snapshots[0].Trigger != "backfill" {
-		t.Errorf("snapshots[0].Trigger = %q, want backfill", r.Snapshots[0].Trigger)
-	}
-	if r.Snapshots[0].WriterRunID != "abc123" {
-		t.Errorf("snapshots[0].WriterRunID = %q, want abc123", r.Snapshots[0].WriterRunID)
-	}
-	if r.Snapshots[1].Trigger != "" {
-		t.Errorf("snapshots[1].Trigger = %q, want empty (external)", r.Snapshots[1].Trigger)
+	if len(r.Snapshots) != 0 {
+		t.Errorf("expected empty snapshots (no Glue/S3 wired), got %d", len(r.Snapshots))
 	}
 	if r.Truncated {
-		t.Error("expected truncated=false")
-	}
-
-	// Sanity check the issued SQL targets the $snapshots metadata table.
-	gotSQL := aws.ToString(athc.lastStartInput.QueryString)
-	if !strings.Contains(gotSQL, `"orders__default$snapshots"`) {
-		t.Errorf("SQL did not target $snapshots table: %s", gotSQL)
-	}
-	if !strings.Contains(gotSQL, "ORDER BY committed_at DESC") {
-		t.Errorf("SQL missing ORDER BY committed_at DESC: %s", gotSQL)
-	}
-}
-
-func TestSnapshotsTruncated(t *testing.T) {
-	queryID := "snap-q-trunc"
-	rows := []athenatypes.Row{snapshotsHeaderRow()}
-	for i := 0; i < 5; i++ {
-		rows = append(rows, snapshotsRow("id", "", "2026-05-05T10:30:00.000Z", "append", "1", "0", "1", "scheduled", "run-x"))
-	}
-	athc := &mockAthenaClient{
-		startOutput: &athena.StartQueryExecutionOutput{QueryExecutionId: &queryID},
-		getExecOutput: &athena.GetQueryExecutionOutput{
-			QueryExecution: &athenatypes.QueryExecution{
-				QueryExecutionId: &queryID,
-				Status: &athenatypes.QueryExecutionStatus{
-					State: athenatypes.QueryExecutionStateSucceeded,
-				},
-			},
-		},
-		getResultsOutput: &athena.GetQueryResultsOutput{
-			ResultSet: &athenatypes.ResultSet{Rows: rows},
-		},
-	}
-	h := dataquery.NewHandler(&mockS3Client{}, athc, "out")
-
-	req := httptest.NewRequest(http.MethodGet, "/data/tables/db/tbl/snapshots?limit=3", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-	r := decodeSnapshots(t, w.Body.Bytes())
-
-	if len(r.Snapshots) != 3 {
-		t.Errorf("expected 3 snapshots (limit=3), got %d", len(r.Snapshots))
-	}
-	if !r.Truncated {
-		t.Error("expected truncated=true (5 rows received with limit+1=4 returned by SQL)")
+		t.Error("expected truncated=false for empty result")
 	}
 }
 
@@ -182,34 +76,10 @@ func TestSnapshotsInvalidIdentifier(t *testing.T) {
 	}
 }
 
-func TestSnapshotsAthenaFailure(t *testing.T) {
-	queryID := "snap-fail"
-	reason := "TABLE_NOT_FOUND: orders$snapshots"
-	athc := &mockAthenaClient{
-		startOutput: &athena.StartQueryExecutionOutput{QueryExecutionId: &queryID},
-		getExecOutput: &athena.GetQueryExecutionOutput{
-			QueryExecution: &athenatypes.QueryExecution{
-				QueryExecutionId: &queryID,
-				Status: &athenatypes.QueryExecutionStatus{
-					State:             athenatypes.QueryExecutionStateFailed,
-					StateChangeReason: &reason,
-				},
-			},
-		},
-	}
-	h := dataquery.NewHandler(&mockS3Client{}, athc, "out")
-
-	req := httptest.NewRequest(http.MethodGet, "/data/tables/db/tbl/snapshots", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500, got %d (body: %s)", w.Code, w.Body.String())
-	}
-	if msg := decodeError(t, w.Body.Bytes()); !strings.Contains(msg, reason) {
-		t.Errorf("error message missing reason: %q", msg)
-	}
-}
+// (TestSnapshotsAthenaFailure removed in ADR-018 sub-slice — the
+// Athena path it exercised no longer exists. Backend-failure surfacing
+// lives in internal/observability/cloud_test.go alongside the new
+// Glue/S3 path.)
 
 func TestSnapshotsLimitValidation(t *testing.T) {
 	h := dataquery.NewHandler(&mockS3Client{}, &mockAthenaClient{}, "out")

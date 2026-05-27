@@ -2,11 +2,11 @@
 
 > **When you have one:** a deployed pipeline that's running incrementally on new data, and you need to (re-)process a window of older data — files that landed before the pipeline existed, a quarter of archived logs after a vendor finally exported them, or any range of partitions after a transform-logic change made the existing rows wrong.
 
-Backfill stages the historical window into a parallel Iceberg table, lets you review the result side-by-side with the canonical target, then promotes via a single MERGE INTO. Direct-to-target is the escape hatch, not the default — `append` outputs dupe on overlap, `replace` outputs can overwrite newer data with older reconstructions; only `merge` outputs are naturally safe.
+Backfill stages the historical window into a parallel Delta table, lets you review the result side-by-side with the canonical target, then promotes via a single MERGE INTO. Direct-to-target is the escape hatch, not the default — `append` outputs dupe on overlap, `replace` outputs can overwrite newer data with older reconstructions; only `merge` outputs are naturally safe.
 
 ## What you'll end up with
 
-- A parallel Iceberg table `<target>__backfill__<run_id>` in the same Glue DB as the canonical target — same schema, tagged with the window range so it's obvious in the Catalog page.
+- A parallel Delta table `<target>__backfill__<run_id>` in the same Glue DB as the canonical target — same schema, tagged with the window range so it's obvious in the Catalog page.
 - One `runs` row per backfill execution with `trigger = "backfill"` and a `target_table` column pointing at the staging table.
 - A reviewed promote that MERGEs staging into the canonical target in one statement; or a discard that drops staging without touching the target.
 
@@ -69,13 +69,13 @@ When the transform is `mode = "merge"` and you trust the keys, you can skip stag
 When a backfill runs against a pipeline that's also receiving live S3-event triggers, the two paths are independent:
 
 - **Live triggers** (see [s3-trigger](s3-trigger.md)) advance the partition watermark and write to canonical.
-- **Backfill** invokes the transform Lambda directly with a `_backfill` event payload that overrides the partition window and routes the write to a parallel staging table. The watermark is neither read nor advanced. Same runner code path otherwise; same Iceberg writer; same IAM scope.
+- **Backfill** invokes the transform Lambda directly with a `_backfill` event payload that overrides the partition window and routes the write to a parallel staging table. The watermark is neither read nor advanced. Same runner code path otherwise; same Delta writer; same IAM scope.
 
 So you can backfill last quarter while new files keep streaming in — the staging table accumulates the historical window, the canonical target keeps growing from live events, and promote merges them when you're ready.
 
 ## Auto-expiry
 
-Unpromoted staging tables get swept by the Iceberg-maintenance slice after `backfill_retention_days` (workspace-level, default 30). Tied to the broader Iceberg maintenance work; for now, explicit `backfill discard` is the deterministic cleanup.
+Unpromoted staging tables get swept by the Delta-maintenance slice after `backfill_retention_days` (workspace-level, default 30). Tied to the broader Delta maintenance work (bucket 11); for now, explicit `backfill discard` is the deterministic cleanup.
 
 ## Troubleshooting
 

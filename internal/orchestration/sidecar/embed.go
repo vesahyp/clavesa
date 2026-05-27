@@ -1,6 +1,11 @@
-// Package sidecar embeds the Python source for the two Lambdas that the
-// orchestration TF emitter wires in: poller.py (SQS → SFN trigger) and
-// runs_writer/index.py (SFN status events → Iceberg `runs` table).
+// Package sidecar embeds the Python source for the poller Lambda the
+// orchestration TF emitter wires in: poller.py (SQS → SFN trigger).
+//
+// Previously this also embedded runs_writer/index.py (a separate
+// zip-Lambda). ADR-018 swapped runs_writer to the runner image, so its
+// handler now lives in runner.py and no per-pipeline Python ships here
+// for it. The empty `_clavesa_sidecar/` directory still exists for
+// the poller and any future sidecar Lambdas.
 //
 // tfgen-emitted orchestration.tf references these files via
 // `${path.module}/_clavesa_sidecar/...`, so the service layer must
@@ -18,7 +23,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/orchestration/tfgen"
 )
 
-//go:embed poller.py runs_writer/*.py
+//go:embed poller.py
 var files embed.FS
 
 // Materialise copies every embedded sidecar file into

@@ -162,11 +162,11 @@ terraform.tfstate.backup
 const pipelineRunsDashboardJSON = `{
   "title": "Pipeline runs — %[1]s",
   "datasets": [
-    { "name": "failures_24h", "dir": "%[1]s", "sql": "SELECT COUNT(*) AS n FROM clavesa.%[2]s.runs WHERE pipeline = '%[1]s' AND status = 'FAILED' AND started_at > current_timestamp - INTERVAL 1 DAY" },
-    { "name": "runs_total", "dir": "%[1]s", "sql": "SELECT COUNT(*) AS n FROM clavesa.%[2]s.runs WHERE pipeline = '%[1]s'" },
-    { "name": "duration", "dir": "%[1]s", "sql": "SELECT x, y FROM (SELECT started_at AS x, duration_ms AS y FROM clavesa.%[2]s.runs WHERE pipeline = '%[1]s' ORDER BY started_at DESC LIMIT 50) t ORDER BY x ASC" },
-    { "name": "failures_by_node", "dir": "%[1]s", "sql": "SELECT node AS x, COUNT(*) AS y FROM clavesa.%[2]s.node_runs WHERE pipeline = '%[1]s' AND status = 'failed' GROUP BY node ORDER BY y DESC" },
-    { "name": "recent_runs", "dir": "%[1]s", "sql": "SELECT run_id, status, trigger, duration_ms FROM clavesa.%[2]s.runs WHERE pipeline = '%[1]s' ORDER BY started_at DESC LIMIT 10" }
+    { "name": "failures_24h", "dir": "%[1]s", "sql": "SELECT COUNT(*) AS n FROM %[2]s.runs WHERE pipeline = '%[1]s' AND status = 'FAILED' AND started_at > current_timestamp - INTERVAL 1 DAY" },
+    { "name": "runs_total", "dir": "%[1]s", "sql": "SELECT COUNT(*) AS n FROM %[2]s.runs WHERE pipeline = '%[1]s'" },
+    { "name": "duration", "dir": "%[1]s", "sql": "SELECT x, y FROM (SELECT started_at AS x, duration_ms AS y FROM %[2]s.runs WHERE pipeline = '%[1]s' ORDER BY started_at DESC LIMIT 50) t ORDER BY x ASC" },
+    { "name": "failures_by_node", "dir": "%[1]s", "sql": "SELECT node AS x, COUNT(*) AS y FROM %[2]s.node_runs WHERE pipeline = '%[1]s' AND status = 'failed' GROUP BY node ORDER BY y DESC" },
+    { "name": "recent_runs", "dir": "%[1]s", "sql": "SELECT run_id, status, trigger, duration_ms FROM %[2]s.runs WHERE pipeline = '%[1]s' ORDER BY started_at DESC LIMIT 10" }
   ],
   "widgets": [
     { "id": "failures-24h", "type": "big_number", "title": "Failures (24h)", "dataset": "failures_24h", "value_field": "n", "layout": { "x": 0, "y": 0, "w": 3, "h": 2 } },

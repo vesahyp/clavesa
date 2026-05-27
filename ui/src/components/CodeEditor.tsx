@@ -57,6 +57,14 @@ export interface CodeEditorProps {
   // Caller-injected extensions — the seam for ghost text, gutter
   // widgets, dock panels without rewriting the wrapper.
   extensions?: Extension[];
+
+  // Fires once the user has paused typing for `onIdleMs` (default 800ms)
+  // and also on blur. The seam for auto-preview: an editor wired with
+  // onIdle gets a debounced "user is done for now" signal without the
+  // caller having to manage timers. Latest-value semantics — a fresh
+  // edit during the debounce resets the timer.
+  onIdle?: (value: string) => void;
+  onIdleMs?: number;
 }
 
 // Shadcn-tuned visual polish on top of oneDark.
@@ -123,7 +131,54 @@ export function CodeEditor({
   sqlLint,
   onReady,
   extensions,
+  onIdle,
+  onIdleMs = 800,
 }: CodeEditorProps) {
+  // Idle-debounce + blur-fire signal for auto-preview. The handler ref
+  // keeps the latest onIdle / onIdleMs visible to the listener closure
+  // without re-installing the extension on every render.
+  const onIdleRef = useRef(onIdle);
+  const onIdleMsRef = useRef(onIdleMs);
+  useEffect(() => {
+    onIdleRef.current = onIdle;
+    onIdleMsRef.current = onIdleMs;
+  }, [onIdle, onIdleMs]);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const idleExt = useMemo<Extension>(() => {
+    function fire(view: EditorView) {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+      const cb = onIdleRef.current;
+      if (cb) cb(view.state.doc.toString());
+    }
+    return [
+      EditorView.updateListener.of((u) => {
+        if (!onIdleRef.current) return;
+        if (!u.docChanged) return;
+        // Only user-input transactions reset the timer — programmatic
+        // controlled-value syncs from the parent shouldn't kick auto-preview.
+        const isUser = u.transactions.some(
+          (tr) => tr.isUserEvent("input") || tr.isUserEvent("delete"),
+        );
+        if (!isUser) return;
+        if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = setTimeout(
+          () => fire(u.view),
+          onIdleMsRef.current,
+        );
+      }),
+      EditorView.domEventHandlers({
+        blur: (_, view) => {
+          if (onIdleRef.current) fire(view);
+          return false;
+        },
+      }),
+    ];
+    // The handler ref keeps this extension stable across re-renders so
+    // the editor never re-mounts when the caller passes a new arrow.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Compartments are stable refs — created once, reconfigured live.
   const langCompRef = useRef(new Compartment());
   const lintCompRef = useRef(new Compartment());
@@ -151,13 +206,14 @@ export function CodeEditor({
     ];
     if (lineNumbers) exts.unshift(lineNumbersExt());
     if (wordWrap) exts.push(EditorView.lineWrapping);
+    exts.push(idleExt);
     if (extensions) exts.push(...extensions);
     return exts;
     // The language/lint compartments are reconfigured by the effects
     // below; we only want the base array rebuilt when the layout-style
     // props change (initial language/schema is captured at mount).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [heightStr, lineNumbers, wordWrap, extensions]);
+  }, [heightStr, lineNumbers, wordWrap, extensions, idleExt]);
 
   // Live language swap — also fires on sqlSchema / sqlKeywords change
   // so a freshly-arrived schema feeds the completion source without
@@ -220,6 +276,24 @@ export function CodeEditor({
       }}
       onCreateEditor={(view) => {
         viewRef.current = view;
+        // CodeMirror creates the view asynchronously from <CodeMirror>'s
+        // own effect, which fires AFTER our compartment-reconfigure
+        // effects. By the time those ran viewRef was still null, so the
+        // initial language/lint values never landed. Apply them here so
+        // the first paint already has them; subsequent prop changes
+        // continue to flow through the effects above.
+        view.dispatch({
+          effects: langCompRef.current.reconfigure(
+            buildLanguageExt(language, sqlSchema, sqlKeywords),
+          ),
+        });
+        if (language === "sql" && sqlLint) {
+          view.dispatch({
+            effects: lintCompRef.current.reconfigure(
+              linter((v) => sqlLint(v.state.doc.toString(), v), { delay: 300 }),
+            ),
+          });
+        }
         onReady?.(view);
       }}
       className={className}

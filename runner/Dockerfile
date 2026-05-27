@@ -1,16 +1,14 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# JRE for PySpark. Java 11 (not 17) — Spark 3.5.x's StorageUtils accesses
-# sun.nio.ch.DirectBuffer, which Java 17's module system blocks without
-# explicit --add-opens flags. Matches the version SoAL uses.
+# JRE for PySpark. Spark 4.0.x requires Java 17.
 #
-# tzdata is needed by Pandas' to_json date serialization — without it any
+# tzdata is needed by Pandas' to_json date serialization. Without it any
 # query returning a TimestampType column fails with "No time zone found
 # with key :/etc/localtime" the moment the result hits CLAVESA_QUERY's
 # pdf.to_json(date_format="iso") shim. Lambda's base image strips it for
 # size; cost of adding back is ~3 MB.
-RUN dnf install -y java-11-amazon-corretto-headless wget tzdata && dnf clean all
-ENV JAVA_HOME=/usr/lib/jvm/java-11-amazon-corretto
+RUN dnf install -y java-17-amazon-corretto-headless wget tzdata && dnf clean all
+ENV JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
 ENV PATH=$JAVA_HOME/bin:$PATH
 ENV TZ=UTC
 
@@ -19,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 ENV SPARK_HOME=/var/lang/lib/python3.12/site-packages/pyspark
 
-# Iceberg + AWS + hadoop-aws JARs for Iceberg writes via Glue Data Catalog
-# and source-data S3 reads.
+# Delta Lake + hadoop-aws JARs for Delta writes via Glue Hive metastore
+# (ADR-018) and source-data S3 reads.
 COPY download_jars.sh /tmp/
 RUN chmod +x /tmp/download_jars.sh && /tmp/download_jars.sh && rm /tmp/download_jars.sh
 

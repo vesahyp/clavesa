@@ -10,8 +10,9 @@
  * server-side at query time.
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,6 +27,12 @@ import {
   useDashboardQuery,
   type DashboardControl,
 } from "@/lib/queries";
+import {
+  normaliseExpr,
+  parseRelative,
+  resolveTimeRange as resolveTimeRangeShared,
+  TIME_RANGE_PRESETS,
+} from "@/lib/timeRange";
 
 /**
  * useDashboardParams — resolve URL search params + declared control
@@ -46,13 +53,27 @@ export function useDashboardParams(
       if (c.type === "time_range") {
         const startKey = `${c.name}.start`;
         const endKey = `${c.name}.end`;
+        const relKey = `${c.name}.rel`;
+        // Resolution priority:
+        //   1. Explicit absolute pair on the URL → freeze the window.
+        //      The right shape for shareable point-in-time links.
+        //   2. Relative expression on the URL → re-evaluate every render.
+        //      The default the picker emits; reload shows fresh `now-1h`.
+        //   3. Declared control default → same back-compat path as before.
         const start = searchParams.get(startKey);
         const end = searchParams.get(endKey);
+        const rel = searchParams.get(relKey);
         if (start && end) {
           out[startKey] = start;
           out[endKey] = end;
+        } else if (rel) {
+          const { start: s, end: e } = resolveTimeRangeShared(rel);
+          out[startKey] = s;
+          out[endKey] = e;
         } else {
-          const { start: s, end: e } = resolveTimeRange(c.default || "last_30d");
+          const { start: s, end: e } = resolveTimeRangeShared(
+            c.default || "now-30d",
+          );
           out[startKey] = s;
           out[endKey] = e;
         }
@@ -82,15 +103,13 @@ interface ControlStripProps {
   params: Record<string, string>;
 }
 
-// TIME_PRESETS labels the short, ordered set the user picks from. The
-// keys match resolveTimePreset in the Go service so the same preset
-// chosen here renders the same window the CLI would pick.
-const TIME_PRESETS: { key: string; label: string }[] = [
-  { key: "last_24h", label: "Last 24 hours" },
-  { key: "last_7d", label: "Last 7 days" },
-  { key: "last_30d", label: "Last 30 days" },
-  { key: "last_90d", label: "Last 90 days" },
-  { key: "custom", label: "Custom range" },
+// Preset options for the dropdown — sourced from the shared
+// `TIME_RANGE_PRESETS` table so the Go side, the picker, and the
+// default-value editor in `ControlsPanel` all agree on what's offered.
+// "Custom range" is the explicit absolute / relative escape hatch.
+const TIME_PRESET_OPTIONS: { value: string; label: string }[] = [
+  ...TIME_RANGE_PRESETS.map((p) => ({ value: p.expr, label: p.label })),
+  { value: "custom", label: "Custom range" },
 ];
 
 export function ControlStrip({ controls, params }: ControlStripProps) {
@@ -109,19 +128,35 @@ export function ControlStrip({ controls, params }: ControlStripProps) {
 
   return (
     <div className="mb-4 flex flex-wrap items-end gap-3 rounded-md border border-border bg-card p-3">
+      <RefreshControl />
       {controls.map((c) => {
         if (c.type === "time_range") {
           const startKey = `${c.name}.start`;
           const endKey = `${c.name}.end`;
+          const relKey = `${c.name}.rel`;
+          // The picker needs to know what's *on the URL*, not what
+          // `useDashboardParams` resolved — the latter always fills
+          // start/end, so checking it would make every state look
+          // "absolute" and the picker would stick on Custom forever.
+          const urlStart = searchParams.get(startKey) ?? "";
+          const urlEnd = searchParams.get(endKey) ?? "";
+          const urlRel = searchParams.get(relKey) ?? "";
           return (
             <TimeRangeControl
               key={c.name}
               control={c}
-              startValue={params[startKey] ?? ""}
-              endValue={params[endKey] ?? ""}
-              onChange={(start, end) =>
-                update({ [startKey]: start, [endKey]: end })
-              }
+              startValue={urlStart}
+              endValue={urlEnd}
+              relValue={urlRel}
+              onChange={(updates) => {
+                const next: Record<string, string | null> = {};
+                for (const [k, v] of Object.entries(updates)) {
+                  const key =
+                    k === "start" ? startKey : k === "end" ? endKey : relKey;
+                  next[key] = v;
+                }
+                update(next);
+              }}
             />
           );
         }
@@ -145,39 +180,56 @@ function TimeRangeControl({
   control,
   startValue,
   endValue,
+  relValue,
   onChange,
 }: {
   control: DashboardControl;
   startValue: string;
   endValue: string;
-  onChange: (start: string, end: string) => void;
+  relValue: string;
+  onChange: (updates: { start?: string | null; end?: string | null; rel?: string | null }) => void;
 }) {
-  // Infer which preset the current {start,end} pair matches; if none
-  // does, the picker shows "Custom range" with the explicit inputs.
-  const preset = matchPreset(startValue, endValue);
-  const isCustom = preset === "custom";
+  // What's the picker showing?
+  //   - rel set + matches a preset → that preset.
+  //   - rel set + custom relative   → "custom" (reveals the relative field).
+  //   - absolute start/end set      → "custom" (reveals absolute fields).
+  //   - nothing set                 → falls back to the declared default.
+  const isAbsolute = !!startValue && !!endValue;
+  const presetExpr = isAbsolute
+    ? "custom"
+    : pickPresetExpr(relValue, control.default);
+  const isCustom = presetExpr === "custom";
 
-  function onPresetPick(key: string) {
-    if (key === "custom") {
-      // Keep the current values, just reveal the inputs.
-      onChange(startValue, endValue);
+  function onPresetPick(value: string) {
+    if (value === "custom") {
+      // "Switch to custom" = freeze the current window as absolute so
+      // the user has a concrete starting point to tweak. Drops the rel
+      // param. This also flips `presetExpr` to "custom" above (because
+      // isAbsolute is now true) so the inline inputs reveal.
+      if (isAbsolute) {
+        // Already custom-absolute — nothing to do.
+        return;
+      }
+      const seed = resolveTimeRangeShared(relValue || control.default);
+      onChange({ start: seed.start, end: seed.end, rel: null });
       return;
     }
-    const { start, end } = resolveTimeRange(key);
-    onChange(start, end);
+    // Adopting a preset means: clear any frozen absolute window, set
+    // the relative expression so the page re-evaluates each render.
+    onChange({ start: null, end: null, rel: value });
   }
 
   return (
     <div className="flex items-end gap-2">
       <div className="space-y-1">
         <Label className="text-xs">{control.label || control.name}</Label>
-        <Select value={preset} onValueChange={onPresetPick}>
+        <Select value={presetExpr} onValueChange={onPresetPick}>
           <SelectTrigger className="w-44">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {TIME_PRESETS.map((p) => (
-              <SelectItem key={p.key} value={p.key}>
+            {TIME_PRESET_OPTIONS.map((p) => (
+              <SelectItem key={p.value} value={p.value}>
                 {p.label}
               </SelectItem>
             ))}
@@ -187,23 +239,40 @@ function TimeRangeControl({
       {isCustom && (
         <>
           <div className="space-y-1">
-            <Label className="text-xs">Start</Label>
+            <Label className="text-xs">Relative</Label>
+            <RelativeInput
+              value={relValue}
+              onCommit={(next) =>
+                onChange({ start: null, end: null, rel: next || null })
+              }
+            />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs">Start (absolute)</Label>
             <Input
               type="datetime-local"
               value={isoToLocal(startValue)}
               onChange={(e) =>
-                onChange(localToISO(e.target.value), endValue)
+                onChange({
+                  start: localToISO(e.target.value),
+                  end: endValue,
+                  rel: null,
+                })
               }
               className="w-52 font-mono text-xs"
             />
           </div>
           <div className="space-y-1">
-            <Label className="text-xs">End</Label>
+            <Label className="text-xs">End (absolute)</Label>
             <Input
               type="datetime-local"
               value={isoToLocal(endValue)}
               onChange={(e) =>
-                onChange(startValue, localToISO(e.target.value))
+                onChange({
+                  start: startValue,
+                  end: localToISO(e.target.value),
+                  rel: null,
+                })
               }
               className="w-52 font-mono text-xs"
             />
@@ -212,6 +281,135 @@ function TimeRangeControl({
       )}
     </div>
   );
+}
+
+/**
+ * RefreshControl — viewer-side auto-refresh dropdown. Reads `?refresh=`
+ * from the URL; when set to a non-`off` value, invalidates every
+ * `["dashboards", "query", …]` cache entry on the interval so widgets
+ * re-fire. Off (default) preserves the pre-Slice-E behaviour where
+ * widgets only re-fetched on React Query's stale-time expiry.
+ */
+const REFRESH_OPTIONS: { value: string; label: string; ms: number }[] = [
+  { value: "off", label: "Off", ms: 0 },
+  { value: "30s", label: "30s", ms: 30_000 },
+  { value: "1m", label: "1 min", ms: 60_000 },
+  { value: "5m", label: "5 min", ms: 5 * 60_000 },
+  { value: "15m", label: "15 min", ms: 15 * 60_000 },
+];
+
+function RefreshControl() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const qc = useQueryClient();
+  const raw = searchParams.get("refresh") ?? "off";
+  const opt =
+    REFRESH_OPTIONS.find((o) => o.value === raw) ?? REFRESH_OPTIONS[0];
+
+  useEffect(() => {
+    if (opt.ms <= 0) return;
+    const id = window.setInterval(() => {
+      // Hits every widget query AND the dataset-column probes; matches
+      // the React-Query key prefix used by useDashboardQuery /
+      // useDatasetColumns / SqlPreview.
+      void qc.invalidateQueries({ queryKey: ["dashboards", "query"] });
+    }, opt.ms);
+    return () => window.clearInterval(id);
+  }, [opt.ms, qc]);
+
+  function onPick(value: string) {
+    const sp = new URLSearchParams(searchParams);
+    if (value === "off") sp.delete("refresh");
+    else sp.set("refresh", value);
+    setSearchParams(sp, { replace: true });
+  }
+
+  return (
+    <div className="space-y-1">
+      <Label className="text-xs">Refresh</Label>
+      <Select value={opt.value} onValueChange={onPick}>
+        <SelectTrigger className="w-24">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {REFRESH_OPTIONS.map((o) => (
+            <SelectItem key={o.value} value={o.value}>
+              {o.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+/**
+ * pickPresetExpr — match the current `rel` against the preset table,
+ * falling back to "custom" when it's something the dropdown can't
+ * represent (typed relative expression, or absolute-only state). If
+ * `rel` is empty, the declared default takes its place so a saved
+ * dashboard's `last_24h` reads back as "Last 24 hours" on the picker.
+ */
+function pickPresetExpr(relValue: string, controlDefault: string): string {
+  const candidate = normaliseExpr(relValue || controlDefault || "now-30d");
+  if (TIME_RANGE_PRESETS.some((p) => p.expr === candidate)) return candidate;
+  return "custom";
+}
+
+/**
+ * RelativeInput — small text input that validates a `now-<n><unit>`
+ * expression on commit (Enter / blur). Empty input clears the relative
+ * filter; an invalid expression doesn't update URL state — the input
+ * stays red until corrected. Cheap UX without a Form library.
+ */
+function RelativeInput({
+  value,
+  onCommit,
+}: {
+  value: string;
+  onCommit: (next: string) => void;
+}) {
+  const [draft, setDraft] = useMemoizedDraft(value);
+  let bad = false;
+  if (draft.trim() !== "") {
+    try {
+      parseRelative(draft);
+    } catch {
+      bad = true;
+    }
+  }
+  function commit() {
+    if (draft === value) return;
+    if (bad) return;
+    onCommit(draft.trim());
+  }
+  return (
+    <Input
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+        }
+      }}
+      placeholder="now-1h"
+      className={`w-32 font-mono text-xs${bad ? " border-destructive" : ""}`}
+    />
+  );
+}
+
+/**
+ * useMemoizedDraft — mirror an upstream value into local state. Resets
+ * when the upstream changes (e.g. user picks a preset) so the draft
+ * doesn't drift away from the canonical source.
+ */
+function useMemoizedDraft(value: string): [string, (v: string) => void] {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+  return [draft, setDraft];
 }
 
 function SelectControl({
@@ -268,55 +466,6 @@ function SelectControl({
       </Select>
     </div>
   );
-}
-
-// resolveTimeRange mirrors the Go resolveTimePreset helper. Same preset
-// keys, same window math; computed at "now" so a custom-range stays
-// stable but a preset re-evaluates each load.
-function resolveTimeRange(preset: string): { start: string; end: string } {
-  const now = new Date();
-  const end = now.toISOString();
-  let ms = 30 * 24 * 60 * 60 * 1000;
-  switch (preset) {
-    case "last_24h":
-      ms = 24 * 60 * 60 * 1000;
-      break;
-    case "last_7d":
-      ms = 7 * 24 * 60 * 60 * 1000;
-      break;
-    case "last_30d":
-      ms = 30 * 24 * 60 * 60 * 1000;
-      break;
-    case "last_90d":
-      ms = 90 * 24 * 60 * 60 * 1000;
-      break;
-  }
-  return { start: new Date(now.getTime() - ms).toISOString(), end };
-}
-
-// matchPreset returns the preset key whose window matches the current
-// {start, end} pair (within ±2 minutes — preset windows are computed at
-// load time so they drift second-by-second). Falls back to "custom".
-function matchPreset(start: string, end: string): string {
-  if (!start || !end) return "last_30d";
-  const s = new Date(start).getTime();
-  const e = new Date(end).getTime();
-  if (!Number.isFinite(s) || !Number.isFinite(e)) return "custom";
-  const span = e - s;
-  const candidates: { key: string; ms: number }[] = [
-    { key: "last_24h", ms: 24 * 60 * 60 * 1000 },
-    { key: "last_7d", ms: 7 * 24 * 60 * 60 * 1000 },
-    { key: "last_30d", ms: 30 * 24 * 60 * 60 * 1000 },
-    { key: "last_90d", ms: 90 * 24 * 60 * 60 * 1000 },
-  ];
-  // Preset windows end at "now"; allow a small slack so a 30-second
-  // page-load gap doesn't flip the dropdown to Custom.
-  const now = Date.now();
-  if (Math.abs(e - now) > 5 * 60 * 1000) return "custom";
-  for (const c of candidates) {
-    if (Math.abs(span - c.ms) < 5 * 60 * 1000) return c.key;
-  }
-  return "custom";
 }
 
 // isoToLocal converts an ISO timestamp into the `YYYY-MM-DDTHH:MM`

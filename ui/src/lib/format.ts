@@ -24,7 +24,7 @@ export function formatDuration(ms: number | null | undefined): string {
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
-// formatRowCount renders an Iceberg row count compactly. Same suffix rules
+// formatRowCount renders a Delta table row count compactly. Same suffix rules
 // across surfaces — keeps the Catalog row badges and the dashboard's
 // Output tables panel speaking the same shorthand.
 export function formatRowCount(n: number): string {

@@ -2,7 +2,7 @@
 
 > **When you have one:** a bucket where new files land continuously — application logs, daily exports from a scraper, partner data drops — and you want each new file to kick off a pipeline run.
 
-Each S3 object-create event hits an EventBridge rule, lands on an SQS queue, and a cron-triggered poller Lambda starts one Step Functions execution per distinct partition. The runner reads only the new partitions since the last watermark and writes the result to an Iceberg table.
+Each S3 object-create event hits an EventBridge rule, lands on an SQS queue, and a cron-triggered poller Lambda starts one Step Functions execution per distinct partition. The runner reads only the new partitions since the last watermark and writes the result to a Delta table.
 
 If you also need to load historical files that existed before the pipeline was set up, see [backfill](backfill.md) — staging and reviewing a window is its own flow once the pipeline above is live.
 
@@ -10,7 +10,7 @@ If you also need to load historical files that existed before the pipeline was s
 
 - A deployed pipeline (`compute = "lambda"`) that processes one partition's worth of new files per run.
 - An EventBridge rule + SQS queue subscribed to S3 object-create events on the source bucket, draining into a Step Functions execution per partition.
-- An Iceberg table in Glue Data Catalog that grows incrementally as new files arrive.
+- A Delta table in Glue Data Catalog that grows incrementally as new files arrive.
 
 ## Prerequisites
 
@@ -64,7 +64,7 @@ Apply provisions: the runner Lambda with read permission on `your-source-bucket`
 Drop a new file in `s3://your-source-bucket/events/year=2026/month=05/day=13/hour=14/<anything>.parquet`. Within ~60 seconds:
 
 - `/pipelines/dashboard?dir=stream` shows a new run with `trigger = "event"`.
-- The Iceberg table grows by however many rows the file contributed.
+- The Delta table grows by however many rows the file contributed.
 - The watermark advances to that partition cursor; the next run sees only newer partitions.
 
 If you drop two files in the same partition while a run is in flight, EventBridge deduplicates at the partition level — the runner reads the whole partition's contents in one pass, so file-count fan-out doesn't translate to run-count fan-out.
@@ -87,7 +87,7 @@ Three independent pieces, each runnable on its own:
 
 ## Loading historical files
 
-The pipeline above only processes files that land *after* the EventBridge rule is in place. To load anything older — a year of archival logs, last quarter's partner exports — use the [backfill](backfill.md) flow: stage the historical window into a parallel Iceberg table, review the result side-by-side with the canonical target, then promote.
+The pipeline above only processes files that land *after* the EventBridge rule is in place. To load anything older — a year of archival logs, last quarter's partner exports — use the [backfill](backfill.md) flow: stage the historical window into a parallel Delta table, review the result side-by-side with the canonical target, then promote.
 
 ## Troubleshooting
 

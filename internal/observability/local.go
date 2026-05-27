@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/delta"
 	"github.com/vesahyp/clavesa/internal/errs"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/pathutil"
@@ -246,7 +247,7 @@ func (p *LocalProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
   module_version,
   output_rows,
   sf_execution_arn
-FROM clavesa.%s.node_runs
+FROM %s.node_runs
 %s
 ORDER BY started_at DESC
 LIMIT %d`, dbName, whereClause, q.Limit+1)
@@ -361,17 +362,22 @@ func (p *LocalProvider) Runs(ctx context.Context, q RunsQuery) (*RunsResult, err
 	return &RunsResult{Rows: out, Truncated: truncated}, nil
 }
 
-// tablesFromMetadata walks the Iceberg warehouse directly: one
-// subdirectory per output table, each carrying a `metadata/` dir whose
-// `version-hint.text` points at the current `vN.metadata.json`. That
-// JSON has every column the dashboard renders — row count, byte size,
-// last writer's run id, snapshot timestamp — without a Spark roundtrip.
+// tablesFromMetadata walks the warehouse directly: one subdirectory
+// per output table, each carrying a `_delta_log/` directory whose JSON
+// commit files Delta's transaction-log protocol describes. The reader
+// gets the row counts we surface (per-commit operationMetrics from
+// commitInfo) plus the snapshot timestamp without a Spark roundtrip.
+//
+// ADR-018: pre-Delta this read Iceberg's metadata.json + version-hint;
+// the file paths changed, the response shape did not. Local-cloud
+// parity (ADR-014) means cloud's CloudProvider.Snapshots took the same
+// _delta_log path in this sub-slice.
 //
 // Returns (nil, false) when the warehouse or per-pipeline namespace
 // dir is missing; callers fall through to the Spark path (which
 // likewise treats missing tables as an empty success). Reads are
-// independent per table so one malformed metadata.json doesn't poison
-// the whole listing — that table is skipped and logging stays at the
+// independent per table so one malformed commit doesn't poison the
+// whole listing — that table is skipped and logging stays at the
 // caller.
 func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) {
 	warehouse := workspace.LocalWarehouseDir(p.workspaceRoot)
@@ -394,7 +400,11 @@ func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) 
 	if schema == "" {
 		schema = filepath.Base(abs)
 	}
-	namespaceDir := filepath.Join(warehouse, identutil.EncodeGlueDatabase(catalog, schema))
+	// Hive metastore layout uses `<db>.db/` on disk (v2.0.0 persistent
+	// metastore — see runner/spark_conf.py). The logical DB name comes
+	// from the same encoder the runner writes against; we append `.db`
+	// here at the filesystem layer.
+	namespaceDir := filepath.Join(warehouse, identutil.EncodeGlueDatabase(catalog, schema)+".db")
 	entries, err := os.ReadDir(namespaceDir)
 	if err != nil {
 		// Pipeline namespace not present yet (fresh pipeline, no
@@ -417,7 +427,7 @@ func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) 
 			continue
 		}
 		tableName := e.Name()
-		info, ok := readIcebergCurrentSnapshot(filepath.Join(namespaceDir, tableName))
+		info, ok := readDeltaCurrentSnapshot(filepath.Join(namespaceDir, tableName))
 		if !ok {
 			continue
 		}
@@ -426,7 +436,7 @@ func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) 
 		info.Node = node
 		info.OutputKey = outputKey
 		info.TableName = tableName
-		info.TableID = fmt.Sprintf("clavesa.%s.%s", identutil.EncodeGlueDatabase(catalog, schema), tableName)
+		info.TableID = fmt.Sprintf("%s.%s", identutil.EncodeGlueDatabase(catalog, schema), tableName)
 		out = append(out, info)
 	}
 	// Newest snapshot first — matches the Spark path's `ORDER BY
@@ -455,76 +465,50 @@ func splitTableName(name string) (node, outputKey string) {
 	return name[:i], name[i+2:]
 }
 
-// readIcebergCurrentSnapshot reads <table>/metadata/version-hint.text +
-// the pointed-at v<N>.metadata.json and projects the current snapshot's
-// summary into a TableInfo. Returns ok=false when the table isn't a
-// valid Iceberg table (missing metadata dir, malformed JSON, no
-// current snapshot — happens transiently while a writer is committing).
-func readIcebergCurrentSnapshot(tableDir string) (TableInfo, bool) {
-	metaDir := filepath.Join(tableDir, "metadata")
-	hintBytes, err := os.ReadFile(filepath.Join(metaDir, "version-hint.text"))
+// readDeltaCurrentSnapshot reads <table>/_delta_log/ and projects the
+// latest commit's metadata into a TableInfo. Returns ok=false when the
+// directory isn't a Delta table (no `_delta_log/`, empty log, malformed
+// commit — happens transiently while a writer is committing).
+//
+// Maps Delta commitInfo.operationMetrics + userMetadata into the same
+// TableInfo fields the v1.x Iceberg path filled from snapshot.summary,
+// keeping the dashboard / catalog UI agnostic of which storage format
+// the table uses (ADR-018, ADR-014).
+func readDeltaCurrentSnapshot(tableDir string) (TableInfo, bool) {
+	_, commits, err := delta.ReadCurrentFromPath(tableDir)
 	if err != nil {
+		// Missing log, malformed commit, or any other read failure —
+		// the catalog walker silently skips this table.
+		_ = errors.Is(err, delta.ErrNotDelta)
 		return TableInfo{}, false
 	}
-	version := strings.TrimSpace(string(hintBytes))
-	if version == "" {
+	if len(commits) == 0 {
 		return TableInfo{}, false
 	}
-	metaPath := filepath.Join(metaDir, "v"+version+".metadata.json")
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		return TableInfo{}, false
-	}
-	var meta struct {
-		CurrentSnapshotID json.Number `json:"current-snapshot-id"`
-		Snapshots         []struct {
-			SnapshotID  json.Number       `json:"snapshot-id"`
-			TimestampMs int64             `json:"timestamp-ms"`
-			Summary     map[string]string `json:"summary"`
-		} `json:"snapshots"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return TableInfo{}, false
-	}
-	currentID := meta.CurrentSnapshotID.String()
-	if currentID == "" || currentID == "0" {
-		return TableInfo{}, false
-	}
-	var snap *struct {
-		SnapshotID  json.Number       `json:"snapshot-id"`
-		TimestampMs int64             `json:"timestamp-ms"`
-		Summary     map[string]string `json:"summary"`
-	}
-	for i := range meta.Snapshots {
-		if meta.Snapshots[i].SnapshotID.String() == currentID {
-			snap = &meta.Snapshots[i]
-			break
-		}
-	}
-	if snap == nil {
-		return TableInfo{}, false
-	}
+	latest := commits[0]
 	info := TableInfo{
-		SnapshotID: snap.SnapshotID.String(),
-		SnapshotTS: time.UnixMilli(snap.TimestampMs).UTC().Format("2006-01-02T15:04:05.000Z"),
+		SnapshotID: strconv.FormatInt(latest.Version, 10),
 	}
-	if v, ok := snap.Summary["total-records"]; ok {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			info.RowCount = &n
+	if latest.TimestampMs > 0 {
+		info.SnapshotTS = time.UnixMilli(latest.TimestampMs).UTC().Format("2006-01-02T15:04:05.000Z")
+	}
+	if latest.AddedRecords != nil {
+		v := *latest.AddedRecords
+		info.RowCount = &v
+	}
+	// Delta's per-commit metrics don't expose total-data-files or
+	// total-files-size the way Iceberg's snapshot.summary did. The
+	// runner stamps these into the workspace `tables` system table
+	// via spark.catalog.listTables for cloud reads; the local
+	// fast-path leaves them nil rather than guessing — the UI
+	// renders an "unknown" badge cleanly.
+	if latest.UserMetadata != "" {
+		var m map[string]string
+		if err := json.Unmarshal([]byte(latest.UserMetadata), &m); err == nil {
+			if v, ok := m["clavesa.run-id"]; ok {
+				info.LastWriterRunID = v
+			}
 		}
-	}
-	if v, ok := snap.Summary["total-data-files"]; ok {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			info.FileCount = &n
-		}
-	}
-	if v, ok := snap.Summary["total-files-size"]; ok {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			info.TotalBytes = &n
-		}
-	}
-	if v, ok := snap.Summary["clavesa.run-id"]; ok {
-		info.LastWriterRunID = v
 	}
 	return info, true
 }
@@ -641,13 +625,14 @@ func (p *LocalProvider) Tables(ctx context.Context, q TablesQuery) (*TablesResul
 	if !validPipelineName(q.PipelineName) {
 		return nil, fmt.Errorf("invalid pipeline name: %q", q.PipelineName)
 	}
-	// Fast path: read each output table's Iceberg metadata.json directly.
-	// The dashboard's left-rail row counts come from here; the Spark-
-	// backed system-catalog read below would take 1-30s and made every
-	// node read "no data yet" until Spark warmed. Falls back to Spark
-	// when the warehouse / pipeline dir is missing — preserves cloud-
-	// like behaviour for fresh workspaces where the metadata directory
-	// hasn't been written yet.
+	// Fast path: read each output table's Delta transaction log
+	// directly (ADR-018; swapped from Iceberg metadata.json in this
+	// sub-slice). The dashboard's left-rail row counts come from here;
+	// the Spark-backed system-catalog read below would take 1-30s and
+	// made every node read "no data yet" until Spark warmed. Falls
+	// back to Spark when the warehouse / pipeline dir is missing —
+	// preserves cloud-like behaviour for fresh workspaces where the
+	// `_delta_log/` directory hasn't been written yet.
 	if res, ok := p.tablesFromMetadata(q); ok {
 		return res, nil
 	}
@@ -665,7 +650,7 @@ func (p *LocalProvider) Tables(ctx context.Context, q TablesQuery) (*TablesResul
   row_count, file_count, total_bytes, last_writer_run_id
 FROM (
   SELECT *, row_number() OVER (PARTITION BY table_id ORDER BY snapshot_ts DESC) AS _rn
-  FROM clavesa.%s.tables
+  FROM %s.tables
   WHERE pipeline = '%s'
 ) WHERE _rn = 1
 ORDER BY snapshot_ts DESC
@@ -717,55 +702,50 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	if !validIdentifier(q.Table) {
 		return nil, fmt.Errorf("invalid table name: %q", q.Table)
 	}
-	// PipelineDir takes precedence; fall back to deriving from the database
-	// name only when callers haven't migrated yet (legacy path; the
-	// derivation is wrong for pipelines whose dir name uses dashes).
-	pipelineRef := q.PipelineDir
-	if pipelineRef == "" {
-		pipelineRef = strings.TrimPrefix(q.Database, "clavesa_")
-	}
 
-	sql := fmt.Sprintf(
-		`SELECT
-  CAST(snapshot_id AS string) AS snapshot_id,
-  CAST(parent_id   AS string) AS parent_id,
-  concat(date_format(committed_at, 'yyyy-MM-dd'), 'T', date_format(committed_at, 'HH:mm:ss.SSSXXX')) AS committed_at,
-  operation,
-  summary['added-records']    AS added_records,
-  summary['deleted-records']  AS deleted_records,
-  summary['total-records']    AS total_records,
-  summary['clavesa.trigger'] AS trigger,
-  summary['clavesa.run-id']  AS writer_run_id
-FROM clavesa.%s.%s.snapshots
-ORDER BY committed_at DESC
-LIMIT %d`, q.Database, q.Table, q.Limit+1)
-
-	res, err := p.runQueryFor(ctx, pipelineRef, sql)
+	// ADR-018: read Delta's `_delta_log/` directly. Same posture as
+	// CloudProvider.Snapshots — the v1.x Iceberg `<table>$snapshots`
+	// SQL is gone, and `DESCRIBE HISTORY` would force a Spark spawn
+	// per snapshot fetch. The local-mode Hive layout puts the table at
+	// `<warehouse>/<db>.db/<table>/_delta_log/`.
+	warehouse := workspace.LocalWarehouseDir(p.workspaceRoot)
+	tablePath := filepath.Join(warehouse, q.Database+".db", q.Table)
+	schema, commits, err := delta.ReadCurrentFromPath(tablePath)
+	_ = schema // unused — caller is asking for snapshots only
 	if err != nil {
-		return nil, err
+		if errors.Is(err, delta.ErrNotDelta) {
+			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
+		}
+		return nil, fmt.Errorf("read delta log: %w", err)
 	}
-	idx := columnIndex(res.Columns)
 
-	rows := res.Rows
+	limit := q.Limit
+	if limit <= 0 {
+		limit = len(commits)
+	}
 	truncated := false
-	if len(rows) > q.Limit {
-		rows = rows[:q.Limit]
+	if len(commits) > limit {
+		commits = commits[:limit]
 		truncated = true
 	}
 
-	out := make([]SnapshotInfo, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, SnapshotInfo{
-			SnapshotID:     stringValue(rowAt(r, idx, "snapshot_id")),
-			ParentID:       stringValue(rowAt(r, idx, "parent_id")),
-			CommittedAt:    stringValue(rowAt(r, idx, "committed_at")),
-			Operation:      stringValue(rowAt(r, idx, "operation")),
-			AddedRecords:   int64Pointer(rowAt(r, idx, "added_records")),
-			DeletedRecords: int64Pointer(rowAt(r, idx, "deleted_records")),
-			TotalRecords:   int64Pointer(rowAt(r, idx, "total_records")),
-			Trigger:        stringValue(rowAt(r, idx, "trigger")),
-			WriterRunID:    stringValue(rowAt(r, idx, "writer_run_id")),
-		})
+	out := make([]SnapshotInfo, 0, len(commits))
+	for _, ci := range commits {
+		trigger, runID := extractProvenance(ci.UserMetadata)
+		info := SnapshotInfo{
+			SnapshotID:     strconv.FormatInt(ci.Version, 10),
+			CommittedAt:    formatMillis(ci.TimestampMs),
+			Operation:      ci.Operation,
+			AddedRecords:   ci.AddedRecords,
+			DeletedRecords: ci.DeletedRecords,
+			TotalRecords:   ci.TotalRecords,
+			Trigger:        trigger,
+			WriterRunID:    runID,
+		}
+		if ci.Version > 0 {
+			info.ParentID = strconv.FormatInt(ci.Version-1, 10)
+		}
+		out = append(out, info)
 	}
 	result := &SnapshotsResult{Snapshots: out, Truncated: truncated}
 	if len(out) > 0 && out[0].TotalRecords != nil {
@@ -810,7 +790,7 @@ func (p *LocalProvider) ColumnStats(ctx context.Context, q ColumnStatsQuery) (*C
 FROM (
   SELECT *,
     row_number() OVER (PARTITION BY column_name ORDER BY computed_at DESC) AS _rn
-  FROM clavesa.%s.column_stats
+  FROM %s.column_stats
   WHERE table_identifier = '%s'
 ) WHERE _rn = 1
 ORDER BY column_name`, q.Database, safeIdent)
@@ -869,7 +849,7 @@ func (p *LocalProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 		limit = 100
 	}
 
-	sql := fmt.Sprintf("SELECT * FROM clavesa.%s.%s LIMIT %d", q.Database, q.Table, limit+1)
+	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT %d", q.Database, q.Table, limit+1)
 	res, err := p.runQueryFor(ctx, pipelineRef, sql)
 	if err != nil {
 		// Fresh table that hasn't been written yet — surface an empty

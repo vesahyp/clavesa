@@ -16,6 +16,7 @@ import GridLayout, { WidthProvider, type Layout } from "react-grid-layout";
 import { GripHorizontal } from "lucide-react";
 
 import type { DashboardDataset, DashboardWidget } from "@/lib/queries";
+import { cn } from "@/lib/utils";
 
 import { Widget } from "./Widget";
 
@@ -30,6 +31,10 @@ interface EditorGridProps {
   onChange: (widgets: DashboardWidget[]) => void;
   /** When set, the matching widget cell scrolls into view (freshly added). */
   scrollToId?: string;
+  /** Currently-selected widget id; renders a ring on its cell. */
+  selectedId?: string | null;
+  /** Cell-body click handler — opens the chart-first drawer. */
+  onSelect?: (id: string) => void;
 }
 
 export function EditorGrid({
@@ -37,6 +42,8 @@ export function EditorGrid({
   datasets,
   onChange,
   scrollToId,
+  selectedId,
+  onSelect,
 }: EditorGridProps) {
   const datasetMap = useMemo(() => {
     const m = new Map<string, DashboardDataset>();
@@ -96,6 +103,7 @@ export function EditorGrid({
     >
       {widgets.map((w) => {
         const ds = datasetMap.get(w.dataset);
+        const selected = selectedId === w.id;
         return (
           <div
             key={w.id}
@@ -103,12 +111,43 @@ export function EditorGrid({
               if (el) cellRefs.current.set(w.id, el);
               else cellRefs.current.delete(w.id);
             }}
-            className="flex flex-col"
+            className={cn(
+              "flex flex-col rounded-md transition-shadow",
+              selected && "ring-2 ring-primary ring-offset-1 ring-offset-background",
+            )}
           >
             <div className="widget-drag-handle flex cursor-move items-center justify-center rounded-t-md border border-b-0 border-border bg-muted/40 py-0.5 text-muted-foreground hover:bg-muted">
               <GripHorizontal className="h-3.5 w-3.5" />
             </div>
-            <div className="min-h-0 flex-1">
+            <div
+              className={cn("min-h-0 flex-1", onSelect && "cursor-pointer")}
+              onClick={(e) => {
+                // Don't fire on clicks bubbling from interactive widget
+                // controls (Recharts tooltips, in-cell links). The handle
+                // is a sibling, not a descendant, so dragging is
+                // unaffected. The check walks from the click target up to
+                // — but NOT including — the wrapper itself, so the
+                // wrapper's own role doesn't self-match and swallow every
+                // click.
+                if (!onSelect) return;
+                const wrapper = e.currentTarget;
+                let n: HTMLElement | null = e.target as HTMLElement;
+                while (n && n !== wrapper) {
+                  if (n.matches("button, a, input, [role='button']")) return;
+                  n = n.parentElement;
+                }
+                onSelect(w.id);
+              }}
+              tabIndex={onSelect ? 0 : undefined}
+              onKeyDown={(e) => {
+                if (!onSelect) return;
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelect(w.id);
+                }
+              }}
+              aria-label={onSelect ? `Edit widget ${w.title}` : undefined}
+            >
               <Widget
                 widget={w}
                 sql={ds?.sql ?? ""}

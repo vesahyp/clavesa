@@ -272,7 +272,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			// transforms can read via spark.table(...). Iceberg in local
 			// matches CLAUDE.md's "Iceberg is the default output" rule and
 			// closes the catalog/observability parity gap with cloud.
-			tableID := autoIcebergTableID(catalog, schema, nodeID)
+			tableID := autoDeltaTableID(catalog, schema, nodeID)
 
 			// Cascade-skip: if every parent node skipped this run, the
 			// upstream tables are bit-for-bit identical to last run, so this
@@ -551,11 +551,11 @@ func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath,
 			}
 		}
 		// Cross-pipeline reads (ADR-016). `external_inputs` holds
-		// `alias -> "<schema>.<table>"`; resolve each to the runner catalog
-		// identifier `clavesa.<catalog>__<schema>.<table>`. The runner
-		// reads a slashless bare string via `spark.table()`, and the
-		// workspace-shared local warehouse means the producing pipeline's
-		// table is in the same Hadoop catalog the consumer's Spark sees.
+		// `alias -> "<schema>.<table>"`; resolve each to the runner Delta
+		// table identifier `<catalog>__<schema>.<table>`. The runner reads a
+		// slashless bare string via `spark.table()`, and the workspace-shared
+		// local warehouse means the producing pipeline's table is in the
+		// same Hadoop catalog the consumer's Spark sees.
 		if extInputs, ok := n.Config["external_inputs"].(map[string]interface{}); ok {
 			for alias, raw := range extInputs {
 				ref, _ := raw.(string)
@@ -593,23 +593,43 @@ func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath,
 		}
 		format := outputFormat[e.FromNode]
 		if format == "iceberg" && incremental[alias] {
-			// v0.24.0: snapshot-bounded read on a transform upstream.
-			// Runner discovers the current snapshot id at execution
-			// time, compares against a stored watermark, reads the
-			// committed-since range. Local watermarks live under the
-			// pipeline's `.clavesa/watermarks/` (mounted into the
-			// container by runTransform); cloud uses the pipeline's
-			// S3 bucket.
-			inputs[alias] = map[string]any{
-				"kind":  "iceberg_table_incremental",
+			// v2.0.0 (ADR-018): CDF-bounded read on a Delta upstream.
+			// Runner discovers the current Delta version via
+			// `DESCRIBE HISTORY`, compares against the stored watermark,
+			// and reads the (last, current] range through readChangeFeed.
+			// Local watermarks live under the pipeline's
+			// `.clavesa/watermarks/` (mounted into the container by
+			// runTransform); cloud uses the pipeline's S3 bucket.
+			//
+			// When the upstream producer declares merge_keys (mode=merge),
+			// stamp them onto the descriptor so the runner dedupes the CDF
+			// range to the latest row per key by `_commit_version DESC`
+			// (mirror of the cloud-side wiring in orchestration.go's
+			// buildNodeInputsExpr).
+			desc := map[string]any{
+				"kind":  "delta_table_cdf",
 				"table": path,
 				"alias": nodeID + "__" + alias,
 			}
+			var fromNode *graph.Node
+			for i := range g.Nodes {
+				if g.Nodes[i].ID == e.FromNode {
+					fromNode = &g.Nodes[i]
+					break
+				}
+			}
+			if fromNode != nil {
+				fromOutput := "default"
+				if mk := outputMergeKeys(*fromNode, fromOutput); len(mk) > 0 {
+					desc["merge_keys"] = mk
+				}
+			}
+			inputs[alias] = desc
 			continue
 		}
 		// Bare-string descriptor handles two cases the runner already
-		// dispatches correctly: parquet paths (slash → spark.read.parquet)
-		// and iceberg table ids (no slash → spark.table). The dict-form
+		// dispatches correctly: Delta table ids (no slash → spark.table)
+		// and parquet paths (slash → spark.read.parquet). The dict-form
 		// descriptor is reserved for non-Parquet path-form sources.
 		if format == "" || format == "parquet" || format == "iceberg" {
 			inputs[alias] = path
@@ -721,15 +741,16 @@ func tfvarsCandidates(dir string) []string {
 	return out
 }
 
-// autoIcebergTableID mirrors runner.py::_table_id_for so Go can pass an
-// explicit Iceberg table id into the runner's `outputs.default` field
+// autoDeltaTableID mirrors runner.py::_table_id_for so Go can pass an
+// explicit Delta table id into the runner's `outputs.default` field
 // (instead of letting the runner auto-generate, which Go can't observe
 // for downstream-input wiring). Same ADR-016 encoding as the runner's
-// `_glue_db()` and `internal/identutil.EncodeGlueDatabase`. Empty
-// catalog signals legacy pre-ADR-016 mode.
-func autoIcebergTableID(catalog, schema, nodeID string) string {
+// `_glue_db()` and `internal/identutil.EncodeGlueDatabase`. Delta tables
+// (ADR-018) live under Spark's default `spark_catalog`, so the identifier
+// is bare `<db>.<table>` — no leading catalog prefix.
+func autoDeltaTableID(catalog, schema, nodeID string) string {
 	nodeSafe := identutil.Sanitize(nodeID)
-	return fmt.Sprintf("clavesa.%s.%s__default",
+	return fmt.Sprintf("%s.%s__default",
 		identutil.EncodeGlueDatabase(catalog, schema), nodeSafe)
 }
 
@@ -844,8 +865,8 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	if err := os.MkdirAll(warehouse, 0o755); err != nil {
 		return "", nil, fmt.Errorf("create warehouse: %w", err)
 	}
-	// Local-side watermark directory for v0.24.0's iceberg_table_incremental
-	// kind (and any future watermark-tracking inputs). The runner reads / writes
+	// Local-side watermark directory for v2.0.0's delta_table_cdf kind
+	// (and any future watermark-tracking inputs). The runner reads / writes
 	// `<watermarks>/<consumer>__<alias>.json`; cloud uses `s3://<bucket>/<pipeline>/_watermarks/`
 	// for the same purpose. ADR-014 local-cloud parity.
 	watermarks := filepath.Join(pipelineDir, ".clavesa", "watermarks")
@@ -1498,7 +1519,7 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 			}
 		}
 		desc := map[string]any{
-			"kind":       "iceberg_table",
+			"kind":       "delta_table",
 			"table_id":   target,
 			"mode":       resolvedMode,
 			"merge_keys": mergeKeys,

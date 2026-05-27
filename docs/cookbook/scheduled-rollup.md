@@ -1,22 +1,22 @@
 # Scheduled rollup
 
-> **When you have one:** an Iceberg table that grows over time (a bronze ingest, an event log, a session table) and you want a daily/hourly summary computed on a schedule — the kind of thing you'd otherwise put in a dbt run on Airflow.
+> **When you have one:** a Delta table that grows over time (a bronze ingest, an event log, a session table) and you want a daily/hourly summary computed on a schedule — the kind of thing you'd otherwise put in a dbt run on Airflow.
 
-This recipe wires a cron-triggered pipeline whose only job is to recompute an aggregate from an upstream table. No source files involved — the input is another Iceberg table you already have.
+This recipe wires a cron-triggered pipeline whose only job is to recompute an aggregate from an upstream table. No source files involved — the input is another Delta table you already have.
 
 ## What you'll end up with
 
 - A deployed pipeline with one transform.
 - An EventBridge schedule rule that starts the pipeline at a cadence you set (e.g. nightly at 02:00 UTC).
-- An Iceberg summary table that gets rewritten on each run from the current contents of the upstream.
+- A Delta summary table that gets rewritten on each run from the current contents of the upstream.
 
 ## Prerequisites
 
 - A deployed workspace (`clavesa workspace deploy`).
-- An existing Iceberg table you want to roll up. Could be the output of a transform in another pipeline ([multi-stage-pipeline](multi-stage-pipeline.md) builds one), or any table already in the workspace catalog.
+- An existing Delta table you want to roll up. Could be the output of a transform in another pipeline ([multi-stage-pipeline](multi-stage-pipeline.md) builds one), or any table already in the workspace catalog.
 - AWS credentials in your shell so the eventual `pipeline deploy` can read state.
 
-> **`compute = "local"` works for a manual run.** The recipe uses `compute = "lambda"` below because the *scheduled* trigger needs a deployed pipeline. Cross-pipeline `--from-table` reads themselves work on `compute = "local"` too — every local pipeline in a workspace shares one Iceberg warehouse, so a local `clavesa pipeline run` of this recipe resolves the upstream table. Use `compute = "local"` to iterate on the SQL before deploying; switch to `compute = "lambda"` once you wire the schedule.
+> **Local iteration works too.** The recipe deploys to Lambda because the *scheduled* trigger needs a deployed pipeline. Cross-pipeline `--from-table` reads themselves work locally too. Every local pipeline in a workspace shares one Delta warehouse, so a local `clavesa pipeline run` of this recipe resolves the upstream table. Iterate on the SQL with `clavesa pipeline run` before deploying; deploy once you wire the schedule.
 
 For this recipe we'll assume the upstream is `clavesa_<workspace>__taxis.trips_bronze__default` — the bronze table the [multi-stage-pipeline](multi-stage-pipeline.md) recipe produces. Substitute your own table.
 
@@ -27,12 +27,11 @@ For this recipe we'll assume the upstream is `clavesa_<workspace>__taxis.trips_b
 #    a cross-pipeline reference to the bronze table.
 bin/clavesa pipeline create taxi_daily
 
-# 2. Add the transform, then set its SQL and compute target.
-#    compute=lambda because we want the deployed scheduler to invoke it
-#    without your laptop in the loop.
+# 2. Add the transform, then set its SQL. Compute target is decided
+#    at run time: `clavesa pipeline run` executes locally, the deployed
+#    scheduler invokes Lambda. No per-node attr to set.
 bin/clavesa node add taxi_daily --type transform --name daily_trips
 bin/clavesa node edit taxi_daily daily_trips \
-  --set compute=lambda \
   --set "sql=
   SELECT
     DATE(pickup_ts)         AS dt,
@@ -81,7 +80,7 @@ Deploy provisions: the transform Lambda with read permission on `taxis.trips_bro
 ## What you should see
 
 - At the scheduled time, `/pipelines/dashboard?dir=taxi_daily` gets a new run with `trigger = "scheduled"`.
-- The Iceberg summary table at `clavesa_<workspace>__taxi_daily.daily_trips__default` either appears (first run) or gets overwritten (subsequent runs).
+- The Delta summary table at `clavesa_<workspace>__taxi_daily.daily_trips__default` either appears (first run) or gets overwritten (subsequent runs).
 - Catalog → click through → daily summary rows, one per pickup date.
 
 To trigger manually for testing, use the **Run pipeline** button on the dashboard (CLI: `pipeline run`). Manual runs and scheduled runs are indistinguishable downstream — they just stamp `runs.trigger` differently for observability.
@@ -90,7 +89,7 @@ To trigger manually for testing, use the **Run pipeline** button on the dashboar
 
 By default the rollup full-reads the bronze table on every cron tick. For a daily aggregate that's cheap (Lambda, cents per day), and re-aggregating from scratch is the simplest correctness story. But on a high-volume bronze, you can pay for re-aggregating the same months of history every night.
 
-Flip the upstream to incremental reads and the rollup only sees rows committed since its last successful run:
+Flip the upstream to incremental reads and the rollup only sees rows from new Delta commits since its last successful run:
 
 ```bash
 bin/clavesa node edit taxi_daily daily_trips --incremental-input trips_bronze

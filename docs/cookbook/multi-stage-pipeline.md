@@ -2,11 +2,11 @@
 
 > **When you have one:** a raw source you want to land as-is for auditability **and** a cleaned-up, aggregated view of the same data for analysts. The classic medallion shape: bronze does ingest, silver does the joins and the cleanup, gold does the rollups.
 
-This recipe builds bronze + silver. Gold is the same pattern repeated — one more transform reading from silver's Iceberg output.
+This recipe builds bronze + silver. Gold is the same pattern repeated — one more transform reading from silver's Delta output.
 
 ## What you'll end up with
 
-- Two Iceberg tables in the same pipeline:
+- Two Delta tables in the same pipeline:
   - `<node>__default` for bronze (raw, passthrough)
   - `<node>__default` for silver (cleaned + typed)
 - A lineage panel on TableDetail showing the source → bronze → silver chain.
@@ -42,7 +42,7 @@ bin/clavesa node edit taxis trips_bronze --set "sql=
     CAST(total_amount          AS DOUBLE)    AS total_amount
   FROM trips"
 
-# 4. Silver: aggregate by payment type. Reads from bronze's Iceberg
+# 4. Silver: aggregate by payment type. Reads from bronze's Delta
 #    output, not from the source — that's what makes it 'silver' and
 #    not just a second bronze.
 bin/clavesa node add taxis --type transform --name revenue_by_payment
@@ -74,7 +74,7 @@ bin/clavesa pipeline run taxis
 
 ## How the stages talk to each other
 
-Each transform writes an Iceberg table at `clavesa_<workspace>__<pipeline>.<node>__<output_key>`. Downstream transforms reference upstream tables through their `inputs` map. In the `.tf` Clavesa emits, that wiring shows up as:
+Each transform writes a Delta table at `clavesa_<workspace>__<pipeline>.<node>__<output_key>`. Downstream transforms reference upstream tables through their `inputs` map. In the `.tf` Clavesa emits, that wiring shows up as:
 
 ```hcl
 module "revenue_by_payment" {
@@ -85,13 +85,13 @@ module "revenue_by_payment" {
 }
 ```
 
-`module.trips_bronze.outputs["default"]` is the catalog table id `trips_bronze__default` — silver reads it as a regular Iceberg table, not as a Parquet path. That means each silver run sees the **full** current contents of bronze.
+`module.trips_bronze.outputs["default"]` is the catalog table id `trips_bronze__default` — silver reads it as a regular Delta table, not as a Parquet path. That means each silver run sees the **full** current contents of bronze.
 
 ## Incremental upstream reads
 
-Default behaviour: every silver run full-reads the bronze Iceberg table. For nightly aggregations over small/medium data that's the right call; the planner re-derives the answer from the current state every time.
+Default behaviour: every silver run full-reads the bronze Delta table. For nightly aggregations over small/medium data that's the right call; the planner re-derives the answer from the current state every time.
 
-For high-throughput pipelines, mark the upstream alias as incremental. The runner then stores a watermark per `(consumer, alias)` pair and reads only the snapshot range Iceberg has committed since the consumer's last successful run:
+For high-throughput pipelines, mark the upstream alias as incremental. The runner then stores a watermark per `(consumer, alias)` pair and reads only the Delta commits since the consumer's last successful run via Change Data Feed:
 
 ```bash
 bin/clavesa node edit taxis revenue_by_payment --incremental-input trips_bronze
@@ -99,20 +99,21 @@ bin/clavesa node edit taxis revenue_by_payment --incremental-input trips_bronze
 
 (UI equivalent: select silver in the editor, then check the box next to `trips_bronze` in the right panel's **Incremental upstream reads** section.)
 
-On the next `pipeline run`, silver does:
+On the next `pipeline run`, silver reads only the new commits from bronze via Change Data Feed:
 
 ```python
-spark.read \
-  .option("start-snapshot-id", last_seen) \
-  .option("end-snapshot-id",   current) \
+spark.read.format("delta") \
+  .option("readChangeFeed", "true") \
+  .option("startingVersion", last_version + 1) \
+  .option("endingVersion",   current_version) \
   .table("clavesa_<workspace>__taxis.trips_bronze__default")
 ```
 
-First run on the flag reads everything (no watermark yet) and stamps the watermark to bronze's current snapshot. Each later run reads only what bronze appended since.
+First run on the flag reads everything (no watermark yet) and stamps the watermark to bronze's current Delta version. Each later run reads only what bronze committed since. CDF returns rows tagged with `_change_type` (`insert`, `update_postimage`, etc.); the runner filters to inserted and updated rows automatically.
 
-**At-least-once on retry.** The watermark advances *after* outputs commit. A runner crash mid-write leaves the watermark at the prior snapshot, so the next attempt re-reads the same range. Pair an incremental input with an **`append`-mode output** that declares `merge_keys` (so retries upsert instead of duplicating); same shape as the event-driven recipe at [s3-trigger](s3-trigger.md). Plain `append` with no merge keys will dupe on retry.
+**At-least-once on retry.** The watermark advances *after* outputs commit. A runner crash mid-write leaves the watermark at the prior version, so the next attempt re-reads the same version range. Pair an incremental input with an **`append`-mode output** that declares `merge_keys` (so retries upsert instead of duplicating); same shape as the event-driven recipe at [s3-trigger](s3-trigger.md). Plain `append` with no merge keys will dupe on retry.
 
-**Replace-mode upstreams reset the watermark.** Bronze defaults to `mode = "replace"`: every run wipes the upstream table and writes a fresh snapshot tree, orphaning the previous head. The runner detects this (the stored watermark isn't an ancestor of the new current snapshot) and falls back to a full read for that run, re-stamping the watermark to the new current. So `incremental_input` is correct against replace-mode upstreams but only delivers incremental savings against `append`-mode upstreams whose snapshot lineage extends across runs.
+**Replace-mode upstreams reset the watermark.** Bronze defaults to `mode = "replace"`: every run overwrites the upstream table, which resets Delta's version counter for that logical table if it is dropped and recreated. The runner detects this (stored version is higher than the new current) and falls back to a full read for that run, re-stamping the watermark. So `incremental_input` is correct against replace-mode upstreams but only delivers incremental savings against `append`-mode upstreams whose Delta version monotonically increases across runs.
 
 ## Adding a gold layer
 

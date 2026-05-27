@@ -3,7 +3,7 @@
  *
  * Workspace's saved dashboards. Each entry links to /dashboards/:slug
  * for the detail/render view. Dashboards live in the `dashboards` system
- * Iceberg table, shared across everyone with workspace access. "New
+ * Delta table, shared across everyone with workspace access. "New
  * dashboard" opens the editor on a blank spec.
  */
 

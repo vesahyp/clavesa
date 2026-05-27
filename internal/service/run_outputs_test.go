@@ -26,7 +26,7 @@ func TestBuildLocalOutputsMergeKeysImpliesMergeMode(t *testing.T) {
 		},
 	}
 
-	out := buildLocalOutputs(node, "clavesa.demo.dim_customers__default")
+	out := buildLocalOutputs(node, "demo.dim_customers__default")
 	def, ok := out["default"].(map[string]any)
 	if !ok {
 		t.Fatalf("default output not a dict: %T", out["default"])
@@ -37,7 +37,7 @@ func TestBuildLocalOutputsMergeKeysImpliesMergeMode(t *testing.T) {
 	if !reflect.DeepEqual(def["merge_keys"], []string{"customer_id"}) {
 		t.Errorf("merge_keys = %v, want [customer_id]", def["merge_keys"])
 	}
-	if def["table_id"] != "clavesa.demo.dim_customers__default" {
+	if def["table_id"] != "demo.dim_customers__default" {
 		t.Errorf("table_id = %v, want demo table id", def["table_id"])
 	}
 }
@@ -58,7 +58,7 @@ func TestBuildLocalOutputsExplicitModeWins(t *testing.T) {
 			},
 		},
 	}
-	out := buildLocalOutputs(node, "clavesa.demo.events__default")
+	out := buildLocalOutputs(node, "demo.events__default")
 	def := out["default"].(map[string]any)
 	if def["mode"] != "append" {
 		t.Errorf("explicit mode=append lost: got %v", def["mode"])
@@ -74,8 +74,8 @@ func TestBuildLocalOutputsBareReplace(t *testing.T) {
 		Type:   "transform",
 		Config: map[string]interface{}{},
 	}
-	out := buildLocalOutputs(node, "clavesa.demo.passthrough__default")
-	if out["default"] != "clavesa.demo.passthrough__default" {
+	out := buildLocalOutputs(node, "demo.passthrough__default")
+	if out["default"] != "demo.passthrough__default" {
 		t.Errorf("bare-replace default = %v, want bare target string", out["default"])
 	}
 }

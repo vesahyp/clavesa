@@ -32,10 +32,13 @@ import (
 // branch bug that HCL couldn't represent) and inlined via jsonencode({...})
 // in the resource definition by internal/orchestration/tfgen.
 //
-// Sidecar Python (runs_writer/index.py, poller.py) is copied from embedded
-// FS into <pipeline>/_clavesa_sidecar/ so the generated archive_file blocks
+// Sidecar Python (poller.py) is copied from embedded FS into
+// <pipeline>/_clavesa_sidecar/ so the generated archive_file blocks
 // resolve locally and the pipeline directory is detach-complete: a user
 // dropping clavesa keeps idiomatic Terraform with no module dependency.
+// runs_writer used to ship here too as a zip Lambda but ADR-018
+// moved it into the runner image (Athena's Delta support is read-only
+// so the Iceberg INSERT path is gone).
 //
 // Trigger configuration is read from pipeline variables (trigger_schedule,
 // trigger_batch_window) automatically. Pass schedule as a non-empty string
@@ -143,6 +146,10 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		bucketExpr = "data.terraform_remote_state.workspace.outputs.pipeline_bucket"
 		systemCatalog = ws.SystemCatalogIdentifier()
 	}
+	// ADR-018: runs_writer deploys as the runner image (Athena INSERT
+	// is gone with the Iceberg→Delta swap). Same expression every
+	// transform node uses for `runner_image`.
+	runnerImageExpr := "data.terraform_remote_state.workspace.outputs.runner_image"
 
 	// Materialise registered s3 source modules at the top of the file.
 	sourceModuleSrc := s.ModuleSource(abs, SourceModuleRel)
@@ -157,6 +164,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		SchemaExpr:        "var.schema",
 		SystemCatalog:     systemCatalog,
 		BucketExpr:        bucketExpr,
+		RunnerImageExpr:   runnerImageExpr,
 		ScheduleExpr:      "var.trigger_schedule",
 		BatchWindowExpr:   "var.trigger_batch_window",
 		TriggerQueueExprs: queueExprs,
@@ -189,10 +197,10 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 // buildNodeInputsExpr returns the inputs map for a transform node as a
 // single-line HCL map literal `{ alias = value, … }` suitable for inlining
 // inside the Lambda Payload. Each entry is one of:
-//   - "<table_id>" (Iceberg upstream from another transform)
+//   - "<table_id>" (Delta upstream from another transform)
 //   - { kind = "http", … } (registered http source)
 //   - { kind = "s3", … } / { kind = "partitioned_path", … } (s3 sources)
-//   - { kind = "iceberg_table_incremental", … } (snapshot-bounded read)
+//   - { kind = "delta_table_cdf", … } (CDF-bounded incremental read)
 //   - "<table_path>" (pass-through S3 source)
 //   - module.X.outputs[...].table_path (destination passthrough)
 //
@@ -289,12 +297,23 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 		switch {
 		case from.Type == "transform" && incrementalAliases[alias]:
 			watermarkAlias := id + "__" + alias
+			// Stamp upstream's merge_keys onto the CDF descriptor when the
+			// producer declares them (mode=merge or explicit merge_keys
+			// list). The runner dedupes the CDF range to the latest row
+			// per key by `_commit_version DESC`; without merge_keys the
+			// range is read raw and downstream sees one row per change
+			// event rather than the latest state per business key.
+			mergeKeys := outputMergeKeys(from, fromOutput)
+			mergeKeysAttr := ""
+			if len(mergeKeys) > 0 {
+				mergeKeysAttr = fmt.Sprintf(", merge_keys = [%s]", quoteList(mergeKeys))
+			}
 			entries = append(entries, fmt.Sprintf(
-				`%s = { kind = "iceberg_table_incremental", table = "clavesa.${module.%s.outputs[%q].catalog_db}.${module.%s.outputs[%q].catalog_table}", alias = %q }`,
-				alias, e.FromNode, fromOutput, e.FromNode, fromOutput, watermarkAlias))
+				`%s = { kind = "delta_table_cdf", table = "${module.%s.outputs[%q].catalog_db}.${module.%s.outputs[%q].catalog_table}", alias = %q%s }`,
+				alias, e.FromNode, fromOutput, e.FromNode, fromOutput, watermarkAlias, mergeKeysAttr))
 		case from.Type == "transform":
 			entries = append(entries, fmt.Sprintf(
-				`%s = "clavesa.${module.%s.outputs[%q].catalog_db}.${module.%s.outputs[%q].catalog_table}"`,
+				`%s = "${module.%s.outputs[%q].catalog_db}.${module.%s.outputs[%q].catalog_table}"`,
 				alias, e.FromNode, fromOutput, e.FromNode, fromOutput))
 		case from.Type == "source" && sourceHasPartitions(from):
 			entries = append(entries, fmt.Sprintf(
@@ -353,7 +372,7 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 			statsAttr = ", stats = true"
 		}
 		entries = append(entries, fmt.Sprintf(
-			`%s = { kind = "iceberg_table", table_id = %s, mode = %q, merge_keys = [%s]%s }`,
+			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s }`,
 			key, dest, mode, quoteList(mergeKeys), statsAttr))
 	}
 	return "{ " + strings.Join(entries, ", ") + " }"

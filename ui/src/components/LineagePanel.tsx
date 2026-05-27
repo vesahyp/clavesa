@@ -1,5 +1,5 @@
 /**
- * LineagePanel — upstream + downstream neighbors for one Iceberg table.
+ * LineagePanel — upstream + downstream neighbors for one Delta table.
  *
  * Reads pipeline edges from /api/pipeline/lineage and partitions them into
  * "upstream of this table" (edges where this node is the consumer) and

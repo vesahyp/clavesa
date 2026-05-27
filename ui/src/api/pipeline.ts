@@ -67,7 +67,7 @@ export function updateNode(
 /**
  * POST /pipeline/nodes/:id/rename — rename a node. Moves the module block,
  * every downstream edge reference, and the transform's script files. The
- * node id is also the stem of its Iceberg output table, so a rename
+ * node id is also the stem of its Delta output table, so a rename
  * changes that table's name.
  */
 export function renameNode(

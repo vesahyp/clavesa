@@ -51,17 +51,19 @@ func EncodeGlueDatabase(catalog, schema string) string {
 }
 
 // EncodeExternalTableRef translates an ADR-016 cross-pipeline reference
-// `<schema>.<table>` into the runner catalog identifier
-// `clavesa.<catalog>__<schema>.<table>`. The runner's Spark catalog is
-// always named `clavesa`; the database segment is the flat-encoded
-// (catalog, schema) pair. Both the cloud orchestration emitter and the
-// local pipeline-run path resolve cross-pipeline inputs through this so the
-// two surfaces can't drift. Errors when `ref` lacks the `.` separator.
+// `<schema>.<table>` into the runner Delta table identifier
+// `<catalog>__<schema>.<table>`. The Delta catalog (ADR-018) lives under
+// Spark's default `spark_catalog`, so the identifier is the bare
+// two-segment `<db>.<table>` form — no leading catalog prefix. The
+// database segment is the flat-encoded (catalog, schema) pair. Both the
+// cloud orchestration emitter and the local pipeline-run path resolve
+// cross-pipeline inputs through this so the two surfaces can't drift.
+// Errors when `ref` lacks the `.` separator.
 func EncodeExternalTableRef(catalog, ref string) (string, error) {
 	dot := strings.Index(ref, ".")
 	if dot < 0 {
 		return "", fmt.Errorf("malformed cross-pipeline reference %q (want <schema>.<table>)", ref)
 	}
 	schema, table := ref[:dot], ref[dot+1:]
-	return "clavesa." + EncodeGlueDatabase(catalog, schema) + "." + table, nil
+	return EncodeGlueDatabase(catalog, schema) + "." + table, nil
 }

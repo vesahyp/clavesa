@@ -75,7 +75,7 @@ export interface ConfigPanelProps {
    */
   nodeSchemas?: Map<string, Column[]>;
   /**
-   * The node's own Iceberg output table, if one exists in the catalog.
+   * The node's own Delta output table, if one exists in the catalog.
    * When set, the panel auto-samples a few rows so the user sees current
    * output without clicking Preview. Absent on never-run nodes.
    */
@@ -545,13 +545,13 @@ function ComputeSection({
   );
 }
 
-// IncrementalUpstreamSection — per-alias toggle for snapshot-bounded
-// reads of upstream transform tables.
+// IncrementalUpstreamSection — per-alias toggle for CDF-bounded reads
+// of upstream transform tables.
 //
 // Each transform→transform edge into this node shows up as one row.
 // Toggling the checkbox flips the alias on/off in this node's
 // `incremental_inputs` list (committed via updateNode). The runner
-// then reads only snapshots committed since the consumer's last
+// then reads only Delta CDF rows committed since the consumer's last
 // successful run, tracking watermark per (consumer, alias). Defaults
 // off (full-read every run, the historical behaviour).
 function IncrementalUpstreamSection({
@@ -629,15 +629,14 @@ function IncrementalUpstreamSection({
               <code>{alias}</code>
             </label>
             <span className="text-[11px] text-muted-foreground">
-              {current.has(alias) ? "snapshot range" : "full read"}
+              {current.has(alias) ? "CDF range" : "full read"}
             </span>
           </li>
         ))}
       </ul>
       <p className="text-[11px] text-muted-foreground">
-        When on, the runner reads only Iceberg snapshots committed since
-        this node's last successful run. Defaults off (full read every
-        run).
+        When on, the runner reads only Delta CDF rows committed since this
+        node's last successful run. Defaults off (full read every run).
       </p>
       {error && (
         <div className="mt-1 text-[11px] text-status-failed">{error}</div>
@@ -776,7 +775,7 @@ function ExtraOutputsField({
 }
 
 // ---------------------------------------------------------------------------
-// LiveDataTab — Athena/Iceberg live data for destination nodes
+// LiveDataTab — Athena/Delta live data for destination nodes
 // ---------------------------------------------------------------------------
 
 interface LiveDataRow {
@@ -919,7 +918,7 @@ function LiveDataTab({
 // NodeNameEditor — inline-editable node id in the panel header.
 //
 // Click the name to edit; Enter or blur commits via renameNode, Escape
-// cancels. A rename also moves the node's Iceberg output table, so the
+// cancels. A rename also moves the node's Delta output table, so the
 // caption says so. On success the parent reselects the node under its new
 // id, which resyncs this component.
 // ---------------------------------------------------------------------------
@@ -1001,7 +1000,7 @@ function NodeNameEditor({
         className="h-7 w-48 font-mono text-sm"
       />
       <p className="mt-1 text-[11px] text-muted-foreground">
-        Renames the node&apos;s Iceberg output table too.
+        Renames the node&apos;s Delta output table too.
       </p>
       {error && (
         <div className="mt-1 text-[11px] text-status-failed">{error}</div>
@@ -1246,7 +1245,7 @@ export function ConfigPanel({
     upstreamIncrementalInputs,
   ]);
 
-  // Auto-sample of this node's output Iceberg table. Drives both the
+  // Auto-sample of this node's output Delta table. Drives both the
   // inline sample-rows panel and the right-side TransformInputsBrowser
   // (column list + loader). One query keyed on (database, table) — the
   // panel below uses the same hook so TanStack dedupes the network call.
@@ -1605,7 +1604,7 @@ export function ConfigPanel({
 }
 
 /**
- * OutputSamplePanel — inline sample of the node's current Iceberg output.
+ * OutputSamplePanel — inline sample of the node's current Delta output.
  *
  * Fires `useTableSample` automatically; no button press. This is the
  * "preview should be automatic" affordance — open a node whose output

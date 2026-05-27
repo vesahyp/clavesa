@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 
+# Stripped replacement for PySpark's upstream `spark-class`. Upstream uses
+# bash process substitution and `ps`, both of which fail in Lambda's
+# restricted runtime; this fork skips launcher.Main and execs java directly
+# with a hard-coded classpath (originally from aws-samples/spark-on-aws-lambda).
+#
+# v2.0.0 adds the 15 --add-opens flags Spark 4 expects under Java 17. Mirrors
+# Spark's own JavaModuleOptions.java at the v4.0.2 tag. Without these, any
+# off-heap shuffle / DirectBuffer path (e.g. StorageUtils.bufferCleaner)
+# throws InaccessibleObjectException once a query needs to spill.
+
 # Debug: Print environment variables
 echo "JAVA_HOME: $JAVA_HOME" >&2
 echo "PATH: $PATH" >&2
@@ -15,9 +25,9 @@ if [ ! -f "$JAVA_EXECUTABLE" ]; then
   if [ -n "$JAVA_HOME" ] && [ -f "$JAVA_HOME/bin/java" ]; then
     JAVA_EXECUTABLE="$JAVA_HOME/bin/java"
     echo "Using Java from JAVA_HOME: $JAVA_EXECUTABLE" >&2
-  # Try Java 11 Amazon Corretto path
-  elif [ -f "/usr/lib/jvm/java-11-amazon-corretto/bin/java" ]; then
-    JAVA_EXECUTABLE="/usr/lib/jvm/java-11-amazon-corretto/bin/java"
+  # Try Java 17 Amazon Corretto path
+  elif [ -f "/usr/lib/jvm/java-17-amazon-corretto/bin/java" ]; then
+    JAVA_EXECUTABLE="/usr/lib/jvm/java-17-amazon-corretto/bin/java"
     echo "Using Java from Amazon Corretto path: $JAVA_EXECUTABLE" >&2
   # Try common JRE path (for compatibility)
   elif [ -f "/usr/lib/jvm/jre/bin/java" ]; then
@@ -47,5 +57,23 @@ fi
 echo "Using Java executable: $JAVA_EXECUTABLE" >&2
 $JAVA_EXECUTABLE -version >&2 2>&1
 
-# Use Python 3.12 paths for PySpark
-exec "$JAVA_EXECUTABLE" -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx1g "$@"
+# Use Python 3.12 paths for PySpark. The --add-opens set mirrors Spark 4's
+# JavaModuleOptions.java at the v4.0.2 tag — Java 17 module-system access
+# the JVM denies by default but Spark's off-heap / unsafe paths need.
+exec "$JAVA_EXECUTABLE" \
+  --add-opens=java.base/java.lang=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+  --add-opens=java.base/java.lang.reflect=ALL-UNNAMED \
+  --add-opens=java.base/java.io=ALL-UNNAMED \
+  --add-opens=java.base/java.net=ALL-UNNAMED \
+  --add-opens=java.base/java.nio=ALL-UNNAMED \
+  --add-opens=java.base/java.util=ALL-UNNAMED \
+  --add-opens=java.base/java.util.concurrent=ALL-UNNAMED \
+  --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED \
+  --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED \
+  --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+  --add-opens=java.base/sun.nio.cs=ALL-UNNAMED \
+  --add-opens=java.base/sun.security.action=ALL-UNNAMED \
+  --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
+  --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
+  -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx1g "$@"

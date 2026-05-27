@@ -24,14 +24,14 @@ The question we kept dodging: **could a single engine cover the local↔Lambda�
 
 **Spark / PySpark everywhere.** Mature. Has SQL, Python UDFs, joins, windows, partitioning. Runs from a laptop (`local[*]`) to thousands of cores (EMR Serverless). One dialect — what runs locally runs in production. The cost is a JVM cold start (~5s) and image size (~1.3 GB).
 
-The Lambda question. Spark wasn't built for Lambda; PySpark 3.5.x's launcher scripts use bash process substitution and `ps`, neither of which work in Lambda's restricted runtime. We discovered this on first deploy. Two paths from there:
+The Lambda question. Spark wasn't built for Lambda; PySpark's launcher scripts use bash process substitution and `ps`, neither of which work in Lambda's restricted runtime. We discovered this on first deploy. Two paths from there:
 
 1. **Drop Lambda; use Fargate as the small tier.** Spark runs cleanly in Fargate. Loses Lambda's per-ms billing and warm starts; gains simplicity.
 2. **Adopt the [Spark on AWS Lambda (SoAL)](https://github.com/aws-samples/spark-on-aws-lambda) pattern.** AWS-published, AWS-maintained. Replaces upstream Spark's `spark-class` with a stripped-down `exec java` script that sidesteps the bash and `procps` issues. Bakes in `hadoop-aws` JARs for native S3, optional Iceberg/Delta/Hudi JARs.
 
-We chose **(2)** — Lambda stays as the small tier, with the SoAL adaptation in our runner image. Specifics required to make Spark 3.5.x run in Lambda:
+We chose **(2)** — Lambda stays as the small tier, with the SoAL adaptation in our runner image. Specifics required to make Spark run in Lambda:
 
-- Java 11 (not 17). Spark 3.5's `StorageUtils` accesses `sun.nio.ch.DirectBuffer`; Java 17's module system blocks it without `--add-opens`.
+- Java 17 with the full `--add-opens` set Spark 4 expects. The stripped `spark-class` fork injects the 15 module-opens flags that upstream Spark 4 ships in `JavaModuleOptions`, covering the off-heap shuffle and DirectBuffer paths (e.g. `StorageUtils.bufferCleaner`).
 - `spark.driver.bindAddress=127.0.0.1` and `spark.driver.host=127.0.0.1`. Lambda's hostname doesn't resolve to a bindable interface.
 - `spark.ui.enabled=false`. The SparkUI HTTP server can't bind to `0.0.0.0` in Lambda either, and we don't need it for batch ETL.
 

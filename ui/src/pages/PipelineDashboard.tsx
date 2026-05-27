@@ -183,7 +183,7 @@ export function PipelineDashboard() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [nodeSchemas, setNodeSchemas] = useState<Map<string, Column[]>>(new Map());
 
-  // Catalog-derived columns for every node whose output Iceberg table
+  // Catalog-derived columns for every node whose output Delta table
   // already exists. Merged into the schemas passed to the DAG so each
   // node card lists its columns without requiring the user to click
   // Preview first; live-preview entries (richer, possibly from unsaved
@@ -203,9 +203,9 @@ export function PipelineDashboard() {
     return m;
   }, [catalogTables.data, dir, nodeSchemas]);
 
-  // Node IDs whose Iceberg output table actually exists in the workspace
+  // Node IDs whose Delta output table actually exists in the workspace
   // catalog right now. Drives the auto-sample affordance in ConfigPanel —
-  // a transform with no committed snapshot has nothing to show, so we
+  // a transform with no committed Delta write has nothing to show, so we
   // skip the sample entirely rather than render an error state.
   const nodesWithExistingOutput = useMemo(() => {
     const s = new Set<string>();
@@ -219,7 +219,7 @@ export function PipelineDashboard() {
   const [previewedNodeId, setPreviewedNodeId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"graph" | "runs">("graph");
 
-  // Per-node Iceberg output table for the DAG node footers — same
+  // Per-node Delta output table for the DAG node footers — same
   // derivation the editor uses, so both DAGs name their outputs alike.
   const lineage = useLineage(dir);
   const nodeOutputs = useMemo(
@@ -344,7 +344,7 @@ export function PipelineDashboard() {
   );
   const [bfDialogOpen, setBfDialogOpen] = useState(false);
 
-  // Per-output-table snapshot summary from <pipeline>.tables, keyed by the
+  // Per-output-table commit summary from <pipeline>.tables, keyed by the
   // short `<node>__<output_key>` name so the Nodes grid can show each
   // node's row count + freshness next to its run history.
   const tablesState = useTablesState(queryPipeline, {
@@ -360,7 +360,7 @@ export function PipelineDashboard() {
   }, [tablesState.data]);
 
   // Per-node output-table state for the Nodes grid's left panel: the
-  // Iceberg table each transform writes, with its current row count and
+  // Delta table each transform writes, with its current row count and
   // freshness. nodeOutputs (derived from .tf + lineage) gives the table
   // identity; tablesState gives the live counts.
   const nodeInfo = useMemo(() => {

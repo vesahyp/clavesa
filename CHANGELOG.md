@@ -10,7 +10,186 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
-## [Unreleased]
+## [v2.0.0] — 2026-05-27
+
+### Fixed
+
+- Cloud-deployed Delta transforms now register their output tables in
+  Glue Data Catalog. Pre-fix, the runner's cloud Spark session ran
+  with an in-memory session catalog, so `saveAsTable` wrote Parquet
+  + `_delta_log/` to S3 correctly but the table only lived inside
+  the Lambda container and vanished on exit — UI Catalog, Athena,
+  and cross-pipeline reads all saw nothing. The runner now bundles
+  the AWS Glue Data Catalog client for Hive Metastore JARs (Spark 4
+  build) and wires `AWSGlueDataCatalogHiveClientFactory` so Spark's
+  session catalog federates to Glue. New `CREATE DATABASE` calls
+  pin a `LOCATION` derived from `CLAVESA_WAREHOUSE`, fixing the
+  follow-on `IllegalArgumentException: Can not create a Path from
+  an empty string` from `saveAsTable` on a freshly-created Glue DB.
+- Cloud runs against Spark 4 + hadoop-aws no longer fail with
+  `NumberFormatException: For input string: "60s"` on the first
+  `spark.read.parquet("s3://...")`. The bundled hadoop-aws is now
+  3.4.1 (was 3.3.4) to match Spark 4.0.2's hadoop-client-3.4.1
+  jars, which use duration strings (`"60s"`) for s3a timeouts.
+- `clavesa workspace deploy` no longer rejects a freshly-retagged
+  workspace runner image with "does not match the embedded runner
+  SHA". The retag path now stamps the `clavesa.runner_sha` label
+  via a tiny `docker build` (FROM + LABEL) so the deploy preflight
+  recognises it as current.
+
+### Changed (BREAKING — v2.0.0 cutover)
+
+- **Delta Lake replaces Apache Iceberg as the default table format.**
+  [ADR-018](docs/decisions/018-delta-table-format.md) supersedes ADR-013.
+  Existing Iceberg workspaces (v1.x) cannot be auto-upgraded; recreate
+  the workspace under v2.0.0 and re-run pipelines from sources. Athena
+  loses INSERT/MERGE on clavesa-managed tables (Athena's Delta support
+  is read-only). Gained: Change Data Feed (`readChangeFeed = true`)
+  delivers the incremental-MERGE-downstream-of-MERGE-upstream pattern
+  Iceberg v2 couldn't serve.
+- **Runner upgraded to Spark 4.0.2 + Delta 4.0.0 + Java 17 + Scala 2.13.**
+  Iceberg JARs removed; `delta-spark_2.13-4.0.0` + `delta-storage-4.0.0`
+  added. Spark session config loads `io.delta.sql.DeltaSparkSessionExtension`
+  and wraps `spark_catalog` with `DeltaCatalog`. Single-writer log store
+  (`S3SingleDriverLogStore`) is the default for S3-backed warehouses.
+  `pyspark[connect]==4.0.2`, pandas 3.0, numpy 2.4, pyarrow 24.0 ride in
+  on the pyspark bump.
+- **ANSI SQL is now on by default.** Lax casts that silently returned
+  NULL in Spark 3 now throw `CAST_INVALID_INPUT`; division by zero
+  throws `DIVIDE_BY_ZERO`; integer overflow throws `ARITHMETIC_OVERFLOW`.
+  Use `try_cast(x AS <type>)` when you want the old silent-NULL
+  behaviour and guard divisions with `NULLIF(divisor, 0)`. Cookbook
+  examples already follow these patterns; pre-existing transforms that
+  relied on Spark-3 lax casts need updating.
+- **VARIANT type + Delta 4 identity columns + type widening GA.**
+  New surface inherited from the Spark 4 / Delta 4 bump. VARIANT
+  stores semi-structured columns without a declared schema (relevant
+  for evolving event payloads); identity columns give monotonically-
+  increasing surrogate keys without runner-side wiring; type widening
+  lets columns broaden (`int` → `bigint`, `float` → `double`) without
+  rewrites.
+- **Runner write paths use Delta `DataFrameWriter`.**
+  Transform output + system tables (`node_runs`, `runs`, `tables`,
+  `column_stats`) and backfill-promote writes now go through
+  `df.write.format("delta").mode("…").saveAsTable(…)` instead of
+  Iceberg's `df.writeTo(…).createOrReplace()` / `.append()` / `.create()`.
+  Append-first-run no longer branches on `tableExists` (Delta auto-
+  creates); MERGE first-run still does.
+- **Provenance via Delta `commitInfo.userMetadata`.** `clavesa.trigger`
+  and `clavesa.run-id` are stamped on every Delta commit (DataFrame
+  writes + `MERGE INTO`) by setting
+  `spark.databricks.delta.commitInfo.userMetadata` once per
+  transform / backfill-promote scope. Surfaces via
+  `DESCRIBE HISTORY <table>` — replaces Iceberg's
+  `snapshot-property.<key>` summary entries.
+- **Incremental reads use Delta Change Data Feed.** The
+  snapshot-id-bounded scan (`start-snapshot-id` / `end-snapshot-id`,
+  blocked on MERGE upstreams by [apache/iceberg#1949](https://github.com/apache/iceberg/issues/1949))
+  is replaced by `spark.read.format("delta").option("readChangeFeed", "true")`
+  over `(last_version, current_version]`. CDF is enabled session-wide
+  (`delta.properties.defaults.enableChangeDataFeed = true`) so every
+  table the runner creates carries it by default — no per-table opt-in.
+  When the descriptor carries `merge_keys`, the framework dedupes to
+  the latest row per key by `_commit_version DESC`, replacing the
+  obsolete v1.x `recency_column` design. The four Iceberg
+  metadata-table reads (`.history`, `.snapshots`) now go through
+  `DESCRIBE HISTORY`.
+- **Docs sweep + v1.x migration recipe.** README, CLAUDE.md, TODO.md,
+  and all cookbook recipes updated to reflect Delta as the default
+  format. `merge-dim-table.md` gains a "Consuming this dim
+  incrementally" section covering the CDF downstream pattern.
+  New `docs/cookbook/migrate-to-v2.md` documents the recreate-from-source
+  upgrade path for existing Iceberg workspaces.
+
+### Added
+
+- **Dashboard autosave + restore.** The editor now debounces every
+  state change to `localStorage["dashboard-draft:<slug>"]`. A reload
+  mid-edit surfaces a "Restore unsaved changes" banner; accepting
+  re-seeds the editor with the autosaved spec, dismissing discards
+  it. Server `updated_at` decides whether a draft is fresher than
+  the saved copy (an out-of-date draft is silently discarded so the
+  user isn't pestered).
+- **Publish-time validation gate on Save.** A pure validator
+  (`validateDraft`) runs before the POST and blocks publishes that
+  would otherwise break: widget bound to a missing dataset, widget
+  with required field-mapping unset for its type, dataset
+  referencing `{{name}}` no control declares, field-mapping pointing
+  at a column the dataset's last successful result didn't return.
+  Failures surface as an inline banner listing each issue; clicking
+  one opens the offending widget's drawer. Save pill on the header
+  reflects state: saving · saved · blocked.
+- **"Create dashboard from this table" on `/tables/:db/:table`.** New
+  button next to the table-type badge that opens a fresh dashboard
+  preloaded with a `SELECT * FROM <table> LIMIT 100` and one
+  full-width table widget bound to it. Disabled when the owning
+  pipeline isn't known (a dataset needs a `dir` to dispatch). Spec
+  flows via React Router location state so the editor opens directly
+  on it, no extra round trip.
+- **Dashboard template gallery on `?new=1`.** Picker shows before the
+  editor opens: Blank / Scoreboard (four big-numbers) / Line + bar /
+  Top-N table. Selection materialises a starting spec and stamps
+  `?template=<id>` on the URL so a mid-edit reload rebuilds the same
+  shape rather than re-prompting.
+- **`world_map` widget — country choropleth.** New dashboard widget that
+  colors world countries by a numeric metric from a `(region, value)`
+  result. Region codes accepted in ISO 3166-1 alpha-2 (`US`, `DE`) or
+  alpha-3 (`USA`, `DEU`); auto-detected from the first non-empty row.
+  Optional `tooltip_field` shows on hover. Topology ships in the binary
+  via the `world-atlas` package's `countries-50m` TopoJSON — no Mapbox
+  token, no tile server. Bundle cost: dashboard chunk grew ~280KB gz.
+  Unknown region codes are skipped silently (`console.debug` for the
+  author), missing regions render grey. v2 follow-ons deferred (US-state
+  choropleth, lat/lng pin maps).
+- **Unknown placeholder linter on dataset SQL.** The widget drawer's SQL
+  editor now flags `{{name}}` references that no declared control
+  provides, with a warning-level gutter mark and an inline hint listing
+  the placeholders the dashboard actually accepts. Same regex as the
+  server-side parser (`internal/dashboardsql/expand.go`) so what the
+  linter accepts is what the runtime accepts. The drawer also surfaces
+  an "Available:" chip strip under the SQL editor for click-to-insert.
+- **Time-range picker on AWS Console + Grafana standards.** Dashboard
+  `time_range` controls now offer 11 quick-pick presets matching AWS
+  CloudWatch's range dropdown (5m / 15m / 30m / 1h / 3h / 12h / 24h
+  / 3d / 7d / 30d / 90d). "Custom range" reveals a relative
+  expression field that accepts Grafana's `now-<n><unit>` syntax
+  (`now-1h`, `now-2w`, units `m|h|d|w`) plus the existing absolute
+  start/end inputs. URL gains an optional `?<name>.rel=now-1h`
+  that re-evaluates on every render — picking "Last 1 hour" no
+  longer freezes after the first paint. Absolute pairs (`.start`
+  + `.end`) still freeze the window for shareable point-in-time
+  links. Legacy preset keys (`last_24h` / `last_7d` / `last_30d`
+  / `last_90d`) keep working: dashboards saved before this change
+  read back through the back-compat alias in
+  `internal/service/timerange.go` and `ui/src/lib/timeRange.ts`.
+- **Auto-refresh dropdown on the dashboard controls strip.** Off
+  (default) / 30s / 1m / 5m / 15m, URL-synced as `?refresh=30s`.
+  When set, the page re-fires every widget query on the interval —
+  the knob the prior "per-dashboard refresh interval" TODO asked
+  for.
+
+### Changed
+
+- **Dashboard editor is chart-first.** The three-tab editor (Datasets /
+  Controls / Widgets) is gone; the new shell renders the live grid with
+  a per-widget side drawer that holds everything for that widget — title,
+  type, SQL, field mapping, layout — in one place. Selection is URL-synced
+  (`?widget=<id>`) so deep links and the back button work. Field pickers
+  populate automatically as you type SQL (idle-debounced, last good
+  columns kept sticky through transient errors), with per-role type
+  hints (numeric columns first for `value_field` / `y_field`, etc.).
+  Datasets stay shareable — promote any widget's inline query to a
+  named dataset from the drawer, then bind other widgets to it.
+
+### Fixed
+
+- **SQL linter now installs on the first paint.** `CodeEditor`'s lint
+  compartment was reconfigured in a post-mount `useEffect` that ran
+  before CodeMirror created its view, so the initial reconfigure
+  dispatch was a no-op and the linter never attached. `onCreateEditor`
+  now also reconfigures the lint compartment, so the linter is live
+  immediately. Affects the dataset-SQL placeholder linter (above) and
+  the transform-editor SQL parse-error linter.
 
 ## [v1.1.7] — 2026-05-25
 

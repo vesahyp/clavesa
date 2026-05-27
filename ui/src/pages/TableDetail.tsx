@@ -7,9 +7,15 @@
  */
 
 import { useMemo, useState } from "react";
-import { Navigate, useParams, NavLink } from "react-router-dom";
+import { Navigate, useNavigate, useParams, NavLink } from "react-router-dom";
 import { formatDistanceToNow } from "date-fns";
-import { ChevronDown, ChevronRight, FileWarning, Terminal } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  FileWarning,
+  LayoutDashboard,
+  Terminal,
+} from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
 import { AdhocQuery } from "@/components/AdhocQuery";
@@ -22,12 +28,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   useCatalogTables,
   useColumnStats,
+  useDashboards,
   usePipelines,
   useTableSample,
   useTableSnapshots,
   type CatalogTable,
   type ColumnStat,
   type ColumnStatsResult,
+  type Dashboard,
   type SnapshotInfo,
   type SnapshotsResult,
 } from "@/lib/queries";
@@ -53,10 +61,11 @@ export function TableDetail() {
   // three pieces separately but the on-disk shape is unchanged.
   const database = schemaName ? `${catalogName}__${schemaName}` : catalogName;
   // Fully-qualified name as written in dashboard / ad-hoc SQL:
-  // `clavesa.<catalog>__<schema>.<table>` — the runner's Iceberg
-  // catalog is `clavesa`, and the same three-part name resolves on
-  // Athena. This is the string a user pastes into a dataset query.
-  const tablePath = `clavesa.${database}.${tableName}`;
+  // `<catalog>__<schema>.<table>` — the two-part Delta table id.
+  // Under ADR-018, Delta tables live under `spark_catalog` (no leading
+  // clavesa. prefix); sub-slice 8 retired the prefix everywhere. This
+  // is the string a user pastes into a dataset query.
+  const tablePath = `${database}.${tableName}`;
 
   const catalog = useCatalogTables();
   const tableMeta = useMemo<CatalogTable | undefined>(() => {
@@ -88,16 +97,19 @@ export function TableDetail() {
     dir: owningPipelineDir,
     enabled: catalog.data !== undefined,
   });
-  const isIceberg = tableMeta?.table_type === "ICEBERG";
+  // Every clavesa-managed table is Delta under v2.0.0. The commit timeline
+  // and column-stats panels render for any Delta table; non-clavesa tables
+  // (external, non-Delta) fall through to the lite-columns view.
+  const isClavesaManaged = tableMeta?.table_type === "DELTA";
   const snapshots = useTableSnapshots(
-    isIceberg ? database : "",
-    isIceberg ? tableName : "",
+    isClavesaManaged ? database : "",
+    isClavesaManaged ? tableName : "",
     SNAPSHOTS_LIMIT,
     { dir: owningPipelineDir },
   );
   const columnStats = useColumnStats(
-    isIceberg ? database : "",
-    isIceberg ? tableName : "",
+    isClavesaManaged ? database : "",
+    isClavesaManaged ? tableName : "",
     { dir: owningPipelineDir },
   );
 
@@ -159,11 +171,18 @@ export function TableDetail() {
               </p>
             )}
           </div>
-          {tableMeta?.table_type && (
-            <Badge variant="outline" className="font-mono">
-              {tableMeta.table_type}
-            </Badge>
-          )}
+          <div className="flex shrink-0 items-center gap-2">
+            <CreateDashboardButton
+              tableName={tableName}
+              tablePath={tablePath}
+              owningPipelineDir={owningPipelineDir}
+            />
+            {tableMeta?.table_type && (
+              <Badge variant="outline" className="font-mono">
+                {tableMeta.table_type}
+              </Badge>
+            )}
+          </div>
         </div>
 
         {/* Columns — one column-oriented overview. Rich mode (null %,
@@ -173,7 +192,7 @@ export function TableDetail() {
             Schema-on-left / Sample-on-right grid — row data lives in the
             Query pane below now. */}
         <div>
-          {isIceberg && columnStats.data && columnStats.data.stats.length > 0 ? (
+          {isClavesaManaged && columnStats.data && columnStats.data.stats.length > 0 ? (
             <ColumnStatsCard data={columnStats.data} />
           ) : (
             <LiteColumnsCard
@@ -186,7 +205,7 @@ export function TableDetail() {
 
         <div className="mt-6">
           <TableQueryPane
-            sql={`SELECT * FROM clavesa.${ident(database)}.${ident(tableName)} LIMIT 100`}
+            sql={`SELECT * FROM ${ident(database)}.${ident(tableName)} LIMIT 100`}
             defaultOpen
             autoRun
           />
@@ -206,7 +225,7 @@ export function TableDetail() {
           </div>
         )}
 
-        {isIceberg && (
+        {isClavesaManaged && (
           <div className="mt-6">
             <VolumeTimelineCard
               isLoading={snapshots.isLoading}
@@ -244,11 +263,11 @@ function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps)
   return (
     <Card>
       <CardHeader className="flex-row items-center justify-between pb-3">
-        <CardTitle>Volume timeline</CardTitle>
+        <CardTitle>Commit timeline</CardTitle>
         {data && data.snapshots.length > 0 && (
           <span className="text-xs text-muted-foreground">
             {data.snapshots.length}
-            {data.truncated ? "+" : ""} snapshot
+            {data.truncated ? "+" : ""} commit
             {data.snapshots.length === 1 ? "" : "s"}
           </span>
         )}
@@ -266,7 +285,7 @@ function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps)
             <FileWarning className="mt-0.5 h-4 w-4 flex-shrink-0 text-destructive" />
             <div className="min-w-0">
               <div className="font-medium text-destructive">
-                Snapshot history unavailable
+                Commit history unavailable
               </div>
               <p className="mt-1 break-words text-xs text-muted-foreground">
                 {error instanceof Error ? error.message : String(error)}
@@ -276,7 +295,7 @@ function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps)
         )}
         {data && data.snapshots.length === 0 && (
           <div className="p-6 text-sm text-muted-foreground">
-            No snapshots reported for this table.
+            No commits recorded for this table.
           </div>
         )}
         {data && data.snapshots.length > 0 && (
@@ -291,11 +310,11 @@ function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps)
   );
 }
 
-// Transform-output snapshots written by clavesa carry an
-// `clavesa.trigger` summary key naming the run that produced them. A
-// snapshot with no key gets no badge: it was either a manual Athena/Spark
-// INSERT, or written by a pre-provenance runner. Either way the bare row
-// stands out against the badged ones, which is the signal users want.
+// Transform-output commits written by clavesa carry a trigger key in the
+// Delta commitInfo userMetadata naming the run that produced them. A
+// commit with no key gets no badge: it was either a manual write or
+// written by a pre-provenance runner. Either way the bare row stands out
+// against the badged ones, which is the signal users want.
 const TRIGGER_DISPLAY: Record<string, { label: string; className: string }> = {
   backfill: {
     label: "backfill",
@@ -424,7 +443,7 @@ function ColumnStatsCard({ data }: { data: ColumnStatsResult }) {
         <CardTitle>Column profile</CardTitle>
         <span className="text-xs text-muted-foreground">
           {data.stats.length} column{data.stats.length === 1 ? "" : "s"}
-          {data.snapshot_id ? ` · snapshot ${data.snapshot_id.slice(0, 12)}` : ""}
+          {data.snapshot_id ? ` · commit ${data.snapshot_id.slice(0, 12)}` : ""}
         </span>
       </CardHeader>
       <CardContent className="p-0">
@@ -758,9 +777,104 @@ function LiteColumnsCard({
   );
 }
 
-// ident quotes a SQL identifier with backticks. Catalog/schema/table parts
-// can include digits or other characters Spark needs quoted; backticks are
-// the Iceberg-on-Spark idiom.
+// ident quotes a SQL identifier with double-quotes. Athena (Presto) rejects
+// backtick-quoted multi-part identifiers with MALFORMED_QUERY; double-quotes
+// are the ANSI SQL standard and Spark accepts both, so double-quotes work in
+// both local and cloud modes.
 function ident(s: string): string {
-  return "`" + s.replace(/`/g, "``") + "`";
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+/**
+ * CreateDashboardButton — one-click "build a dashboard with this table
+ * preloaded". Constructs an initial spec (one named dataset reading the
+ * table at `LIMIT 100`, one full-width `table` widget bound to it),
+ * generates a slug that doesn't collide with existing dashboards, and
+ * navigates to the editor at `/dashboards/<slug>?new=1&title=…` carrying
+ * the spec via React Router location state. Dashboard.tsx reads that
+ * state and seeds the editor with it instead of the empty default.
+ *
+ * If the owning pipeline isn't resolved (legacy table without a pipeline
+ * mapping), the button stays visible but is disabled — a dashboard
+ * dataset needs a `dir` to dispatch through.
+ */
+function CreateDashboardButton({
+  tableName,
+  tablePath,
+  owningPipelineDir,
+}: {
+  tableName: string;
+  tablePath: string;
+  owningPipelineDir: string;
+}) {
+  const navigate = useNavigate();
+  const dashboards = useDashboards();
+
+  function onClick() {
+    const taken = new Set(dashboards.data?.dashboards.map((d) => d.slug) ?? []);
+    const base = slugifyForDashboard(tableName) || "explore";
+    let slug = base;
+    for (let n = 2; taken.has(slug); n++) slug = `${base}-${n}`;
+    const title = stripDefaultSuffix(tableName);
+    const spec: Dashboard = {
+      slug,
+      title,
+      datasets: [
+        { name: "default", dir: owningPipelineDir, sql: `SELECT * FROM ${tablePath} LIMIT 100` },
+      ],
+      widgets: [
+        {
+          id: "explore",
+          type: "table",
+          title,
+          dataset: "default",
+          value_field: "",
+          x_field: "",
+          y_field: "",
+          series_fields: [],
+          line_field: "",
+          region_field: "",
+          tooltip_field: "",
+          layout: { x: 0, y: 0, w: 12, h: 8 },
+        },
+      ],
+      controls: [],
+      updated_at: "",
+    };
+    navigate(`/dashboards/${encodeURIComponent(slug)}?new=1&title=${encodeURIComponent(title)}`, {
+      state: { prefilled: spec },
+    });
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={onClick}
+      disabled={!owningPipelineDir}
+      title={
+        owningPipelineDir
+          ? "Open a new dashboard preloaded with a SELECT against this table"
+          : "Needs a known owning pipeline to dispatch the dataset query"
+      }
+    >
+      <LayoutDashboard className="mr-1 h-3.5 w-3.5" />
+      Create dashboard
+    </Button>
+  );
+}
+
+/**
+ * slugifyForDashboard — mirror of `Dashboards.tsx: slugify` (lowercase,
+ * `[a-z0-9_-]` only, trim hyphens, ≤64 chars). Duplicated here rather
+ * than imported because TableDetail shouldn't need the page module just
+ * for one helper; the rule is small enough that a copy is cheaper than
+ * a coupling.
+ */
+function slugifyForDashboard(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
 }

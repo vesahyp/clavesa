@@ -11,6 +11,8 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/glue"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/spf13/cobra"
 
@@ -68,7 +70,9 @@ func newDashboardService(cmd *cobra.Command) (*service.Service, string, error) {
 		}
 		cloud = observability.NewCloudProvider(
 			athena.NewFromConfig(awsCfg), bucket,
-			sfn.NewFromConfig(awsCfg), cloudwatchlogs.NewFromConfig(awsCfg))
+			sfn.NewFromConfig(awsCfg), cloudwatchlogs.NewFromConfig(awsCfg)).
+			WithGlue(glue.NewFromConfig(awsCfg)).
+			WithS3(s3.NewFromConfig(awsCfg))
 	}
 	local := observability.NewLocalProvider(workspace)
 	resolver := observability.NewResolver(workspace, cloud, local)

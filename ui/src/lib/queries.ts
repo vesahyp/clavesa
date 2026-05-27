@@ -66,7 +66,7 @@ const SnapshotInfo = z.object({
   added_records: z.number().nullish(),
   deleted_records: z.number().nullish(),
   total_records: z.number().nullish(),
-  // Provenance from the Iceberg snapshot summary — empty for snapshots
+  // Provenance from the Delta commitInfo userMetadata — empty for commits
   // written outside clavesa or by a pre-provenance runner image.
   trigger: z.string().optional().default(""),
   writer_run_id: z.string().optional().default(""),
@@ -101,7 +101,7 @@ export type PipelineInfo = z.infer<typeof PipelineInfo>;
 // Hooks
 // ---------------------------------------------------------------------------
 
-/** GET /api/workspace/tables — every Iceberg table in the workspace catalog. */
+/** GET /api/workspace/tables — every Delta table in the workspace catalog. */
 export function useCatalogTables() {
   return useQuery({
     queryKey: ["catalog", "tables"],
@@ -113,7 +113,7 @@ export function useCatalogTables() {
 }
 
 /**
- * GET /api/data/table — sample rows from one Iceberg table.
+ * GET /api/data/table — sample rows from one Delta table.
  *
  * Routes through observability.Provider on the server: with `dir` set,
  * local pipelines query their per-pipeline Hadoop catalog via the runner-
@@ -155,12 +155,12 @@ export function useTableSample(
 }
 
 /**
- * GET /api/data/tables/{database}/{table}/snapshots — Iceberg snapshot
- * history for one table. Surfaces freshness ("when did this last commit?")
- * and rowcount via Athena over <table>$snapshots.
+ * GET /api/data/tables/{database}/{table}/snapshots — Delta commit history
+ * for one table. Surfaces freshness ("when did this last commit?") and
+ * rowcount from the _delta_log (local) or S3 log scan (cloud).
  *
  * Errors are not fatal for the catalog UI — a per-table 500 (e.g.
- * non-Iceberg table) should leave the rest of the catalog functional.
+ * non-Delta table) should leave the rest of the catalog functional.
  */
 export function useTableSnapshots(
   database: string,
@@ -227,9 +227,9 @@ export type ColumnStatsResult = z.infer<typeof ColumnStatsResult>;
 
 /**
  * GET /api/data/tables/{database}/{table}/column-stats — opt-in per-column
- * profile for one Iceberg table. The card on TableDetail only renders
+ * profile for one Delta table. The card on TableDetail only renders
  * when the result has rows; an empty result means the transform's
- * `stats` flag is off (or has never produced a snapshot yet).
+ * `stats` flag is off (or has never produced a commit yet).
  */
 export function useColumnStats(
   database: string,
@@ -266,7 +266,7 @@ const LineageEdge = z.object({
   from_type: z.string(),
   to_node: z.string(),
   to_type: z.string(),
-  // "<database>.<table>" when the upstream is a transform writing an Iceberg
+  // "<database>.<table>" when the upstream is a transform writing a Delta
   // auto-table; empty for source→transform edges (sources stream Parquet,
   // not a catalog table). TableDetail filters by exact "<db>.<t>" match to
   // surface downstream consumers of the table being viewed.
@@ -454,8 +454,8 @@ const NodeRun = z.object({
   // pre-dated the slice — keeps clients schema-stable across upgrades.
   runner_image_digest: z.string().optional().default(""),
   module_version: z.string().optional().default(""),
-  // Sum of added-records across this run's Iceberg outputs. Null when
-  // the run had no Iceberg outputs (path-mode-only, skipped) or when
+  // Sum of added-records across this run's Delta outputs. Null when
+  // the run had no Delta outputs (path-mode-only, skipped) or when
   // the producing runner pre-dated this column.
   output_rows: z.number().nullish(),
 });
@@ -544,7 +544,7 @@ export type RunsResult = z.infer<typeof RunsResult>;
 /**
  * GET /api/data/runs?pipeline=…[&dir=…] — recent executions from the per-
  * pipeline runs table. Cloud-deployed pipelines source rows from the
- * EventBridge-writer-populated Iceberg table; local pipelines source from
+ * EventBridge-writer-populated Delta table; local pipelines source from
  * the same table written via runner-Spark (ADR-014). Same graceful
  * degradation: a fresh pipeline returns empty rows.
  */
@@ -600,9 +600,9 @@ export type TablesResult = z.infer<typeof TablesResult>;
 
 /**
  * GET /api/data/tables-state?pipeline=…[&dir=…] — current-state-per-table.
- * One row per Iceberg-output the pipeline produces, projecting the latest
- * snapshot's row count + file count + bytes + refresh time. Distinct from
- * /data/tables/{db}/{table}/snapshots, which lists snapshot history for one
+ * One row per Delta-output the pipeline produces, projecting the latest
+ * commit's row count + file count + bytes + refresh time. Distinct from
+ * /data/tables/{db}/{table}/snapshots, which lists commit history for one
  * specific table.
  */
 export function useTablesState(
@@ -754,6 +754,10 @@ const DashboardWidget = z.object({
   // line_field is the line series of a bar_line combo.
   series_fields: z.array(z.string()).optional().default([]),
   line_field: z.string().optional().default(""),
+  // world_map-only: ISO 3166-1 alpha-2 or alpha-3 country code column,
+  // and an optional column shown in the hover tooltip.
+  region_field: z.string().optional().default(""),
+  tooltip_field: z.string().optional().default(""),
   layout: DashboardWidgetLayout,
 });
 export type DashboardWidget = z.infer<typeof DashboardWidget>;
@@ -1238,7 +1242,7 @@ export type BackfillPromoteResult = z.infer<typeof BackfillPromoteResult>;
  * Returns `columns_added` so the UI can surface schema evolution that
  * happened during the promote — the runner ALTER-TABLE-ADD-COLUMNs any
  * staging-only columns into the target before the MERGE so they don't
- * get silently dropped (Iceberg schema evolution).
+ * get silently dropped (Delta schema evolution via mergeSchema).
  */
 export async function promoteBackfill(
   runID: string,

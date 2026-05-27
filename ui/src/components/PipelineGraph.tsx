@@ -126,7 +126,7 @@ export type PipelineGraphProps = {
   onEdgeClick?: (edgeId: string) => void;
   /** Per-node schema columns inferred from preview results */
   nodeSchemas?: Map<string, Column[]>;
-  /** Per-node Iceberg output table, shown in the node footer. */
+  /** Per-node Delta output table, shown in the node footer. */
   nodeOutputs?: Map<string, NodeOutput>;
   /** Node ID currently loading preview (null if none) */
   loadingNodeId?: string | null;
@@ -208,7 +208,7 @@ function FocusController({ focusNodeId }: { focusNodeId?: string | null }) {
 }
 
 /**
- * deriveNodeOutputs maps each transform node to the Iceberg table it writes,
+ * deriveNodeOutputs maps each transform node to the Delta table it writes,
  * for the DAG node footers. `catalog` / `schema` are the queried pipeline's
  * own ADR-016 namespace (from the lineage response) — every transform in a
  * pipeline writes into that one `<catalog>.<schema>`. Lineage parses `.tf`,
@@ -579,7 +579,7 @@ export function PipelineGraph({
 
     // Read mode per edge: a transform→transform edge is incremental when
     // the consumer lists the edge's input alias in `incremental_inputs`.
-    // The runner then reads only Iceberg snapshots committed since the
+    // The runner then reads only Delta CDF rows committed since the
     // consumer's last run, instead of a full table scan. Incremental edges
     // are drawn dashed + animated; full-read edges stay plain.
     const nodeById = new Map(allNodes.map((n) => [n.id, n]));

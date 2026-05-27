@@ -1,13 +1,13 @@
 # Bulk-read an S3 bucket
 
-> **When you have one:** an existing bucket of historical data — exports from another system, a static archive, a one-time dump from a vendor — and you want it loaded into Clavesa as an Iceberg table you can query.
+> **When you have one:** an existing bucket of historical data — exports from another system, a static archive, a one-time dump from a vendor — and you want it loaded into Clavesa as a Delta table you can query.
 
 This recipe is the one-shot case: read every file in the prefix, write it to a table, done. If new files arrive over time and you want them flowing in automatically, see [s3-trigger](s3-trigger.md).
 
 ## What you'll end up with
 
-- One Iceberg table at `clavesa_<workspace>__<pipeline>.<node>__default` in Glue Data Catalog.
-- Rows readable from Athena, the Clavesa Catalog, or any Iceberg-aware query engine.
+- One Delta table at `clavesa_<workspace>__<pipeline>.<node>__default` in Glue Data Catalog.
+- Rows readable from Athena, the Clavesa Catalog, or any Delta-aware query engine.
 - A pipeline you can re-run on demand to refresh the table against the latest contents of the bucket.
 
 ## Prerequisites

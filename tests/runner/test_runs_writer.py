@@ -1,15 +1,23 @@
-"""Unit tests for the runs-writer Lambda's pure helpers.
+"""Unit tests for the runs_writer Lambda's pure helpers.
+
+ADR-018 (v2.0.0): runs_writer used to be a stand-alone Python zip
+Lambda at internal/orchestration/sidecar/runs_writer/index.py that
+INSERTed via Athena. That path is gone — Athena's Delta support is
+read-only, so we bundled runs_writer into the runner image and the
+helpers now live inside runner.py alongside the transform handler.
+These tests exercise those helpers directly against runner.py.
 
 Run with: python3 tests/runner/test_runs_writer.py
 
-Exercises the row construction + cause parsing + Athena value rendering
-for internal/orchestration/sidecar/runs_writer/index.py. The Athena
-round-trip (StartQueryExecution/GetQueryExecution polling) needs real
-AWS or a moto-server stub; cover that in cloud validation, not here.
+The Spark + Delta round-trip (`_record_run` itself) needs the full
+runner container; cover that via `make test-runner` rather than here.
+This file covers the pure helpers + the no-stub-needed parts of
+`runs_writer_handler`.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import importlib.util
 import json
 import os
@@ -18,25 +26,25 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-# v1.1.5: sidecar Python moved into internal/orchestration/sidecar/ so
-# it can be embedded with go:embed and materialised into pipeline dirs.
-WRITER = REPO / "internal" / "orchestration" / "sidecar" / "runs_writer" / "index.py"
+RUNNER = REPO / "runner" / "runner.py"
 
 
-def _load_writer():
-    """Import index.py with boto3 stubbed to avoid an AWS profile lookup
-    at import time. The handler module reads three env vars at import,
-    so the test sets minimal placeholders before loading.
+def _load_runner():
+    """Import runner.py with PySpark stubbed so the module loads
+    without a real JVM. Only the runs_writer helpers we exercise here
+    avoid Spark; the rest of runner.py (transform handler, record_run)
+    stays importable but uninvoked.
     """
-    boto3_mod = types.ModuleType("boto3")
-    boto3_mod.client = lambda *_a, **_k: None  # type: ignore[attr-defined]
-    sys.modules.setdefault("boto3", boto3_mod)
-
+    # Stub out the heavyweight imports so module top-level executes
+    # without a JVM. PySpark itself isn't imported at top level (lazy
+    # via _spark()), so we don't need to stub it.
     os.environ.setdefault("CLAVESA_PIPELINE", "test_pipeline")
-    os.environ.setdefault("CLAVESA_DATABASE", "clavesa_test_pipeline")
-    os.environ.setdefault("CLAVESA_WAREHOUSE_BUCKET", "clavesa-bucket")
+    os.environ.setdefault("CLAVESA_SYSTEM_CATALOG", "test_sys")
 
-    spec = importlib.util.spec_from_file_location("runs_writer", str(WRITER))
+    # spark_conf is imported lazily inside _spark() — same story; the
+    # helpers we exercise never call _spark.
+
+    spec = importlib.util.spec_from_file_location("runner_under_test", str(RUNNER))
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mod)
@@ -44,182 +52,71 @@ def _load_writer():
 
 
 # ---------------------------------------------------------------------------
-# _format_athena_ts — millisecond precision, UTC, Athena literal shape.
-# ---------------------------------------------------------------------------
-
-
-def test_format_ts_basic():
-    w = _load_writer()
-    # 2026-05-07T12:30:45.500Z = 1778157045500 ms
-    out = w._format_athena_ts(1778157045500)
-    assert out == "2026-05-07 12:30:45.500"
-
-
-def test_format_ts_handles_none_and_non_int():
-    w = _load_writer()
-    assert w._format_athena_ts(None) is None
-    assert w._format_athena_ts("123") is None
-    assert w._format_athena_ts(0) is None  # treat 0 as "missing"
-
-
-# ---------------------------------------------------------------------------
-# _parse_cause — best-effort error_msg extraction.
-# ---------------------------------------------------------------------------
-
-
-def test_parse_cause_lambda_json():
-    w = _load_writer()
-    cause = '{"errorMessage": "Table not found", "errorType": "AnalysisException"}'
-    msg, step = w._parse_cause(cause)
-    assert msg == "Table not found"
-    assert step == ""
-
-
-def test_parse_cause_plain_text():
-    w = _load_writer()
-    msg, step = w._parse_cause("State machine failed: timeout")
-    assert msg == "State machine failed: timeout"
-    assert step == ""
-
-
-def test_parse_cause_truncates_huge():
-    w = _load_writer()
-    huge = "X" * 10_000
-    msg, _ = w._parse_cause(huge)
-    assert len(msg) <= 4096
-    assert msg.endswith("...")
-
-
-def test_parse_cause_empty():
-    w = _load_writer()
-    msg, step = w._parse_cause("")
-    assert msg == "" and step == ""
-
-
-# ---------------------------------------------------------------------------
-# _build_row — the EventBridge detail → Iceberg row mapping.
-# ---------------------------------------------------------------------------
-
-
-def test_build_row_succeeded():
-    w = _load_writer()
-    detail = {
-        "executionArn": "arn:aws:states:us-east-1:1:execution:clavesa-x:abc-123",
-        "stateMachineArn": "arn:aws:states:us-east-1:1:stateMachine:clavesa-x",
-        "status": "SUCCEEDED",
-        "startDate": 1778157045000,
-        "stopDate": 1778157050000,
-    }
-    row = w._build_row(detail)
-    assert row["run_id"] == "abc-123"
-    assert row["pipeline"] == "test_pipeline"
-    assert row["sf_execution_arn"] == detail["executionArn"]
-    assert row["status"] == "SUCCEEDED"
-    assert row["duration_ms"] == 5000
-    assert row["error_class"] == ""
-    assert row["error_msg"] == ""
-    assert row["failed_step"] == ""
-    assert row["started_at"] == "2026-05-07 12:30:45.000"
-    assert row["ended_at"] == "2026-05-07 12:30:50.000"
-
-
-def test_build_row_failed_carries_error():
-    w = _load_writer()
-    detail = {
-        "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
-        "status": "FAILED",
-        "startDate": 1778157045000,
-        "stopDate": 1778157046000,
-        "error": "States.TaskFailed",
-        "cause": '{"errorMessage": "boom", "errorType": "RuntimeError"}',
-    }
-    row = w._build_row(detail)
-    assert row["status"] == "FAILED"
-    assert row["error_class"] == "States.TaskFailed"
-    assert row["error_msg"] == "boom"
-    assert row["duration_ms"] == 1000
-
-
-def test_build_row_running_no_stop_leaves_duration_null():
-    w = _load_writer()
-    detail = {
-        "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
-        "status": "RUNNING",  # not terminal — handler skips, but builder still works
-        "startDate": 1778157045000,
-        # stopDate absent
-    }
-    row = w._build_row(detail)
-    assert row["duration_ms"] is None
-    assert row["ended_at"] is None
-
-
-def test_build_row_negative_duration_clamped():
-    w = _load_writer()
-    detail = {
-        "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
-        "status": "SUCCEEDED",
-        "startDate": 1778157045010,
-        "stopDate": 1778157045005,  # clock skew
-    }
-    row = w._build_row(detail)
-    assert row["duration_ms"] == 0
-
-
-# ---------------------------------------------------------------------------
-# _extract_trigger — read `_trigger` smuggled through the SFN exec input
-# (orchestration emitter sets it on every known automated start path; manual
-# runs default to "manual").
+# _runs_writer_extract_trigger — read `_trigger` smuggled through the SFN
+# exec input. Default to "manual" when missing / malformed / unknown.
 # ---------------------------------------------------------------------------
 
 
 def test_extract_trigger_scheduled():
-    w = _load_writer()
+    r = _load_runner()
     payload = json.dumps({"pipeline": "p", "_trigger": "scheduled"})
-    assert w._extract_trigger(payload) == "scheduled"
+    assert r._runs_writer_extract_trigger(payload) == "scheduled"
 
 
 def test_extract_trigger_event():
-    w = _load_writer()
-    assert w._extract_trigger(json.dumps({"_trigger": "event"})) == "event"
+    r = _load_runner()
+    assert r._runs_writer_extract_trigger(json.dumps({"_trigger": "event"})) == "event"
 
 
 def test_extract_trigger_manual_when_input_empty():
     """Manual runs via console / CLI / `clavesa pipeline run-cloud` typically
     pass an empty input (or omit _trigger). Default to 'manual' rather than
     leaving the column NULL — keeps queries on `runs.trigger` total."""
-    w = _load_writer()
-    assert w._extract_trigger("") == "manual"
-    assert w._extract_trigger(None) == "manual"
-    assert w._extract_trigger("{}") == "manual"
+    r = _load_runner()
+    assert r._runs_writer_extract_trigger("") == "manual"
+    assert r._runs_writer_extract_trigger(None) == "manual"
+    assert r._runs_writer_extract_trigger("{}") == "manual"
 
 
 def test_extract_trigger_malformed_input():
     """SFN can pass arbitrary input; a non-JSON string or non-dict shouldn't
     crash the writer — degrade to 'manual'."""
-    w = _load_writer()
-    assert w._extract_trigger("not json at all") == "manual"
-    assert w._extract_trigger(json.dumps([1, 2, 3])) == "manual"
+    r = _load_runner()
+    assert r._runs_writer_extract_trigger("not json at all") == "manual"
+    assert r._runs_writer_extract_trigger(json.dumps([1, 2, 3])) == "manual"
 
 
 def test_extract_trigger_already_parsed_dict():
     """Some test paths and direct invocations may hand us the dict already
     parsed; the function should accept that without re-parsing."""
-    w = _load_writer()
-    assert w._extract_trigger({"_trigger": "scheduled"}) == "scheduled"
+    r = _load_runner()
+    assert r._runs_writer_extract_trigger({"_trigger": "scheduled"}) == "scheduled"
 
 
 def test_extract_trigger_backfill():
     """Backfill executions get trigger='backfill' so the runs history surfaces
     them separately from regular scheduled/event runs."""
-    w = _load_writer()
-    assert w._extract_trigger({"_trigger": "backfill"}) == "backfill"
-    assert w._extract_trigger({"_trigger": "backfill-direct"}) == "backfill-direct"
+    r = _load_runner()
+    assert r._runs_writer_extract_trigger({"_trigger": "backfill"}) == "backfill"
+    assert r._runs_writer_extract_trigger({"_trigger": "backfill-direct"}) == "backfill-direct"
+
+
+def test_extract_trigger_unknown_value():
+    """Unknown trigger values degrade to 'manual' so the column stays clean."""
+    r = _load_runner()
+    assert r._runs_writer_extract_trigger({"_trigger": "lambda-warm-shot"}) == "manual"
+
+
+# ---------------------------------------------------------------------------
+# _runs_writer_extract_target_table — picks the staging table id from a
+# backfill payload.
+# ---------------------------------------------------------------------------
 
 
 def test_extract_target_table_from_backfill_input():
     """Backfill stamps `_backfill.target_outputs` into the SFN input — the
     runs row carries the staging table id so the UI can join target → staging."""
-    w = _load_writer()
+    r = _load_runner()
     bf_input = {
         "_trigger": "backfill",
         "_backfill": {
@@ -230,27 +127,136 @@ def test_extract_target_table_from_backfill_input():
         },
     }
     assert (
-        w._extract_target_table(bf_input)
+        r._runs_writer_extract_target_table(bf_input)
         == "clavesa.db.passthrough__default__backfill__run123"
     )
     # JSON string form (the EventBridge payload shape) parses too.
     assert (
-        w._extract_target_table(json.dumps(bf_input))
+        r._runs_writer_extract_target_table(json.dumps(bf_input))
         == "clavesa.db.passthrough__default__backfill__run123"
     )
 
 
 def test_extract_target_table_none_when_no_backfill():
     """Regular runs leave target_table NULL."""
-    w = _load_writer()
-    assert w._extract_target_table(None) is None
-    assert w._extract_target_table("") is None
-    assert w._extract_target_table({"_trigger": "manual"}) is None
-    assert w._extract_target_table({"_backfill": "not-a-dict"}) is None
+    r = _load_runner()
+    assert r._runs_writer_extract_target_table(None) is None
+    assert r._runs_writer_extract_target_table("") is None
+    assert r._runs_writer_extract_target_table({"_trigger": "manual"}) is None
+    assert r._runs_writer_extract_target_table({"_backfill": "not-a-dict"}) is None
+
+
+# ---------------------------------------------------------------------------
+# _runs_writer_parse_cause — best-effort error_msg extraction.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_cause_lambda_json():
+    r = _load_runner()
+    cause = '{"errorMessage": "Table not found", "errorType": "AnalysisException"}'
+    msg, step = r._runs_writer_parse_cause(cause)
+    assert msg == "Table not found"
+    assert step == ""
+
+
+def test_parse_cause_plain_text():
+    r = _load_runner()
+    msg, step = r._runs_writer_parse_cause("State machine failed: timeout")
+    assert msg == "State machine failed: timeout"
+    assert step == ""
+
+
+def test_parse_cause_truncates_huge():
+    r = _load_runner()
+    huge = "X" * 10_000
+    msg, _ = r._runs_writer_parse_cause(huge)
+    assert len(msg) <= 4096
+    assert msg.endswith("...")
+
+
+def test_parse_cause_empty():
+    r = _load_runner()
+    msg, step = r._runs_writer_parse_cause("")
+    assert msg == "" and step == ""
+
+
+# ---------------------------------------------------------------------------
+# _runs_writer_build_row — the EventBridge detail → runs-row mapping.
+# Returns typed values (datetime, int, None) for direct Spark createDataFrame
+# consumption — no Athena value rendering anymore.
+# ---------------------------------------------------------------------------
+
+
+def test_build_row_succeeded():
+    r = _load_runner()
+    detail = {
+        "executionArn": "arn:aws:states:us-east-1:1:execution:clavesa-x:abc-123",
+        "stateMachineArn": "arn:aws:states:us-east-1:1:stateMachine:clavesa-x",
+        "status": "SUCCEEDED",
+        "startDate": 1778157045000,
+        "stopDate": 1778157050000,
+    }
+    row = r._runs_writer_build_row(detail)
+    assert row["run_id"] == "abc-123"
+    assert row["pipeline"] == "test_pipeline"
+    assert row["sf_execution_arn"] == detail["executionArn"]
+    assert row["status"] == "SUCCEEDED"
+    assert row["duration_ms"] == 5000
+    assert row["error_class"] == ""
+    assert row["error_msg"] is None
+    assert row["failed_step"] == ""
+    # Typed datetime values, not strings — runner._record_run writes via
+    # spark.createDataFrame so it expects native types.
+    assert isinstance(row["started_at"], _dt.datetime)
+    assert isinstance(row["ended_at"], _dt.datetime)
+    assert row["started_at"].tzinfo is not None
+    assert row["ended_at"].tzinfo is not None
+
+
+def test_build_row_failed_carries_error():
+    r = _load_runner()
+    detail = {
+        "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
+        "status": "FAILED",
+        "startDate": 1778157045000,
+        "stopDate": 1778157046000,
+        "error": "States.TaskFailed",
+        "cause": '{"errorMessage": "boom", "errorType": "RuntimeError"}',
+    }
+    row = r._runs_writer_build_row(detail)
+    assert row["status"] == "FAILED"
+    assert row["error_class"] == "States.TaskFailed"
+    assert row["error_msg"] == "boom"
+    assert row["duration_ms"] == 1000
+
+
+def test_build_row_running_no_stop_leaves_duration_null():
+    r = _load_runner()
+    detail = {
+        "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
+        "status": "RUNNING",  # not terminal — handler skips, but builder still works
+        "startDate": 1778157045000,
+        # stopDate absent
+    }
+    row = r._runs_writer_build_row(detail)
+    assert row["duration_ms"] is None
+    assert row["ended_at"] is None
+
+
+def test_build_row_negative_duration_clamped():
+    r = _load_runner()
+    detail = {
+        "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
+        "status": "SUCCEEDED",
+        "startDate": 1778157045010,
+        "stopDate": 1778157045005,  # clock skew
+    }
+    row = r._runs_writer_build_row(detail)
+    assert row["duration_ms"] == 0
 
 
 def test_build_row_populates_trigger_from_input():
-    w = _load_writer()
+    r = _load_runner()
     detail = {
         "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
         "status": "SUCCEEDED",
@@ -258,12 +264,12 @@ def test_build_row_populates_trigger_from_input():
         "stopDate": 1778157050000,
         "input": json.dumps({"pipeline": "p", "_trigger": "scheduled"}),
     }
-    row = w._build_row(detail)
+    row = r._runs_writer_build_row(detail)
     assert row["trigger"] == "scheduled"
 
 
 def test_build_row_defaults_trigger_to_manual():
-    w = _load_writer()
+    r = _load_runner()
     detail = {
         "executionArn": "arn:aws:states:us-east-1:1:execution:sm:exec",
         "status": "SUCCEEDED",
@@ -271,61 +277,56 @@ def test_build_row_defaults_trigger_to_manual():
         "stopDate": 1778157050000,
         # No input field — manual run via CLI/console.
     }
-    row = w._build_row(detail)
+    row = r._runs_writer_build_row(detail)
     assert row["trigger"] == "manual"
 
 
 # ---------------------------------------------------------------------------
-# _render_value — INSERT VALUES literal rendering, including quote escape.
-# ---------------------------------------------------------------------------
-
-
-def test_render_value_string_escapes_quote():
-    w = _load_writer()
-    assert w._render_value("error_msg", "it's broken") == "'it''s broken'"
-
-
-def test_render_value_timestamp():
-    w = _load_writer()
-    assert (
-        w._render_value("started_at", "2026-05-07 12:30:45.500")
-        == "TIMESTAMP '2026-05-07 12:30:45.500'"
-    )
-
-
-def test_render_value_bigint():
-    w = _load_writer()
-    assert w._render_value("duration_ms", 1500) == "1500"
-
-
-def test_render_value_null_for_none():
-    w = _load_writer()
-    assert w._render_value("error_msg", None) == "NULL"
-    assert w._render_value("started_at", None) == "NULL"
-    assert w._render_value("duration_ms", None) == "NULL"
-
-
-# ---------------------------------------------------------------------------
-# handler — short-circuit on non-terminal status.
+# runs_writer_handler — short-circuit on non-terminal status.
+# Real terminal-status round-trips need Spark; cover via make test-runner.
 # ---------------------------------------------------------------------------
 
 
 def test_handler_skips_running():
-    w = _load_writer()
-    out = w.handler({"detail": {"status": "RUNNING"}}, None)
+    r = _load_runner()
+    out = r.runs_writer_handler({"detail": {"status": "RUNNING"}}, None)
     assert out.get("skipped")
 
 
 def test_handler_skips_unknown_status():
-    w = _load_writer()
-    out = w.handler({"detail": {"status": "PENDING"}}, None)
+    r = _load_runner()
+    out = r.runs_writer_handler({"detail": {"status": "PENDING"}}, None)
     assert out.get("skipped")
 
 
 def test_handler_skips_empty_detail():
-    w = _load_writer()
-    out = w.handler({}, None)
+    r = _load_runner()
+    out = r.runs_writer_handler({}, None)
     assert out.get("skipped")
+
+
+# ---------------------------------------------------------------------------
+# _runs_writer_truncate — string truncation helper.
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_under_limit():
+    r = _load_runner()
+    assert r._runs_writer_truncate("hello") == "hello"
+
+
+def test_truncate_at_limit():
+    r = _load_runner()
+    s = "x" * 4096
+    assert r._runs_writer_truncate(s) == s
+
+
+def test_truncate_over_limit_ellipsis():
+    r = _load_runner()
+    s = "x" * 5000
+    out = r._runs_writer_truncate(s)
+    assert len(out) == 4096
+    assert out.endswith("...")
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +347,12 @@ def main():
             fn()
         except Exception as e:
             failed.append((name, f"{type(e).__name__}: {e}"))
-            print(f"FAIL  {name}  →  {type(e).__name__}: {e}")
+            print(f"FAIL  {name}  -  {type(e).__name__}: {e}")
         else:
             passed += 1
             print(f"PASS  {name}")
     total = passed + len(failed)
-    print(f"\n{passed}/{total} passed", "❌" if failed else "✅")
+    print(f"\n{passed}/{total} passed", "FAILED" if failed else "OK")
     return 0 if not failed else 1
 
 

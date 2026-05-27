@@ -10,6 +10,7 @@ import {
   Activity,
   BarChart3,
   CircleSlash,
+  Globe,
   Hash,
   Layers,
   LineChart,
@@ -33,7 +34,8 @@ export type WidgetType =
   | "bar_line"
   | "pie"
   | "donut"
-  | "table";
+  | "table"
+  | "world_map";
 
 const TYPES: {
   type: WidgetType;
@@ -88,6 +90,12 @@ const TYPES: {
     label: "Table",
     hint: "The raw query result, all columns.",
     Icon: Table,
+  },
+  {
+    type: "world_map",
+    label: "World map",
+    hint: "Country choropleth by ISO code.",
+    Icon: Globe,
   },
 ];
 

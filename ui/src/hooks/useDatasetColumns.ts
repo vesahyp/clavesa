@@ -16,12 +16,18 @@
  * a synthesized default map from the dashboard's declared controls.
  */
 
+import { useRef } from "react";
 import { useQueries } from "@tanstack/react-query";
 
 import { runDashboardQuery, type DashboardDataset } from "@/lib/queries";
 
+export interface DatasetColumn {
+  name: string;
+  type: string;
+}
+
 export interface DatasetColumns {
-  columns: string[];
+  columns: DatasetColumn[];
   isLoading: boolean;
   error: unknown;
 }
@@ -41,11 +47,26 @@ export function useDatasetColumns(
     })),
   });
 
+  // Sticky cache of the last-known-good column set per dataset name. The
+  // chart-first drawer's auto-preview fires queries against partial SQL
+  // mid-edit; those return errors and would otherwise blink the field
+  // pickers to empty. Reusing the previous good result keeps the UI
+  // stable through transient errors while the SQL settles.
+  const lastGoodRef = useRef(new Map<string, DatasetColumn[]>());
+  const liveNames = new Set(datasets.map((d) => d.name));
+  for (const k of Array.from(lastGoodRef.current.keys())) {
+    if (!liveNames.has(k)) lastGoodRef.current.delete(k);
+  }
+
   const map = new Map<string, DatasetColumns>();
   datasets.forEach((d, i) => {
     const r = results[i];
+    const fresh =
+      r?.data?.columns.map((c) => ({ name: c.name, type: c.type })) ?? [];
+    if (fresh.length > 0) lastGoodRef.current.set(d.name, fresh);
+    const sticky = lastGoodRef.current.get(d.name) ?? [];
     map.set(d.name, {
-      columns: r?.data?.columns.map((c) => c.name) ?? [],
+      columns: fresh.length > 0 ? fresh : sticky,
       isLoading: r?.isLoading ?? false,
       error: r?.error ?? null,
     });

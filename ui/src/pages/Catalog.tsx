@@ -1,7 +1,7 @@
 /**
  * Catalog — workspace data-catalog landing page.
  *
- * Lists every Iceberg table the workspace owns — both Glue-registered
+ * Lists every Delta table the workspace owns — both Glue-registered
  * tables from deployed pipelines and Hadoop-catalog tables produced by
  * compute = "local" pipelines (ADR-014). Grouped by owning pipeline,
  * each row clickable through to the table detail page.
@@ -211,7 +211,7 @@ const columns = [
   }),
   columnHelper.display({
     id: "snapshots",
-    header: "Snapshots",
+    header: "Commits",
     cell: (info) => <SnapshotsCell table={info.row.original} />,
   }),
   columnHelper.display({
@@ -229,25 +229,25 @@ const columns = [
 ];
 
 /**
- * Per-row snapshot data hooks. Each visible Iceberg row issues one Athena
- * query against <table>$snapshots — TanStack Query dedupes via the cache
- * key, parallelizes across rows, and serves stale data for 60s before
+ * Per-row commit data hooks. Each visible Delta-managed row issues one
+ * commit-history fetch — TanStack Query dedupes via the cache key,
+ * parallelizes across rows, and serves stale data for 60s before
  * refetching, so the cost stays bounded for typical workspaces.
  *
- * Errors are silent: a non-Iceberg table or a missing snapshot history
+ * Errors are silent: a non-Delta table or a missing commit history
  * shouldn't break the rest of the catalog. We just fall back to Glue's
  * UpdateTime and dashes for the data we couldn't fetch.
  */
 
 function RowsCell({ table }: { table: CatalogTable }) {
-  const isIceberg = table.table_type === "ICEBERG";
+  const isClavesaManaged = table.table_type === "DELTA";
   const { data, isLoading } = useTableSnapshots(
-    isIceberg ? table.database : "",
-    isIceberg ? table.name : "",
+    isClavesaManaged ? table.database : "",
+    isClavesaManaged ? table.name : "",
     1,
     { dir: table.dir },
   );
-  if (!isIceberg) {
+  if (!isClavesaManaged) {
     return <span className="text-xs text-muted-foreground">—</span>;
   }
   if (isLoading) {
@@ -271,14 +271,14 @@ function RowsCell({ table }: { table: CatalogTable }) {
 }
 
 function SnapshotsCell({ table }: { table: CatalogTable }) {
-  const isIceberg = table.table_type === "ICEBERG";
+  const isClavesaManaged = table.table_type === "DELTA";
   const { data, isLoading } = useTableSnapshots(
-    isIceberg ? table.database : "",
-    isIceberg ? table.name : "",
+    isClavesaManaged ? table.database : "",
+    isClavesaManaged ? table.name : "",
     20,
     { dir: table.dir },
   );
-  if (!isIceberg) {
+  if (!isClavesaManaged) {
     return <span className="text-xs text-muted-foreground">—</span>;
   }
   if (isLoading) {
@@ -297,14 +297,14 @@ function SnapshotsCell({ table }: { table: CatalogTable }) {
 }
 
 function UpdatedCell({ table }: { table: CatalogTable }) {
-  const isIceberg = table.table_type === "ICEBERG";
+  const isClavesaManaged = table.table_type === "DELTA";
   const { data } = useTableSnapshots(
-    isIceberg ? table.database : "",
-    isIceberg ? table.name : "",
+    isClavesaManaged ? table.database : "",
+    isClavesaManaged ? table.name : "",
     1,
     { dir: table.dir },
   );
-  // Prefer the latest Iceberg snapshot's committed_at when available — it's
+  // Prefer the latest Delta commit's committed_at when available — it's
   // the actual data freshness signal. Glue's UpdateTime is only the catalog
   // metadata mtime and lags behind real writes.
   const latest = data?.snapshots?.[0]?.committed_at;
@@ -479,7 +479,7 @@ export function Catalog() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Catalog</h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              Iceberg tables in this workspace — deployed pipelines via Glue
+              Delta tables in this workspace — deployed pipelines via Glue
               (queryable from Athena) and local pipelines via the Hadoop
               catalog under <code className="font-mono">.clavesa/warehouse/</code>.
             </p>
@@ -814,7 +814,7 @@ function EmptyState({ icon, title, body, action }: EmptyStateProps) {
 }
 
 // WelcomeEmptyState renders the first-launch hero on Catalog when the
-// workspace has no Iceberg tables yet. Two shapes:
+// workspace has no Delta tables yet. Two shapes:
 //   - no pipelines exist → 3-step quickstart with primary CTA "Create a
 //     pipeline"; the AWS-availability state is a soft footnote because
 //     the local-only path doesn't need it.
@@ -856,7 +856,7 @@ function WelcomeEmptyState({
           <div>
             <div className="text-base font-semibold">Welcome to your workspace</div>
             <p className="mt-1 max-w-md text-sm text-muted-foreground">
-              Every pipeline output lands here as an Iceberg table. To get
+              Every pipeline output lands here as a Delta table. To get
               your first row, do the three steps below — no terminal needed
               after this point.
             </p>

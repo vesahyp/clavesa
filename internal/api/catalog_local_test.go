@@ -57,23 +57,15 @@ module "xform" {
 }
 `
 
-// minimal Iceberg metadata.json — enough to exercise the catalog walker's
-// fields. Real Iceberg metadata has many more keys; we ignore them.
-const icebergMetadataJSON = `{
-  "format-version": 2,
-  "location": "/abs/warehouse/clavesa_demo/xform__default",
-  "last-updated-ms": 1746615600000,
-  "current-schema-id": 0,
-  "schemas": [
-    {
-      "schema-id": 0,
-      "fields": [
-        {"id": 1, "name": "id",     "type": "long",   "required": false},
-        {"id": 2, "name": "amount", "type": "double", "required": false}
-      ]
-    }
-  ]
-}`
+// minimal Delta _delta_log/00000000000000000000.json — protocol + metaData
+// + commitInfo + add, newline-delimited. The metaData carries a JSON-
+// encoded Spark schema string with two columns. Backslash escapes are
+// needed because the schemaString itself is JSON nested inside JSON.
+const deltaInitialCommit = `{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"abc","format":{"provider":"parquet"},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"double\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{}}}
+{"commitInfo":{"timestamp":1746615600000,"operation":"CREATE TABLE","userMetadata":"{\"trigger\":\"manual\",\"run-id\":\"run-1\"}"}}
+{"add":{"path":"part-00000.snappy.parquet","partitionValues":{},"size":42,"modificationTime":1746615600000,"dataChange":true}}
+`
 
 func TestCatalogListLocalTables(t *testing.T) {
 	workspace := t.TempDir()
@@ -90,14 +82,14 @@ func TestCatalogListLocalTables(t *testing.T) {
 		t.Fatalf("write tf: %v", err)
 	}
 
-	// Lay out an Iceberg-style table at the encoded warehouse path:
-	//   <pipelineDir>/.clavesa/warehouse/clavesa_test__demo/xform__default/metadata/v1.metadata.json
-	tableDir := filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_test__demo", "xform__default", "metadata")
-	if err := os.MkdirAll(tableDir, 0o755); err != nil {
-		t.Fatalf("mkdir table: %v", err)
+	// Lay out a Delta-style table at the encoded warehouse path:
+	//   <pipelineDir>/.clavesa/warehouse/clavesa_test__demo/xform__default/_delta_log/00000000000000000000.json
+	logDir := filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_test__demo", "xform__default", "_delta_log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir log: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(tableDir, "v1.metadata.json"), []byte(icebergMetadataJSON), 0o644); err != nil {
-		t.Fatalf("write metadata: %v", err)
+	if err := os.WriteFile(filepath.Join(logDir, "00000000000000000000.json"), []byte(deltaInitialCommit), 0o644); err != nil {
+		t.Fatalf("write commit: %v", err)
 	}
 
 	h := api.NewCatalogHandler(nil).WithWorkspace(workspace)
@@ -136,14 +128,14 @@ func TestCatalogListLocalTables(t *testing.T) {
 	if got.OutputKey != "default" {
 		t.Errorf("OutputKey = %q, want default", got.OutputKey)
 	}
-	if got.TableType != "ICEBERG" {
-		t.Errorf("TableType = %q, want ICEBERG", got.TableType)
+	if got.TableType != "DELTA" {
+		t.Errorf("TableType = %q, want DELTA", got.TableType)
 	}
 	if len(got.Columns) != 2 {
 		t.Errorf("expected 2 columns, got %d", len(got.Columns))
 	}
 	if got.UpdateTime == nil {
-		t.Error("UpdateTime should be populated from last-updated-ms")
+		t.Error("UpdateTime should be populated from the latest commit's timestamp")
 	}
 	if res.AWSAvailable {
 		t.Error("AWSAvailable should be false when no Glue client is wired")
@@ -164,10 +156,10 @@ module "xform" { source = "clavesa/transform/aws" pipeline_name = var.pipeline_n
 `
 	_ = os.WriteFile(filepath.Join(pipelineDir, "main.tf"), []byte(cloudTF), 0o644)
 	// Even with a stray warehouse dir, nothing should surface.
-	_ = os.MkdirAll(filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_cloud", "xform__default", "metadata"), 0o755)
+	_ = os.MkdirAll(filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_cloud", "xform__default", "_delta_log"), 0o755)
 	_ = os.WriteFile(
-		filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_cloud", "xform__default", "metadata", "v1.metadata.json"),
-		[]byte(icebergMetadataJSON),
+		filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_cloud", "xform__default", "_delta_log", "00000000000000000000.json"),
+		[]byte(deltaInitialCommit),
 		0o644,
 	)
 

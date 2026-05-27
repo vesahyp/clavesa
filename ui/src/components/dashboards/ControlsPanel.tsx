@@ -22,8 +22,9 @@ import {
 } from "@/components/ui/select";
 import { CodeEditor } from "@/components/CodeEditor";
 import type { DashboardControl, PipelineInfo } from "@/lib/queries";
+import { normaliseExpr, TIME_RANGE_PRESETS } from "@/lib/timeRange";
 
-import { uniqueName } from "./DatasetPanel";
+import { uniqueName } from "./uniqueName";
 
 interface ControlsPanelProps {
   controls: DashboardControl[];
@@ -31,12 +32,15 @@ interface ControlsPanelProps {
   onChange: (controls: DashboardControl[]) => void;
 }
 
-const TIME_PRESET_OPTIONS = [
-  { value: "last_24h", label: "Last 24 hours" },
-  { value: "last_7d", label: "Last 7 days" },
-  { value: "last_30d", label: "Last 30 days" },
-  { value: "last_90d", label: "Last 90 days" },
-];
+// Default-value picker for time_range controls. Drawn from the same
+// shared preset table the viewer's ControlStrip uses, so authoring +
+// viewing agree on what's offered. The Default is stored in canonical
+// `now-<n><unit>` form; legacy `last_*` keys still resolve at runtime
+// via the back-compat alias map in `lib/timeRange.ts`.
+const TIME_PRESET_OPTIONS = TIME_RANGE_PRESETS.map((p) => ({
+  value: p.expr,
+  label: p.label,
+}));
 
 export function ControlsPanel({
   controls,
@@ -57,7 +61,7 @@ export function ControlsPanel({
         name,
         type: "time_range",
         label: "Time range",
-        default: "last_30d",
+        default: "now-30d",
         dir: "",
         sql: "",
         options: [],
@@ -157,7 +161,7 @@ export function ControlsPanel({
             <div className="w-48 space-y-1">
               <Label className="text-xs">Default preset</Label>
               <Select
-                value={c.default || "last_30d"}
+                value={normaliseExpr(c.default) || "now-30d"}
                 onValueChange={(v) => update(i, { default: v })}
               >
                 <SelectTrigger>
@@ -171,6 +175,10 @@ export function ControlsPanel({
                   ))}
                 </SelectContent>
               </Select>
+              <p className="text-xs text-muted-foreground">
+                Override on the viewer's URL with{" "}
+                <code className="font-mono">?{c.name || "name"}.rel=now-1h</code>.
+              </p>
             </div>
           )}
 

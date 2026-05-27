@@ -57,6 +57,13 @@ locals {
 resource "aws_glue_catalog_database" "system_pipelines" {
   name        = local.system_pipelines_db
   description = "Clavesa workspace observability — runs / node_runs / tables across every pipeline in ${var.workspace_name}."
+
+  # location_uri is required for Spark's Glue Hive Client to resolve the DB's
+  # warehouse path on saveAsTable. Without it Hive trips
+  # `IllegalArgumentException: Can not create a Path from an empty string`
+  # when the runs_writer Lambda writes runs / node_runs / tables rows.
+  location_uri = "s3://${aws_s3_bucket.workspace_bucket.id}/_system/pipelines/${local.system_pipelines_db}.db"
+
   tags = merge(var.tags, {
     "clavesa:workspace" = var.workspace_name
     "clavesa:catalog"   = var.system_catalog

@@ -437,7 +437,9 @@ func TestLocalProviderSampleTableViaQuery(t *testing.T) {
 		t.Errorf("amount row 1 (nil) = %q, want empty string", res.Rows[1][1])
 	}
 	// SQL targets the per-pipeline namespace.
-	if !contains(stub.gotSQL, "clavesa.clavesa_demo.orders__default") {
+	// ADR-018: two-part `<db>.<table>` resolved under spark_catalog; the
+	// legacy `clavesa.<db>.<table>` was Iceberg-era and is gone.
+	if !contains(stub.gotSQL, "clavesa_demo.orders__default") {
 		t.Errorf("SQL did not target the right table:\n%s", stub.gotSQL)
 	}
 }
@@ -534,21 +536,24 @@ func TestLocalProviderRunsTreatsMissingTableAsEmpty(t *testing.T) {
 	}
 }
 
-func TestLocalProviderSnapshotsViaQuery(t *testing.T) {
+func TestLocalProviderSnapshotsFromDeltaLog(t *testing.T) {
+	// ADR-018: Snapshots reads the Delta transaction log directly from
+	// the local Hadoop-catalog warehouse. The on-disk layout uses Hive's
+	// `<db>.db/` directory (v2.0.0 persistent metastore).
 	workspace := t.TempDir()
-	stub := &stubQueryRunner{
-		result: &observability.QueryRunnerResult{
-			Columns: []string{
-				"snapshot_id", "parent_id", "committed_at", "operation",
-				"added_records", "deleted_records", "total_records",
-			},
-			Rows: [][]interface{}{
-				{"123", "", "2026-05-07T10:00:00.000+00:00", "append", float64(5), float64(0), float64(5)},
-			},
-		},
+	logDir := filepath.Join(workspace, ".clavesa", "warehouse", "clavesa_demo.db", "xform__default", "_delta_log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir log: %v", err)
 	}
-	p := observability.NewLocalProvider(workspace).WithQueryRunner(stub)
+	// Minimal valid Delta commit — metaData + commitInfo with provenance
+	// metadata. Mirrors the shape the runner writes.
+	commitJSON := `{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1715000000000}}
+{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"5"},"userMetadata":"{\"clavesa.trigger\":\"manual\",\"clavesa.run-id\":\"r1\"}"}}`
+	if err := os.WriteFile(filepath.Join(logDir, "00000000000000000000.json"), []byte(commitJSON), 0o644); err != nil {
+		t.Fatalf("write commit: %v", err)
+	}
 
+	p := observability.NewLocalProvider(workspace)
 	res, err := p.Snapshots(context.Background(), observability.SnapshotsQuery{
 		Database: "clavesa_demo",
 		Table:    "xform__default",
@@ -557,11 +562,18 @@ func TestLocalProviderSnapshotsViaQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshots: %v", err)
 	}
-	if len(res.Snapshots) != 1 || res.Snapshots[0].SnapshotID != "123" {
+	if len(res.Snapshots) != 1 || res.Snapshots[0].SnapshotID != "0" {
 		t.Fatalf("unexpected snapshots: %+v", res.Snapshots)
 	}
-	if res.LatestRecordCount == nil || *res.LatestRecordCount != 5 {
-		t.Errorf("LatestRecordCount = %v, want 5", res.LatestRecordCount)
+	got := res.Snapshots[0]
+	if got.Operation != "WRITE" {
+		t.Errorf("operation = %q, want WRITE", got.Operation)
+	}
+	if got.Trigger != "manual" {
+		t.Errorf("trigger = %q, want manual", got.Trigger)
+	}
+	if got.WriterRunID != "r1" {
+		t.Errorf("writer run id = %q, want r1", got.WriterRunID)
 	}
 }
 

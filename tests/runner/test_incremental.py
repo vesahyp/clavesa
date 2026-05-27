@@ -432,10 +432,12 @@ def test_resolve_input_string_form_table_id():
     spark = MagicMock()
     spark.table.return_value = "<df>"
 
-    df, advance = runner._resolve_input(spark, "alias", "clavesa.db.t")
+    # ADR-018: Delta tables resolve via spark_catalog, two-segment
+    # `<db>.<table>` — no leading catalog prefix.
+    df, advance = runner._resolve_input(spark, "alias", "db.t")
     assert df == "<df>"
     assert advance is None
-    spark.table.assert_called_with("clavesa.db.t")
+    spark.table.assert_called_with("db.t")
 
 
 def test_resolve_output_string_forms():
@@ -446,13 +448,16 @@ def test_resolve_output_string_forms():
     os.environ["CLAVESA_SCHEMA"] = "p"
 
     s = runner._resolve_output("default", "")
-    assert s == {"kind": "iceberg_table", "target": "clavesa.clavesa_demo_ws__p.n__default", "mode": "replace", "merge_keys": []}
+    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "replace", "merge_keys": []}
 
     s = runner._resolve_output("default", "s3://bucket/dest/")
     assert s == {"kind": "path", "target": "s3://bucket/dest/", "mode": "replace", "merge_keys": []}
 
-    s = runner._resolve_output("default", "clavesa.db.t")
-    assert s == {"kind": "iceberg_table", "target": "clavesa.db.t", "mode": "replace", "merge_keys": []}
+    # Bare-string table id is passed through as-is — the runner no longer
+    # interprets a "clavesa." prefix (ADR-018: Delta tables resolve via
+    # spark_catalog, two-segment `<db>.<table>`).
+    s = runner._resolve_output("default", "demo_ws__p.n__default")
+    assert s == {"kind": "delta_table", "target": "demo_ws__p.n__default", "mode": "replace", "merge_keys": []}
 
 
 def test_resolve_output_dict_append():
@@ -462,12 +467,12 @@ def test_resolve_output_dict_append():
     os.environ["CLAVESA_CATALOG"] = "clavesa_demo_ws"
     os.environ["CLAVESA_SCHEMA"] = "p"
 
-    s = runner._resolve_output("default", {"kind": "iceberg_table", "table_id": "", "mode": "append"})
-    assert s == {"kind": "iceberg_table", "target": "clavesa.clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False}
+    s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "", "mode": "append"})
+    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False}
 
     # stats opt-in flows through to the resolved spec — the call site
     # only reads spec["stats"], so propagation is the whole test.
-    s = runner._resolve_output("default", {"kind": "iceberg_table", "table_id": "", "stats": True})
+    s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "", "stats": True})
     assert s["stats"] is True
 
 

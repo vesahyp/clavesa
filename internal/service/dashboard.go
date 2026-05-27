@@ -45,6 +45,7 @@ var dashboardWidgetTypes = map[string]bool{
 	"pie":         true,
 	"donut":       true,
 	"table":       true,
+	"world_map":   true,
 }
 
 // dashboardControlTypes is the set of dashboard-level control types the
@@ -88,6 +89,12 @@ type DashboardWidget struct {
 	YField       string                `json:"y_field,omitempty"`
 	SeriesFields []string              `json:"series_fields,omitempty"`
 	LineField    string                `json:"line_field,omitempty"`
+	// RegionField + TooltipField are world_map-only; ISO 3166-1 alpha-2
+	// or alpha-3 country code in the region column, a numeric metric in
+	// value_field (already declared above). Both omitempty so other
+	// widget types serialise unchanged.
+	RegionField  string                `json:"region_field,omitempty"`
+	TooltipField string                `json:"tooltip_field,omitempty"`
 	Layout       DashboardWidgetLayout `json:"layout"`
 	// SQL is a decode-only legacy field — pre-datasets dashboards carried
 	// inline per-widget SQL. normalizeDashboardFile lifts it into a
@@ -444,14 +451,14 @@ func (s *Service) systemGlueDB() string {
 }
 
 // dashboardTableRef is the fully-qualified `dashboards` table identifier
-// in the form each backend expects: the runner's Hadoop catalog uses a
-// three-part `clavesa.<db>.<table>` name; Athena uses a quoted
-// two-part `"<db>"."<table>"`. This mirrors how CloudProvider.Runs
-// addresses `"<db>"."runs"` and the runner addresses `clavesa.<db>.runs`.
+// in the form each backend expects. ADR-018 dropped the legacy
+// `clavesa.<db>.<table>` Iceberg-catalog prefix; Delta tables now resolve
+// under Spark's default session catalog, so the runner identifier is
+// the two-part `<db>.<table>` Athena already used.
 func (s *Service) dashboardTableRef() string {
 	db := s.systemGlueDB()
 	if s.dashResolver != nil && s.dashResolver.IsLocal() {
-		return fmt.Sprintf("clavesa.%s.%s", db, dashboardsSystemTable)
+		return fmt.Sprintf("%s.%s", db, dashboardsSystemTable)
 	}
 	return fmt.Sprintf("%q.%q", db, dashboardsSystemTable)
 }
@@ -474,13 +481,13 @@ func (s *Service) ensureDashboardTable(ctx context.Context, prov observability.P
 	cols := "slug STRING, title STRING, spec STRING, updated_at TIMESTAMP, updated_by STRING"
 	if s.dashResolver.IsLocal() {
 		if err := prov.Exec(ctx, observability.ExecQuery{
-			SQL:         fmt.Sprintf("CREATE NAMESPACE IF NOT EXISTS clavesa.%s", db),
+			SQL:         fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", db),
 			PipelineDir: s.workspace,
 		}); err != nil {
 			return fmt.Errorf("create system namespace: %w", err)
 		}
 		if err := prov.Exec(ctx, observability.ExecQuery{
-			SQL:         fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) USING iceberg", s.dashboardTableRef(), cols),
+			SQL:         fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) USING delta", s.dashboardTableRef(), cols),
 			PipelineDir: s.workspace,
 		}); err != nil {
 			return fmt.Errorf("create dashboards table: %w", err)
@@ -491,9 +498,13 @@ func (s *Service) ensureDashboardTable(ctx context.Context, prov observability.P
 			return fmt.Errorf("dashboards: workspace is not deployed — cannot create the dashboards table (run `clavesa workspace deploy`)")
 		}
 		loc := fmt.Sprintf("s3://%s/_system/pipelines/%s", bucket, dashboardsSystemTable)
+		// ADR-018: Athena reads the Delta external table from the same
+		// `_delta_log/` Spark writes. `USING delta` is rejected by Athena
+		// DDL (it doesn't know `USING`); the metastore form is a
+		// `TBLPROPERTIES('table_type'='DELTA')` external Glue table.
 		if err := prov.Exec(ctx, observability.ExecQuery{
 			SQL: fmt.Sprintf(
-				"CREATE TABLE IF NOT EXISTS %s (%s) LOCATION '%s' TBLPROPERTIES ('table_type'='ICEBERG', 'format'='parquet')",
+				"CREATE EXTERNAL TABLE IF NOT EXISTS %s (%s) LOCATION '%s' TBLPROPERTIES ('table_type'='DELTA')",
 				s.dashboardTableRef(), cols, loc),
 			PipelineDir: s.workspace,
 		}); err != nil {
@@ -802,28 +813,17 @@ func resolveControlDefaults(controls []DashboardControl, out map[string]string, 
 	}
 }
 
-// resolveTimePreset turns a preset key (`last_24h` / `last_7d` /
-// `last_30d` / `last_90d`) into a {start, end} pair of ISO timestamps
-// at `now`. Unknown values default to `last_30d` — that keeps a
-// freshly-added time_range control workable even before the author
-// touches the default.
+// resolveTimePreset turns a canonical `now-<n><unit>` expression (or
+// one of the legacy preset keys `last_24h` / `last_7d` / `last_30d` /
+// `last_90d`) into a {start, end} pair of ISO timestamps at `now`.
+// Empty or invalid input defaults to `now-30d` so a freshly-added
+// time_range control works before the author touches the default.
+//
+// Thin wrapper over ResolveTimeRange — kept for stable internal call
+// sites (resolveControlDefaults). New callers should reach for
+// ResolveTimeRange directly.
 func resolveTimePreset(preset string, now time.Time) (start, end string) {
-	end = now.UTC().Format(time.RFC3339)
-	var d time.Duration
-	switch preset {
-	case "last_24h":
-		d = 24 * time.Hour
-	case "last_7d":
-		d = 7 * 24 * time.Hour
-	case "last_90d":
-		d = 90 * 24 * time.Hour
-	case "last_30d":
-		d = 30 * 24 * time.Hour
-	default:
-		d = 30 * 24 * time.Hour
-	}
-	start = now.UTC().Add(-d).Format(time.RFC3339)
-	return start, end
+	return ResolveTimeRange(preset, now)
 }
 
 // isMissingDashboardsTable classifies a query error as "the dashboards

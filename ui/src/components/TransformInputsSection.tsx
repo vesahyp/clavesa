@@ -4,7 +4,7 @@
  *
  *   - Source (ADR-017): pick from the workspace source registry.
  *     POSTs to /api/sources/{name}/attach.
- *   - Workspace table (ADR-016 slice 2): pick from any Iceberg table
+ *   - Workspace table (ADR-016 slice 2): pick from any Delta table
  *     produced by *another* pipeline in this workspace. POSTs to
  *     /api/pipeline/external-table/attach.
  *   - Pipeline node: wire an upstream transform in *this* pipeline as

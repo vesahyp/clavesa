@@ -418,7 +418,11 @@ func handleColumnStats(w http.ResponseWriter, r *http.Request, p observability.P
 		return
 	}
 
-	tableIdentifier := "clavesa." + db + "." + tbl
+	// ADR-018: Delta tables use the two-part `<db>.<table>` form under
+	// spark_catalog. The runner writes `table_identifier = <db>.<table>`
+	// into column_stats — prefixing with the legacy `clavesa.` Iceberg
+	// catalog name here made the filter never match.
+	tableIdentifier := db + "." + tbl
 	res, err := p.ColumnStats(r.Context(), observability.ColumnStatsQuery{
 		Database:        systemDatabase,
 		TableIdentifier: tableIdentifier,

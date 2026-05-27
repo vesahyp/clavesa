@@ -2,6 +2,8 @@ package observability
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -12,8 +14,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
+
+	"github.com/vesahyp/clavesa/internal/delta"
+	"github.com/vesahyp/clavesa/internal/delta/s3fs"
 )
 
 // AthenaClient is the subset of the AWS Athena API the cloud provider uses.
@@ -34,18 +40,37 @@ type CWLClient interface {
 	FilterLogEvents(ctx context.Context, params *cloudwatchlogs.FilterLogEventsInput, optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.FilterLogEventsOutput, error)
 }
 
-// CloudProvider satisfies Provider for deployed pipelines: Athena over Iceberg
-// metadata for run history, SFN for execution state, CloudWatch for logs.
+// GlueClient is the subset of Glue this provider uses. ADR-018: Athena
+// can't read Delta's commit history (`DESCRIBE HISTORY` isn't supported
+// for Delta tables in Athena), so we resolve the table's S3 LOCATION via
+// Glue and read `_delta_log/` directly. v1.x's `<table>$snapshots`
+// Athena query is gone with Iceberg.
+type GlueClient interface {
+	GetTable(ctx context.Context, params *glue.GetTableInput, optFns ...func(*glue.Options)) (*glue.GetTableOutput, error)
+}
+
+// CloudProvider satisfies Provider for deployed pipelines: Athena for
+// row reads + run history, SFN for execution state, CloudWatch for logs,
+// and Glue+S3+delta for the snapshot timeline (ADR-018 swap from Iceberg
+// `<table>$snapshots`).
 type CloudProvider struct {
 	athena             AthenaClient
 	athenaOutputBucket string
 	sfn                SFNClient
 	cwl                CWLClient
+	// Glue + S3 are optional — when both are wired, Snapshots() reads
+	// Delta `_delta_log/` directly from S3. When either is missing
+	// (legacy callers without WithGlue/WithS3), Snapshots returns an
+	// empty result rather than blowing up — same fail-soft contract as
+	// `undeployed()` above.
+	glue GlueClient
+	s3   s3fs.S3API
 }
 
 // NewCloudProvider wires a provider against AWS SDK clients. Any subset of
 // clients may be nil; methods that require an unset client return a typed
-// error rather than panicking.
+// error rather than panicking. Snapshots() additionally needs both Glue
+// and S3 — set them via WithGlue / WithS3 before calling.
 func NewCloudProvider(athenaC AthenaClient, athenaOutputBucket string, sfnC SFNClient, cwlC CWLClient) *CloudProvider {
 	return &CloudProvider{
 		athena:             athenaC,
@@ -53,6 +78,20 @@ func NewCloudProvider(athenaC AthenaClient, athenaOutputBucket string, sfnC SFNC
 		sfn:                sfnC,
 		cwl:                cwlC,
 	}
+}
+
+// WithGlue attaches a Glue client for table-location lookup. Required
+// (together with WithS3) for Snapshots() to read Delta commit history.
+func (c *CloudProvider) WithGlue(g GlueClient) *CloudProvider {
+	c.glue = g
+	return c
+}
+
+// WithS3 attaches an S3 client for reading `_delta_log/` directly.
+// Required (together with WithGlue) for Snapshots() — see ADR-018.
+func (c *CloudProvider) WithS3(s3c s3fs.S3API) *CloudProvider {
+	c.s3 = s3c
+	return c
 }
 
 // undeployed reports whether the workspace has no deployed Athena
@@ -370,12 +409,21 @@ LIMIT %d`, dbName, safePipeline, q.Limit+1)
 // Snapshots
 // ---------------------------------------------------------------------------
 
+// Snapshots reads the Delta transaction log for one table and projects
+// the recent commit history into the same JSON shape v1.x's Iceberg
+// `<table>$snapshots` Athena query produced. ADR-018: Athena's Delta
+// support is read-only and lacks `DESCRIBE HISTORY`, so we resolve the
+// table's S3 LOCATION via Glue and read `_delta_log/` ourselves via
+// internal/delta + internal/delta/s3fs.
+//
+// Empty result on undeployed workspaces, missing Glue/S3 clients, or a
+// table that hasn't materialised yet — same fail-soft contract the
+// Iceberg path used. UI gates the snapshot timeline on a non-empty
+// result; an empty list renders as "no snapshots yet" rather than an
+// error toast.
 func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*SnapshotsResult, error) {
 	if c.undeployed() {
 		return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
-	}
-	if c.athena == nil {
-		return nil, fmt.Errorf("cloud: athena client not configured")
 	}
 	if !IsValidIdentifier(q.Database) {
 		return nil, fmt.Errorf("invalid database name: %q", q.Database)
@@ -383,53 +431,67 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	if !IsValidIdentifier(q.Table) {
 		return nil, fmt.Errorf("invalid table name: %q", q.Table)
 	}
+	if c.glue == nil || c.s3 == nil {
+		// No Glue/S3 wiring means this provider was built by an older
+		// caller (dataquery tests with NewHandler) — degrade to empty
+		// rather than 500 so handler-level tests keep working without
+		// learning the new dependency.
+		return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
+	}
 
-	sql := fmt.Sprintf(
-		`SELECT
-  CAST(snapshot_id AS varchar) AS snapshot_id,
-  CAST(parent_id AS varchar) AS parent_id,
-  to_iso8601(committed_at) AS committed_at,
-  operation,
-  summary['added-records'] AS added_records,
-  summary['deleted-records'] AS deleted_records,
-  summary['total-records'] AS total_records,
-  summary['clavesa.trigger'] AS trigger,
-  summary['clavesa.run-id'] AS writer_run_id
-FROM "%s"."%s$snapshots"
-ORDER BY committed_at DESC
-LIMIT %d`, q.Database, q.Table, q.Limit+1)
-
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	bucket, prefix, err := c.tableS3Location(ctx, q.Database, q.Table)
 	if err != nil {
+		if errors.Is(err, errTableNotFound) {
+			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
+		}
 		return nil, err
 	}
+	if bucket == "" || prefix == "" {
+		return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
+	}
+	logPrefix := strings.TrimSuffix(prefix, "/") + "/_delta_log/"
 
-	rows := rs.Rows
-	if len(rows) > 0 {
-		rows = rows[1:]
+	fsys := s3fs.New(ctx, c.s3, bucket, logPrefix)
+	_, commits, err := delta.ReadCurrent(fsys)
+	if err != nil {
+		if errors.Is(err, delta.ErrNotDelta) {
+			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
+		}
+		return nil, fmt.Errorf("read delta log: %w", err)
+	}
+
+	limit := q.Limit
+	if limit <= 0 {
+		limit = len(commits)
 	}
 	truncated := false
-	if len(rows) > q.Limit {
-		rows = rows[:q.Limit]
+	if len(commits) > limit {
+		commits = commits[:limit]
 		truncated = true
 	}
 
-	out := make([]SnapshotInfo, 0, len(rows))
-	for _, row := range rows {
-		if len(row.Data) < 9 {
-			continue
+	out := make([]SnapshotInfo, 0, len(commits))
+	for _, ci := range commits {
+		trigger, runID := extractProvenance(ci.UserMetadata)
+		info := SnapshotInfo{
+			SnapshotID:     strconv.FormatInt(ci.Version, 10),
+			CommittedAt:    formatMillis(ci.TimestampMs),
+			Operation:      ci.Operation,
+			AddedRecords:   ci.AddedRecords,
+			DeletedRecords: ci.DeletedRecords,
+			TotalRecords:   ci.TotalRecords,
+			Trigger:        trigger,
+			WriterRunID:    runID,
 		}
-		out = append(out, SnapshotInfo{
-			SnapshotID:     stringDatum(row.Data[0]),
-			ParentID:       stringDatum(row.Data[1]),
-			CommittedAt:    stringDatum(row.Data[2]),
-			Operation:      stringDatum(row.Data[3]),
-			AddedRecords:   intDatum(row.Data[4]),
-			DeletedRecords: intDatum(row.Data[5]),
-			TotalRecords:   intDatum(row.Data[6]),
-			Trigger:        stringDatum(row.Data[7]),
-			WriterRunID:    stringDatum(row.Data[8]),
-		})
+		// Delta doesn't carry a `parent_id` per commit the way Iceberg
+		// did — versions are strictly monotonic, so the previous
+		// version's id is "this one minus 1" for v > 0. Surface that
+		// for UI back-compat; the field is optional in the JSON shape
+		// and the UI uses it for nothing more than rendering "v3 ← v2".
+		if ci.Version > 0 {
+			info.ParentID = strconv.FormatInt(ci.Version-1, 10)
+		}
+		out = append(out, info)
 	}
 	res := &SnapshotsResult{Snapshots: out, Truncated: truncated}
 	if len(out) > 0 && out[0].TotalRecords != nil {
@@ -437,6 +499,91 @@ LIMIT %d`, q.Database, q.Table, q.Limit+1)
 		res.LatestRecordCount = &v
 	}
 	return res, nil
+}
+
+// errTableNotFound is the sentinel tableS3Location returns when Glue's
+// GetTable surfaces an EntityNotFoundException. Callers (Snapshots) map
+// it to an empty success rather than a 500.
+var errTableNotFound = errors.New("table not found in Glue catalog")
+
+// tableS3Location resolves the table's S3 (bucket, key prefix) via Glue.
+// The StorageDescriptor.Location field is an s3:// URI Spark/Delta wrote
+// at create time — for Delta tables it's the table root, so callers
+// append `_delta_log/` to read the transaction log.
+func (c *CloudProvider) tableS3Location(ctx context.Context, db, table string) (bucket, prefix string, err error) {
+	out, err := c.glue.GetTable(ctx, &glue.GetTableInput{
+		DatabaseName: aws.String(db),
+		Name:         aws.String(table),
+	})
+	if err != nil {
+		// Glue surfaces missing tables as EntityNotFoundException; the
+		// SDK v2 wraps it in a typed error we can match on the ErrorCode
+		// string. Fall back to a substring check for older SDK
+		// versions / direct HTTP errors.
+		var coder interface{ ErrorCode() string }
+		if errors.As(err, &coder) && coder.ErrorCode() == "EntityNotFoundException" {
+			return "", "", errTableNotFound
+		}
+		if strings.Contains(err.Error(), "EntityNotFoundException") {
+			return "", "", errTableNotFound
+		}
+		return "", "", fmt.Errorf("glue.GetTable %s.%s: %w", db, table, err)
+	}
+	if out.Table == nil || out.Table.StorageDescriptor == nil {
+		return "", "", errTableNotFound
+	}
+	loc := aws.ToString(out.Table.StorageDescriptor.Location)
+	return parseS3URI(loc)
+}
+
+// parseS3URI splits `s3://bucket/key/path` into (bucket, key). Returns
+// empty strings for non-S3 or malformed URIs — caller treats that as
+// "no Delta log here" and surfaces an empty result.
+func parseS3URI(uri string) (bucket, prefix string, err error) {
+	const scheme = "s3://"
+	if !strings.HasPrefix(uri, scheme) {
+		return "", "", nil
+	}
+	rest := uri[len(scheme):]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return rest, "", nil
+	}
+	bucket = rest[:slash]
+	prefix = rest[slash+1:]
+	return bucket, prefix, nil
+}
+
+// extractProvenance unmarshals the JSON object commit's userMetadata
+// field carries (`{"clavesa.trigger": "...", "clavesa.run-id": "..."}`,
+// stamped by sub-slice 3 via _apply_snapshot_props in the runner) and
+// returns (trigger, runID). Non-JSON / missing fields gracefully
+// degrade to empty strings — the UI hides empty values cleanly.
+//
+// Mirrors the v1.x Iceberg path which read the same two keys from
+// snapshot.summary at Athena query time; the shape on the wire is
+// identical so the UI doesn't have to learn about the new storage
+// site.
+func extractProvenance(userMetadata string) (trigger, runID string) {
+	if userMetadata == "" {
+		return "", ""
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(userMetadata), &m); err != nil {
+		return "", ""
+	}
+	return m["clavesa.trigger"], m["clavesa.run-id"]
+}
+
+// formatMillis renders epoch milliseconds as the same ISO-8601 UTC
+// shape Athena's `to_iso8601(committed_at)` produced — the UI parses
+// this string directly, so a divergent format would break the snapshot
+// timeline's relative-time rendering.
+func formatMillis(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 // ---------------------------------------------------------------------------

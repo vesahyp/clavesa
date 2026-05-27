@@ -143,6 +143,17 @@ func TestValidateDashboard(t *testing.T) {
 		t.Fatalf("valid dashboard rejected: %v", err)
 	}
 
+	// world_map is a valid widget type with the right shape (Slice F).
+	withMap := ok
+	withMap.Widgets = []DashboardWidget{{
+		ID: "m1", Type: "world_map", Dataset: "rev",
+		RegionField: "country", ValueField: "hits",
+		Layout: DashboardWidgetLayout{W: 6, H: 5},
+	}}
+	if err := validateDashboard(withMap); err != nil {
+		t.Fatalf("world_map widget rejected: %v", err)
+	}
+
 	cases := []struct {
 		name   string
 		mutate func(*Dashboard)
@@ -342,11 +353,25 @@ func TestResolveTimePreset(t *testing.T) {
 		preset   string
 		wantSpan time.Duration
 	}{
+		// Canonical now-<n><unit> form (Slice E).
+		{"now-5m", 5 * time.Minute},
+		{"now-15m", 15 * time.Minute},
+		{"now-1h", time.Hour},
+		{"now-3h", 3 * time.Hour},
+		{"now-24h", 24 * time.Hour},
+		{"now-7d", 7 * 24 * time.Hour},
+		{"now-30d", 30 * 24 * time.Hour},
+		{"now-2w", 14 * 24 * time.Hour},
+		{"now-90d", 90 * 24 * time.Hour},
+		// Legacy preset keys still resolve (back-compat with saved
+		// dashboards written before Slice E).
 		{"last_24h", 24 * time.Hour},
 		{"last_7d", 7 * 24 * time.Hour},
 		{"last_30d", 30 * 24 * time.Hour},
 		{"last_90d", 90 * 24 * time.Hour},
-		{"", 30 * 24 * time.Hour}, // default
+		// Empty + bogus fall back to 30d (don't crash a freshly-added
+		// control whose Default the author hasn't set yet).
+		{"", 30 * 24 * time.Hour},
 		{"bogus", 30 * 24 * time.Hour},
 	} {
 		t.Run(c.preset, func(t *testing.T) {
@@ -358,6 +383,24 @@ func TestResolveTimePreset(t *testing.T) {
 			}
 			if !e.Equal(now) {
 				t.Errorf("end should equal now, got %v", e)
+			}
+		})
+	}
+}
+
+func TestParseRelativeRejectsBadInput(t *testing.T) {
+	for _, in := range []string{
+		"now+1h",
+		"now-",
+		"now-1y",        // year not supported
+		"now-1.5h",      // fractional not supported
+		"now-0h",        // zero not allowed
+		"1h",            // missing now- prefix
+		"now-abc",       // non-numeric
+	} {
+		t.Run(in, func(t *testing.T) {
+			if _, err := ParseRelative(in); err == nil {
+				t.Errorf("expected error for %q", in)
 			}
 		})
 	}

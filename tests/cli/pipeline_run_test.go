@@ -15,8 +15,9 @@ import (
 //   - workspace init / pipeline create / node add / node edit / node connect
 //   - the run command's --json output shape (contract for tooling consumers)
 //   - runner-container dispatch under the default (local) environment mode
-//   - the auto-table identifier convention (Iceberg writes to
-//     clavesa.clavesa_<pipeline>.<node>__default by default)
+//   - the auto-table identifier convention (Delta writes to
+//     clavesa_<pipeline>.<node>__default by default — ADR-018: Delta
+//     tables live under spark_catalog, no leading catalog segment)
 //
 // The smoke test was previously manual — TODO calls this out. Gating: same
 // integration tag as the rest of tests/cli, so it only runs under
@@ -77,20 +78,20 @@ func TestPipelineRunEndToEnd(t *testing.T) {
 		t.Errorf("transform status = %q, want ok\nnote: %s", xform.Status, xform.Note)
 	}
 
-	// The runner writes to an Iceberg auto-table when no destination override
-	// is configured. Output identifier follows the ADR-016 three-level
-	// encoding: <spark_catalog>.<glue_db>.<table>, where the Glue DB is
+	// The runner writes to a Delta auto-table when no destination override
+	// is configured. Output identifier follows the ADR-016 namespace
+	// encoding flattened against Delta's spark_catalog resolution
+	// (ADR-018): `<glue_db>.<table>`, where the Glue DB is
 	// `<workspace_catalog>__<pipeline_schema>` for post-ADR workspaces
 	// (`test-ws` → `clavesa_test_ws` catalog, `orders` → `orders` schema
-	// → `clavesa_test_ws__orders` Glue DB). Spark catalog name stays
-	// literal `clavesa` since Iceberg's SparkCatalog can't filter Glue
-	// by namespace prefix.
-	wantPrefix := "clavesa.clavesa_test_ws__orders." + transformID + "__default"
+	// → `clavesa_test_ws__orders` Glue DB). No leading catalog prefix —
+	// Delta lives under Spark's default session catalog.
+	wantPrefix := "clavesa_test_ws__orders." + transformID + "__default"
 	if xform.Output != wantPrefix {
 		t.Errorf("transform output = %q, want %q", xform.Output, wantPrefix)
 	}
 
-	// The Iceberg table should now exist on disk under the pipeline's local
+	// The Delta table should now exist on disk under the pipeline's local
 	// warehouse. Sanity check that the warehouse layout is what the catalog
 	// handler will subsequently walk (cf. internal/api/catalog_local.go).
 	// Warehouse subdir matches the encoded Glue DB name so local and cloud

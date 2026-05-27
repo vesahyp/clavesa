@@ -20,7 +20,7 @@ import type { Column } from "../types/pipeline";
 import { cn } from "@/lib/utils";
 
 /**
- * The Iceberg table a transform node writes its default output to.
+ * The Delta table a transform node writes its default output to.
  * `table` keeps the raw `<node>__default` form; the node footer hides the
  * `__default` suffix for display but links with the full identifier.
  */
@@ -41,7 +41,7 @@ export type PipelineNodeData = {
    */
   compute?: string;
   /**
-   * Iceberg write mode for the `default` output — `replace` (default) /
+   * Delta write mode for the `default` output — `replace` (default) /
    * `append` / `merge`. Surfaced as a footer chip next to the output
    * table so authors can see at a glance whether each transform overwrites
    * or accumulates. Absent on source/destination nodes.
@@ -58,7 +58,7 @@ export type PipelineNodeData = {
   sourceFormat?: string;
   sourceLocation?: string;
   columns?: Column[];
-  /** Iceberg output table — shown in the node footer (transforms only). */
+  /** Delta output table — shown in the node footer (transforms only). */
   output?: NodeOutput;
   loading?: boolean;
   /** Node was part of a completed preview chain */

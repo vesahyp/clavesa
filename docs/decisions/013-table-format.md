@@ -1,6 +1,8 @@
 # ADR 013: Table Format — Iceberg, Delta, or Hudi
 
-**Status**: Accepted. The catalog/database naming illustrated below (`clavesa` / `clavesa_<pipeline>`) was generalized in ADR 016 — catalog identifier is now a workspace-level setting (default `clavesa_<sanitize(workspace_name)>`) and schema identifier is per-pipeline. The format decision and write semantics in this ADR are unchanged; only the identifiers in the examples have moved.
+**Status**: Superseded by [ADR 018](018-delta-table-format.md) (v2.0.0, 2026-05-26). The workload-fit assumption ("append-mostly with light updates") didn't survive contact with the cloudfront-analytics medallion pattern (heavy CDC on MOR upstreams), and Iceberg v2's CDC API gaps proved structural. Delta Lake replaces Iceberg as the default table format; existing Iceberg workspaces stay on v1.x. The catalog/database naming generalized in ADR 016 still applies to Delta tables in v2.0.0.
+
+**Original status (now historical)**: Accepted. The catalog/database naming illustrated below (`clavesa` / `clavesa_<pipeline>`) was generalized in ADR 016 — catalog identifier is now a workspace-level setting (default `clavesa_<sanitize(workspace_name)>`) and schema identifier is per-pipeline. The format decision and write semantics in this ADR are unchanged; only the identifiers in the examples have moved.
 
 ## Context
 

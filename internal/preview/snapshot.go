@@ -84,7 +84,7 @@ func ResolveUpstreamFromSnapshot(
 	}
 	image, _ := parent.Config["runner_image"].(string)
 	sql := fmt.Sprintf(
-		"SELECT * FROM clavesa.%s.%s LIMIT %d",
+		"SELECT * FROM %s.%s LIMIT %d",
 		glueDB, table, rowCount,
 	)
 	rows, err := QueryWarehouseTable(ctx, localTag, image, warehouse, sql)

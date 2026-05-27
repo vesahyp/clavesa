@@ -477,7 +477,7 @@ function PerNodeRow({ row }: { row: NodeRun }) {
         </div>
         <div className="flex items-center gap-3 whitespace-nowrap text-[11px] text-muted-foreground">
           {row.output_rows != null && (
-            <span title="Rows written to Iceberg outputs this run">
+            <span title="Rows written to Delta outputs this run">
               {formatRowCount(row.output_rows)}
             </span>
           )}

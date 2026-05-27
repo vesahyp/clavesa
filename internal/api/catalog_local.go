@@ -1,18 +1,19 @@
 package api
 
 import (
-	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/delta"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
-// listLocalTables surfaces every Iceberg table in the workspace-shared
+// listLocalTables surfaces every Delta table in the workspace-shared
 // local Hadoop warehouse at <workspaceRoot>/.clavesa/warehouse/<glue_db>/,
 // where <glue_db> is `identutil.EncodeGlueDatabase(catalog, schema)`. One
 // warehouse per workspace holds every local pipeline's tables under separate
@@ -27,7 +28,7 @@ import (
 // The encoding MUST match what the runner's `_glue_db()` writes — same
 // sanitization rule. If they drift, local tables stop showing up.
 //
-// Errors are swallowed at each level — a bad metadata.json on one table
+// Errors are swallowed at each level — a bad `_delta_log/` on one table
 // shouldn't hide the rest of the workspace.
 func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipelines []discoveredPipeline) []CatalogTable {
 	var out []CatalogTable
@@ -65,12 +66,19 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 		if !dbEntry.IsDir() {
 			continue
 		}
-		db := dbEntry.Name()
+		dirName := dbEntry.Name()
+		// Hive metastore wraps each DB in a `<db>.db/` directory. The
+		// runner switched to a persistent local Hive metastore in
+		// v2.0.0 so cross-transform reads can resolve table names from
+		// the previous container's catalog state; the on-disk layout
+		// gained the `.db` suffix as a side-effect. Strip it to recover
+		// the logical DB name the (catalog, schema) encoder produces.
+		db := strings.TrimSuffix(dirName, ".db")
 		pip, isUserDB := userDBToPipeline[db]
 		if !isUserDB && db != systemDB {
 			continue // stray namespace (e.g. a destroyed pipeline) — skip
 		}
-		dbRoot := filepath.Join(warehouse, db)
+		dbRoot := filepath.Join(warehouse, dirName)
 		entries, err := os.ReadDir(dbRoot)
 		if err != nil {
 			continue
@@ -286,49 +294,28 @@ func candidateDirs(root string) []string {
 	return out
 }
 
-// readLocalTable reads the latest metadata.json under tableDir/metadata/ and
-// projects it into a CatalogTable. Returns (_, false) when the directory is
-// not a valid Iceberg table (no metadata files, unparseable JSON, etc.).
+// readLocalTable reads the Delta transaction log under tableDir/_delta_log/
+// and projects the current schema + latest commit into a CatalogTable.
+// Returns (_, false) when the directory is not a valid Delta table — no
+// `_delta_log/`, an empty log, or any commit fails to parse. Per-table
+// errors swallow rather than surface; the walker is best-effort.
 func readLocalTable(db, name, tableDir string) (CatalogTable, bool) {
-	metaDir := filepath.Join(tableDir, "metadata")
-	metaPath, ok := latestMetadataFile(metaDir)
-	if !ok {
-		return CatalogTable{}, false
-	}
-	data, err := os.ReadFile(metaPath)
+	schema, commits, err := delta.ReadCurrentFromPath(tableDir)
 	if err != nil {
+		// ErrNotDelta is the expected "directory isn't a table" signal;
+		// any other error (malformed commit, IO failure) gets the same
+		// treatment — the catalog page degrades gracefully rather than
+		// 500ing because of one bad table.
+		_ = errors.Is(err, delta.ErrNotDelta) // documented signal, not load-bearing here
 		return CatalogTable{}, false
 	}
 
-	var meta struct {
-		Location        string `json:"location"`
-		LastUpdatedMs   int64  `json:"last-updated-ms"`
-		CurrentSchemaID int    `json:"current-schema-id"`
-		Schemas         []struct {
-			SchemaID int `json:"schema-id"`
-			Fields   []struct {
-				Name     string      `json:"name"`
-				Type     interface{} `json:"type"` // string for primitives, object for nested
-				Required bool        `json:"required"`
-			} `json:"fields"`
-		} `json:"schemas"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return CatalogTable{}, false
-	}
-
-	cols := make([]CatalogColumn, 0)
-	for _, sch := range meta.Schemas {
-		if sch.SchemaID != meta.CurrentSchemaID {
-			continue
-		}
-		for _, f := range sch.Fields {
-			cols = append(cols, CatalogColumn{
-				Name: f.Name,
-				Type: typeString(f.Type),
-			})
-		}
-		break
+	cols := make([]CatalogColumn, 0, len(schema.Columns))
+	for _, c := range schema.Columns {
+		cols = append(cols, CatalogColumn{
+			Name: c.Name,
+			Type: c.Type,
+		})
 	}
 
 	// `<catalog>__<schema>` post-v0.18 — the part after `__` is the
@@ -349,78 +336,17 @@ func readLocalTable(db, name, tableDir string) (CatalogTable, bool) {
 		OwningPipeline: owningPipeline,
 		OwningNode:     owningNode,
 		OutputKey:      outputKey,
-		Location:       meta.Location,
-		TableType:      "ICEBERG",
-		Columns:        cols,
+		// Delta's transaction log doesn't carry a separate "location"
+		// field the way Iceberg's metadata.json did — the location IS
+		// the directory we're reading from. Hand it back so the UI's
+		// existing rendering keeps working.
+		Location:  tableDir,
+		TableType: "DELTA",
+		Columns:   cols,
 	}
-	if meta.LastUpdatedMs > 0 {
-		ts := time.UnixMilli(meta.LastUpdatedMs).UTC()
+	if len(commits) > 0 && commits[0].TimestampMs > 0 {
+		ts := time.UnixMilli(commits[0].TimestampMs).UTC()
 		t.UpdateTime = &ts
 	}
 	return t, true
-}
-
-// latestMetadataFile returns the highest-versioned vN.metadata.json file in
-// metaDir. Iceberg's Hadoop catalog rewrites with strictly increasing N on
-// every commit; sort + last gives us the current one.
-func latestMetadataFile(metaDir string) (string, bool) {
-	entries, err := os.ReadDir(metaDir)
-	if err != nil {
-		return "", false
-	}
-	best := ""
-	for _, e := range entries {
-		n := e.Name()
-		if !strings.HasPrefix(n, "v") || !strings.HasSuffix(n, ".metadata.json") {
-			continue
-		}
-		if best == "" || lexLess(best, n) {
-			best = n
-		}
-	}
-	if best == "" {
-		return "", false
-	}
-	return filepath.Join(metaDir, best), true
-}
-
-// lexLess compares two metadata filenames by their numeric prefix so
-// "v10.metadata.json" sorts after "v9.metadata.json" — purely lexicographic
-// comparison would put "v10" before "v9".
-func lexLess(a, b string) bool {
-	na := numericVersion(a)
-	nb := numericVersion(b)
-	if na != nb {
-		return na < nb
-	}
-	return a < b
-}
-
-func numericVersion(name string) int {
-	if !strings.HasPrefix(name, "v") {
-		return 0
-	}
-	end := strings.Index(name, ".")
-	if end < 0 {
-		return 0
-	}
-	n := 0
-	for _, ch := range name[1:end] {
-		if ch < '0' || ch > '9' {
-			return 0
-		}
-		n = n*10 + int(ch-'0')
-	}
-	return n
-}
-
-// typeString flattens an Iceberg field type. Primitive fields encode the
-// type as a JSON string ("string", "long", etc.); nested types come through
-// as objects. We surface the primitive name verbatim and "<nested>" for
-// anything else — the catalog UI doesn't render struct details today.
-func typeString(t interface{}) string {
-	if s, ok := t.(string); ok {
-		return s
-	}
-	return "<nested>"
 }

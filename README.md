@@ -2,7 +2,7 @@
 
 **Clavesa is a self-hosted lakehouse platform. You write transforms in SQL, or in PySpark when SQL isn't enough, and Clavesa compiles them to the cheapest AWS compute that fits: Lambda, Fargate, or EMR Serverless. The whole stack is Terraform in your repo.**
 
-![Catalog page showing every Iceberg table the workspace produced, ops and user data side by side](docs/images/catalog.png)
+![Catalog page showing every Delta table the workspace produced, ops and user data side by side](docs/images/catalog.png)
 
 ---
 
@@ -12,7 +12,7 @@ A single Go binary that gives a solo engineer or a small team everything needed 
 
 - **Pipeline authoring.** Visual DAG editor and a CLI, both reading and writing the same `.tf` files. Transforms in SQL or PySpark.
 - **Distributed execution.** One PySpark runtime, identical on your laptop and on AWS Lambda, Fargate, or EMR Serverless.
-- **Data lakehouse.** Every transform output is an Apache Iceberg table in Glue Data Catalog, queryable from Athena with no DDL.
+- **Data lakehouse.** Every transform output is a Delta table in Glue Data Catalog, queryable from Athena with no DDL.
 - **Observability.** Run history, lineage, freshness SLAs, and SQL-driven dashboards over the same catalog as your data.
 - **Local-cloud parity.** Every authoring and operating capability works against deployed pipelines and against local-only ones. Develop offline; deploy when ready.
 
@@ -32,8 +32,8 @@ Clavesa is a fourth shape: a lakehouse platform you own, with the authoring ergo
 
 - **SQL-first, PySpark when SQL isn't enough.** Analytics engineers write SQL and drop to PySpark only for the transforms that need it. One language for most of the warehouse, one runtime for the rest.
 - **Right-sized backend per transform.** A small filter runs on Lambda; a 100M-row join on Fargate; a multi-TB shuffle on EMR Serverless (roughly 5× cheaper than Glue at the same scale). You pick the target per transform, in the same Terraform that defines the pipeline.
-- **One engine, local and cloud.** PySpark runs on Lambda, on EMR Serverless, and on your laptop. The same SQL produces the same Iceberg table in every target.
-- **Observability without a second stack.** Run history, lineage, and freshness live as Iceberg tables in the same catalog as your data. Query them with the same SQL: `SELECT * FROM clavesa_<pipeline>.runs WHERE status = 'FAILED'`.
+- **One engine, local and cloud.** PySpark runs on Lambda, on EMR Serverless, and on your laptop. The same SQL produces the same Delta table in every target.
+- **Observability without a second stack.** Run history, lineage, and freshness live as Delta tables in the same catalog as your data. Query them with the same SQL: `SELECT * FROM clavesa_<pipeline>.runs WHERE status = 'FAILED'`.
 
 ---
 
@@ -121,7 +121,7 @@ Now drive the rest from the browser:
    SELECT * FROM src_trips
    ```
 
-   The `trips` transform passes the full NYC TLC schema through to its own Iceberg table — that's what gives the column profile something interesting to show.
+   The `trips` transform passes the full NYC TLC schema through to its own Delta table — that's what gives the column profile something interesting to show.
 
 5. **Add the aggregation transform.** Back in the palette, type `revenue_by_payment` → **+ SQL Transform**. Select it, **Inputs** → **Add**, wire `trips` (alias `trips`), **Attach**. Paste and **Save**:
 
@@ -138,7 +138,7 @@ Now drive the rest from the browser:
 
 6. **Run it.** Click the `demo` breadcrumb in the editor header to open the pipeline dashboard, then click **Run pipeline**. ~30–60s end-to-end including Spark cold start. When the run finishes the page auto-navigates to the run detail view, where the DAG shows both transforms marked **ok** and the per-node breakdown is populated.
 
-7. **Browse the result.** Click **Catalog** in the nav. Two new Iceberg tables show up under your `demo` pipeline — open `trips__default` first: schema + sample rows + the **Column profile** card with one row per column showing null %, distinct count (a handful for `payment_type`, millions for `tpep_pickup_datetime`), top-K bars where the cardinality is low, and p50/p95 for numeric columns like `fare_amount` and `total_amount`. Then `revenue_by_payment__default` for the aggregated view (no column profile here — that transform didn't opt in). Run the pipeline two more times (back to the dashboard, **Run pipeline**) to get more than one data point on the seeded `/dashboards/pipeline-runs-demo` duration chart.
+7. **Browse the result.** Click **Catalog** in the nav. Two new Delta tables show up under your `demo` pipeline — open `trips__default` first: schema + sample rows + the **Column profile** card with one row per column showing null %, distinct count (a handful for `payment_type`, millions for `tpep_pickup_datetime`), top-K bars where the cardinality is low, and p50/p95 for numeric columns like `fare_amount` and `total_amount`. Then `revenue_by_payment__default` for the aggregated view (no column profile here — that transform didn't opt in). Run the pipeline two more times (back to the dashboard, **Run pipeline**) to get more than one data point on the seeded `/dashboards/pipeline-runs-demo` duration chart.
 
 #### Or: drive everything from the CLI
 
@@ -184,11 +184,11 @@ Here's what you'll see in the UI once the pipeline has run. The Catalog (top of 
 
 ![Pipeline runs dashboard for the demo pipeline with five widgets driven by the seeded JSON, populated by three local runs](docs/images/dashboard.png)
 
-The two output tables (`trips__default` and `revenue_by_payment__default`) live at `/tables/<db>/<table>`. Each page shows schema, sample rows of real NYC TLC trip data, snapshot timeline (one append per run), and a lineage panel showing upstream sources and transforms. `trips__default` also renders the per-column profile card — null %, distinct count, top-K bars, percentiles for numerics — because the transform opted in via the **Compute column stats** checkbox. Clicking any run row in the pipeline dashboard opens the per-execution view with the DAG colored by per-node status and a per-node breakdown.
+The two output tables (`trips__default` and `revenue_by_payment__default`) live at `/tables/<db>/<table>`. Each page shows schema, sample rows of real NYC TLC trip data, commit timeline (one commit per run), and a lineage panel showing upstream sources and transforms. `trips__default` also renders the per-column profile card — null %, distinct count, top-K bars, percentiles for numerics — because the transform opted in via the **Compute column stats** checkbox. Clicking any run row in the pipeline dashboard opens the per-execution view with the DAG colored by per-node status and a per-node breakdown.
 
 ### Author your own dashboard
 
-Dashboards live in the `dashboards` system Iceberg table, shared with everyone who has workspace access, in the same catalog as your data. From `/dashboards` click **New dashboard** to open the editor.
+Dashboards live in the `dashboards` system Delta table, shared with everyone who has workspace access, in the same catalog as your data. From `/dashboards` click **New dashboard** to open the editor.
 
 The editor splits authoring into three tabs. Under **Datasets**, add one or more named SQL queries; each query picks its own pipeline, so one dashboard can blend tables from several pipelines and mix local with cloud. A catalog browser sits beside the SQL editor: click a table or column to insert its identifier, then hit **Run** for an inline preview of the result before saving. Under **Controls**, add dashboard-level filters — a time-range picker or a select dropdown — referenced from dataset SQL as `{{name}}` (or `{{name.start}}` / `{{name.end}}` for a time range); the rendered dashboard surfaces the controls in a strip above the grid and round-trips selections through URL search params so a filtered view is shareable. Under **Widgets**, **Add widget** opens a type picker with eight types (big number, line, bar, stacked bar, bar + line, pie, donut, table); each widget binds to a dataset and picks its fields from that dataset's actual result columns. Drag a widget on the layout grid to move it, or drag its corner to resize. **Save** writes the whole dashboard back to the system table.
 
@@ -223,7 +223,7 @@ The pipeline's run history shows up in the same `/dashboards` UI. Response shape
 
 ## Screenshots
 
-**Browse any table in the catalog.** Schema, sample rows, snapshot history, and a lineage panel for every Iceberg table the workspace produces. Athena pulls sample rows in the cloud and PySpark pulls them locally, against identical SQL.
+**Browse any table in the catalog.** Schema, sample rows, commit history, and a lineage panel for every Delta table the workspace produces. Athena pulls sample rows in the cloud and PySpark pulls them locally, against identical SQL.
 
 ![Per-table view of revenue_by_payment showing schema, sample rows, snapshot history, and lineage](docs/images/table-detail.png)
 
@@ -237,7 +237,7 @@ The pipeline's run history shows up in the same `/dashboards` UI. Response shape
 
 - **[CHANGELOG.md](CHANGELOG.md)** lists what shipped in each release, in user-facing terms.
 - **[docs/architecture.md](docs/architecture.md)** covers system layers and the data model.
-- **[docs/decisions/](docs/decisions/)** holds the ADRs. ADR-012 (PySpark engine), ADR-013 (Iceberg), and ADR-014 (local-cloud parity) are the current architectural anchors.
+- **[docs/decisions/](docs/decisions/)** holds the ADRs. ADR-012 (PySpark engine), ADR-018 (Delta table format), and ADR-014 (local-cloud parity) are the current architectural anchors.
 
 ## Development
 

@@ -86,16 +86,28 @@ sources and strips deprecated module arguments.`,
 			// pure-Go tests can exercise it without Docker. Surface the
 			// image refresh error but don't abort: the TF rewrite is
 			// already on disk and useful on its own.
-			if _, imgErr := workspace.EnsureLocalRunnerImage(root); imgErr != nil {
+			runnerRefreshed := false
+			if _, refreshed, imgErr := workspace.EnsureLocalRunnerImageStatus(root); imgErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: refresh local runner image: %v\n", imgErr)
+			} else {
+				runnerRefreshed = refreshed
+			}
+			// Compose the post-action summary from what actually
+			// happened. "runner refreshed" only fires when a retag or
+			// rebuild actually occurred — otherwise it's "runner
+			// unchanged" so the user sees the truth and doesn't trust a
+			// stale image.
+			runnerNote := "runner unchanged"
+			if runnerRefreshed {
+				runnerNote = "runner refreshed"
 			}
 			switch {
 			case prev == "":
-				fmt.Printf("Workspace at %s: module source line not found in main.tf; modules + runner refreshed.\n", root)
+				fmt.Printf("Workspace at %s: module source line not found in main.tf; modules refreshed, %s.\n", root, runnerNote)
 			case prev == target && rewritten == 0:
-				fmt.Printf("Workspace at %s: already on %s; modules + runner refreshed.\n", root, target)
+				fmt.Printf("Workspace at %s: already on %s; modules refreshed, %s.\n", root, target, runnerNote)
 			default:
-				fmt.Printf("Upgraded workspace at %s: %s → %s\n", root, prev, target)
+				fmt.Printf("Upgraded workspace at %s: %s → %s (%s)\n", root, prev, target, runnerNote)
 				if rewritten > 0 {
 					fmt.Printf("  main.tf: rewrote `module \"workspace\"` source\n")
 				}

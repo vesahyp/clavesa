@@ -25,14 +25,14 @@ export interface NodeInput {
   from: string;
   /** Lineage edge type — "source-registry", "transform", … */
   kind: string;
-  /** Catalog table read, when the upstream is an Iceberg producer. */
+  /** Catalog table read, when the upstream is a Delta producer. */
   table: string;
 }
 
 /** Static node spec, the same for every run. */
 export interface NodeSpec {
   language: string;
-  /** Iceberg write mode — replace / append / merge. */
+  /** Delta write mode — replace / append / merge. */
   outputMode: string;
   mergeKeys: string[];
   inputs: NodeInput[];
