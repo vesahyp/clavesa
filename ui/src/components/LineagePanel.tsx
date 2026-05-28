@@ -190,7 +190,8 @@ function LineageEdgeRow({ edge, direction, database }: LineageEdgeRowProps) {
     if (edge.to_table) {
       linkTarget = toTableRoute(edge.to_table);
     } else {
-      const consumerTable = `${sanitize(otherNode)}__default`;
+      // ADR-019: single-output transforms write to the bare node name.
+      const consumerTable = sanitize(otherNode);
       linkTarget = buildTableRoute(database, consumerTable);
     }
   }
@@ -201,6 +202,9 @@ function LineageEdgeRow({ edge, direction, database }: LineageEdgeRowProps) {
   const isExternal = otherPipeline === "(external)";
 
   if (linkTarget && !isExternal) {
+    const wireRef = isUpstream
+      ? edge.via_table
+      : edge.to_table || `${database}.${sanitize(otherNode)}`;
     return (
       <NavLink
         to={linkTarget}
@@ -211,9 +215,7 @@ function LineageEdgeRow({ edge, direction, database }: LineageEdgeRowProps) {
       >
         <Database className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground group-hover:text-primary" />
         <code className="truncate font-mono text-xs">
-          {isUpstream
-            ? edge.via_table
-            : edge.to_table || `${database}.${sanitize(otherNode)}__default`}
+          {displayWireRef(wireRef)}
         </code>
         <span className="ml-auto flex flex-shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-muted-foreground">
           {isCrossPipeline && (
@@ -281,4 +283,20 @@ function buildTableRoute(db: string, table: string): string {
 // internal/service/lineage.go:sanitizeNodeForTable.
 function sanitize(s: string): string {
   return s.replace(/-/g, "_");
+}
+
+// displayWireRef collapses the wire form `<catalog>__<schema>.<table>`
+// the lineage edges carry into the human-readable `schema.table` shape
+// (ADR-020 display normalization). Workspace is implicit on the pipeline
+// editor surface, so dropping the catalog segment keeps row labels
+// compact; the `__default` suffix on single-output legacy tables is
+// stripped the same way displayTableName does it elsewhere.
+function displayWireRef(wireRef: string): string {
+  const lastDot = wireRef.lastIndexOf(".");
+  if (lastDot < 0) return wireRef;
+  const db = wireRef.slice(0, lastDot);
+  const table = wireRef.slice(lastDot + 1).replace(/__default$/, "");
+  const sep = db.indexOf("__");
+  const schema = sep >= 0 ? db.slice(sep + 2) : db;
+  return schema ? `${schema}.${table}` : table;
 }

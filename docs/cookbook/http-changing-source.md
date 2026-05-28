@@ -110,9 +110,9 @@ bin/clavesa pipeline run newsfeed
 ## What you should see
 
 - `pipeline run` reports both `stories` and `fact_story_snapshot` as `ok`.
-- `/` (Catalog) lists `stories__default` and `fact_story_snapshot__default` under `clavesa_hn-demo__newsfeed`.
-- **`stories__default`** — after run 1, ~100 rows. After a later run, the row count grows by *only the new stories* since the previous run — a handful, not another 100; overlapping `objectID`s were updated in place. (If two runs were close together the feed may not have moved at all, and the count stays flat — that's correct, not a bug.) `SELECT count(*), count(DISTINCT objectID)` returns two equal numbers — no duplicates, ever. A story seen in several runs shows its **most recent** `points`.
-- **`fact_story_snapshot__default`** — grows by ~100 every run. A story fetched in three runs has three rows, with three `fetched_at` values and (usually) three different `points`. This is the history `stories` throws away.
+- `/` (Catalog) lists `stories` and `fact_story_snapshot` under `clavesa_hn-demo__newsfeed`.
+- **`stories`** — after run 1, ~100 rows. After a later run, the row count grows by *only the new stories* since the previous run — a handful, not another 100; overlapping `objectID`s were updated in place. (If two runs were close together the feed may not have moved at all, and the count stays flat — that's correct, not a bug.) `SELECT count(*), count(DISTINCT objectID)` returns two equal numbers — no duplicates, ever. A story seen in several runs shows its **most recent** `points`.
+- **`fact_story_snapshot`** — grows by ~100 every run. A story fetched in three runs has three rows, with three `fetched_at` values and (usually) three different `points`. This is the history `stories` throws away.
 - TableDetail **snapshot timeline**: one snapshot per run. For `stories`, run 1 is `append +N` (initial create) and later runs are `overwrite` (the merge rewrites via copy-on-write). For `fact_story_snapshot`, every run is `append +~100`.
 - The **lineage** panel on each table shows the producing node tracing back to the `hn` source.
 
@@ -143,17 +143,17 @@ Default `replace` mode is right here — a rollup is fully recomputed from the f
 
 ## Troubleshooting
 
-**`stories__default` only ever has ~100 rows; old stories disappear.** The output isn't keyed — it's running in `replace` mode. Confirm `--output-merge-keys objectID` was set; check the transform's `.tf` has `mode = "merge"` and a non-empty `merge_keys`.
+**`stories` only ever has ~100 rows; old stories disappear.** The output isn't keyed — it's running in `replace` mode. Confirm `--output-merge-keys objectID` was set; check the transform's `.tf` has `mode = "merge"` and a non-empty `merge_keys`.
 
 **Row count jumps by ~100 every run, full of duplicate `objectID`s.** That's `append` mode on a table you meant to be `merge`. Re-run `node edit ... --output-merge-keys objectID`.
 
-**`stories__default` has the same row count after two runs.** The HN feed didn't move between the fetches — every `objectID` in the second fetch already existed, so the merge updated all 100 in place and inserted nothing. Expected for runs a few minutes apart; space them 15+ minutes (or hours) to see the table grow. The snapshot timeline still shows a new `overwrite` snapshot each run — the scores were refreshed even when the row count held.
+**`stories` has the same row count after two runs.** The HN feed didn't move between the fetches — every `objectID` in the second fetch already existed, so the merge updated all 100 in place and inserted nothing. Expected for runs a few minutes apart; space them 15+ minutes (or hours) to see the table grow. The snapshot timeline still shows a new `overwrite` snapshot each run — the scores were refreshed even when the row count held.
 
 **`AnalysisException: cannot resolve 'hits'`.** The source format wasn't set to `json`. The URL has no `.json` extension, so format can't be inferred — re-register with `--format json`.
 
 **All story columns come back `null`.** You selected `objectID` / `title` directly off `hn` instead of off the exploded row. The source DataFrame has a single row whose `hits` column is an array; you must `explode(hits)` and project from the exploded alias (`hit.objectID`, `hit.title`, …).
 
-**`source preview hn` shows a single row with a giant `hits` blob.** Expected. Preview reads the envelope as one JSON line and does not explode it. The explode happens inside the transform — run the pipeline and inspect `stories__default` instead.
+**`source preview hn` shows a single row with a giant `hits` blob.** Expected. Preview reads the envelope as one JSON line and does not explode it. The explode happens inside the transform — run the pipeline and inspect `stories` instead.
 
 **MERGE fails: "matched a single row from target with multiple rows of source".** The fetch contained a duplicate `objectID` (rare for HN). De-dupe in the SQL with a window: `ROW_NUMBER() OVER (PARTITION BY hit.objectID ORDER BY hit.created_at_i DESC)` and keep `= 1`.
 

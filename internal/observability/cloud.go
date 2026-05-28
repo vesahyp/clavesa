@@ -510,7 +510,22 @@ var errTableNotFound = errors.New("table not found in Glue catalog")
 // The StorageDescriptor.Location field is an s3:// URI Spark/Delta wrote
 // at create time — for Delta tables it's the table root, so callers
 // append `_delta_log/` to read the transaction log.
+//
+// Accepts both the post-ADR-019 bare form (`<node>`) and the legacy
+// `<node>__default` form: on EntityNotFoundException for a bare name,
+// retries with the `__default` suffix so pre-cutover Glue tables still
+// resolve under the new URL scheme.
 func (c *CloudProvider) tableS3Location(ctx context.Context, db, table string) (bucket, prefix string, err error) {
+	bucket, prefix, err = c.glueGetLocation(ctx, db, table)
+	if errors.Is(err, errTableNotFound) && !strings.Contains(table, "__") {
+		if b2, p2, err2 := c.glueGetLocation(ctx, db, table+"__default"); err2 == nil {
+			return b2, p2, nil
+		}
+	}
+	return bucket, prefix, err
+}
+
+func (c *CloudProvider) glueGetLocation(ctx context.Context, db, table string) (bucket, prefix string, err error) {
 	out, err := c.glue.GetTable(ctx, &glue.GetTableInput{
 		DatabaseName: aws.String(db),
 		Name:         aws.String(table),
@@ -700,7 +715,18 @@ func (c *CloudProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 		limit = 100
 	}
 
-	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT %d", q.Database, q.Table, limit+1)
+	// Back-compat for legacy `<node>__default` tables: if Glue lacks the
+	// bare table, retry against the suffixed variant before issuing SQL.
+	tableForSQL := q.Table
+	if c.glue != nil && !strings.Contains(q.Table, "__") {
+		if _, _, err := c.glueGetLocation(ctx, q.Database, q.Table); errors.Is(err, errTableNotFound) {
+			if _, _, err2 := c.glueGetLocation(ctx, q.Database, q.Table+"__default"); err2 == nil {
+				tableForSQL = q.Table + "__default"
+			}
+		}
+	}
+
+	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT %d", q.Database, tableForSQL, limit+1)
 	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
 	if err != nil {
 		return nil, err

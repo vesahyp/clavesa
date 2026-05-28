@@ -719,7 +719,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
     raise RuntimeError(f"input {alias!r}: unknown kind {kind!r}")
 
 
-def _resolve_output(key: str, dest: Any) -> dict[str, Any]:
+def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dict[str, Any]:
     """Returns {kind: "path"|"delta_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...]}.
 
     String forms map to the existing semantics:
@@ -728,11 +728,15 @@ def _resolve_output(key: str, dest: Any) -> dict[str, Any]:
     Dict form (v0.12+) carries an explicit mode. `mode = "merge"` requires
     a non-empty `merge_keys` list naming the columns that uniquely identify
     a row in the target.
+
+    `all_outputs` is the full output dict from the transform — used to detect
+    the single-output-default case so `_table_id_for` can drop the `__default`
+    suffix (ADR-019).
     """
     if isinstance(dest, str):
         if dest and _looks_like_path(dest):
             return {"kind": "path", "target": dest, "mode": "replace", "merge_keys": []}
-        target = dest if dest else _table_id_for(key)
+        target = dest if dest else _table_id_for(key, all_outputs)
         return {"kind": "delta_table", "target": target, "mode": "replace", "merge_keys": []}
 
     if not isinstance(dest, dict):
@@ -749,7 +753,7 @@ def _resolve_output(key: str, dest: Any) -> dict[str, Any]:
         raise RuntimeError(f"output {key!r}: mode='merge' requires non-empty merge_keys")
     target = dest.get("target") or dest.get("table_id") or dest.get("path") or ""
     if kind == "delta_table" and not target:
-        target = _table_id_for(key)
+        target = _table_id_for(key, all_outputs)
     stats = bool(dest.get("stats"))
     return {
         "kind": kind,
@@ -768,16 +772,29 @@ def _glue_db() -> str:
     Python and Go encoders MUST stay byte-identical, since the runner
     writes to the same Glue DB the catalog handler reads from.
 
-    Both CLAVESA_CATALOG and CLAVESA_SCHEMA are required as of
-    v0.18.0. The pre-v0.18 legacy fallback (empty catalog →
-    `clavesa_<schema>`) was removed once the only production user
-    (cloudfront-analytics) migrated to the encoded form. CLAVESA_SCHEMA
-    falls back to a sanitized CLAVESA_PIPELINE only as a defensive
-    last resort — orchestration always sets both.
+    Both CLAVESA_CATALOG and CLAVESA_SCHEMA are required as of v0.18.0.
+    CLAVESA_SCHEMA falls back to a sanitized CLAVESA_PIPELINE only as a
+    defensive last resort — orchestration always sets both.
+
+    ADR-019's three-level native ``<catalog>.<schema>.<table>`` addressing
+    is blocked on Delta 4.0's session-only ``DeltaCatalog``; Slice 4
+    instead moves the local on-disk layout to ``<warehouse>/<catalog>/
+    <schema>/<table>/`` while keeping this flat encoded form as the
+    in-metastore DB name.
     """
     catalog = os.environ["CLAVESA_CATALOG"]
     schema = os.environ.get("CLAVESA_SCHEMA") or os.environ.get("CLAVESA_PIPELINE", "default")
     return f"{catalog.replace('-', '_')}__{schema.replace('-', '_')}"
+
+
+def _sanitize_ident(name: str) -> str:
+    """Mirror of internal/identutil.Sanitize — dashes become underscores
+    so Glue's ``[A-Za-z_][A-Za-z0-9_]*`` constraint is satisfied at the
+    table-name segment of the Spark identifier ``_table_id_for`` builds.
+    Catalog / schema parts are sanitized by ``_glue_db`` separately."""
+    return name.replace("-", "_")
+
+
 
 
 # Workspace system observability schema (ADR-016 "Workspace system
@@ -805,27 +822,33 @@ def _system_glue_db() -> str:
 
 
 def _ensure_database(spark, db_part: str) -> None:
-    """`CREATE DATABASE IF NOT EXISTS` with the right LOCATION clause.
+    """``CREATE DATABASE IF NOT EXISTS`` with a ``LOCATION`` clause that
+    pins on-disk layout.
 
     Hive metastore federation to Glue (sub-slice 15) registers a new DB
-    with an empty LOCATION when `CREATE DATABASE IF NOT EXISTS <db>`
-    runs without an explicit LOCATION; the subsequent `saveAsTable`
+    with an empty LOCATION when ``CREATE DATABASE IF NOT EXISTS <db>``
+    runs without an explicit LOCATION; the subsequent ``saveAsTable``
     then trips ``IllegalArgumentException: Can not create a Path from
     an empty string`` while computing the table's default path under
-    the DB's warehouse dir.
+    the DB's warehouse dir. Pinning the LOCATION at create time avoids
+    that.
 
-    The fix is to pin the DB's LOCATION at create time. The base is:
-      - ``CLAVESA_SYSTEM_WAREHOUSE`` for the workspace system DB
-        (``<system_catalog>__pipelines``) — shared across pipelines.
-      - ``CLAVESA_WAREHOUSE`` for the per-pipeline user DB.
-      - ``spark.sql.warehouse.dir`` (set from CLAVESA_WAREHOUSE by
-        spark_conf.py) as a defensive fallback.
-    Each table inside the DB will then land at
-    ``<base>/<db_part>.db/<table>/`` — the same default the Hive
-    metastore would have computed had its own warehouse-dir been set.
+    ADR-019 Slice 4 moves the local-mode on-disk layout from
+    ``<base>/<catalog>__<schema>.db/`` to ``<base>/<catalog>/<schema>/``
+    while keeping the in-metastore database name as the flat
+    ``<catalog>__<schema>`` form (Delta's V2 multi-catalog support is
+    blocked on a Delta 4.0 limitation — see spark_conf.py). The two
+    pieces meet at LOCATION: the metastore still names the DB
+    ``<catalog>__<schema>`` but every table inside it lands at the new
+    nested path. Slice 5's cloud Glue V2 cutover then encodes the same
+    shape in Glue's catalog tree.
 
-    Idempotent: if the DB already exists, Hive's ``IF NOT EXISTS`` skips
-    the create entirely and the LOCATION clause is ignored.
+    Cloud (``s3://`` warehouse) keeps the legacy ``.db`` suffix so the
+    Glue Hive client's ``GetDatabase`` lookup, which expects
+    ``<base>/<db>.db/``, still resolves.
+
+    Idempotent: if the DB already exists, ``IF NOT EXISTS`` skips the
+    create entirely and the LOCATION clause is ignored.
     """
     system_db = _system_glue_db()
     if db_part == system_db:
@@ -836,26 +859,69 @@ def _ensure_database(spark, db_part: str) -> None:
         base = os.environ.get("CLAVESA_WAREHOUSE", "")
     base = base.rstrip("/")
     if base:
+        location = _v2_layout_path(base, db_part)
         spark.sql(
-            f"CREATE DATABASE IF NOT EXISTS {db_part} LOCATION '{base}/{db_part}.db'"
+            f"CREATE DATABASE IF NOT EXISTS {db_part} LOCATION '{location}'"
         )
     else:
-        # Local / preview: spark.sql.warehouse.dir is configured and
-        # Hive's local-warehouse resolution kicks in. No LOCATION needed.
-        _ensure_database(spark, db_part)
+        # Preview / no warehouse configured: spark.sql.warehouse.dir is
+        # the fallback and Hive's local-warehouse resolution kicks in.
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_part}")
 
 
-def _table_id_for(output_key: str) -> str:
+def _v2_layout_path(base: str, db_part: str) -> str:
+    """ADR-019 Slice 4 on-disk layout for a Hive-style ``<catalog>__<schema>``
+    DB: ``<base>/<catalog>/<schema>`` (no ``.db`` suffix) for local
+    warehouses, falling back to the legacy ``<base>/<db_part>.db`` for
+    cloud / unsplittable inputs.
+
+    Cloud keeps the ``.db`` suffix because Glue's Hive client expects
+    its DB LOCATION to live at ``<warehouse>/<db_name>.db/`` — changing
+    it there is out of scope for Slice 4 and tied to Glue catalog
+    provisioning in Slice 5.
+    """
+    if base.startswith("s3://"):
+        return f"{base}/{db_part}.db"
+    catalog, schema, ok = _split_catalog_schema(db_part)
+    if not ok:
+        return f"{base}/{db_part}.db"
+    return f"{base}/{catalog}/{schema}"
+
+
+def _split_catalog_schema(db_part: str):
+    """Best-effort decode of ``<catalog>__<schema>`` into its parts. The
+    ``__`` boundary is the convention `EncodeGlueDatabase` writes. Returns
+    (_, _, False) when the boundary isn't present so callers can fall
+    back to the legacy single-segment layout."""
+    idx = db_part.find("__")
+    if idx < 0:
+        return "", "", False
+    return db_part[:idx], db_part[idx + 2:], True
+
+
+def _table_id_for(output_key: str, all_outputs: dict | None = None) -> str:
     """Auto-generated Delta table identifier for a transform output.
 
-    Two-segment Spark identifier `<glue_db>.<table>` — the table resolves
-    through Spark's default session catalog (`spark_catalog`) which our
-    DeltaCatalog wraps. ADR-018 dropped the legacy `clavesa.` catalog
-    prefix the Iceberg SparkCatalog required. `<glue_db>` comes from
-    `_glue_db()` (ADR-016's flat-encoded catalog__schema); `<table>` is
-    `<node>__<output_key>`.
+    Two-segment Spark identifier ``<glue_db>.<table>``. ``<glue_db>``
+    comes from ``_glue_db()`` (ADR-016's flat-encoded
+    ``<catalog>__<schema>``). The table part is ``<node>`` for the
+    single-default-output case (ADR-019 Slice 3) and
+    ``<node>__<output_key>`` otherwise.
+
+    The three-level native ``<catalog>.<schema>.<table>`` shape ADR-019
+    targets requires Delta V2 multi-catalog support, which Delta 4.0
+    doesn't ship outside the session catalog (see spark_conf.py). The
+    on-disk layout still moves to the V2 tree via ``_ensure_database``'s
+    LOCATION clause, so reads + writes only need to agree on the flat
+    DB name in the Hive metastore.
     """
-    node = os.environ.get("CLAVESA_NODE", "node")
+    node = _sanitize_ident(os.environ.get("CLAVESA_NODE", "node"))
+    if (
+        output_key == "default"
+        and isinstance(all_outputs, dict)
+        and list(all_outputs.keys()) == ["default"]
+    ):
+        return f"{_glue_db()}.{node}"
     return f"{_glue_db()}.{node}__{output_key}"
 
 
@@ -1117,7 +1183,7 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
     written: dict[str, str] = {}
     backfill_targets = (backfill or {}).get("target_outputs", {}) if backfill else {}
     for key, df in result.items():
-        spec = _resolve_output(key, outputs.get(key, ""))
+        spec = _resolve_output(key, outputs.get(key, ""), all_outputs=result)
         if backfill and key in backfill_targets:
             # Redirect this output to its staging table; always replace so
             # backfill retries rewrite the staging cleanly.
@@ -1310,10 +1376,7 @@ def _system_table_location(table_name: str) -> str | None:
 def _node_runs_table_id() -> str:
     """<system_glue_db>.node_runs — workspace-wide observability table
     (ADR-016 "Workspace system catalog", v0.20.0). Every pipeline appends
-    here; the `pipeline` column distinguishes rows. Two-segment under
-    spark_catalog (ADR-018); pre-v0.20 runs landed in the per-pipeline
-    `<glue_db>.node_runs` instead.
-    """
+    here; the `pipeline` column distinguishes rows."""
     return f"{_system_glue_db()}.node_runs"
 
 
@@ -2177,11 +2240,13 @@ def handler(event, context):
             for output_key, target in response["outputs"].items():
                 if not isinstance(target, str):
                     continue
-                # Iceberg table identifiers are dotted (catalog.db.table);
-                # path-mode targets are filesystem/S3 paths and skipped here.
+                # Delta table identifiers are dotted (``db.table`` for
+                # legacy spark_catalog or ``catalog.schema.table`` for
+                # ADR-019 V2); path-mode targets are filesystem/S3 paths
+                # and skipped here.
                 if "/" in target or "\\" in target:
                     continue
-                if target.count(".") < 2:
+                if target.count(".") < 1:
                     continue
                 try:
                     added = _record_table_state(run_id, output_key, target)

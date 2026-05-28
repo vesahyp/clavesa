@@ -254,7 +254,9 @@ func crossPipelineEdges(siblings []scannedPipeline, thisName, thisSchema, thisDB
 					// Consumer's own output table id — the UI uses this
 					// instead of deriving from `database` (which is THIS
 					// pipeline's DB, wrong for a cross-pipeline jump).
-					ToTable: sib.db + "." + identutil.Sanitize(n.ID) + "__default",
+					// ADR-019: single-output transforms write to the bare
+					// node name, no `__default` suffix.
+					ToTable: sib.db + "." + identutil.Sanitize(n.ID),
 				})
 			}
 		}
@@ -284,9 +286,10 @@ func buildLineage(g graph.PipelineGraph, db string) []LineageEdge {
 		if from.Type == "transform" {
 			// All transform outputs land at <db>.<from>__<output_key>.
 			// The orchestration emitter hardcodes "default" because graph.Edge
-			// doesn't carry the from-output today; mirror that here so the UI
-			// can match `via_table` against the table it's viewing.
-			via = db + "." + identutil.Sanitize(e.FromNode) + "__default"
+			// doesn't carry the from-output today; ADR-019 drops the suffix
+			// for single-output (default-only) tables so the UI's wire-form
+			// matches what the catalog page lists.
+			via = db + "." + identutil.Sanitize(e.FromNode)
 		}
 		edges = append(edges, LineageEdge{
 			FromNode: e.FromNode,

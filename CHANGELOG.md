@@ -10,6 +10,61 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.1.0] — 2026-05-28
+
+### Added
+
+- `clavesa --version` (and `-v`) print the binary version, alongside the
+  existing `clavesa version` subcommand.
+- SQL editor catches the common `FROM "db"."table"` double-quote mistake
+  before sending to the runner, with a friendly hint that Spark reads
+  double-quoted text as a string literal not an identifier.
+
+### Changed
+
+- `clavesa workspace init <name>` now scaffolds into `./<name>/` when
+  `--workspace` is omitted, instead of writing in-place into the current
+  directory. Re-initializing a workspace (existing `clavesa.json`) is
+  refused with a clear error. Explicit `--workspace <path>` is unchanged.
+- TableDetail's sample query emits bare identifiers (`db.table`) instead
+  of double-quoted ones, so the default `SELECT * FROM ... LIMIT 100`
+  succeeds on Spark.
+- Single-output transforms write their output as `<node>` instead of
+  `<node>__default`. Multi-output nodes still use `<node>__<key>`. Read
+  paths transparently resolve both the new bare form and the legacy
+  suffixed form, so existing tables and bookmarks keep working.
+- Local pipelines write Delta tables under a per-catalog warehouse
+  layout (`<warehouse>/<catalog>/<schema>/<table>/`), replacing the flat
+  `<warehouse>/<catalog>__<schema>.db/<table>/` form. The Hive
+  metastore database name stays at `<catalog>__<schema>` for now (Delta
+  4.0 doesn't yet support DeltaCatalog as a non-session V2 catalog);
+  the nested on-disk shape comes from a `LOCATION` clause on
+  `CREATE DATABASE`. The catalog page and table reads transparently
+  fall back to the legacy layout for not-yet-rewritten workspaces.
+- Catalog API exposes `catalog`, `schema`, and `table` as separate
+  fields on each entry. The legacy `database` field stays as a back-
+  compat alias for one release.
+- UI displays the three-level `<catalog>.<schema>.<table>` shape on
+  every table-naming surface — Catalog page tree, TableDetail header
+  chip, lineage panel rows, transform input picker, and the SQL
+  editor's table browser. The `__default` suffix on single-output
+  tables is hidden from display throughout. SQL editors and the
+  TableDetail SQL pane still emit the wire form
+  (`<catalog>__<schema>.<table>`) because that's what Spark and
+  Athena accept (ADR-020).
+
+### Fixed
+
+- Catalog page's "Rows" column shows real counts for local Delta tables.
+  Previously rendered `—` because the runner emits per-commit
+  `numOutputRows` but no running total; the snapshots endpoint walks
+  the commit log respecting each commit's semantics: overwrite (CTAS,
+  CREATE OR REPLACE, WRITE Overwrite) resets the running total to that
+  commit's `numOutputRows`; MERGE adds `numTargetRowsInserted -
+  numTargetRowsDeleted` (updates don't change row count); append adds
+  `numOutputRows`; delete subtracts. Merge-keyed dim tables in
+  particular now report the correct stable row count across runs.
+
 ## [v2.0.0] — 2026-05-27
 
 ### Fixed

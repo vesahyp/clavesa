@@ -18,7 +18,7 @@ This recipe wires a cron-triggered pipeline whose only job is to recompute an ag
 
 > **Local iteration works too.** The recipe deploys to Lambda because the *scheduled* trigger needs a deployed pipeline. Cross-pipeline `--from-table` reads themselves work locally too. Every local pipeline in a workspace shares one Delta warehouse, so a local `clavesa pipeline run` of this recipe resolves the upstream table. Iterate on the SQL with `clavesa pipeline run` before deploying; deploy once you wire the schedule.
 
-For this recipe we'll assume the upstream is `clavesa_<workspace>__taxis.trips_bronze__default` — the bronze table the [multi-stage-pipeline](multi-stage-pipeline.md) recipe produces. Substitute your own table.
+For this recipe we'll assume the upstream is `clavesa_<workspace>__taxis.trips_bronze` — the bronze table the [multi-stage-pipeline](multi-stage-pipeline.md) recipe produces. Substitute your own table.
 
 ## The recipe
 
@@ -45,7 +45,7 @@ bin/clavesa node edit taxi_daily daily_trips \
 #    is the cross-pipeline path: <schema>.<table> reference, no edge
 #    against another node in *this* pipeline.
 bin/clavesa node connect taxi_daily \
-  --from-table taxis.trips_bronze__default \
+  --from-table taxis.trips_bronze \
   --to daily_trips \
   --input trips_bronze
 ```
@@ -75,12 +75,12 @@ Common cron expressions:
 bin/clavesa pipeline deploy taxi_daily
 ```
 
-Deploy provisions: the transform Lambda with read permission on `taxis.trips_bronze__default` (cross-pipeline read is handled by IAM), an EventBridge schedule rule that invokes the pipeline at the configured cadence, and the system catalog row tracking this pipeline's runs.
+Deploy provisions: the transform Lambda with read permission on `taxis.trips_bronze` (cross-pipeline read is handled by IAM), an EventBridge schedule rule that invokes the pipeline at the configured cadence, and the system catalog row tracking this pipeline's runs.
 
 ## What you should see
 
 - At the scheduled time, `/pipelines/dashboard?dir=taxi_daily` gets a new run with `trigger = "scheduled"`.
-- The Delta summary table at `clavesa_<workspace>__taxi_daily.daily_trips__default` either appears (first run) or gets overwritten (subsequent runs).
+- The Delta summary table at `clavesa_<workspace>__taxi_daily.daily_trips` either appears (first run) or gets overwritten (subsequent runs).
 - Catalog → click through → daily summary rows, one per pickup date.
 
 To trigger manually for testing, use the **Run pipeline** button on the dashboard (CLI: `pipeline run`). Manual runs and scheduled runs are indistinguishable downstream — they just stamp `runs.trigger` differently for observability.

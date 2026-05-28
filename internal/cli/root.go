@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // newRootCmd builds a fresh command tree. Using a factory (not a package-level
@@ -28,9 +30,11 @@ Quick start:
   clavesa node edit my-pipeline transform1 --set sql="SELECT * FROM trips"
   clavesa node preview my-pipeline transform1
   clavesa ui                               # open the visual editor`,
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		Version:           service.ModuleVersion,
+		SilenceUsage:      true,
+		SilenceErrors:     true,
 	}
+	root.SetVersionTemplate("{{.Version}}\n")
 
 	root.PersistentFlags().String("workspace", "", "workspace root directory (default: current directory)")
 

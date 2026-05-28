@@ -36,6 +36,7 @@ import {
   type CatalogTable,
   type SourceSpec,
 } from "@/lib/queries";
+import { displayTableName } from "@/lib/format";
 import { addEdge, detachInput } from "@/api/pipeline";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -151,9 +152,8 @@ export function TransformInputsSection({
     const all = catalog.data?.tables ?? [];
     const currentPipeline = dir.replace(/^.*\//, "");
     return all.filter((t) => {
-      if (!t.database.includes("__")) return false;
-      const catalogName = t.database.slice(0, t.database.indexOf("__"));
-      if (catalogName.endsWith("_system")) return false;
+      if (!t.schema) return false;
+      if (t.catalog.endsWith("_system")) return false;
       if (t.owning_pipeline === currentPipeline) return false;
       return true;
     });
@@ -166,9 +166,7 @@ export function TransformInputsSection({
     const firstSource = sourceList[0]?.name ?? "";
     setPickedSource(firstSource);
     const firstTable = tableList[0];
-    const firstRef = firstTable
-      ? `${firstTable.database.slice(firstTable.database.indexOf("__") + 2)}.${firstTable.name}`
-      : "";
+    const firstRef = firstTable ? `${firstTable.schema}.${firstTable.name}` : "";
     setPickedTable(firstRef);
     const firstNode = nodeList[0] ?? "";
     setPickedNode(firstNode);
@@ -306,7 +304,9 @@ function defaultAliasForTable(ref: string): string {
               <Database className="h-3 w-3 flex-shrink-0 text-indigo-500" />
               <span className="font-medium">{k}</span>
               <span className="text-muted-foreground">→</span>
-              <code className="flex-1 truncate">{v}</code>
+              <code className="flex-1 truncate" title={v}>
+                {v.replace(/__default$/, "")}
+              </code>
               <span className="rounded bg-indigo-500/10 px-1 py-0.5 font-mono text-[10px] text-indigo-700 dark:text-indigo-300">
                 cross-pipeline
               </span>
@@ -434,12 +434,12 @@ function defaultAliasForTable(ref: string): string {
                 data-testid="add-input-table"
               >
                 {tableList.map((t) => {
-                  const schema = t.database.slice(t.database.indexOf("__") + 2);
-                  const ref = `${schema}.${t.name}`;
+                  const ref = `${t.schema}.${t.name}`;
+                  const display = `${t.schema}.${displayTableName(t)}`;
                   return (
                     <option key={ref} value={ref}>
-                      {schema}.{t.name}
-                      {t.owning_pipeline && t.owning_pipeline !== schema
+                      {display}
+                      {t.owning_pipeline && t.owning_pipeline !== t.schema
                         ? ` — ${t.owning_pipeline}`
                         : ""}
                     </option>

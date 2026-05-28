@@ -227,10 +227,13 @@ export function deriveNodeOutputs(
   if (!catalog || !schema) return m;
   for (const n of nodes) {
     if (n.type !== "transform") continue;
+    // ADR-019: single-output transforms drop the `__default` suffix on disk.
+    // Wire form is the bare sanitized node id; multi-output editing isn't
+    // surfaced in this derivation today so a single-output assumption is fine.
     m.set(n.id, {
       catalog,
       schema,
-      table: `${n.id.replace(/-/g, "_")}__default`,
+      table: n.id.replace(/-/g, "_"),
     });
   }
   return m;

@@ -39,6 +39,7 @@ import {
   type SnapshotInfo,
   type SnapshotsResult,
 } from "@/lib/queries";
+import { displayTablePath } from "@/lib/format";
 
 const SAMPLE_LIMIT = 100;
 const SNAPSHOTS_LIMIT = 20;
@@ -60,19 +61,35 @@ export function TableDetail() {
   // ADR-016 — that's what the backend queries use. The URL surfaces the
   // three pieces separately but the on-disk shape is unchanged.
   const database = schemaName ? `${catalogName}__${schemaName}` : catalogName;
-  // Fully-qualified name as written in dashboard / ad-hoc SQL:
-  // `<catalog>__<schema>.<table>` — the two-part Delta table id.
-  // Under ADR-018, Delta tables live under `spark_catalog` (no leading
-  // clavesa. prefix); sub-slice 8 retired the prefix everywhere. This
-  // is the string a user pastes into a dataset query.
-  const tablePath = `${database}.${tableName}`;
+  // Wire form (ADR-020) — what the engine accepts when the user copies
+  // this for Athena / Spark / dbt. Two-segment `<catalog>__<schema>.<table>`.
+  const sqlPath = `${database}.${tableName}`;
 
   const catalog = useCatalogTables();
+  // ADR-019 dropped the `__default` suffix from single-output tables. Existing
+  // dashboard links + bookmarks may still carry the suffix; new tables on disk
+  // don't. Match the URL against either form so both bookmark shapes resolve.
+  const tableNameBare = tableName.replace(/__default$/, "");
   const tableMeta = useMemo<CatalogTable | undefined>(() => {
     return catalog.data?.tables.find(
-      (t) => t.database === database && t.name === tableName
+      (t) =>
+        t.database === database &&
+        (t.name === tableName ||
+          t.name === tableNameBare ||
+          t.name === `${tableNameBare}__default`)
     );
-  }, [catalog.data, database, tableName]);
+  }, [catalog.data, database, tableName, tableNameBare]);
+
+  // Three-level logical path (ADR-020) — what the header chip renders.
+  // Resolved from `tableMeta` once the catalog has loaded so the
+  // `__default` suffix and owning-node display rules match displayTablePath
+  // everywhere else; until then fall back to the URL pieces literally so
+  // a legacy bookmark still shows a coherent string before the API lands.
+  const displayPath = tableMeta
+    ? displayTablePath(tableMeta)
+    : [catalogName, schemaName, stripDefaultSuffix(tableName)]
+        .filter(Boolean)
+        .join(".");
 
   // The catalog response stamps `dir` (relative to the workspace root) on
   // every table when the owning pipeline is in the user's workspace — both
@@ -148,10 +165,13 @@ export function TableDetail() {
               )}
             </h1>
             <div className="mt-2 flex items-center gap-1.5">
-              <code className="break-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground">
-                {tablePath}
+              <code
+                className="break-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-foreground"
+                title="Three-level logical path — display only. The SQL pane below uses the wire form the engine accepts."
+              >
+                {displayPath}
               </code>
-              <CopyButton value={tablePath} label="Copy table path" />
+              <CopyButton value={sqlPath} label="Copy SQL identifier" />
             </div>
             {tableMeta?.owning_pipeline && (
               <p className="mt-1 text-sm text-muted-foreground">
@@ -174,7 +194,7 @@ export function TableDetail() {
           <div className="flex shrink-0 items-center gap-2">
             <CreateDashboardButton
               tableName={tableName}
-              tablePath={tablePath}
+              tablePath={sqlPath}
               owningPipelineDir={owningPipelineDir}
             />
             {tableMeta?.table_type && (
@@ -205,7 +225,7 @@ export function TableDetail() {
 
         <div className="mt-6">
           <TableQueryPane
-            sql={`SELECT * FROM ${ident(database)}.${ident(tableName)} LIMIT 100`}
+            sql={`SELECT * FROM ${database}.${tableName} LIMIT 100`}
             defaultOpen
             autoRun
           />
@@ -775,14 +795,6 @@ function LiteColumnsCard({
       </CardContent>
     </Card>
   );
-}
-
-// ident quotes a SQL identifier with double-quotes. Athena (Presto) rejects
-// backtick-quoted multi-part identifiers with MALFORMED_QUERY; double-quotes
-// are the ANSI SQL standard and Spark accepts both, so double-quotes work in
-// both local and cloud modes.
-function ident(s: string): string {
-  return '"' + s.replace(/"/g, '""') + '"';
 }
 
 /**

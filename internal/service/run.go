@@ -742,15 +742,26 @@ func tfvarsCandidates(dir string) []string {
 }
 
 // autoDeltaTableID mirrors runner.py::_table_id_for so Go can pass an
-// explicit Delta table id into the runner's `outputs.default` field
+// explicit Delta table id into the runner's ``outputs.default`` field
 // (instead of letting the runner auto-generate, which Go can't observe
 // for downstream-input wiring). Same ADR-016 encoding as the runner's
-// `_glue_db()` and `internal/identutil.EncodeGlueDatabase`. Delta tables
-// (ADR-018) live under Spark's default `spark_catalog`, so the identifier
-// is bare `<db>.<table>` — no leading catalog prefix.
+// ``_glue_db()`` and ``internal/identutil.EncodeGlueDatabase``. Delta
+// tables live under Spark's default ``spark_catalog``, so the identifier
+// is the bare ``<db>.<table>`` two-segment form.
+//
+// ADR-019 Slice 3 drops the ``__default`` suffix from single-output
+// transforms. The Go-side service only ever feeds the runner the
+// ``outputs.default`` slot from this pipeline-run path, so the
+// bare-node-name table segment is always correct here.
+//
+// Slice 4 leaves this shape unchanged. The architectural goal of native
+// three-level ``<catalog>.<schema>.<table>`` addressing is blocked on
+// Delta 4.0's session-only DeltaCatalog implementation (see
+// runner/spark_conf.py); the on-disk warehouse layout moves to the V2
+// tree via ``_ensure_database``'s LOCATION clause regardless.
 func autoDeltaTableID(catalog, schema, nodeID string) string {
 	nodeSafe := identutil.Sanitize(nodeID)
-	return fmt.Sprintf("%s.%s__default",
+	return fmt.Sprintf("%s.%s",
 		identutil.EncodeGlueDatabase(catalog, schema), nodeSafe)
 }
 

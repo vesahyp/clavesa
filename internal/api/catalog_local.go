@@ -58,28 +58,25 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 	}
 
 	warehouse := workspace.LocalWarehouseDir(workspaceRoot)
-	dbDirs, err := os.ReadDir(warehouse)
-	if err != nil {
-		return out // no local pipeline has run yet — nothing to surface
-	}
-	for _, dbEntry := range dbDirs {
-		if !dbEntry.IsDir() {
+
+	// ADR-019 Slice 4: new on-disk layout is
+	// ``<warehouse>/<catalog>/<schema>/<table>/`` (V2 multi-catalog
+	// DeltaCatalog with per-catalog warehouse). Legacy layout from pre-
+	// Slice-4 (Hive metastore federation) was
+	// ``<warehouse>/<catalog>__<schema>.db/<table>/``. Walk both — the JSON
+	// shape stays at ``Database = <catalog>__<schema>`` for this slice; the
+	// UI keeps its existing splitDatabase decoder until Slice 6 rewires
+	// API + UI to three-level fields natively.
+	for _, ns := range listWarehouseNamespaces(warehouse, workspaceCatalog, systemCatalog) {
+		var (
+			pip       discoveredPipeline
+			isUserDB  bool
+			logicalDB = ns.logicalDB
+		)
+		if pip, isUserDB = userDBToPipeline[logicalDB]; !isUserDB && logicalDB != systemDB {
 			continue
 		}
-		dirName := dbEntry.Name()
-		// Hive metastore wraps each DB in a `<db>.db/` directory. The
-		// runner switched to a persistent local Hive metastore in
-		// v2.0.0 so cross-transform reads can resolve table names from
-		// the previous container's catalog state; the on-disk layout
-		// gained the `.db` suffix as a side-effect. Strip it to recover
-		// the logical DB name the (catalog, schema) encoder produces.
-		db := strings.TrimSuffix(dirName, ".db")
-		pip, isUserDB := userDBToPipeline[db]
-		if !isUserDB && db != systemDB {
-			continue // stray namespace (e.g. a destroyed pipeline) — skip
-		}
-		dbRoot := filepath.Join(warehouse, dirName)
-		entries, err := os.ReadDir(dbRoot)
+		entries, err := os.ReadDir(ns.dir)
 		if err != nil {
 			continue
 		}
@@ -87,7 +84,7 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 			if !e.IsDir() {
 				continue
 			}
-			t, ok := readLocalTable(db, e.Name(), filepath.Join(dbRoot, e.Name()))
+			t, ok := readLocalTable(logicalDB, ns.catalog, ns.schema, e.Name(), filepath.Join(ns.dir, e.Name()))
 			if !ok {
 				continue
 			}
@@ -111,6 +108,101 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 				}
 			}
 			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// localNamespace is one resolved namespace location on disk plus the
+// logical ``<catalog>__<schema>`` key listLocalTables uses to look up the
+// owning pipeline. `catalog` and `schema` carry the three-piece form
+// (ADR-020) populated from on-disk path components when the V2 layout
+// is in use, and from splitting `logicalDB` on `__` for the two
+// legacy layouts. `Database` in the JSON response stays at the wire
+// form for one-release back-compat.
+type localNamespace struct {
+	dir       string // absolute path to walk for `<table>/_delta_log/` directories
+	logicalDB string // ``<catalog>__<schema>`` form (key into userDBToPipeline)
+	catalog   string
+	schema    string
+}
+
+// listWarehouseNamespaces enumerates every (catalog, schema) namespace
+// directory in the workspace warehouse across the three on-disk
+// layouts the catalog page surfaces:
+//
+//  1. ADR-019 V2 (Slice 4): ``<warehouse>/<catalog>/<schema>/<table>/``.
+//     Restricted to known workspace + system catalogs so unrelated
+//     warehouse-root entries (e.g. Derby's ``_metastore/``) don't get
+//     mistakenly probed as catalogs.
+//  2. Legacy Hive with ``.db`` suffix:
+//     ``<warehouse>/<catalog>__<schema>.db/<table>/`` — what v2.0.0
+//     through Slice-3 wrote via the persistent Hive metastore.
+//  3. Legacy flat without ``.db`` suffix:
+//     ``<warehouse>/<catalog>__<schema>/<table>/`` — pre-v2.0.0
+//     in-memory-Hive layout, still showing up in workspaces migrated
+//     from per-pipeline warehouses (migrateLocalWarehouses keeps the
+//     namespace dir name as-is).
+func listWarehouseNamespaces(warehouse, workspaceCatalog, systemCatalog string) []localNamespace {
+	var out []localNamespace
+	entries, err := os.ReadDir(warehouse)
+	if err != nil {
+		return out
+	}
+	known := map[string]bool{}
+	if workspaceCatalog != "" {
+		known[workspaceCatalog] = true
+	}
+	if systemCatalog != "" {
+		known[systemCatalog] = true
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".db") {
+			logical := strings.TrimSuffix(name, ".db")
+			cat, sch := splitGlueDB(logical)
+			out = append(out, localNamespace{
+				dir:       filepath.Join(warehouse, name),
+				logicalDB: logical,
+				catalog:   cat,
+				schema:    sch,
+			})
+			continue
+		}
+		if strings.Contains(name, "__") {
+			// Pre-v2.0.0 flat layout. The flat-encoded
+			// ``<catalog>__<schema>`` name is its own logicalDB —
+			// listLocalTables filters by exact match against the
+			// known catalog/schema set so noise gets skipped there.
+			cat, sch := splitGlueDB(name)
+			out = append(out, localNamespace{
+				dir:       filepath.Join(warehouse, name),
+				logicalDB: name,
+				catalog:   cat,
+				schema:    sch,
+			})
+			continue
+		}
+		if !known[name] {
+			continue
+		}
+		schemas, err := os.ReadDir(filepath.Join(warehouse, name))
+		if err != nil {
+			continue
+		}
+		for _, sc := range schemas {
+			if !sc.IsDir() {
+				continue
+			}
+			out = append(out, localNamespace{
+				dir:       filepath.Join(warehouse, name, sc.Name()),
+				logicalDB: identutil.EncodeGlueDatabase(name, sc.Name()),
+				catalog:   name,
+				schema:    sc.Name(),
+			})
 		}
 	}
 	return out
@@ -299,7 +391,11 @@ func candidateDirs(root string) []string {
 // Returns (_, false) when the directory is not a valid Delta table — no
 // `_delta_log/`, an empty log, or any commit fails to parse. Per-table
 // errors swallow rather than surface; the walker is best-effort.
-func readLocalTable(db, name, tableDir string) (CatalogTable, bool) {
+//
+// `catalog` and `schema` are the three-piece pieces (ADR-020); they come
+// from on-disk path components for V2 layouts and from splitting the
+// wire-form `db` for the two legacy layouts.
+func readLocalTable(db, catalog, schemaID, name, tableDir string) (CatalogTable, bool) {
 	schema, commits, err := delta.ReadCurrentFromPath(tableDir)
 	if err != nil {
 		// ErrNotDelta is the expected "directory isn't a table" signal;
@@ -332,6 +428,9 @@ func readLocalTable(db, name, tableDir string) (CatalogTable, bool) {
 
 	t := CatalogTable{
 		Database:       db,
+		Catalog:        catalog,
+		Schema:         schemaID,
+		Table:          name,
 		Name:           name,
 		OwningPipeline: owningPipeline,
 		OwningNode:     owningNode,

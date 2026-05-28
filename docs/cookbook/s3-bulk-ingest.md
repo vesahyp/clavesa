@@ -6,7 +6,7 @@ This recipe is the one-shot case: read every file in the prefix, write it to a t
 
 ## What you'll end up with
 
-- One Delta table at `clavesa_<workspace>__<pipeline>.<node>__default` in Glue Data Catalog.
+- One Delta table at `clavesa_<workspace>__<pipeline>.<node>` in Glue Data Catalog.
 - Rows readable from Athena, the Clavesa Catalog, or any Delta-aware query engine.
 - A pipeline you can re-run on demand to refresh the table against the latest contents of the bucket.
 
@@ -42,7 +42,7 @@ bin/clavesa pipeline run sales
 ## What you should see
 
 - `pipeline run` reports `orders_raw` as `ok` after Spark cold-start (~30s) plus however long the read takes.
-- `/` (Catalog) shows a new table `orders_raw__default` under `clavesa_<workspace>__sales`.
+- `/` (Catalog) shows a new table `orders_raw` under `clavesa_<workspace>__sales`.
 - Click the table: schema inferred from your data, sample rows pulled by the runner.
 - `/pipelines/dashboard?dir=sales` shows the run history; click a row → run-detail with the per-node breakdown.
 

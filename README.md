@@ -138,7 +138,7 @@ Now drive the rest from the browser:
 
 6. **Run it.** Click the `demo` breadcrumb in the editor header to open the pipeline dashboard, then click **Run pipeline**. ~30–60s end-to-end including Spark cold start. When the run finishes the page auto-navigates to the run detail view, where the DAG shows both transforms marked **ok** and the per-node breakdown is populated.
 
-7. **Browse the result.** Click **Catalog** in the nav. Two new Delta tables show up under your `demo` pipeline — open `trips__default` first: schema + sample rows + the **Column profile** card with one row per column showing null %, distinct count (a handful for `payment_type`, millions for `tpep_pickup_datetime`), top-K bars where the cardinality is low, and p50/p95 for numeric columns like `fare_amount` and `total_amount`. Then `revenue_by_payment__default` for the aggregated view (no column profile here — that transform didn't opt in). Run the pipeline two more times (back to the dashboard, **Run pipeline**) to get more than one data point on the seeded `/dashboards/pipeline-runs-demo` duration chart.
+7. **Browse the result.** Click **Catalog** in the nav. Two new Delta tables show up under your `demo` pipeline — open `trips` first: schema + sample rows + the **Column profile** card with one row per column showing null %, distinct count (a handful for `payment_type`, millions for `tpep_pickup_datetime`), top-K bars where the cardinality is low, and p50/p95 for numeric columns like `fare_amount` and `total_amount`. Then `revenue_by_payment` for the aggregated view (no column profile here — that transform didn't opt in). Run the pipeline two more times (back to the dashboard, **Run pipeline**) to get more than one data point on the seeded `/dashboards/pipeline-runs-demo` duration chart.
 
 #### Or: drive everything from the CLI
 
@@ -184,7 +184,7 @@ Here's what you'll see in the UI once the pipeline has run. The Catalog (top of 
 
 ![Pipeline runs dashboard for the demo pipeline with five widgets driven by the seeded JSON, populated by three local runs](docs/images/dashboard.png)
 
-The two output tables (`trips__default` and `revenue_by_payment__default`) live at `/tables/<db>/<table>`. Each page shows schema, sample rows of real NYC TLC trip data, commit timeline (one commit per run), and a lineage panel showing upstream sources and transforms. `trips__default` also renders the per-column profile card — null %, distinct count, top-K bars, percentiles for numerics — because the transform opted in via the **Compute column stats** checkbox. Clicking any run row in the pipeline dashboard opens the per-execution view with the DAG colored by per-node status and a per-node breakdown.
+The two output tables (`trips` and `revenue_by_payment`) live at `/tables/<catalog>/<schema>/<table>`. Each page shows schema, sample rows of real NYC TLC trip data, commit timeline (one commit per run), and a lineage panel showing upstream sources and transforms. `trips` also renders the per-column profile card — null %, distinct count, top-K bars, percentiles for numerics — because the transform opted in via the **Compute column stats** checkbox. Clicking any run row in the pipeline dashboard opens the per-execution view with the DAG colored by per-node status and a per-node breakdown.
 
 ### Author your own dashboard
 

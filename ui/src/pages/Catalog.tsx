@@ -107,16 +107,6 @@ function formatRowCount(n: number): string {
   return `${(n / 1_000_000_000).toFixed(1)}B`;
 }
 
-// splitDatabase decodes an ADR-016 Glue DB name (`<catalog>__<schema>`)
-// back into its three-level-namespace pieces. Falls back to (db, "") for
-// legacy / pre-ADR DBs that don't carry the boundary marker — keeps the
-// UI working on workspaces that haven't been migrated yet.
-function splitDatabase(db: string): { catalog: string; schema: string } {
-  const i = db.indexOf("__");
-  if (i < 0) return { catalog: db, schema: "" };
-  return { catalog: db.slice(0, i), schema: db.slice(i + 2) };
-}
-
 // Workspace system catalogs end in `_system` by convention
 // (`DefaultSystemCatalog(catalog) = catalog + "_system"` in
 // internal/workspace/workspace.go). Used purely for UI affordance — the
@@ -126,8 +116,7 @@ function isSystemCatalog(catalog: string): boolean {
 }
 
 function tableHref(t: CatalogTable): string {
-  const { catalog, schema } = splitDatabase(t.database);
-  return `/tables/${encodeURIComponent(catalog)}/${encodeURIComponent(schema)}/${encodeURIComponent(t.name)}`;
+  return `/tables/${encodeURIComponent(t.catalog)}/${encodeURIComponent(t.schema)}/${encodeURIComponent(t.name)}`;
 }
 
 const columns = [
@@ -371,21 +360,22 @@ interface CatalogGroup {
 // user catalog plus its `_system` companion), a schema is a pipeline.
 // The Catalog page gives each catalog a single box and nests its
 // schemas inside, so the eye reads one catalog as one coherent data
-// model rather than a pile of unrelated pipelines. Each Glue DB name
-// encodes a (catalog, schema) pair via the `__` marker. System catalogs
-// sort last so the user's pipeline outputs sit where the eye looks first.
+// model rather than a pile of unrelated pipelines. ADR-020: the API
+// surfaces `catalog`/`schema`/`table` as separate fields (Slice 7), so
+// the UI consumes them directly — no `__`-marker parsing client-side.
+// System catalogs sort last so the user's pipeline outputs sit where
+// the eye looks first.
 function groupByCatalog(tables: CatalogTable[]): CatalogGroup[] {
   const byCatalog = new Map<string, Map<string, CatalogTable[]>>();
   for (const t of tables) {
-    const { catalog, schema } = splitDatabase(t.database);
-    let schemas = byCatalog.get(catalog);
+    let schemas = byCatalog.get(t.catalog);
     if (!schemas) {
       schemas = new Map();
-      byCatalog.set(catalog, schemas);
+      byCatalog.set(t.catalog, schemas);
     }
-    const arr = schemas.get(schema) ?? [];
+    const arr = schemas.get(t.schema) ?? [];
     arr.push(t);
-    schemas.set(schema, arr);
+    schemas.set(t.schema, arr);
   }
   return Array.from(byCatalog.entries())
     .map(([catalog, schemaMap]) => {
@@ -429,12 +419,11 @@ export function Catalog() {
   const textFiltered = useMemo(() => {
     const all = data?.tables ?? [];
     if (!q) return all;
-    return all.filter((t) => {
-      const { catalog, schema } = splitDatabase(t.database);
-      return [t.name, t.owning_node, t.output_key, catalog, schema].some(
-        (f) => f.toLowerCase().includes(q),
-      );
-    });
+    return all.filter((t) =>
+      [t.name, t.owning_node, t.output_key, t.catalog, t.schema].some((f) =>
+        f.toLowerCase().includes(q),
+      ),
+    );
   }, [data, q]);
 
   const catalogs = useMemo(

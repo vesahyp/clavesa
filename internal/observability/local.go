@@ -400,18 +400,33 @@ func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) 
 	if schema == "" {
 		schema = filepath.Base(abs)
 	}
-	// Hive metastore layout uses `<db>.db/` on disk (v2.0.0 persistent
-	// metastore — see runner/spark_conf.py). The logical DB name comes
-	// from the same encoder the runner writes against; we append `.db`
-	// here at the filesystem layer.
-	namespaceDir := filepath.Join(warehouse, identutil.EncodeGlueDatabase(catalog, schema)+".db")
-	entries, err := os.ReadDir(namespaceDir)
-	if err != nil {
+	// ADR-019 Slice 4: V2 multi-catalog writes land at
+	// ``<warehouse>/<catalog>/<schema>/<table>/`` (no ``.db`` suffix).
+	// Legacy Hive layout (pre-Slice-4) put them at
+	// ``<warehouse>/<catalog>__<schema>.db/<table>/``. Read both so a
+	// workspace mid-migration shows tables from either layout under the
+	// same logical DB key.
+	namespaceDir := ""
+	if catalog != "" {
+		v2 := filepath.Join(warehouse, catalog, schema)
+		if _, err := os.Stat(v2); err == nil {
+			namespaceDir = v2
+		}
+	}
+	if namespaceDir == "" {
+		legacy := filepath.Join(warehouse, identutil.EncodeGlueDatabase(catalog, schema)+".db")
+		if _, err := os.Stat(legacy); err == nil {
+			namespaceDir = legacy
+		}
+	}
+	if namespaceDir == "" {
 		// Pipeline namespace not present yet (fresh pipeline, no
 		// successful run): empty rows is the correct cloud-parity
-		// answer, not a 500. Distinguish from "warehouse missing
-		// entirely" so callers fall through to Spark only when there's
-		// no filesystem signal at all.
+		// answer, not a 500.
+		return &TablesResult{Rows: []TableInfo{}}, true
+	}
+	entries, err := os.ReadDir(namespaceDir)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return &TablesResult{Rows: []TableInfo{}}, true
 		}
@@ -451,6 +466,95 @@ func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) 
 		truncated = true
 	}
 	return &TablesResult{Rows: out, Truncated: truncated}, true
+}
+
+// splitCatalogSchema decodes a ``<catalog>__<schema>`` Glue-flat
+// database string back into its catalog + schema parts. Returns
+// (_, _, false) when the input doesn't carry the ``__`` boundary —
+// caller falls back to the legacy single-segment path.
+func splitCatalogSchema(database string) (catalog, schema string, ok bool) {
+	idx := strings.Index(database, "__")
+	if idx < 0 {
+		return "", "", false
+	}
+	return database[:idx], database[idx+2:], true
+}
+
+// resolveLocalTablePath returns the on-disk path for a Delta table under
+// the workspace's local warehouse. Probes three layouts in order:
+//
+//  1. ADR-019 V2 (Slice 4): ``<warehouse>/<catalog>/<schema>/<table>/``
+//  2. Legacy Hive ADR-016: ``<warehouse>/<catalog>__<schema>.db/<table>/``
+//  3. Legacy + ``__default`` suffix (pre-Slice-3 single-output tables)
+//
+// Returns the V2 layout path when none of the probes find a
+// ``_delta_log/`` so downstream errors point at the canonical location.
+func resolveLocalTablePath(warehouse, database, table string) string {
+	if catalog, schema, ok := splitCatalogSchema(database); ok {
+		v2 := filepath.Join(warehouse, catalog, schema, table)
+		if _, err := os.Stat(filepath.Join(v2, "_delta_log")); err == nil {
+			return v2
+		}
+		legacy := filepath.Join(warehouse, database+".db", table)
+		if _, err := os.Stat(filepath.Join(legacy, "_delta_log")); err == nil {
+			return legacy
+		}
+		if !strings.Contains(table, "__") {
+			legacyDefault := filepath.Join(warehouse, database+".db", table+"__default")
+			if _, err := os.Stat(filepath.Join(legacyDefault, "_delta_log")); err == nil {
+				return legacyDefault
+			}
+			// Slice 4 may have written the bare form into the V2 layout
+			// while the same workspace still carries a legacy ``__default``
+			// peer; tried above. Fall through to the V2 default below.
+		}
+		return v2
+	}
+	primary := filepath.Join(warehouse, database+".db", table)
+	if _, err := os.Stat(filepath.Join(primary, "_delta_log")); err == nil {
+		return primary
+	}
+	if !strings.Contains(table, "__") {
+		legacy := filepath.Join(warehouse, database+".db", table+"__default")
+		if _, err := os.Stat(filepath.Join(legacy, "_delta_log")); err == nil {
+			return legacy
+		}
+	}
+	return primary
+}
+
+// resolveLocalTableName picks the on-disk table-name variant for SQL.
+// Same back-compat rule as resolveLocalTablePath: prefer the asked name,
+// fall back to `<asked>__default` when only the legacy directory exists.
+// The asked name is correct under the V2 layout (no ``__default`` peer
+// on writes after Slice 3), so the legacy probe is the only fallback.
+func resolveLocalTableName(workspaceRoot, database, table string) string {
+	warehouse := workspace.LocalWarehouseDir(workspaceRoot)
+	if catalog, schema, ok := splitCatalogSchema(database); ok {
+		if _, err := os.Stat(filepath.Join(warehouse, catalog, schema, table, "_delta_log")); err == nil {
+			return table
+		}
+		if _, err := os.Stat(filepath.Join(warehouse, database+".db", table, "_delta_log")); err == nil {
+			return table
+		}
+		if !strings.Contains(table, "__") {
+			if _, err := os.Stat(filepath.Join(warehouse, database+".db", table+"__default", "_delta_log")); err == nil {
+				return table + "__default"
+			}
+		}
+		return table
+	}
+	primary := filepath.Join(warehouse, database+".db", table)
+	if _, err := os.Stat(filepath.Join(primary, "_delta_log")); err == nil {
+		return table
+	}
+	if !strings.Contains(table, "__") {
+		legacy := filepath.Join(warehouse, database+".db", table+"__default")
+		if _, err := os.Stat(filepath.Join(legacy, "_delta_log")); err == nil {
+			return table + "__default"
+		}
+	}
+	return table
 }
 
 // splitTableName separates `<node>__<output_key>` into its parts. The
@@ -709,7 +813,7 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	// per snapshot fetch. The local-mode Hive layout puts the table at
 	// `<warehouse>/<db>.db/<table>/_delta_log/`.
 	warehouse := workspace.LocalWarehouseDir(p.workspaceRoot)
-	tablePath := filepath.Join(warehouse, q.Database+".db", q.Table)
+	tablePath := resolveLocalTablePath(warehouse, q.Database, q.Table)
 	schema, commits, err := delta.ReadCurrentFromPath(tablePath)
 	_ = schema // unused — caller is asking for snapshots only
 	if err != nil {
@@ -717,6 +821,47 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
 		}
 		return nil, fmt.Errorf("read delta log: %w", err)
+	}
+
+	// Compute LatestRecordCount by walking commits oldest-first. Three
+	// shapes matter for table-state row count:
+	//   - Replaces=true commit (CTAS, CREATE OR REPLACE, WRITE Overwrite):
+	//     reset to this commit's AddedRecords.
+	//   - MERGE: net delta is (added - updated - deleted). The log_reader
+	//     folds inserts+updates into AddedRecords for the timeline display;
+	//     subtract UpdatedRecords here because updates don't change row
+	//     count.
+	//   - Otherwise (APPEND, DELETE): net delta is (added - deleted).
+	// commits is newest-first from delta.ReadCurrentFromPath; walk in
+	// reverse to apply oldest-first.
+	var latestCount *int64
+	if len(commits) > 0 {
+		var total int64
+		for i := len(commits) - 1; i >= 0; i-- {
+			ci := commits[i]
+			added := int64(0)
+			if ci.AddedRecords != nil {
+				added = *ci.AddedRecords
+			}
+			updated := int64(0)
+			if ci.UpdatedRecords != nil {
+				updated = *ci.UpdatedRecords
+			}
+			deleted := int64(0)
+			if ci.DeletedRecords != nil {
+				deleted = *ci.DeletedRecords
+			}
+			netDelta := added - updated - deleted
+			if ci.Replaces {
+				total = netDelta
+			} else {
+				total += netDelta
+			}
+		}
+		if total < 0 {
+			total = 0
+		}
+		latestCount = &total
 	}
 
 	limit := q.Limit
@@ -751,6 +896,8 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	if len(out) > 0 && out[0].TotalRecords != nil {
 		v := *out[0].TotalRecords
 		result.LatestRecordCount = &v
+	} else if latestCount != nil {
+		result.LatestRecordCount = latestCount
 	}
 	return result, nil
 }
@@ -849,7 +996,11 @@ func (p *LocalProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 		limit = 100
 	}
 
-	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT %d", q.Database, q.Table, limit+1)
+	// Legacy tables on disk still carry the `__default` suffix (pre-ADR-019).
+	// If the request asks for the bare form and only the legacy variant is
+	// materialised in this workspace, redirect the SQL to the legacy name.
+	tableForSQL := resolveLocalTableName(p.workspaceRoot, q.Database, q.Table)
+	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT %d", q.Database, tableForSQL, limit+1)
 	res, err := p.runQueryFor(ctx, pipelineRef, sql)
 	if err != nil {
 		// Fresh table that hasn't been written yet — surface an empty

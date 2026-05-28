@@ -75,6 +75,16 @@ type Commit struct {
 	AddedRecords   *int64
 	DeletedRecords *int64
 	TotalRecords   *int64
+	// UpdatedRecords is the MERGE `numTargetRowsUpdated` value when the
+	// commit was a MERGE that touched rows in place. Updates don't change
+	// the table-state row count even though they're folded into
+	// AddedRecords for the timeline display; LatestRecordCount aggregation
+	// needs the discriminator to net them out.
+	UpdatedRecords *int64
+	// Replaces is true when the commit overwrites the table state (CTAS,
+	// CREATE OR REPLACE, WRITE with mode=Overwrite). Running-sum row-count
+	// math resets to this commit's AddedRecords when true.
+	Replaces bool
 }
 
 // maxCommitsScanned bounds the history walk so a long-lived table with
@@ -248,6 +258,7 @@ func fillRecordCounts(c *Commit, ci *rawCommitInfo) {
 	if strings.Contains(op, "MERGE") {
 		ins := get("numTargetRowsInserted")
 		upd := get("numTargetRowsUpdated")
+		c.UpdatedRecords = upd
 		if ins != nil || upd != nil {
 			var sum int64
 			if ins != nil {
@@ -262,6 +273,35 @@ func fillRecordCounts(c *Commit, ci *rawCommitInfo) {
 	} else {
 		c.AddedRecords = get("numOutputRows")
 	}
+	// Replaces=true for commit shapes that overwrite the table state.
+	// CTAS, REPLACE TABLE, CREATE OR REPLACE TABLE, and WRITE with
+	// operationParameters.mode=Overwrite all reset the running row count.
+	if isReplaceOp(op, ci) {
+		c.Replaces = true
+	}
+}
+
+// isReplaceOp decides whether a commit overwrites the table state. Used
+// only for LatestRecordCount aggregation; per-snapshot display continues
+// to read AddedRecords / DeletedRecords as-is. Conservative: anything we
+// recognize as a fresh-write resets, MERGE and APPEND don't.
+func isReplaceOp(op string, ci *rawCommitInfo) bool {
+	switch op {
+	case "CREATE TABLE", "REPLACE TABLE", "CREATE OR REPLACE TABLE",
+		"CREATE TABLE AS SELECT", "CREATE OR REPLACE TABLE AS SELECT":
+		return true
+	}
+	if op == "WRITE" && ci != nil && len(ci.Parameters) > 0 {
+		// operationParameters is `json.RawMessage` (Delta stores values as
+		// quoted strings, sometimes as nested objects). A substring match
+		// avoids parsing the dynamic shape; the trade is occasional false
+		// positives on tables that literally have a column named "mode" with
+		// value "Overwrite" — vanishingly unlikely.
+		if strings.Contains(string(ci.Parameters), `"mode":"Overwrite"`) {
+			return true
+		}
+	}
+	return false
 }
 
 // mtimeMs falls back to filesystem mtime when a commit has no

@@ -233,6 +233,11 @@ func handleSource(w http.ResponseWriter, r *http.Request, s3c S3Client) {
 
 // handleTable serves GET /data/table?catalog_db=<db>&catalog_table=<t>&limit=<n>[&dir=<d>].
 //
+// ADR-020: optionally accepts `catalog` + `schema` query params instead of
+// `catalog_db`; when both are present they compose into the wire form
+// `<catalog>__<schema>` the provider expects. `catalog_db` wins when also
+// supplied so legacy callers keep working byte-for-byte.
+//
 // Dispatches through observability.Provider so local pipelines (compute =
 // "local") query their per-pipeline Hadoop catalog instead of falling back
 // to Athena, which has nothing to read from. Cloud pipelines unchanged
@@ -240,9 +245,9 @@ func handleSource(w http.ResponseWriter, r *http.Request, s3c S3Client) {
 func handleTable(w http.ResponseWriter, r *http.Request, p observability.Provider) {
 	q := r.URL.Query()
 
-	catalogDB := q.Get("catalog_db")
+	catalogDB := composeDatabase(q.Get("catalog_db"), q.Get("catalog"), q.Get("schema"))
 	if catalogDB == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: catalog_db")
+		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: catalog_db (or catalog+schema)")
 		return
 	}
 
@@ -360,8 +365,17 @@ const (
 )
 
 // handleSnapshots serves GET /data/tables/{database}/{table}/snapshots[?limit=N].
+//
+// ADR-020: accepts optional `catalog` + `schema` query params; the path
+// `{database}` segment wins when supplied (always, for this route), so
+// the params are effectively decorative here. They exist so callers can
+// pass the three-piece form uniformly without case-splitting on the
+// endpoint.
 func handleSnapshots(w http.ResponseWriter, r *http.Request, p observability.Provider) {
 	db := r.PathValue("database")
+	if db == "" {
+		db = composeDatabase("", r.URL.Query().Get("catalog"), r.URL.Query().Get("schema"))
+	}
 	tbl := r.PathValue("table")
 	if db == "" || tbl == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "missing database or table path segment")
@@ -408,6 +422,9 @@ const (
 // pre-resolver caller renders cleanly instead of 500ing.
 func handleColumnStats(w http.ResponseWriter, r *http.Request, p observability.Provider, systemDatabase string) {
 	db := r.PathValue("database")
+	if db == "" {
+		db = composeDatabase("", r.URL.Query().Get("catalog"), r.URL.Query().Get("schema"))
+	}
 	tbl := r.PathValue("table")
 	if db == "" || tbl == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "missing database or table path segment")
@@ -576,6 +593,21 @@ func handleTables(w http.ResponseWriter, r *http.Request, p observability.Provid
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
+}
+
+// composeDatabase resolves the wire-form `<catalog>__<schema>` Glue
+// database name from either the legacy single `database`/`catalog_db`
+// param or the ADR-020 three-piece `catalog`+`schema` pair. The legacy
+// form wins so byte-for-byte old callers keep working; the three-piece
+// form composes via the same encoder the runner uses (ADR-016).
+func composeDatabase(legacy, catalog, schema string) string {
+	if legacy != "" {
+		return legacy
+	}
+	if catalog != "" && schema != "" {
+		return catalog + "__" + schema
+	}
+	return ""
 }
 
 // isValidExecARN checks that `s` only contains characters that occur in SFN

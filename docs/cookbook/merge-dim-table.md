@@ -70,11 +70,11 @@ The UI equivalent: select `dim_customers` in the editor, expand **Output** on th
 bin/clavesa pipeline run crm
 ```
 
-First run creates `dim_customers__default` in Glue with the rows from the snapshot. Run it again with the same source — the row count doesn't grow; the runner runs `MERGE INTO dim_customers USING staging ON dim_customers.customer_id = staging.customer_id WHEN MATCHED UPDATE * WHEN NOT MATCHED INSERT *`.
+First run creates `dim_customers` in Glue with the rows from the snapshot. Run it again with the same source — the row count doesn't grow; the runner runs `MERGE INTO dim_customers USING staging ON dim_customers.customer_id = staging.customer_id WHEN MATCHED UPDATE * WHEN NOT MATCHED INSERT *`.
 
 ## What you should see
 
-- `/` (Catalog) shows `dim_customers__default` under `clavesa_<workspace>__crm`.
+- `/` (Catalog) shows `dim_customers` under `clavesa_<workspace>__crm`.
 - Click through: schema + sample rows.
 - Run the pipeline twice in a row. The **Volume timeline** on TableDetail shows two commits (one per run); the first is `write +N` (initial create), the second is `merge +N/-N` (the MERGE rewrote every matched row). Row count stays at N either way.
 - Change a single row in the source (re-run `python scripts/synth_events.py --shape dim ... --revision 1` to bump customer #1's tier one band), re-run the pipeline. A third commit lands as `merge +N/-N`; the dim table has the same row count but customer #1's tier reflects the new value.
@@ -84,7 +84,7 @@ First run creates `dim_customers__default` in Glue with the rows from the snapsh
 `mode = "merge"` with the `merge_keys` above gets the runner to translate the write into:
 
 ```sql
-MERGE INTO clavesa_<workspace>__crm.dim_customers__default AS target
+MERGE INTO clavesa_<workspace>__crm.dim_customers AS target
 USING <staging> AS source
 ON target.customer_id = source.customer_id
 WHEN MATCHED THEN UPDATE SET *
@@ -128,7 +128,7 @@ bin/clavesa node edit facts dim_customers_incremental \
   --incremental-input dim_customers
 ```
 
-The runner then reads `(last_version, current_version]` from `dim_customers__default` via Change Data Feed. CDF returns rows tagged with `_change_type` (`insert`, `update_postimage`, `update_preimage`, `delete`) and `_commit_version`. For an SCD-Type-1 dim, you only need `insert` and `update_postimage`; the runner filters to those and dedupes to the latest row per `merge_keys` (`_commit_version DESC`) automatically. No `ROW_NUMBER()` wrapper in your SQL.
+The runner then reads `(last_version, current_version]` from `dim_customers` via Change Data Feed. CDF returns rows tagged with `_change_type` (`insert`, `update_postimage`, `update_preimage`, `delete`) and `_commit_version`. For an SCD-Type-1 dim, you only need `insert` and `update_postimage`; the runner filters to those and dedupes to the latest row per `merge_keys` (`_commit_version DESC`) automatically. No `ROW_NUMBER()` wrapper in your SQL.
 
 This is the pattern the v2.0.0 cutover exists to enable. On Iceberg v2, incremental reads of a MOR-MERGE upstream returned nothing useful ([apache/iceberg#1949](https://github.com/apache/iceberg/issues/1949)). Delta CDF materialises the change rows at write time, so the downstream consumer gets real data regardless of whether the upstream used COW or MOR.
 

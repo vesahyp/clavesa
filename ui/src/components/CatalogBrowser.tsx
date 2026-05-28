@@ -3,9 +3,9 @@
  *
  * Shared across the dashboards dataset editor, the workspace /query page,
  * and notebook editors. Lists tables grouped by database; clicking a table
- * inserts its fully-qualified name (`clavesa.<db>.<table>`), clicking a
- * column inserts the bare column name. Authoring SQL stops being blind
- * guessing of identifiers.
+ * inserts its fully-qualified wire-form name (`<catalog>__<schema>.<table>`,
+ * ADR-016 / ADR-020), clicking a column inserts the bare column name.
+ * Authoring SQL stops being blind guessing of identifiers.
  *
  * Two scopes:
  *   - `pipeline`: filter to one pipeline's tables (dashboards dataset path —
@@ -18,6 +18,7 @@ import { useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, Columns3, Table2 } from "lucide-react";
 
 import { useCatalogTables, type CatalogTable } from "@/lib/queries";
+import { displayTableName } from "@/lib/format";
 
 interface CatalogBrowserProps {
   /** Insert text at the SQL editor's cursor. */
@@ -42,22 +43,27 @@ export function CatalogBrowser({
   const catalog = useCatalogTables();
   const [open, setOpen] = useState<Set<string>>(new Set());
 
-  // Group tables by database (catalog__schema). Filter scope: workspace
-  // shows everything we have, pipeline shows only this dir's tables.
+  // Group tables by catalog.schema (ADR-020 display path). Filter scope:
+  // workspace shows everything we have, pipeline shows only this dir's
+  // tables. Group key stays the wire-form database name so clicking a
+  // row can recover it for the inserted SQL identifier.
   const groups = useMemo(() => {
     const all = catalog.data?.tables ?? [];
     const tables =
       scope === "workspace"
         ? all
         : all.filter((t) => dir !== "" && t.dir === dir);
-    const m = new Map<string, CatalogTable[]>();
+    const m = new Map<string, { display: string; tables: CatalogTable[] }>();
     for (const t of tables) {
-      const g = m.get(t.database) ?? [];
-      g.push(t);
-      m.set(t.database, g);
+      const display = t.catalog && t.schema ? `${t.catalog}.${t.schema}` : t.database;
+      const entry = m.get(t.database) ?? { display, tables: [] };
+      entry.tables.push(t);
+      m.set(t.database, entry);
     }
-    for (const g of m.values()) g.sort((a, b) => a.name.localeCompare(b.name));
-    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    for (const entry of m.values()) {
+      entry.tables.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return [...m.entries()].sort((a, b) => a[1].display.localeCompare(b[1].display));
   }, [catalog.data, dir, scope]);
 
   function toggle(key: string) {
@@ -94,15 +100,15 @@ export function CatalogBrowser({
               : "No tables yet — run the pipeline."}
           </p>
         )}
-        {groups.map(([database, tables]) => (
+        {groups.map(([database, group]) => (
           <div key={database} className="mb-1">
             <div className="truncate px-1 py-0.5 font-mono text-[10px] text-muted-foreground">
-              {database}
+              {group.display}
             </div>
-            {tables.map((t) => {
+            {group.tables.map((t) => {
               const key = `${database}.${t.name}`;
               const expanded = open.has(key);
-              const qualified = `clavesa.${t.database}.${t.name}`;
+              const qualified = `${t.database}.${t.name}`;
               return (
                 <div key={key}>
                   <div className="flex items-center gap-0.5 rounded hover:bg-muted">
@@ -125,7 +131,7 @@ export function CatalogBrowser({
                       className="flex min-w-0 flex-1 items-center gap-1 py-0.5 pr-1 text-left font-mono"
                     >
                       <Table2 className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
-                      <span className="truncate">{t.name}</span>
+                      <span className="truncate">{displayTableName(t)}</span>
                     </button>
                   </div>
                   {expanded && (

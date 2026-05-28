@@ -72,6 +72,18 @@ export function AdhocQuery({
   const runRef = useRef<() => Promise<void>>(async () => {});
   async function run() {
     if (!sql.trim()) return;
+    // Spark parses "..." as a string literal, not an identifier. Catch the
+    // common `FROM "db"."table"` / `FROM "table"` shape before it hits the
+    // runner so the user sees a friendly hint instead of an opaque
+    // "STRING_LITERAL is not a table" stack trace.
+    const dqIdent = doubleQuotedIdentifierHint(sql);
+    if (dqIdent) {
+      const msg =
+        'Double-quotes are string literals in Spark, not identifier quoting. Use backticks for special-character identifiers, or no quoting for normal ones.';
+      setError(msg);
+      toast.error(msg);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -175,6 +187,14 @@ export function AdhocQuery({
       <CardContent className="p-4">{body}</CardContent>
     </Card>
   );
+}
+
+// doubleQuotedIdentifierHint returns true when the SQL has the shape
+// `FROM "x"` / `FROM "x"."y"` / `JOIN "x"`, suggesting the user is
+// double-quoting identifiers. Spark would treat those as string literals
+// and reject the query with a confusing error.
+function doubleQuotedIdentifierHint(sql: string): boolean {
+  return /\b(?:from|join)\s+"[^"]+"(?:\s*\.\s*"[^"]+")?/i.test(sql);
 }
 
 function ResultGrid({ result }: { result: AdhocQueryResult }) {

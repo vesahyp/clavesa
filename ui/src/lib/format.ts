@@ -49,6 +49,28 @@ export function displayTableName(t: {
   return t.owning_node || t.name;
 }
 
+// displayTablePath renders the three-level logical identifier
+// (ADR-020) — `<catalog>.<schema>.<table>` with the `__default` suffix
+// stripped via displayTableName. Pure display: the engine still accepts
+// the flat-encoded wire form `<catalog>__<schema>.<table>`, so SQL
+// surfaces compose their own string. Use this for the TableDetail
+// header chip, lineage labels, dashboard output chips, and anywhere
+// else the goal is to read out the table's identity to a human.
+// Falls back gracefully when catalog/schema are blank (pre-Slice-7
+// API responses): drops empty segments so `database`-only payloads
+// still render something sensible.
+export function displayTablePath(t: {
+  catalog?: string;
+  schema?: string;
+  owning_node?: string;
+  name: string;
+}): string {
+  const parts = [t.catalog ?? "", t.schema ?? "", displayTableName(t)].filter(
+    (s) => s !== "",
+  );
+  return parts.join(".");
+}
+
 // showOutputKey is true only for genuine multi-output nodes — "default" is
 // the implicit single-output key and renders as noise next to the name.
 export function showOutputKey(t: {

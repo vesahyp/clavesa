@@ -50,13 +50,25 @@ func ResolveUpstreamFromSnapshot(
 	// v1 chains only the default output. A downstream that reads a
 	// non-default output (multi-output transform) falls back to
 	// re-execute — preserves correctness without expanding scope.
-	table := identutil.Sanitize(parent.ID) + "__default"
+	// ADR-019 dropped the `__default` suffix from single-output tables;
+	// prefer the bare directory and fall back to the legacy form for
+	// tables written pre-cutover.
+	nodeSafe := identutil.Sanitize(parent.ID)
 
 	warehouse := workspace.LocalWarehouseDir(root)
 	if warehouse == "" {
 		return nil, false, nil
 	}
+	table := nodeSafe
 	metaDir := filepath.Join(warehouse, glueDB, table, "metadata")
+	if _, err := os.Stat(metaDir); err != nil {
+		legacy := nodeSafe + "__default"
+		legacyMeta := filepath.Join(warehouse, glueDB, legacy, "metadata")
+		if _, err2 := os.Stat(legacyMeta); err2 == nil {
+			table = legacy
+			metaDir = legacyMeta
+		}
+	}
 	snapMtime, ok := latestSnapshotMtime(metaDir)
 	if !ok {
 		return nil, false, nil

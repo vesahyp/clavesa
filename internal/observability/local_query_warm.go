@@ -288,9 +288,17 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		"-e", "CLAVESA_QUERY_SERVER_PORT=8765",
 		"-e", "CLAVESA_CONNECT_PORT=15002",
 		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
-		"-v", warehouse + ":" + warehouse,
-		p.resolveImage(),
 	}
+	// ADR-019 Slice 4: register the V2 multi-catalog so warm reads of
+	// three-level addresses ``<catalog>.<schema>.<table>`` resolve. The
+	// runner falls back to spark_catalog for legacy two-segment reads
+	// (pre-Slice-4 tables under the Hive metastore), so this is purely
+	// additive.
+	if m, _ := workspace.Load(p.workspaceRoot); m != nil {
+		args = append(args, "-e", "CLAVESA_CATALOG="+m.CatalogIdentifier())
+		args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+m.SystemCatalogIdentifier())
+	}
+	args = append(args, "-v", warehouse+":"+warehouse, p.resolveImage())
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

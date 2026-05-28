@@ -1,6 +1,6 @@
 # ADR 016: Catalog / Schema / Table Namespace
 
-**Status**: Accepted
+**Status**: Accepted (operative). ADR-019 attempted to supersede but was itself superseded-before-shipping when investigation found the path to a native Glue Catalog blocked at the AWS API level and the V2 Spark catalog blocked by Delta. See ADR-019 for that history. ADR-020 documents the display-normalization-only follow-on. The `<catalog>__<schema>` flat-encoding described below remains the wire format clavesa uses.
 
 ## Context
 

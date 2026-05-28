@@ -218,9 +218,7 @@ function ExternalTableBody({ ref }: { ref: string }) {
     const schema = ref.slice(0, dot);
     const table = ref.slice(dot + 1);
     for (const t of catalog.data?.tables ?? []) {
-      if (!t.database.includes("__")) continue;
-      const sch = t.database.slice(t.database.indexOf("__") + 2);
-      if (sch === schema && t.name === table) return t;
+      if (t.schema === schema && t.name === table) return t;
     }
     return null;
   }, [catalog.data, ref]);

@@ -77,6 +77,74 @@ func TestEncodeExternalTableRef(t *testing.T) {
 	}
 }
 
+func TestTableIDWire(t *testing.T) {
+	cases := []struct {
+		name string
+		id   TableID
+		want string
+	}{
+		{
+			name: "plain three-level",
+			id:   TableID{Catalog: "clavesa_demo_ws", Schema: "cloudfront", Table: "trips"},
+			want: "clavesa_demo_ws.cloudfront.trips",
+		},
+		{
+			name: "dashed at every level is sanitized",
+			id:   TableID{Catalog: "clavesa-demo-ws", Schema: "cloudfront-pipeline", Table: "dim-customers"},
+			want: "clavesa_demo_ws.cloudfront_pipeline.dim_customers",
+		},
+		{
+			name: "short clavesa catalog",
+			id:   TableID{Catalog: "clavesa", Schema: "cloudfront", Table: "trips"},
+			want: "clavesa.cloudfront.trips",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.id.Wire(); got != c.want {
+				t.Errorf("TableID%+v.Wire() = %q, want %q", c.id, got, c.want)
+			}
+		})
+	}
+}
+
+func TestTableIDLegacyGlueDB(t *testing.T) {
+	cases := []struct {
+		name string
+		id   TableID
+		want string
+	}{
+		{
+			name: "plain catalog and schema",
+			id:   TableID{Catalog: "clavesa_demo_ws", Schema: "cloudfront", Table: "trips"},
+			want: "clavesa_demo_ws__cloudfront",
+		},
+		{
+			name: "dashed catalog and schema sanitized at boundary",
+			id:   TableID{Catalog: "clavesa-demo-ws", Schema: "cloudfront-pipeline", Table: "trips"},
+			want: "clavesa_demo_ws__cloudfront_pipeline",
+		},
+		{
+			name: "matches EncodeGlueDatabase for the same pair",
+			id:   TableID{Catalog: "clavesa", Schema: "cloudfront", Table: "ignored"},
+			want: "clavesa__cloudfront",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.id.LegacyGlueDB(); got != c.want {
+				t.Errorf("TableID%+v.LegacyGlueDB() = %q, want %q", c.id, got, c.want)
+			}
+			// Back-compat invariant: LegacyGlueDB and EncodeGlueDatabase
+			// must agree, so Slice 4+ callers can swap to TableID without
+			// changing the wire bytes for legacy paths.
+			if direct := EncodeGlueDatabase(c.id.Catalog, c.id.Schema); direct != c.id.LegacyGlueDB() {
+				t.Errorf("LegacyGlueDB() = %q diverged from EncodeGlueDatabase = %q", c.id.LegacyGlueDB(), direct)
+			}
+		})
+	}
+}
+
 func TestEncodeGlueDatabase(t *testing.T) {
 	cases := []struct {
 		name, catalog, schema, want string

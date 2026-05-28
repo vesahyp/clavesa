@@ -338,7 +338,7 @@ def test_build_row_output_rows_passes_through():
 
 def test_glue_db_three_level_encoding():
     """Post-ADR-016 workspace: both CLAVESA_CATALOG and CLAVESA_SCHEMA
-    set. The runner emits `<catalog>__<schema>` with double-underscore
+    set. The runner emits ``<catalog>__<schema>`` with double-underscore
     boundary. Mirrors internal/identutil.EncodeGlueDatabase on the Go
     side — encoders must stay byte-identical so the catalog handler
     finds what the runner writes."""
@@ -351,8 +351,8 @@ def test_glue_db_three_level_encoding():
     os.environ["CLAVESA_SCHEMA"] = "cloudfront"
     try:
         assert runner._glue_db() == "clavesa_demo_ws__cloudfront"
-        # ADR-018: Delta tables resolve through spark_catalog; no leading
-        # `clavesa.` catalog segment.
+        # Slice 3: single-default-output drops the ``__default`` suffix.
+        assert runner._table_id_for("default", {"default": None}) == "clavesa_demo_ws__cloudfront.node"
         assert runner._table_id_for("default") == "clavesa_demo_ws__cloudfront.node__default"
     finally:
         for k, v in saved.items():
@@ -360,6 +360,25 @@ def test_glue_db_three_level_encoding():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_v2_layout_local_strips_db_suffix():
+    """ADR-019 Slice 4 on-disk layout: ``_ensure_database`` stamps a
+    ``LOCATION`` of ``<base>/<catalog>/<schema>`` (no ``.db`` suffix) so
+    local warehouses store tables at the V2 namespace shape Slice 5's
+    cloud Glue catalog cutover will mirror."""
+    runner = _load_runner()
+    assert runner._v2_layout_path("/tmp/wh", "clavesa_demo_ws__bronze") == \
+        "/tmp/wh/clavesa_demo_ws/bronze"
+    assert runner._v2_layout_path("/tmp/wh", "clavesa_demo_ws_system__pipelines") == \
+        "/tmp/wh/clavesa_demo_ws_system/pipelines"
+    # Cloud (s3://) keeps the legacy ``.db`` suffix — Glue's Hive client
+    # expects the DB location at ``<warehouse>/<db_name>.db/`` and
+    # Slice 4 doesn't touch the cloud catalog tree.
+    assert runner._v2_layout_path("s3://bucket/key", "clavesa_demo_ws__bronze") == \
+        "s3://bucket/key/clavesa_demo_ws__bronze.db"
+    # Malformed input (no ``__`` boundary) falls back to legacy ``.db``.
+    assert runner._v2_layout_path("/tmp/wh", "stray") == "/tmp/wh/stray.db"
 
 
 def test_glue_db_dashes_sanitized_at_both_sides():

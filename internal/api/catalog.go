@@ -62,7 +62,15 @@ type CatalogColumn struct {
 // clavesa's naming convention (`clavesa_<pipeline>.<node>__<key>`) and
 // are best-effort — caller should not rely on them being non-empty.
 type CatalogTable struct {
-	Database       string `json:"database"`
+	Database string `json:"database"`
+	// ADR-020: the three-piece namespace surfaced separately so the UI can
+	// render three-level without client-side splitDatabase('__') parsing.
+	// `Database` stays one release as a back-compat alias for the wire
+	// `<catalog>__<schema>` flat encoding (ADR-016). `Table` duplicates
+	// `Name` for the three-piece readers.
+	Catalog        string `json:"catalog,omitempty"`
+	Schema         string `json:"schema,omitempty"`
+	Table          string `json:"table,omitempty"`
 	Name           string `json:"name"`
 	OwningPipeline string `json:"owning_pipeline,omitempty"`
 	OwningNode     string `json:"owning_node,omitempty"`
@@ -153,8 +161,18 @@ func (h *CatalogHandler) Tables(ctx context.Context) CatalogResponse {
 					fmt.Fprintf(os.Stderr, "catalog: skip cloud db %s (Glue error): %v\n", db, err)
 					continue
 				}
+				// System DBs (`<system_catalog>__pipelines`) hold the workspace-wide
+				// observability tables — node_runs, runs, column_stats, tables.
+				// Their names don't follow the `<node>__<key>` convention; blank
+				// owning_node/output_key so the UI doesn't render them as
+				// transform outputs. Mirrors the local-side treatment.
+				isSystemDB := systemCatalog != "" && dbBelongsToWorkspace(db, systemCatalog)
 				for i := range tables {
-					if pip, ok := pipByName[identutil.Sanitize(tables[i].OwningPipeline)]; ok {
+					if isSystemDB {
+						tables[i].OwningPipeline = ""
+						tables[i].OwningNode = ""
+						tables[i].OutputKey = ""
+					} else if pip, ok := pipByName[identutil.Sanitize(tables[i].OwningPipeline)]; ok {
 						stampPipelineMeta(&tables[i], h.workspaceRoot, pip)
 					}
 				}
@@ -285,9 +303,10 @@ func glueTableToCatalog(db string, t gluetypes.Table) CatalogTable {
 	// --schema <id>`). Falls back to the whole DB name when the
 	// boundary marker is absent (defensive — shouldn't happen against
 	// post-v0.18 producers).
-	owningPipeline := db
-	if i := strings.Index(db, "__"); i >= 0 {
-		owningPipeline = db[i+2:]
+	catalog, schema := splitGlueDB(db)
+	owningPipeline := schema
+	if owningPipeline == "" {
+		owningPipeline = db
 	}
 
 	// Clavesa convention: <node>__<output_key>.
@@ -319,6 +338,9 @@ func glueTableToCatalog(db string, t gluetypes.Table) CatalogTable {
 
 	return CatalogTable{
 		Database:       db,
+		Catalog:        catalog,
+		Schema:         schema,
+		Table:          name,
 		Name:           name,
 		OwningPipeline: owningPipeline,
 		OwningNode:     owningNode,
@@ -330,13 +352,33 @@ func glueTableToCatalog(db string, t gluetypes.Table) CatalogTable {
 	}
 }
 
+// splitGlueDB splits an ADR-016 wire-form database name on the first `__`
+// boundary into (catalog, schema). Single-occurrence rule: catalog is
+// sanitized so it cannot contain `__`; schema in theory could, so we
+// honour the first marker as the level boundary. Returns ("", db) when
+// no separator is present so legacy single-underscore DBs still
+// populate `schema` for the UI fallback.
+func splitGlueDB(db string) (catalog, schema string) {
+	i := strings.Index(db, "__")
+	if i < 0 {
+		return "", db
+	}
+	return db[:i], db[i+2:]
+}
+
 // splitNodeOutput parses "<node>__<output_key>" per clavesa's auto-table
-// naming. Returns ("", "") if the convention doesn't match (e.g. tables added
-// outside clavesa).
+// naming. ADR-019 dropped the `__default` suffix from single-output
+// transforms; a bare table name with no `__` now means key = "default".
+// Tables that contain a `__` keep the legacy split. Returns ("", "") only
+// for system tables that surface via this helper but live outside the
+// node namespace.
 func splitNodeOutput(tableName string) (node, outputKey string) {
 	idx := strings.Index(tableName, "__")
 	if idx < 0 {
-		return "", ""
+		if tableName == "" {
+			return "", ""
+		}
+		return tableName, "default"
 	}
 	return tableName[:idx], tableName[idx+2:]
 }

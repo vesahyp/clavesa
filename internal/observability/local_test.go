@@ -577,6 +577,112 @@ func TestLocalProviderSnapshotsFromDeltaLog(t *testing.T) {
 	}
 }
 
+// TestLocalProviderSnapshotsLatestRecordCountFromDeltaCommits exercises the
+// LatestRecordCount derivation across single-commit CTAS, multi-commit
+// append, and append-with-deletes. Delta commits carry per-commit
+// numOutputRows / numTargetRowsDeleted, never a running total — so the
+// provider has to sum across the full history.
+func TestLocalProviderSnapshotsLatestRecordCountFromDeltaCommits(t *testing.T) {
+	metaLine := `{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1715000000000}}`
+
+	writeCommit := func(t *testing.T, logDir string, version int, body string) {
+		t.Helper()
+		name := fmt.Sprintf("%020d.json", version)
+		if err := os.WriteFile(filepath.Join(logDir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write commit %d: %v", version, err)
+		}
+	}
+
+	cases := []struct {
+		name    string
+		commits []string
+		want    int64
+	}{
+		{
+			name: "single-commit CTAS",
+			commits: []string{
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"16662"}}}`,
+			},
+			want: 16662,
+		},
+		{
+			name: "multi-commit append",
+			commits: []string{
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}`,
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}`,
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"30"}}}`,
+			},
+			want: 180,
+		},
+		{
+			name: "append with deletes via MERGE",
+			commits: []string{
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}`,
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"0","numTargetRowsUpdated":"0","numTargetRowsDeleted":"20"}}}`,
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}`,
+			},
+			want: 130,
+		},
+		{
+			// Merge-keyed dim table — the http-changing-source cookbook
+			// shape. First run inserts 100 rows; later runs see ~5 new IDs
+			// each plus ~95 updates of overlapping IDs. Updates don't move
+			// the row count, so the dim stays near 100 after every run.
+			// Pre-fix this rendered 500 because numTargetRowsUpdated was
+			// folded into AddedRecords and double-counted.
+			name: "merge dim with mostly updates",
+			commits: []string{
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"CREATE TABLE","operationMetrics":{"numOutputRows":"100"}}}`,
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"5","numTargetRowsUpdated":"95","numTargetRowsDeleted":"0"}}}`,
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"3","numTargetRowsUpdated":"100","numTargetRowsDeleted":"0"}}}`,
+				`{"commitInfo":{"timestamp":1715000003000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"4","numTargetRowsUpdated":"100","numTargetRowsDeleted":"0"}}}`,
+			},
+			want: 112,
+		},
+		{
+			// CREATE OR REPLACE TABLE wipes the prior state. A long-running
+			// append-mode table that gets re-bootstrapped should report the
+			// new row count, not the cumulative sum.
+			name: "create or replace resets total",
+			commits: []string{
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"1000"}}}`,
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"500"}}}`,
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"CREATE OR REPLACE TABLE","operationMetrics":{"numOutputRows":"42"}}}`,
+				`{"commitInfo":{"timestamp":1715000003000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"8"}}}`,
+			},
+			want: 50,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			logDir := filepath.Join(ws, ".clavesa", "warehouse", "clavesa_demo.db", "xform__default", "_delta_log")
+			if err := os.MkdirAll(logDir, 0o755); err != nil {
+				t.Fatalf("mkdir log: %v", err)
+			}
+			for i, body := range tc.commits {
+				writeCommit(t, logDir, i, body)
+			}
+			p := observability.NewLocalProvider(ws)
+			res, err := p.Snapshots(context.Background(), observability.SnapshotsQuery{
+				Database: "clavesa_demo",
+				Table:    "xform__default",
+				Limit:    20,
+			})
+			if err != nil {
+				t.Fatalf("Snapshots: %v", err)
+			}
+			if res.LatestRecordCount == nil {
+				t.Fatalf("LatestRecordCount = nil, want %d", tc.want)
+			}
+			if *res.LatestRecordCount != tc.want {
+				t.Errorf("LatestRecordCount = %d, want %d", *res.LatestRecordCount, tc.want)
+			}
+		})
+	}
+}
+
 // errFakeNoTable mimics the AnalysisException Spark raises when querying a
 // table that hasn't been registered in the catalog yet.
 var errFakeNoTable = &fakeErr{msg: "AnalysisException: TABLE_OR_VIEW_NOT_FOUND: clavesa.clavesa_demo.runs"}

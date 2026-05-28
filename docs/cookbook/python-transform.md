@@ -38,8 +38,8 @@ bucket) but a few lines of pandas-style PySpark.
 
 Clavesa's runner calls transform(spark, inputs) and expects back
 {output_key: DataFrame}. Anything you return under "default" lands as
-the Delta table <node>__default; multiple keys land as separate
-tables (see "Multiple outputs" below).
+the Delta table <node>; multiple keys land as separate tables named
+<node>__<key> (see "Multiple outputs" below).
 """
 
 from pyspark.sql import DataFrame, functions as F, Window
@@ -90,7 +90,7 @@ bin/clavesa pipeline run trip_features
 ## What you should see
 
 - `pipeline run` reports `enrich` as `ok`.
-- `/` (Catalog) shows `enrich__default` with extra columns: `fare_z`, `tip_pct`, `tip_bucket`.
+- `/` (Catalog) shows `enrich` with extra columns: `fare_z`, `tip_pct`, `tip_bucket`.
 - Click into TableDetail → Sample rows include the derived features. The Lineage panel shows the source flowing in.
 
 ## The function contract
@@ -127,7 +127,7 @@ def transform(spark, inputs):
     }
 ```
 
-`pipeline run` writes both Delta tables (`enrich__default`, `enrich__outliers`); both surface in `/` (Catalog) under your pipeline. The same shape deploys to Lambda or any other cloud target. To tune the write mode per-key (e.g. `outliers` as `append` instead of `replace`), edit `output_definitions` directly in the transform's `.tf`; the CLI flag seeds new entries with the default mode.
+`pipeline run` writes both Delta tables (`enrich` for the default key, `enrich__outliers` for the named one); both surface in `/` (Catalog) under your pipeline. The same shape deploys to Lambda or any other cloud target. To tune the write mode per-key (e.g. `outliers` as `append` instead of `replace`), edit `output_definitions` directly in the transform's `.tf`; the CLI flag seeds new entries with the default mode.
 
 The UI equivalent: select the transform in the editor, open the right-panel **Output** section, type the extra key under **Extra outputs**, click **Add output**. Same surface for adding more keys or removing them.
 

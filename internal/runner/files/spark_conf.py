@@ -38,6 +38,8 @@ def clavesa_spark_conf(
     warehouse: str | None = None,
     *,
     s3_endpoint: str | None = None,
+    catalog: str | None = None,
+    system_catalog: str | None = None,
 ) -> dict[str, str]:
     """Return the full Spark config dict for a clavesa runner session.
 
@@ -48,11 +50,31 @@ def clavesa_spark_conf(
             Defaults to ``$CLAVESA_WAREHOUSE`` or ``/tmp/clavesa-warehouse``.
         s3_endpoint: Optional S3A endpoint override (moto / MinIO test
             infra). Defaults to ``$CLAVESA_S3_ENDPOINT``.
+        catalog: Workspace catalog identifier (ADR-019). When set, the
+            runner registers ``spark.sql.catalog.<catalog>`` as a V2
+            DeltaCatalog with its own warehouse pinned at
+            ``<warehouse>/<catalog>``, so three-level addresses
+            (``<catalog>.<schema>.<table>``) resolve natively. Defaults
+            to ``$CLAVESA_CATALOG``; empty / unset skips the V2 wiring
+            and the runner stays on the legacy ``spark_catalog`` flat
+            two-segment shape (used by preview / connect-server hosts
+            where no pipeline context is in play).
+        system_catalog: Workspace system catalog identifier. Same V2
+            registration treatment as ``catalog`` so observability
+            tables (``runs`` / ``node_runs`` / ``tables`` /
+            ``column_stats`` under the ``pipelines`` schema) land at
+            ``<warehouse>/<system_catalog>/`` and are addressable as
+            ``<system_catalog>.pipelines.<table>``. Defaults to
+            ``$CLAVESA_SYSTEM_CATALOG``.
     """
     if warehouse is None:
         warehouse = os.environ.get("CLAVESA_WAREHOUSE", "/tmp/clavesa-warehouse")
     if s3_endpoint is None:
         s3_endpoint = os.environ.get("CLAVESA_S3_ENDPOINT")
+    if catalog is None:
+        catalog = os.environ.get("CLAVESA_CATALOG", "")
+    if system_catalog is None:
+        system_catalog = os.environ.get("CLAVESA_SYSTEM_CATALOG", "")
 
     is_s3 = warehouse.startswith("s3://")
 
@@ -173,6 +195,26 @@ def clavesa_spark_conf(
         conf["spark.hadoop.fs.s3a.connection.ssl.enabled"] = (
             "true" if s3_endpoint.startswith("https://") else "false"
         )
+
+    # ADR-019 Slice 4 attempted to register V2 multi-catalogs under
+    # ``spark.sql.catalog.<catalog>=DeltaCatalog`` so transforms could
+    # address tables as three-level ``<catalog>.<schema>.<table>``
+    # natively. Delta 4.0's ``DeltaCatalog`` extends
+    # ``DelegatingCatalogExtension`` and only gets its session-catalog
+    # delegate populated when registered under the ``spark_catalog``
+    # name; any non-session V2 registration trips a
+    # ``NullPointerException`` from ``DelegatingCatalogExtension.name()``
+    # the moment Spark's analyzer runs its ``isSessionCatalog`` check on
+    # any SQL touching the catalog. Until Delta ships a delegate-free V2
+    # implementation, local-mode writes ride through ``spark_catalog``
+    # (DeltaCatalog wrap above) at the two-segment
+    # ``<catalog>__<schema>.<table>`` shape. The on-disk warehouse
+    # layout still moves to ``<warehouse>/<catalog>/<schema>/<table>/``
+    # via the ``LOCATION`` clause ``_ensure_database`` stamps at
+    # ``CREATE DATABASE`` time — same target tree Slice 5's cloud Glue
+    # V2 cutover will mirror.
+    _ = catalog
+    _ = system_catalog
 
     return conf
 

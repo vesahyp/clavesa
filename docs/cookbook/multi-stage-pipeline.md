@@ -7,8 +7,8 @@ This recipe builds bronze + silver. Gold is the same pattern repeated — one mo
 ## What you'll end up with
 
 - Two Delta tables in the same pipeline:
-  - `<node>__default` for bronze (raw, passthrough)
-  - `<node>__default` for silver (cleaned + typed)
+  - `<node>` for bronze (raw, passthrough)
+  - `<node>` for silver (cleaned + typed)
 - A lineage panel on TableDetail showing the source → bronze → silver chain.
 - One pipeline that runs both transforms in order on every invocation; each transform's output is the next one's input.
 
@@ -57,9 +57,12 @@ bin/clavesa node edit taxis revenue_by_payment --set "sql=
   GROUP BY payment_type
   ORDER BY revenue DESC"
 
-# 5. Wire the edges. Source → bronze, bronze → silver.
-bin/clavesa source attach taxis trips --to trips_bronze --as trips
+# 5. Wire the edges. Connect bronze → silver before attaching the
+#    source — `source attach` triggers an orchestration sync, and the
+#    sync rejects a DAG with two roots while silver still has no
+#    inputs. Connect first, then attach to bronze.
 bin/clavesa node connect taxis --from trips_bronze --to revenue_by_payment --input trips_bronze
+bin/clavesa source attach taxis trips --to trips_bronze --as trips
 
 # 6. Run.
 bin/clavesa pipeline run taxis
@@ -68,13 +71,13 @@ bin/clavesa pipeline run taxis
 ## What you should see
 
 - `pipeline run taxis` reports both nodes `ok` after ~30–60s.
-- `/` (Catalog) shows two new tables: `trips_bronze__default` and `revenue_by_payment__default`.
-- `/tables/.../revenue_by_payment__default` → the Lineage panel shows `trips_bronze__default` as Upstream. Click that → its Lineage panel shows the `trips` source as Upstream and `revenue_by_payment__default` as Downstream.
+- `/` (Catalog) shows two new tables: `trips_bronze` and `revenue_by_payment`.
+- `/tables/<catalog>/taxis/revenue_by_payment` → the Lineage panel shows `taxis.trips_bronze` as Upstream. Click that → its Lineage panel shows the `trips` source as Upstream and `taxis.revenue_by_payment` as Downstream.
 - `/pipelines/run?dir=taxis&run=<id>` shows both nodes in the DAG, colored by status.
 
 ## How the stages talk to each other
 
-Each transform writes a Delta table at `clavesa_<workspace>__<pipeline>.<node>__<output_key>`. Downstream transforms reference upstream tables through their `inputs` map. In the `.tf` Clavesa emits, that wiring shows up as:
+Each transform writes a Delta table at `clavesa_<workspace>__<pipeline>.<node>` (single-output, the common case) or `clavesa_<workspace>__<pipeline>.<node>__<key>` (multi-output, when the transform names additional outputs). Downstream transforms reference upstream tables through their `inputs` map. In the `.tf` Clavesa emits, that wiring shows up as:
 
 ```hcl
 module "revenue_by_payment" {
@@ -85,7 +88,7 @@ module "revenue_by_payment" {
 }
 ```
 
-`module.trips_bronze.outputs["default"]` is the catalog table id `trips_bronze__default` — silver reads it as a regular Delta table, not as a Parquet path. That means each silver run sees the **full** current contents of bronze.
+`module.trips_bronze.outputs["default"]` is the catalog table id `trips_bronze` — silver reads it as a regular Delta table, not as a Parquet path. That means each silver run sees the **full** current contents of bronze.
 
 ## Incremental upstream reads
 
@@ -106,7 +109,7 @@ spark.read.format("delta") \
   .option("readChangeFeed", "true") \
   .option("startingVersion", last_version + 1) \
   .option("endingVersion",   current_version) \
-  .table("clavesa_<workspace>__taxis.trips_bronze__default")
+  .table("clavesa_<workspace>__taxis.trips_bronze")
 ```
 
 First run on the flag reads everything (no watermark yet) and stamps the watermark to bronze's current Delta version. Each later run reads only what bronze committed since. CDF returns rows tagged with `_change_type` (`insert`, `update_postimage`, etc.); the runner filters to inserted and updated rows automatically.

@@ -131,10 +131,15 @@ func newWorkspaceInitCmd() *cobra.Command {
 			// workspace init uses the simpler --workspace-or-cwd resolution
 			// rather than the env-var/state-file chain — a remembered
 			// workspace from a previous session shouldn't redirect a
-			// brand-new init into someone else's directory.
-			root, err := resolveWorkspaceForInit(cmd)
+			// brand-new init into someone else's directory. When no
+			// --workspace is given, scaffold into ./<name>/ rather than
+			// the current directory — `init` is creation, not in-place.
+			root, err := resolveWorkspaceForInit(cmd, name)
 			if err != nil {
 				return err
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "clavesa.json")); statErr == nil {
+				return fmt.Errorf("workspace init: %s is already a clavesa workspace (clavesa.json exists)", root)
 			}
 			if err := workspace.Init(root, name, cloud, catalog, tuiservice.ModuleVersion); err != nil {
 				return fmt.Errorf("workspace init: %w", err)
@@ -172,11 +177,20 @@ func newWorkspaceInitCmd() *cobra.Command {
 // resolveWorkspaceForInit only consults --workspace and cwd. Skips the env-
 // var / state-file chain so a previously-remembered workspace doesn't
 // redirect a fresh `workspace init` into a stale parent directory.
-func resolveWorkspaceForInit(cmd *cobra.Command) (string, error) {
+//
+// When --workspace is omitted, the workspace dir defaults to ./<name>/
+// in the current directory — `init` is a creation step, so scaffolding
+// in-place over whatever else lives in cwd is the surprising option.
+// An explicit --workspace path is used verbatim.
+func resolveWorkspaceForInit(cmd *cobra.Command, name string) (string, error) {
 	if w, _ := cmd.Flags().GetString("workspace"); w != "" {
 		return filepath.Abs(w)
 	}
-	return os.Getwd()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cwd, name), nil
 }
 
 func newWorkspaceUseCmd() *cobra.Command {

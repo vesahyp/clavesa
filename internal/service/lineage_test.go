@@ -35,8 +35,8 @@ func TestBuildLineageBasic(t *testing.T) {
 	if got[1].FromNode != "xform" || got[1].ToNode != "dest" {
 		t.Errorf("edge[1] = %+v, want xform→dest", got[1])
 	}
-	if got[1].ViaTable != "clavesa_demo.xform__default" {
-		t.Errorf("transform→destination via_table = %q, want clavesa_demo.xform__default", got[1].ViaTable)
+	if got[1].ViaTable != "clavesa_demo.xform" {
+		t.Errorf("transform→destination via_table = %q, want clavesa_demo.xform", got[1].ViaTable)
 	}
 	if got[1].FromType != "transform" || got[1].ToType != "destination" {
 		t.Errorf("types on xform→dest = %s/%s, want transform/destination", got[1].FromType, got[1].ToType)
@@ -61,8 +61,8 @@ func TestBuildLineageDashSanitization(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 edge, got %d", len(got))
 	}
-	if got[0].ViaTable != "clavesa_my_pipeline.raw_orders__default" {
-		t.Errorf("via_table = %q, want clavesa_my_pipeline.raw_orders__default", got[0].ViaTable)
+	if got[0].ViaTable != "clavesa_my_pipeline.raw_orders" {
+		t.Errorf("via_table = %q, want clavesa_my_pipeline.raw_orders", got[0].ViaTable)
 	}
 	// Node ids preserve their original form — the UI displays both.
 	if got[0].FromNode != "raw-orders" || got[0].ToNode != "agg-revenue" {

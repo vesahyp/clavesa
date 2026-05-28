@@ -22,6 +22,12 @@ const CatalogColumn = z.object({
 
 const CatalogTable = z.object({
   database: z.string(),
+  // ADR-020: three-piece namespace surfaced separately so the UI can render
+  // <catalog>.<schema>.<table> without splitting `database` on `__`. Slice 8
+  // migrates consumers; for this slice they're additive and optional.
+  catalog: z.string().optional().default(""),
+  schema: z.string().optional().default(""),
+  table: z.string().optional().default(""),
   name: z.string(),
   owning_pipeline: z.string().optional().default(""),
   owning_node: z.string().optional().default(""),
