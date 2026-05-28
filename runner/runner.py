@@ -2302,14 +2302,178 @@ def handler(event, context):
             )
 
 
+def pipeline_handler(event, context):
+    """Pipeline-bundle entry point: run every transform in a pipeline
+    sequentially in one Spark session, reusing the module-level ``_SPARK``
+    singleton across calls so the JVM cold-start is paid once per
+    invocation instead of once per transform.
+
+    Event shape (event["_pipeline_run"] must be truthy to dispatch here):
+
+      {
+        "_pipeline_run": True,
+        "run_id": "<uuid>",
+        "transforms": [
+          {
+            "node":     "<node_id>",
+            "language": "sql"|"python",
+            "logic_path": "/absolute/path/to/logic.txt",
+            "inputs":  {alias: <descriptor>, ...},
+            "outputs": {key: <descriptor>, ...},
+            "parents": ["upstream_node", ...]
+          },
+          ...                 # topo-ordered
+        ],
+        "_sf_execution_arn": "<run_id>",  # ties node_runs rows to runs row
+        "_trigger":          "manual"|"scheduled"|"event"|"upstream",
+      }
+
+    Cascade-skip rule (mirrors internal/service/run.go:283-303): if every
+    intra-pipeline parent of a transform skipped this run, the transform
+    is skipped without invoking the runner — upstream tables haven't
+    changed, so the output wouldn't either.
+
+    Progress streaming: each per-transform state transition is emitted to
+    stdout as a JSON line with a top-level ``_event`` key, flushed
+    immediately so the Go-side caller can update the per-run state.json
+    in real time. The aggregated pipeline result is the LAST line on
+    stdout, identifiable by the absence of an ``_event`` key.
+
+    Stops on first transform failure — downstream transforms would fail
+    anyway with missing input tables.
+    """
+    transforms = event.get("transforms", []) or []
+    parents_by_node = {
+        t.get("node"): list(t.get("parents") or [])
+        for t in transforms
+        if isinstance(t, dict)
+    }
+    sf_execution_arn = str(event.get("_sf_execution_arn", "") or "")
+    trigger = str(event.get("_trigger", "") or "")
+
+    results: list[dict[str, Any]] = []
+    skipped_set: set[str] = set()
+    overall_status = "ok"
+    failed_node: str | None = None
+
+    for t in transforms:
+        if not isinstance(t, dict):
+            continue
+        node = str(t.get("node", "") or "")
+        if not node:
+            continue
+
+        # Cascade-skip: only fires when the node has ≥1 intra-pipeline
+        # parent AND every parent skipped this run. Source-only transforms
+        # (no intra-pipeline parents) fall through to the runner's own
+        # per-input skip decision.
+        ps = parents_by_node.get(node, [])
+        if ps and all(p in skipped_set for p in ps):
+            note = "all upstreams skipped"
+            print(
+                json.dumps({"_event": "skipped", "node": node, "note": note}),
+                flush=True,
+            )
+            skipped_set.add(node)
+            results.append({"node": node, "status": "skipped", "note": note})
+            continue
+
+        # Per-transform env: handler() reads CLAVESA_NODE / CLAVESA_LANGUAGE
+        # / CLAVESA_LOGIC_S3_PATH from os.environ, so set them inline.
+        # _SPARK is the module-level singleton (built lazily in _spark())
+        # and survives across these assignments — that's the whole point
+        # of the bundle.
+        os.environ["CLAVESA_NODE"] = node
+        os.environ["CLAVESA_LANGUAGE"] = str(t.get("language", "sql") or "sql")
+        logic_path = str(t.get("logic_path", "") or "")
+        if logic_path:
+            os.environ["CLAVESA_LOGIC_S3_PATH"] = logic_path
+
+        sub_event: dict[str, Any] = {
+            "inputs": t.get("inputs", {}) or {},
+            "outputs": t.get("outputs", {}) or {},
+            "_sf_execution_arn": sf_execution_arn,
+            "_trigger": trigger,
+        }
+
+        print(json.dumps({"_event": "entered", "node": node}), flush=True)
+        try:
+            resp = handler(sub_event, context)
+        except Exception as exc:  # noqa: BLE001
+            # handler() already wrote a failed node_runs row in its finally
+            # block; emit the progress event and stop the pipeline run.
+            err_class = type(exc).__name__
+            err_msg = str(exc) or repr(exc)
+            print(
+                json.dumps({
+                    "_event": "failed",
+                    "node": node,
+                    "error_class": err_class,
+                    "error_msg": err_msg,
+                }),
+                flush=True,
+            )
+            results.append({
+                "node": node,
+                "status": "failed",
+                "error_class": err_class,
+                "error_msg": err_msg,
+            })
+            overall_status = "failed"
+            failed_node = node
+            break
+
+        node_status = (
+            resp.get("status") if isinstance(resp, dict) else None
+        ) or "ok"
+        output_rows = resp.get("output_rows") if isinstance(resp, dict) else None
+        if node_status == "skipped":
+            note = resp.get("reason", "") if isinstance(resp, dict) else ""
+            print(
+                json.dumps({"_event": "skipped", "node": node, "note": note}),
+                flush=True,
+            )
+            skipped_set.add(node)
+            results.append({"node": node, "status": "skipped", "note": note})
+        else:
+            print(
+                json.dumps({
+                    "_event": "succeeded",
+                    "node": node,
+                    "output_rows": output_rows,
+                }),
+                flush=True,
+            )
+            results.append({
+                "node": node,
+                "status": "ok",
+                "output_rows": output_rows,
+            })
+
+    return {
+        "status": overall_status,
+        "transforms": results,
+        "failed_node": failed_node,
+    }
+
+
 def run_local() -> None:
     """CLAVESA_RUN=1 mode — read event JSON from stdin, invoke handler, print result.
 
     Used by `clavesa pipeline run` to drive transforms via the same handler
     that backs Lambda. The event shape is identical to the Lambda contract.
+
+    Pipeline-bundle mode (event["_pipeline_run"] truthy) routes to
+    ``pipeline_handler``, which loops through all transforms in one Spark
+    session. Single-transform events still route through ``handler``
+    (preview, ad-hoc invocations, the per-transform path before Phase B
+    of the bundle rollout).
     """
     event = json.loads(sys.stdin.read())
-    result = handler(event, None)
+    if isinstance(event, dict) and event.get("_pipeline_run"):
+        result = pipeline_handler(event, None)
+    else:
+        result = handler(event, None)
     print(json.dumps(result), flush=True)
 
 

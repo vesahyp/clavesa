@@ -10,6 +10,21 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.2.0] — 2026-05-28
+
+### Changed
+
+- Local `clavesa pipeline run` now executes every transform in one
+  runner container with a single shared Spark session, instead of
+  starting one container per transform. JVM cold start is paid once
+  per pipeline run rather than once per node — pipelines with many
+  small transforms see large wallclock wins (a 14-transform pipeline
+  saves 50–70 s of pure JVM boot on first run after idle). Per-node
+  observability (progress, status, output rows, error class, node_runs
+  rows) is preserved via JSON-line progress events the runner emits to
+  stdout as each transform completes. Cloud Lambda execution is
+  unchanged in this release — see TODO.md for the Phase B follow-up.
+
 ## [v2.1.2] — 2026-05-28
 
 ### Added

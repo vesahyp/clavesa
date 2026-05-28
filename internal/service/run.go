@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -239,19 +240,37 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	}
 
 	finalErr := error(nil)
+
+	// Phase A bundle execution (v2.2.0): all transforms run in one
+	// container so the JVM cold-start is paid once per `pipeline run`,
+	// not once per transform. Sources and destinations stay inline
+	// (sources resolve to local paths with no container; destinations
+	// are no-ops in v1). The bundle path:
+	//   1. First pass: resolve sources (cheap), pre-compute every
+	//      transform's outputPath/format from autoDeltaTableID, collect
+	//      the per-transform bundle configs.
+	//   2. Issue one `docker run` with the pipeline event.
+	//   3. The runner's pipeline_handler emits per-transform progress
+	//      events to stdout; runPipelineBundle scans them, fires
+	//      channel events in real time so the UI state.json updates
+	//      live (no UX regression vs the per-transform loop).
+	//   4. Destinations afterward (always leaves in v1).
+	var bundle []bundleTransformConfig
+	transformResults := map[string]NodeRunStatus{}
+
+	// First pass — sources, pre-compute transform tableIDs/outputs so
+	// downstream buildInputs sees every upstream-transform's tableID
+	// before the bundle runs.
 	for _, nodeID := range prep.order {
 		node := nodeByID[nodeID]
 		if node == nil {
 			continue
 		}
-		status := NodeRunStatus{NodeID: nodeID, Type: node.Type}
-
 		switch node.Type {
 		case "source":
 			path, perr := localSourcePath(node)
 			if perr != nil {
-				status.Status = "failed"
-				status.Note = perr.Error()
+				status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: perr.Error()}
 				channel.nodeFailed(nodeID, "source_error", perr.Error())
 				result.Nodes = append(result.Nodes, status)
 				finalErr = fmt.Errorf("source %s: %w", nodeID, perr)
@@ -259,106 +278,107 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			}
 			outputPath[nodeID] = path
 			outputFormat[nodeID] = sourceFormat(node)
-			status.Status = "ok"
-			status.Output = path
-			// Source nodes don't write Iceberg outputs; no row count to thread.
 			channel.nodeSucceeded(nodeID, nil)
+			result.Nodes = append(result.Nodes, NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "ok", Output: path})
 
 		case "transform":
-			channel.nodeEntered(nodeID)
-			// Auto-generated Iceberg table id matches the runner's
-			// _table_id_for() — empty `target` triggers auto-table mode in
-			// the runner, and we mirror its derivation here so downstream
-			// transforms can read via spark.table(...). Iceberg in local
-			// matches CLAUDE.md's "Iceberg is the default output" rule and
-			// closes the catalog/observability parity gap with cloud.
-			tableID := autoDeltaTableID(catalog, schema, nodeID)
-
-			// Cascade-skip: if every parent node skipped this run, the
-			// upstream tables are bit-for-bit identical to last run, so this
-			// transform's output would be too. Skip without invoking the
-			// runner. Only fires when the node has ≥1 intra-pipeline parent;
-			// source-only transforms (`sources.<name>` reads with no edges)
-			// take their own skip decision via the runner's per-input check.
-			if ps := parents[nodeID]; len(ps) > 0 {
-				allSkipped := true
-				for _, p := range ps {
-					if !skippedThisRun[p] {
-						allSkipped = false
-						break
-					}
-				}
-				if allSkipped {
-					outputPath[nodeID] = tableID
-					outputFormat[nodeID] = "iceberg"
-					skippedThisRun[nodeID] = true
-					cascadeSkipped = append(cascadeSkipped, nodeID)
-					reason := "all upstreams skipped"
-					status.Status = "skipped"
-					status.Output = tableID
-					status.Note = reason
-					channel.nodeSkipped(nodeID, reason)
-					result.Nodes = append(result.Nodes, status)
-					continue
-				}
-			}
-
-			inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
-			if ierr != nil {
-				status.Status = "failed"
-				status.Note = ierr.Error()
-				channel.nodeFailed(nodeID, "input_error", ierr.Error())
-				result.Nodes = append(result.Nodes, status)
-				finalErr = fmt.Errorf("transform %s inputs: %w", nodeID, ierr)
-				goto done
-			}
-
-			skipReason, outputRows, rerr := s.runTransform(ctx, image, abs, workdir, node, inputs, tableID, channel.logPathFor(nodeID), runID, catalog, schema, systemCatalog, nil)
-			if rerr != nil {
-				status.Status = "failed"
-				status.Note = rerr.Error()
-				channel.nodeFailed(nodeID, "runner_error", rerr.Error())
-				result.Nodes = append(result.Nodes, status)
-				finalErr = fmt.Errorf("transform %s: %w", nodeID, rerr)
-				goto done
-			}
-			if skipReason != "" {
-				// Runner reported a non-error skip (e.g. partitioned source
-				// caught up to "now", or an incremental input has no new
-				// snapshots). The Iceberg table still exists from prior runs,
-				// so seed outputPath/outputFormat with the table id and mark
-				// the node skipped so the cascade-skip check above fires for
-				// every downstream transform.
-				outputPath[nodeID] = tableID
-				outputFormat[nodeID] = "iceberg"
-				skippedThisRun[nodeID] = true
-				status.Status = "skipped"
-				status.Output = tableID
-				status.Note = skipReason
-				channel.nodeSkipped(nodeID, skipReason)
-				result.Nodes = append(result.Nodes, status)
-				continue
-			}
-			outputPath[nodeID] = tableID
-			outputFormat[nodeID] = "iceberg" // upstream-of-transform descriptor: bare string → spark.table()
-			status.Status = "ok"
-			status.Output = tableID
-			channel.nodeSucceeded(nodeID, outputRows)
-
-		case "destination":
-			// V1: report the upstream output that would be written.
-			upstream := upstreamOutput(&g, nodeID, outputPath)
-			status.Status = "skipped"
-			status.Output = upstream
-			status.Note = "destinations not executed in v1; data left at upstream output path"
-			channel.nodeSkipped(nodeID, status.Note)
-
-		default:
-			status.Status = "skipped"
-			status.Note = fmt.Sprintf("unknown node type %q", node.Type)
-			channel.nodeSkipped(nodeID, status.Note)
+			outputPath[nodeID] = autoDeltaTableID(catalog, schema, nodeID)
+			outputFormat[nodeID] = "iceberg"
 		}
+	}
 
+	// Second pass — assemble transform bundle entries. Each one knows
+	// its inputs (resolved against the now-fully-populated outputPath),
+	// its outputs HCL, and its parent list (for the cascade-skip rule
+	// pipeline_handler enforces internally).
+	for _, nodeID := range prep.order {
+		node := nodeByID[nodeID]
+		if node == nil || node.Type != "transform" {
+			continue
+		}
+		tableID := outputPath[nodeID]
+		inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
+		if ierr != nil {
+			status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: ierr.Error()}
+			channel.nodeFailed(nodeID, "input_error", ierr.Error())
+			result.Nodes = append(result.Nodes, status)
+			finalErr = fmt.Errorf("transform %s inputs: %w", nodeID, ierr)
+			goto done
+		}
+		language, _ := node.Config["language"].(string)
+		if language == "" {
+			language = "sql"
+		}
+		logic, lerr := readNodeLogic(node, language, abs)
+		if lerr != nil {
+			status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: lerr.Error()}
+			channel.nodeFailed(nodeID, "logic_error", lerr.Error())
+			result.Nodes = append(result.Nodes, status)
+			finalErr = fmt.Errorf("transform %s logic: %w", nodeID, lerr)
+			goto done
+		}
+		logicPath := filepath.Join(workdir, nodeID, "logic.txt")
+		if err := os.MkdirAll(filepath.Dir(logicPath), 0o755); err != nil {
+			finalErr = err
+			goto done
+		}
+		if err := os.WriteFile(logicPath, []byte(logic), 0o644); err != nil {
+			finalErr = err
+			goto done
+		}
+		bundle = append(bundle, bundleTransformConfig{
+			NodeID:    nodeID,
+			Node:      node,
+			Inputs:    inputs,
+			Outputs:   buildLocalOutputs(node, tableID),
+			LogicPath: logicPath,
+			Language:  language,
+			Parents:   parents[nodeID],
+			TableID:   tableID,
+		})
+	}
+
+	// Run the whole pipeline in one container. Per-transform channel
+	// events stream out of pipeline_handler via stdout JSON lines; the
+	// scanner inside runPipelineBundle dispatches them to the channel
+	// in real time. Returns the per-transform terminal statuses for
+	// the destination-pass loop below.
+	if len(bundle) > 0 {
+		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, channel)
+		// Even on bundle error, walk whatever per-node results we got
+		// before the failure so result.Nodes carries the partial picture
+		// (the UI uses this for the per-node breakdown).
+		for _, bs := range bundleStatuses {
+			transformResults[bs.NodeID] = bs
+			if bs.Status == "skipped" && bs.Note == "all upstreams skipped" {
+				cascadeSkipped = append(cascadeSkipped, bs.NodeID)
+			}
+			if bs.Status == "skipped" {
+				skippedThisRun[bs.NodeID] = true
+			}
+		}
+		// Append in topo order so result.Nodes matches today's ordering
+		// guarantee.
+		for _, bt := range bundle {
+			if bs, ok := transformResults[bt.NodeID]; ok {
+				result.Nodes = append(result.Nodes, bs)
+			}
+		}
+		if berr != nil {
+			finalErr = berr
+			goto done
+		}
+	}
+
+	// Destinations (always leaves in v1): report what would be written.
+	for _, nodeID := range prep.order {
+		node := nodeByID[nodeID]
+		if node == nil || node.Type != "destination" {
+			continue
+		}
+		upstream := upstreamOutput(&g, nodeID, outputPath)
+		status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "skipped", Output: upstream, Note: "destinations not executed in v1; data left at upstream output path"}
+		channel.nodeSkipped(nodeID, status.Note)
 		result.Nodes = append(result.Nodes, status)
 	}
 
@@ -1084,6 +1104,277 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	default:
 		return "", nil, fmt.Errorf("runner status: %v\nstdout: %s", resp["status"], stdout.String())
 	}
+}
+
+// bundleTransformConfig is what runPipelineBundle needs per transform —
+// kept as an internal contract between executeRun and the bundle runner.
+// Mirrors the per-transform fields of the runner's pipeline_handler event.
+type bundleTransformConfig struct {
+	NodeID    string
+	Node      *graph.Node
+	Inputs    map[string]any
+	Outputs   map[string]any
+	LogicPath string
+	Language  string
+	Parents   []string
+	TableID   string
+}
+
+// runPipelineBundle invokes the runner image once with CLAVESA_RUN=1 and
+// a pipeline-bundle event (presence of `_pipeline_run = true` routes to
+// runner.pipeline_handler instead of the per-transform handler). The
+// runner shares one Spark session across every transform in the bundle,
+// paying the ~3-5s JVM cold-start once instead of once per node.
+//
+// Progress streaming: pipeline_handler emits one JSON line per
+// per-transform state transition to stdout, prefixed with `_event`.
+// runPipelineBundle scans those lines as they arrive and fires channel
+// events in real time so the UI's per-run state.json reflects progress
+// without waiting for the whole pipeline to finish. Non-event stdout
+// lines (Spark log noise, anything that fails to JSON-parse) get teed
+// to the per-run log file under the pipeline's first node. The final
+// aggregate response is the last line on stdout with no `_event` key.
+//
+// Returns one NodeRunStatus per transform that ran (or skipped) — in
+// the order events arrived — plus an error when the bundle itself
+// failed (docker exit non-zero, unparseable response, transform
+// failure). On a transform failure the bundle stops; statuses for
+// downstream transforms are not returned (they never ran).
+func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, channel *runChannel) ([]NodeRunStatus, error) {
+	pipelineName := filepath.Base(pipelineDir)
+	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	if err := os.MkdirAll(warehouse, 0o755); err != nil {
+		return nil, fmt.Errorf("create warehouse: %w", err)
+	}
+	watermarks := filepath.Join(pipelineDir, ".clavesa", "watermarks")
+	if err := os.MkdirAll(watermarks, 0o755); err != nil {
+		return nil, fmt.Errorf("create watermarks dir: %w", err)
+	}
+
+	// Build the pipeline event payload. Mirrors the per-transform event
+	// shape but carries an array of transforms with the parents map
+	// pipeline_handler needs for cascade-skip.
+	transforms := make([]map[string]any, 0, len(bundle))
+	for _, bt := range bundle {
+		entry := map[string]any{
+			"node":       bt.NodeID,
+			"language":   bt.Language,
+			"logic_path": bt.LogicPath,
+			"inputs":     bt.Inputs,
+			"outputs":    bt.Outputs,
+			"parents":    bt.Parents,
+		}
+		transforms = append(transforms, entry)
+	}
+	event := map[string]any{
+		"_pipeline_run":     true,
+		"run_id":            runID,
+		"transforms":        transforms,
+		"_sf_execution_arn": runID,
+		"_trigger":          "manual",
+	}
+	eventJSON, _ := json.Marshal(event)
+
+	args := []string{"run", "--rm", "-i"}
+	args = append(args, "-e", "CLAVESA_RUN=1")
+	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	args = append(args, "-e", "CLAVESA_WATERMARKS="+watermarks)
+	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
+	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
+	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
+	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
+	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
+	if digest := dockerImageDigest(image); digest != "" {
+		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
+	}
+
+	// Credential env passthrough — union across every transform's
+	// inputs, since one container reads them all. Mirrors the per-
+	// transform logic in runTransform.
+	seenEnv := map[string]bool{}
+	for _, bt := range bundle {
+		for _, name := range envVarsForCredentials(bt.Inputs) {
+			if seenEnv[name] {
+				continue
+			}
+			seenEnv[name] = true
+			v, present := os.LookupEnv(name)
+			if !present {
+				return nil, fmt.Errorf("credential references env var %q which is not set in the current shell", name)
+			}
+			args = append(args, "-e", name+"="+v)
+		}
+	}
+	// AWS env passthrough when any input is kind=s3 (same union policy).
+	needsAWS := false
+	for _, bt := range bundle {
+		if hasS3Input(bt.Inputs) {
+			needsAWS = true
+			break
+		}
+	}
+	if needsAWS {
+		for _, name := range []string{
+			"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+			"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE",
+			"CLAVESA_S3_ENDPOINT",
+		} {
+			if v, ok := os.LookupEnv(name); ok {
+				args = append(args, "-e", name+"="+v)
+			}
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			awsDir := filepath.Join(home, ".aws")
+			if st, err := os.Stat(awsDir); err == nil && st.IsDir() {
+				args = append(args, "-v", awsDir+":/root/.aws:ro")
+			}
+		}
+	}
+
+	// Mount workdir + warehouse + watermarks unconditionally.
+	args = append(args, "-v", workdir+":"+workdir)
+	args = append(args, "-v", warehouse+":"+warehouse)
+	args = append(args, "-v", watermarks+":"+watermarks)
+	credsDir := filepath.Join(s.workspace, ".clavesa", "credentials")
+	if st, err := os.Stat(credsDir); err == nil && st.IsDir() {
+		args = append(args, "-v", credsDir+":"+credsDir+":ro")
+	}
+	// Union of input mount roots across every transform's inputs.
+	mounted := map[string]bool{workdir: true, warehouse: true, watermarks: true}
+	for _, bt := range bundle {
+		for _, v := range bt.Inputs {
+			p := inputLocalPath(v)
+			if p == "" {
+				continue
+			}
+			root := mountRoot(p)
+			if !mounted[root] {
+				args = append(args, "-v", root+":"+root+":ro")
+				mounted[root] = true
+			}
+		}
+	}
+
+	args = append(args, image)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdin = bytes.NewReader(eventJSON)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("docker start: %w", err)
+	}
+
+	// Per-run log file under the pipeline's first transform — channel
+	// events stream to the per-node log via logPathFor, but the bundle
+	// has no single owning node for "everything else stdout"; route
+	// non-event stdout into a pipeline-level log so Spark output is
+	// recoverable for debugging.
+	var bundleLog *os.File
+	bundleLogPath := filepath.Join(pipelineDir, ".clavesa", "runs", runID, "_bundle.log")
+	if err := os.MkdirAll(filepath.Dir(bundleLogPath), 0o755); err == nil {
+		if f, ferr := os.Create(bundleLogPath); ferr == nil {
+			bundleLog = f
+			defer bundleLog.Close()
+		}
+	}
+
+	statuses := make([]NodeRunStatus, 0, len(bundle))
+	statusByNode := map[string]NodeRunStatus{}
+	nodeTypeByID := map[string]string{}
+	for _, bt := range bundle {
+		nodeTypeByID[bt.NodeID] = "transform"
+	}
+
+	var finalResp map[string]any
+	scanner := bufio.NewScanner(stdoutPipe)
+	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var msg map[string]any
+		if json.Unmarshal(line, &msg) != nil {
+			// Non-JSON: Spark log noise. Tee to the per-bundle log.
+			if bundleLog != nil {
+				fmt.Fprintln(bundleLog, scanner.Text())
+			}
+			continue
+		}
+		evRaw, isEvent := msg["_event"]
+		if !isEvent {
+			// Last JSON object without _event key = the aggregate
+			// pipeline result. Overwrite on each occurrence so we keep
+			// the last one (defensive against future shape changes).
+			finalResp = msg
+			continue
+		}
+		ev, _ := evRaw.(string)
+		node, _ := msg["node"].(string)
+		switch ev {
+		case "entered":
+			channel.nodeEntered(node)
+		case "succeeded":
+			var outputRows *int64
+			if v, ok := msg["output_rows"]; ok && v != nil {
+				if f, ok := v.(float64); ok {
+					n := int64(f)
+					outputRows = &n
+				}
+			}
+			channel.nodeSucceeded(node, outputRows)
+			st := NodeRunStatus{NodeID: node, Type: "transform", Status: "ok"}
+			if t, ok := statusByNode[node]; ok {
+				st = t
+			}
+			st.Status = "ok"
+			statusByNode[node] = st
+		case "skipped":
+			note, _ := msg["note"].(string)
+			channel.nodeSkipped(node, note)
+			statusByNode[node] = NodeRunStatus{NodeID: node, Type: "transform", Status: "skipped", Note: note}
+		case "failed":
+			errMsg, _ := msg["error_msg"].(string)
+			errClass, _ := msg["error_class"].(string)
+			if errClass == "" {
+				errClass = "runner_error"
+			}
+			channel.nodeFailed(node, errClass, errMsg)
+			statusByNode[node] = NodeRunStatus{NodeID: node, Type: "transform", Status: "failed", Note: errMsg}
+		}
+	}
+	waitErr := cmd.Wait()
+
+	// Materialize statuses in topo (bundle) order.
+	for _, bt := range bundle {
+		if st, ok := statusByNode[bt.NodeID]; ok {
+			// Wire the table id onto the status's Output so the UI's
+			// per-node breakdown shows the produced table.
+			if st.Output == "" {
+				st.Output = bt.TableID
+			}
+			statuses = append(statuses, st)
+		}
+	}
+
+	if waitErr != nil {
+		stderrTail := stderrBuf.String()
+		if len(stderrTail) > 2048 {
+			stderrTail = "…" + stderrTail[len(stderrTail)-2048:]
+		}
+		return statuses, fmt.Errorf("pipeline runner: %w\nstderr: %s", waitErr, stderrTail)
+	}
+	if finalResp == nil {
+		return statuses, fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s", stderrBuf.String())
+	}
+	if status, _ := finalResp["status"].(string); status == "failed" {
+		failed, _ := finalResp["failed_node"].(string)
+		return statuses, fmt.Errorf("pipeline failed at node %q", failed)
+	}
+	return statuses, nil
 }
 
 // recordLocalRun invokes the runner image once with CLAVESA_RECORD_RUN=1
