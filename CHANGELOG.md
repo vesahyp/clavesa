@@ -10,6 +10,73 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.2.1] — 2026-05-28
+
+### Fixed
+
+- Transform module's `var.inputs` is now `any`, so the documented
+  cross-pipeline (`inputs = { x = "<schema>.<table>" }`) and
+  registry-source (`inputs = { x = "sources.<name>" }`) authoring
+  patterns finally pass `terraform validate`. Previously the typed
+  `map(object({...}))` rejected bare strings even though the parser +
+  orchestration emitter handled them correctly.
+- Pipeline Lambda IAM now grants `s3:GetObject` on external (non-
+  workspace) input buckets. v2.2.0 collapsed the per-transform Lambda
+  IAM into one pipeline-Lambda role scoped to the workspace bucket
+  only, so any pipeline reading from a cross-account S3 source
+  (CloudFront logs, public datasets) started 403'ing on upgrade.
+  Orchestration emitter now walks every transform's inline + registered
+  s3 source buckets, dedupes, and emits an `S3ReadExternal` IAM
+  statement listing them. Empty list → no statement.
+- `clavesa pipeline backfill stage --node <downstream>` no longer
+  errors with `"upstream node X has not produced output yet"` on
+  multi-stage pipelines. The single-node backfill path now seeds
+  `outputPath` / `outputFormat` for transitive intra-pipeline transform
+  upstreams via the same `autoDeltaTableID(...)` the normal-run path
+  uses, so `buildInputs` resolves them just like a full pipeline run.
+- `resolveWorkspace` now prefers a cwd that IS a workspace over the
+  stale global state file at `~/.config/clavesa/current-workspace`.
+  Previously `clavesa workspace destroy` could target a different,
+  last-used workspace when run from inside a workspace dir — and tear
+  down the wrong one. Destructive commands (`workspace deploy`,
+  `workspace destroy`, `pipeline deploy`, `pipeline destroy`,
+  `pipeline run`) now also echo the resolved workspace name + path
+  before acting.
+- Dashboard editor: opening a dashboard whose datasets reference a
+  control placeholder (e.g. `{{period.start}}`) no longer 400s the
+  widget grid. `EditorGrid` now forwards the resolved control params
+  to each `<Widget>`, matching the viewer.
+- Dashboard editor: the widget drawer's body has padding again; the
+  header still spans edge-to-edge so its bottom border looks intact.
+- Dashboard editor: the widget drawer now shows a live results
+  preview (up to 10 rows) under the SQL editor, sourced from the
+  same query that populates the field pickers — no extra request,
+  same React Query cache entry.
+
+### Changed
+
+- Transform module's `var.output_definitions.mode` validator now
+  accepts `"merge"` (previously `replace, append` only) and the object
+  schema includes `merge_keys = optional(list(string), [])`. Merge-mode
+  outputs authored via `node edit --output-mode merge --output-merge-keys`
+  now pass `terraform plan`; previously failed only on `compute = "cloud"`
+  because local runs skip plan.
+
+### Removed
+
+- Transform module's `var.runner_image` (no caller after v2.2.0's
+  per-transform-Lambda collapse). `clavesa pipeline upgrade` now
+  strips `runner_image = ...` from existing v2.1.x pipeline `module
+  "X"` blocks during the v2.1.x → v2.2.1 hop; new transforms authored
+  via `node add` don't emit the attribute.
+- `"local"` from the transform module's `var.compute` validation list.
+  The Go side already rejects `compute = "local"` on input and strips
+  it on upgrade; the module's validator now matches.
+- Dead `input_buckets` local in `modules/transform/aws/main.tf` (its
+  only consumer was the per-transform IAM policy dropped in v2.2.0).
+- `internal/orchestration/aslgen` package — multi-state ASL builder
+  with no callers after v2.2.0's single-Task SFN collapse.
+
 ## [v2.2.0] — 2026-05-28
 
 ### Changed

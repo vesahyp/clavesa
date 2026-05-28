@@ -184,7 +184,17 @@ func (s *Service) backfillStageLocal(
 	}
 	schema := resolvePipelineSchema(pipelineDir, pipelineName)
 
-	inputs, ierr := s.buildInputs(g, req.Node, map[string]string{}, map[string]string{}, catalog)
+	// Seed outputPath / outputFormat for every transitive intra-pipeline
+	// upstream of req.Node. The normal-run path (runPipelineBundle) populates
+	// these as it walks the DAG in topo order; the single-node backfill skips
+	// the walk because it targets one node directly, so we reconstruct the
+	// seed map here from autoDeltaTableID — the same function the runner
+	// uses to derive each transform's output id. Without this, buildInputs
+	// errors `"upstream node X has not produced output yet"` for any edge
+	// into req.Node, which breaks single-node backfills on multi-stage DAGs.
+	outputPath, outputFormat := seedUpstreamPathsForBackfill(g, req.Node, catalog, schema)
+
+	inputs, ierr := s.buildInputs(g, req.Node, outputPath, outputFormat, catalog)
 	if ierr != nil {
 		return nil, fmt.Errorf("resolve inputs: %w", ierr)
 	}
@@ -545,6 +555,56 @@ func (s *Service) backfillDedupCheckLocal(ctx context.Context, dir string, run *
 		return nil, err
 	}
 	return &BackfillDedupCheckResult{MatchingRows: matching, NewRows: newKey}, nil
+}
+
+// seedUpstreamPathsForBackfill reverse-BFS walks the intra-pipeline edges
+// of g from targetNode and returns the (outputPath, outputFormat) maps the
+// normal-run path would have built by the time it reached targetNode. Only
+// transform-typed upstreams contribute Delta table identifiers — source
+// nodes resolve through the `source_inputs` map in node Config (handled by
+// buildInputs separately, not through outputPath), and external Glue / cross-
+// pipeline refs resolve through `external_inputs`. The format value
+// "iceberg" mirrors what runPipelineBundle stamps in run.go so buildInputs
+// takes the same `spark.table(<id>)` path it does for an ordinary run.
+func seedUpstreamPathsForBackfill(g *graph.PipelineGraph, targetNode, catalog, schema string) (map[string]string, map[string]string) {
+	outputPath := map[string]string{}
+	outputFormat := map[string]string{}
+	if g == nil {
+		return outputPath, outputFormat
+	}
+	nodeType := make(map[string]string, len(g.Nodes))
+	for _, n := range g.Nodes {
+		nodeType[n.ID] = n.Type
+	}
+	visited := map[string]bool{}
+	queue := []string{targetNode}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if visited[cur] {
+			continue
+		}
+		visited[cur] = true
+		for _, e := range g.Edges {
+			if e.ToNode != cur {
+				continue
+			}
+			upstream := e.FromNode
+			if visited[upstream] {
+				continue
+			}
+			// Only transform-typed upstreams contribute a Delta table id.
+			// Source nodes flow through node.Config["source_inputs"] in
+			// buildInputs and don't need an outputPath entry.
+			if nodeType[upstream] != "transform" {
+				continue
+			}
+			outputPath[upstream] = autoDeltaTableID(catalog, schema, upstream)
+			outputFormat[upstream] = "iceberg"
+			queue = append(queue, upstream)
+		}
+	}
+	return outputPath, outputFormat
 }
 
 // stableSort sorts a column list by name. The cloud path's

@@ -347,7 +347,7 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 			if err != nil {
 				return err
 			}
-			printTargetContext("deploy "+filepath.Base(dir), "")
+			printTargetContext("deploy "+filepath.Base(dir), ws, "")
 			// ADR-016 §5 preflight: refuse to deploy a pipeline whose
 			// schema is owned by another pipeline. Deploy doesn't re-emit
 			// orchestration.tf, so this is the last gate before terraform.
@@ -404,6 +404,7 @@ deleting anything.
 				return err
 			}
 			pipelineName := filepath.Base(dir)
+			printTargetContext("destroy "+pipelineName, ws, "")
 
 			if !skipSweep {
 				if err := sweepPipelineGlueTables(cmd.Context(), ws, pipelineName, glueDB, os.Stdout, os.Stdin); err != nil {
@@ -491,7 +492,7 @@ dispatch.
 			}
 
 			if !jsonOut {
-				printTargetContext("run "+filepath.Base(dir), mode)
+				printTargetContext("run "+filepath.Base(dir), ws, mode)
 			}
 			if mode == workspace.ModeLocal {
 				return runLocalPipeline(cmd, dir, jsonOut)

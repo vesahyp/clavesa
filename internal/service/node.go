@@ -107,9 +107,10 @@ func (s *Service) AddNode(dir, nodeType, name string) (PipelineGraph, error) {
 		// module.<this>.lambda_function_arn, so the dependency goes the
 		// other way. With every transform on Lambda (post PySpark-everywhere
 		// rewrite) the old depends_on would always create a cycle.
-		if ws != nil {
-			attrs["runner_image"] = fileops.ModuleReference{Type: "reference", Expression: "data.terraform_remote_state.workspace.outputs.runner_image"}
-		}
+		// runner_image was dropped in v2.2.1 (per-transform Lambda was
+		// collapsed in v2.2.0; the pipeline Lambda emitted by
+		// internal/orchestration/tfgen consumes the workspace
+		// remote-state output directly).
 	case "destination":
 		// Destinations are pass-through path declarations — no compute, no pipeline_bucket needed.
 	}

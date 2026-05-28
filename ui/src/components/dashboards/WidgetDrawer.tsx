@@ -45,6 +45,14 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { CodeEditor } from "@/components/CodeEditor";
 import type { DatasetColumns } from "@/hooks/useDatasetColumns";
 import type {
@@ -249,8 +257,10 @@ function DrawerBody({
   const isLoadingCols = !!columns?.isLoading && (columns?.columns.length ?? 0) === 0;
 
   return (
-    <div className="flex h-full flex-col gap-4">
-      <SheetHeader className="space-y-1">
+    <div className="flex h-full flex-col gap-4 px-6 pb-6">
+      {/* Pull the header back to the drawer edges so its bottom border
+          spans the full width, while keeping the body sections padded. */}
+      <SheetHeader className="-mx-6 space-y-1">
         <SheetTitle className="font-mono text-sm">
           {widget.title || "Untitled widget"}
         </SheetTitle>
@@ -430,6 +440,7 @@ function DrawerBody({
             <Loader2 className="h-3 w-3 animate-spin" /> running query…
           </p>
         )}
+        <RowsPreview columns={columns} />
       </section>
 
       {/* Field mapping — type-specific column pickers. */}
@@ -571,6 +582,60 @@ function SqlEditor({
           <PlaceholderChips placeholders={placeholders} onInsert={onInsert} />
         )}
       </div>
+    </div>
+  );
+}
+
+const ROWS_PREVIEW_CAP = 10;
+
+function RowsPreview({ columns }: { columns: DatasetColumns | undefined }) {
+  // Nothing useful to show until a query has actually returned. The
+  // sibling loading/error lines already cover those states.
+  if (!columns || !columns.hasData || columns.error) return null;
+  const cols = columns.columns;
+  const rows = columns.rows;
+  if (cols.length === 0) return null;
+  return (
+    <div className="max-h-64 overflow-auto rounded-md border border-border">
+      {rows.length === 0 ? (
+        <p className="p-3 text-xs text-muted-foreground">No rows.</p>
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              {cols.map((c) => (
+                <TableHead key={c.name} className="whitespace-nowrap">
+                  {c.name}
+                </TableHead>
+              ))}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.slice(0, ROWS_PREVIEW_CAP).map((row, i) => (
+              <TableRow key={i}>
+                {row.map((cell, j) => (
+                  <TableCell
+                    key={j}
+                    className="whitespace-nowrap font-mono text-xs"
+                  >
+                    {cell === "" ? (
+                      <span className="text-muted-foreground">—</span>
+                    ) : (
+                      cell
+                    )}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+      {rows.length > ROWS_PREVIEW_CAP && (
+        <p className="border-t border-border p-2 text-xs text-muted-foreground">
+          Showing first {ROWS_PREVIEW_CAP} of {columns.rowCount}
+          {columns.truncated && "+"} rows.
+        </p>
+      )}
     </div>
   );
 }

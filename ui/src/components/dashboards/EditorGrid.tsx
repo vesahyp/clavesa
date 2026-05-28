@@ -35,6 +35,12 @@ interface EditorGridProps {
   selectedId?: string | null;
   /** Cell-body click handler — opens the chart-first drawer. */
   onSelect?: (id: string) => void;
+  /**
+   * Resolved `{{name}}` values forwarded to every widget query. Without
+   * these, datasets referencing a control placeholder 400 on the column
+   * fetch the moment the editor mounts — same shape the viewer passes.
+   */
+  params?: Record<string, string>;
 }
 
 export function EditorGrid({
@@ -44,6 +50,7 @@ export function EditorGrid({
   scrollToId,
   selectedId,
   onSelect,
+  params,
 }: EditorGridProps) {
   const datasetMap = useMemo(() => {
     const m = new Map<string, DashboardDataset>();
@@ -152,6 +159,7 @@ export function EditorGrid({
                 widget={w}
                 sql={ds?.sql ?? ""}
                 dir={ds?.dir ?? ""}
+                params={params}
                 inGrid
               />
             </div>

@@ -26,7 +26,6 @@ module "validate" {
   bucket        = var.pipeline_bucket
   catalog       = var.catalog        # workspace catalog (ADR-016)
   schema        = var.schema         # pipeline schema  (ADR-016)
-  runner_image  = var.runner_image   # workspace ECR URI
 
   inputs = {
     raw = module.raw_events.outputs["default"]
@@ -57,7 +56,7 @@ module "validate" {
 ```hcl
 module "enrich" {
   source = "../../"
-  # ... pipeline_name, name, bucket, catalog, schema, runner_image ...
+  # ... pipeline_name, name, bucket, catalog, schema ...
 
   inputs = {
     raw    = module.raw_events.outputs["default"]
@@ -76,7 +75,7 @@ module "enrich" {
 ```hcl
 module "score" {
   source = "../../"
-  # ... pipeline_name, name, bucket, catalog, schema, runner_image ...
+  # ... pipeline_name, name, bucket, catalog, schema ...
 
   inputs = { raw = module.raw_events.outputs["default"] }
 
@@ -111,9 +110,8 @@ output_definitions = {
 | `bucket`             | `string`        | Pipeline output bucket (Iceberg warehouse + per-node intermediates). |
 | `catalog`            | `string`        | Workspace catalog identifier (ADR-016). |
 | `schema`             | `string`        | Pipeline schema identifier (ADR-016). |
-| `inputs`             | `map(object)`   | Named input map; keys become SQL table aliases. |
-| `output_definitions` | `map(object)`   | Named outputs with optional schemas and `mode` (`replace` default, `append`). |
-| `runner_image`       | `string`        | Private ECR URI for the runner image (`<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>`). |
+| `inputs`             | `any`           | Named input map; keys become SQL table aliases. Values are upstream module-output objects, cross-pipeline strings (`"<schema>.<table>"`), or registered-source strings (`"sources.<name>"`). |
+| `output_definitions` | `map(object)`   | Named outputs with optional schemas and `mode` (`replace` default, `append`, `merge`). |
 
 ### Optional
 
@@ -122,7 +120,7 @@ output_definitions = {
 | `language`       | `"sql"`    | `sql` (SparkSQL) or `python` (PySpark transform function). |
 | `sql`            | `null`     | SQL body for `language = "sql"`. String for single-output, `map(string)` for multi-output. |
 | `python`         | `null`     | Python source for `language = "python"`. Use `file(...)` to load. |
-| `compute`        | `"lambda"` | One of `local`, `lambda`, `fargate` (planned), `emr-serverless` (planned). |
+| `compute`        | `"lambda"` | One of `lambda`, `fargate` (planned), `emr-serverless` (planned). |
 | `freshness_sla`  | `""`       | Staleness budget for Catalog UI (e.g. `"4h"`, `"24h"`). |
 
 ## Outputs
@@ -134,27 +132,16 @@ output_definitions = {
 
 ## Resources created (compute = lambda)
 
-| Resource                    | Purpose |
-|-----------------------------|---------|
-| `aws_iam_role.lambda_exec`  | Runner execution role. |
-| `aws_iam_role_policy`       | S3 read (logic + inputs), S3 write (warehouse + watermarks), Glue Data Catalog (Iceberg metadata), CloudWatch Logs. |
-| `aws_s3_object.logic`       | SQL or Python body uploaded to `<bucket>/_runtime/<pipeline>/<name>/`. |
-| `aws_lambda_function.runner`| PySpark runner container, pinned to `<repo>@<digest>` via the `aws_ecr_image` data source so re-pushes under the same tag are picked up automatically. |
+| Resource              | Purpose |
+|-----------------------|---------|
+| `aws_s3_object.logic` | SQL or Python body uploaded to `s3://<bucket>/<pipeline>/<name>/_runtime/logic.<py|sql>`. The pipeline-level Lambda (emitted by `internal/orchestration/tfgen`) fetches this at runtime. |
 
-`compute = "local"` creates no AWS resources; output paths still resolve so
-downstream nodes can reference them.
+The per-transform Lambda + IAM role were collapsed in v2.2.0 — the pipeline
+Lambda handles every node now; this module is config-only.
 
 ## Notes
 
-- **Runner image must be private ECR.** Lambda image-digest pinning depends
-  on the `aws_ecr_image` data source, which doesn't resolve public ECR
-  Public Gallery URIs. The standard clavesa workspace flow pre-pushes
-  the runner to the workspace's ECR repo and threads the URI through.
-- **Iceberg auto-tables.** Output paths default to
+- **Delta auto-tables.** Output paths default to
   `<catalog>.<schema>.<name>__<output_key>` in the Glue Data Catalog;
-  the runner's `df.writeTo(...).createOrReplace()` registers them on first
-  write. No `aws_glue_catalog_table` resource is needed.
-- **IAM scope.** S3 write resources cover the warehouse and watermark
-  prefixes plus a per-node legacy path for plain-Parquet output to
-  destination overrides. Glue scope is currently `Resource = "*"`; per-table
-  scoping is in flight.
+  the runner registers them on first write via Delta's `saveAsTable`.
+  No `aws_glue_catalog_table` resource is needed.

@@ -10,4 +10,4 @@ package version
 // Module is the Terraform module version tag this binary ships with.
 // Bump in lockstep with `internal/service/version.go`'s alias on
 // release; see CLAUDE.md "Publishing to clavesa".
-const Module = "v2.2.0"
+const Module = "v2.2.1"

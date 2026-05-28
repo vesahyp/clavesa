@@ -423,7 +423,7 @@ Use --plan-only to stop after plan without applying.`,
 			if err != nil {
 				return err
 			}
-			printTargetContext("workspace deploy", "")
+			printTargetContext("workspace deploy", root, "")
 			return deployFlow{
 				WorkspaceRoot:     root,
 				TfDir:             root,
@@ -463,6 +463,7 @@ targets the system DB only (` + "`<system_catalog>__pipelines`" + ` per ADR-016)
 			if err != nil {
 				return err
 			}
+			printTargetContext("workspace destroy", root, "")
 			if !skipSweep {
 				if err := sweepWorkspaceSystemGlueTables(cmd.Context(), root, os.Stdout, os.Stdin); err != nil {
 					return err

@@ -49,8 +49,6 @@ module "validate" {
   language = "sql"
   sql      = "SELECT * FROM raw WHERE amount > 0"
 
-  runner_image = "000000000000.dkr.ecr.us-east-1.amazonaws.com/example/transform-runner:latest"
-
   output_definitions = {
     "default" = {
       schema = {

@@ -463,6 +463,7 @@ export function DashboardEditor({
               scrollToId={selectedWidgetId ?? undefined}
               selectedId={selectedWidgetId}
               onSelect={selectWidget}
+              params={controlParams}
             />
           )}
         </div>

@@ -79,6 +79,17 @@ type Pipeline struct {
 	// downstream skips driven by `Parents`. Replaces the v2.1.x
 	// StateMachine + NodeMeta pair.
 	Transforms []TransformConfig
+
+	// ExternalBuckets is the list of S3 buckets the pipeline's transforms
+	// read from that live OUTSIDE the workspace bucket (kind=s3 sources,
+	// cross-account inputs). Empty when every input comes from inside the
+	// workspace; non-empty entries are emitted as a sixth IAM Statement
+	// (S3ReadExternal) granting s3:GetObject + s3:ListBucket on the
+	// listed bucket + bucket/* ARNs. The workspace bucket itself is
+	// already covered by the S3Read statement and must NOT appear here
+	// (the IAM merge wouldn't widen anything but it'd be confusing in
+	// the emitted .tf).
+	ExternalBuckets []string
 }
 
 // TransformConfig describes one transform invocation rendered into the
@@ -352,6 +363,20 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}\",\n", p.BucketExpr)
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/*\",\n", p.BucketExpr)
 	fmt.Fprintf(b, "      ]},\n")
+
+	// S3 read — external buckets (kind=s3 sources, cross-account inputs).
+	// Emitted only when ExternalBuckets is non-empty; v2.1.x summed every
+	// transform's input_buckets into per-transform IAM, so collapsing to
+	// the per-pipeline Lambda must preserve that grant or pipelines that
+	// read external S3 start 403'ing on upgrade.
+	if len(p.ExternalBuckets) > 0 {
+		fmt.Fprintf(b, "      { Sid = \"S3ReadExternal\", Effect = \"Allow\", Action = [\"s3:GetObject\", \"s3:ListBucket\", \"s3:GetBucketLocation\"], Resource = [\n")
+		for _, bucket := range p.ExternalBuckets {
+			fmt.Fprintf(b, "          \"arn:aws:s3:::%s\",\n", bucket)
+			fmt.Fprintf(b, "          \"arn:aws:s3:::%s/*\",\n", bucket)
+		}
+		fmt.Fprintf(b, "      ]},\n")
+	}
 
 	// S3 write — this pipeline's prefixes only.
 	fmt.Fprintf(b, "      { Sid = \"S3Write\", Effect = \"Allow\", Action = [\n")

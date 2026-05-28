@@ -328,6 +328,45 @@ module "silver" {
 	}
 }
 
+// TestSyncOrchestrationEmitsS3ReadExternalForRegisteredS3 covers the
+// v2.2.1 regression fix: a transform attached to a registered kind=s3
+// source must populate ExternalBuckets so the per-pipeline Lambda's IAM
+// policy gains an S3ReadExternal Statement covering the external
+// bucket. Without it the runner 403s reading from any bucket outside
+// the workspace bucket — v2.2.0 dropped the per-transform input_buckets
+// grant when collapsing to a single per-pipeline role.
+func TestSyncOrchestrationEmitsS3ReadExternalForRegisteredS3(t *testing.T) {
+	t.Parallel()
+	ws, dir := pipelineForAttachTest(t)
+	svc := New(ws)
+	if _, err := svc.AddSource(SourceSpec{
+		Name:   "logs",
+		Kind:   "s3",
+		Bucket: "external-bucket",
+		Prefix: "ev/",
+		Format: "parquet",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AttachSource(dir, "logs", "t1", "raw"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SyncOrchestration(dir, ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	body, _ := os.ReadFile(filepath.Join(ws, dir, "orchestration.tf"))
+	got := string(body)
+	for _, want := range []string{
+		`Sid = "S3ReadExternal"`,
+		`"arn:aws:s3:::external-bucket"`,
+		`"arn:aws:s3:::external-bucket/*"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("orchestration.tf missing %q\n%s", want, got)
+		}
+	}
+}
+
 func TestSyncOrchestrationFailsOnMissingRegistryEntry(t *testing.T) {
 	t.Parallel()
 	// Set up a pipeline with an inputs reference to a source that doesn't

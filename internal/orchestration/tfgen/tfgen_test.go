@@ -315,6 +315,54 @@ func TestEmit_NoUpstreamTriggers(t *testing.T) {
 	}
 }
 
+// TestEmit_ExternalBuckets asserts that when ExternalBuckets is non-
+// empty, the pipeline Lambda IAM policy gains an `S3ReadExternal`
+// Statement listing the bucket + bucket/* ARNs for each entry. Without
+// this, pipelines reading from any non-workspace S3 bucket (kind=s3
+// sources, cross-account inputs) 403 at runtime — v2.2.0 collapsed the
+// per-transform IAM into a single per-pipeline role and dropped the
+// per-transform input_buckets grant in the process.
+func TestEmit_ExternalBuckets(t *testing.T) {
+	t.Parallel()
+	p := twoTransforms()
+	p.ExternalBuckets = []string{
+		"webbaa-customers-eu-north-1-cloudfront-logs",
+		"another-external-bucket",
+	}
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	wants := []string{
+		`Sid = "S3ReadExternal"`,
+		`Action = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]`,
+		`"arn:aws:s3:::webbaa-customers-eu-north-1-cloudfront-logs"`,
+		`"arn:aws:s3:::webbaa-customers-eu-north-1-cloudfront-logs/*"`,
+		`"arn:aws:s3:::another-external-bucket"`,
+		`"arn:aws:s3:::another-external-bucket/*"`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Emit output missing %q\n--- output ---\n%s", w, out)
+		}
+	}
+}
+
+// TestEmit_NoExternalBuckets asserts the S3ReadExternal Statement is
+// omitted entirely when ExternalBuckets is empty — most pipelines read
+// nothing outside the workspace bucket, and an empty Resource array
+// would be a Terraform plan-time error anyway.
+func TestEmit_NoExternalBuckets(t *testing.T) {
+	t.Parallel()
+	out, err := Emit(twoTransforms())
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if strings.Contains(out, `Sid = "S3ReadExternal"`) {
+		t.Errorf("Emit output unexpectedly contains S3ReadExternal Sid with empty ExternalBuckets:\n%s", out)
+	}
+}
+
 // TestEmit_Validate asserts the new validation rules around Transforms.
 func TestEmit_Validate(t *testing.T) {
 	t.Parallel()

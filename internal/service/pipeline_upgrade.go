@@ -103,6 +103,17 @@ var localComputeRE = regexp.MustCompile(`(?m)^[ \t]*compute[ \t]*=[ \t]*"local"[
 // incremental behaviour itself (the emitter falls back to full reads).
 var incrementalInputsRE = regexp.MustCompile(`(?m)^[ \t]*incremental_inputs[ \t]*=[ \t]*\[[^\]\n]*\][ \t]*\r?\n`)
 
+// runnerImageRE matches a standalone `runner_image = <expr>` attribute
+// line inside a transform module block. v2.2.0 collapsed the
+// per-transform Lambda; v2.2.1 dropped `var.runner_image` from the
+// transform module. A v2.1.x pipeline carrying `runner_image =
+// data.terraform_remote_state.workspace.outputs.runner_image` now fails
+// `terraform validate` with "Unsupported argument: runner_image".
+// `pipeline upgrade` strips the line; the pipeline Lambda emitted by
+// orchestration tfgen still threads the URI from workspace remote state
+// directly, so deploys keep working.
+var runnerImageRE = regexp.MustCompile(`(?m)^[ \t]*runner_image[ \t]*=[ \t]*[^\r\n]+\r?\n`)
+
 // UpgradePipeline rewrites every Clavesa module `source = "..."`
 // in a pipeline's .tf files to the embedded-modules form at targetRef
 // (defaults to the binary's ModuleVersion when empty), strips the
@@ -161,6 +172,20 @@ func (s *Service) UpgradePipeline(dir, targetRef string) (currentRef, finalRef s
 	// descriptor moved to a different authoring shape (TODO line item).
 	for _, f := range tfFiles {
 		n, merr := stripIncrementalInputs(f)
+		if merr != nil {
+			return currentRef, finalRef, updated, migrated, merr
+		}
+		migrated += n
+	}
+
+	// One-shot migration: strip `runner_image = ...`. v2.2.0 collapsed
+	// the per-transform Lambda; v2.2.1 dropped the variable. Existing
+	// pipelines on v2.1.x have `runner_image =
+	// data.terraform_remote_state.workspace.outputs.runner_image` in
+	// every transform module block — `pipeline upgrade` clears it so
+	// the pipeline validates against the new module.
+	for _, f := range tfFiles {
+		n, merr := stripRunnerImage(f)
 		if merr != nil {
 			return currentRef, finalRef, updated, migrated, merr
 		}
@@ -320,6 +345,14 @@ func stripLocalCompute(path string) (int, error) {
 // this variable; carrying it makes deploys fail at validate-time.
 func stripIncrementalInputs(path string) (int, error) {
 	return stripLines(path, incrementalInputsRE)
+}
+
+// stripRunnerImage removes every `runner_image = ...` line from a
+// single tf file. v2.2.1 dropped `var.runner_image` from the transform
+// module; carrying the attribute on a v2.1.x pipeline makes upgraded
+// deploys fail with "Unsupported argument".
+func stripRunnerImage(path string) (int, error) {
+	return stripLines(path, runnerImageRE)
 }
 
 func stripLines(path string, re *regexp.Regexp) (int, error) {

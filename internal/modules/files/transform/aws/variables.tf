@@ -63,37 +63,27 @@ variable "bucket" {
 }
 
 variable "inputs" {
-  description = "Named input map. Keys become SQL table aliases. Values are upstream module output objects (transform→transform Iceberg edges)."
-  type = map(object({
-    table_path    = string
-    catalog_db    = string
-    catalog_table = string
-    schema = optional(object({
-      columns = list(object({
-        name     = string
-        type     = string
-        nullable = optional(bool, true)
-      }))
-      include_rescued_data = optional(bool, false)
-    }))
-    # Incremental processing fields (v0.12+). Sources expose these; transforms
-    # leave them empty (transform→transform incremental is via Iceberg snapshots,
-    # tracked separately).
-    partitions = optional(list(string), [])
-    start_from = optional(string, "all")
-  }))
+  description = <<-EOT
+    Named input map. Keys become SQL table aliases. Three shapes are accepted:
+      - Module-output object (transform→transform Delta edge): the upstream
+        transform's `outputs[...]` object with `table_path`, `catalog_db`,
+        `catalog_table`, and optional `schema` / `partitions` / `start_from`.
+      - Cross-pipeline string `"<schema>.<table>"`: written by
+        `node connect --from-table`; resolved at orchestration emit time.
+      - Registered-source string `"sources.<name>"`: ADR-017 (v0.22.0);
+        resolved against the workspace registry at orchestration emit time.
+    Typed as `any` because Terraform rejects mixed-type maps when given an
+    explicit object shape — the runtime validation happens in the Go parser
+    and orchestration emitter, not at `terraform validate`.
+  EOT
+  type    = any
   default = {}
 }
 
 # Registered-source attachments (ADR-017 v0.22.0). Separate variable from
-# var.inputs because:
-#   - var.inputs is typed against transform→transform module-output
-#     objects (table_path / catalog_db / …); a registered-source descriptor
-#     can't satisfy that shape, and Terraform rejects "any" mixed-type
-#     maps at plan time.
-#   - The runner event payload comes from the orchestration module (which
-#     resolves the registry name → descriptor at SFN execution time).
-#     This module only consumes the bucket list for IAM read scope.
+# var.inputs because the runner event payload comes from the orchestration
+# module (which resolves the registry name → descriptor at SFN execution
+# time); this module only consumes the bucket list for IAM read scope.
 #
 # Populated by `clavesa source attach` and refreshed from the registry
 # at every `SyncOrchestration` call. Hand-edits get overwritten — treat
@@ -152,7 +142,6 @@ variable "compute" {
   description = <<-EOT
     Compute target. All targets run the same PySpark runtime — pick the one
     that matches the workload size and cost shape:
-    - local:  no AWS resources; runs in-process for development and CI.
     - lambda: Clavesa runner container on Lambda. Cheapest cloud option;
               pay-per-ms with scale-to-zero. Suits batches under ~15 min.
     - fargate: (planned) ECS Fargate task. Long-running medium jobs.
@@ -163,30 +152,8 @@ variable "compute" {
   default = "lambda"
 
   validation {
-    condition     = contains(["local", "lambda", "fargate", "emr-serverless"], var.compute)
-    error_message = "compute must be one of: local, lambda, fargate, emr-serverless."
-  }
-}
-
-variable "runner_image" {
-  description = <<-EOT
-    Clavesa transform runner container image URI (PySpark). Used for
-    lambda, fargate, and emr-serverless compute targets.
-
-    Required: must be a *private* ECR URI in the form
-      <account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>
-    Public ECR Public Gallery URIs (public.ecr.aws/...) are not supported:
-    Lambda image-digest pinning depends on the `aws_ecr_image` data source,
-    which only resolves private ECR repositories.
-
-    `clavesa workspace init` creates the workspace's ECR repo and pushes
-    the runner image into it; pipelines pass that URI through verbatim.
-  EOT
-  type        = string
-
-  validation {
-    condition     = can(regex("\\.dkr\\.ecr\\.[a-z0-9-]+\\.amazonaws\\.com/", var.runner_image))
-    error_message = "runner_image must be a private ECR URI (<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>). Public ECR Public Gallery is not supported because Lambda image-digest pinning requires aws_ecr_image."
+    condition     = contains(["lambda", "fargate", "emr-serverless"], var.compute)
+    error_message = "compute must be one of: lambda, fargate, emr-serverless."
   }
 }
 

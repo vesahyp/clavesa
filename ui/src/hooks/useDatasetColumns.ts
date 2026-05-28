@@ -1,5 +1,6 @@
 /**
- * useDatasetColumns — result columns for every dataset on a dashboard.
+ * useDatasetColumns — result columns (and the rows behind them) for every
+ * dataset on a dashboard.
  *
  * Widget field pickers (X / Y / value) need the column names a dataset's
  * SQL actually returns. The number of datasets is dynamic, so a plain
@@ -9,6 +10,10 @@
  * The query key matches `useDashboardQuery` / `SqlPreview`, so all three
  * share one cache entry per (dir, sql, params) — running a SQL preview
  * warms the dropdowns and vice versa.
+ *
+ * The hook also exposes `rows` / `rowCount` / `truncated` straight off
+ * the same result, so the widget drawer can render a results preview
+ * without firing a second request.
  *
  * `params` carries the substituted values for any `{{name}}` tokens in
  * the dataset SQL. Without them the editor's column probe would 400 on
@@ -28,6 +33,12 @@ export interface DatasetColumn {
 
 export interface DatasetColumns {
   columns: DatasetColumn[];
+  /** Result rows from the same query — empty when the query hasn't returned yet. */
+  rows: string[][];
+  rowCount: number;
+  truncated: boolean;
+  /** True once a result has arrived at least once for this dataset. */
+  hasData: boolean;
   isLoading: boolean;
   error: unknown;
 }
@@ -52,6 +63,9 @@ export function useDatasetColumns(
   // mid-edit; those return errors and would otherwise blink the field
   // pickers to empty. Reusing the previous good result keeps the UI
   // stable through transient errors while the SQL settles.
+  //
+  // Rows are NOT made sticky — the preview should reflect what the
+  // current SQL returns, including an empty result.
   const lastGoodRef = useRef(new Map<string, DatasetColumn[]>());
   const liveNames = new Set(datasets.map((d) => d.name));
   for (const k of Array.from(lastGoodRef.current.keys())) {
@@ -67,6 +81,10 @@ export function useDatasetColumns(
     const sticky = lastGoodRef.current.get(d.name) ?? [];
     map.set(d.name, {
       columns: fresh.length > 0 ? fresh : sticky,
+      rows: r?.data?.rows ?? [],
+      rowCount: r?.data?.row_count ?? 0,
+      truncated: r?.data?.truncated ?? false,
+      hasData: r?.data != null,
       isLoading: r?.isLoading ?? false,
       error: r?.error ?? null,
     });

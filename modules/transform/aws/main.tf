@@ -13,16 +13,6 @@ locals {
     "clavesa:node"     = var.name
     "clavesa:type"     = "transform"
   })
-
-  # Extract bucket names for IAM read policy. Two upstream shapes contribute:
-  #   - var.inputs        : transform→transform Iceberg upstreams. Bucket
-  #                         lives under `table_path` ("s3://<bucket>/.../warehouse").
-  #   - var.source_inputs : registered s3 sources (ADR-017 v0.22.0).
-  #                         Bucket is on the spec directly.
-  input_buckets = distinct(concat(
-    [for alias, inp in var.inputs : split("/", trimprefix(inp.table_path, "s3://"))[0]],
-    [for alias, src in var.source_inputs : src.bucket if src.bucket != ""],
-  ))
 }
 
 # ---------------------------------------------------------------------------

@@ -26,10 +26,12 @@ import (
 // top of the file (sources stay as modules; this slice scopes orchestration
 // only).
 //
-// The ASL state machine definition is built by internal/orchestration/aslgen
-// (graph traversal in Go — fixes the v1.1.4 nested-fanout / multi-hop
-// branch bug that HCL couldn't represent) and inlined via jsonencode({...})
-// in the resource definition by internal/orchestration/tfgen.
+// As of v2.2.0 the ASL collapses to a single Task that invokes the
+// per-pipeline runner Lambda; the runner's pipeline_handler loops the
+// transforms list in topo order, sharing one Spark session across them
+// (local-cloud parity per ADR-014). tfgen owns the emit; the
+// per-transform Lambda function and the multi-state ASL machinery
+// (aslgen package, dropped in v2.2.1) are gone.
 //
 // Sidecar Python (poller.py) is copied from embedded FS into
 // <pipeline>/_clavesa_sidecar/ so the generated archive_file blocks
@@ -115,6 +117,34 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	for _, src := range registeredS3 {
 		queueExprs = append(queueExprs, fmt.Sprintf("module.%s.trigger_queue_arn", srcModuleName(src.Name)))
 	}
+
+	// External S3 buckets — union of inline source-module buckets and
+	// registered s3 source attachments. Pre-v2.2.0 the per-transform IAM
+	// summed every transform's input_buckets into its own role; collapsing
+	// to a single per-pipeline Lambda dropped that grant, so pipelines
+	// reading from any non-workspace bucket (cross-account CloudFront logs,
+	// public datasets, …) started 403'ing on upgrade. tfgen emits an
+	// `S3ReadExternal` IAM Statement listing these buckets only when the
+	// list is non-empty.
+	externalBucketSet := map[string]struct{}{}
+	for _, n := range g.Nodes {
+		if n.Type != "source" {
+			continue
+		}
+		if bucket, ok := n.Config["bucket"].(string); ok && bucket != "" {
+			externalBucketSet[bucket] = struct{}{}
+		}
+	}
+	for _, src := range registeredS3 {
+		if src.Bucket != "" {
+			externalBucketSet[src.Bucket] = struct{}{}
+		}
+	}
+	externalBuckets := make([]string, 0, len(externalBucketSet))
+	for b := range externalBucketSet {
+		externalBuckets = append(externalBuckets, b)
+	}
+	sort.Strings(externalBuckets)
 
 	// Cross-pipeline auto-trigger producers (ADR-016 §6, this slice). For
 	// each transform reading another pipeline's table via
@@ -208,6 +238,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		TriggerQueueExprs: queueExprs,
 		UpstreamPipelines: upstreamProducers,
 		Transforms:        transforms,
+		ExternalBuckets:   externalBuckets,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestration: emit tf: %w", err)
