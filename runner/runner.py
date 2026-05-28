@@ -2025,6 +2025,10 @@ _RUNS_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTE
 # (tfgen.go) — adding a new trigger requires bumping both sides.
 _RUNS_TRIGGER_VALUES = frozenset({
     "manual", "scheduled", "event", "backfill", "backfill-direct",
+    # Cross-pipeline auto-trigger (ADR-016 §6): producer's
+    # EventBridge rule stamps `_trigger = "upstream"` on the SFN input
+    # and carries the producer name separately in `_upstream_pipeline`.
+    "upstream",
 })
 
 

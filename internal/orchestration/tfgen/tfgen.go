@@ -65,6 +65,15 @@ type Pipeline struct {
 	// queue ARNs (one per source). Empty disables the poller.
 	TriggerQueueExprs []string
 
+	// UpstreamPipelines is the list of sibling pipeline names whose
+	// state-machine SUCCEEDED events should auto-start this pipeline
+	// (ADR-016 §6 cross-pipeline trigger). Each name becomes one
+	// EventBridge rule + IAM role + target wired against
+	// `arn:aws:states:<region>:<account>:stateMachine:clavesa-<name>`.
+	// Empty disables auto-trigger; the cross-pipeline reference in the
+	// pipeline's `inputs` is the opt-in (no separate knob).
+	UpstreamPipelines []string
+
 	// StateMachine is the graph-derived ASL shape; tfgen materialises it
 	// into the resource's `definition = jsonencode({...})` block.
 	StateMachine aslgen.StateMachine
@@ -103,6 +112,7 @@ func Emit(p Pipeline) (string, error) {
 	emitStateMachine(&b, p)
 	emitSchedule(&b, p)
 	emitPoller(&b, p)
+	emitUpstreamTriggers(&b, p)
 	emitRunsWriter(&b, p)
 
 	return b.String(), nil
@@ -528,6 +538,103 @@ func emitPoller(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  principal     = \"events.amazonaws.com\"\n")
 	fmt.Fprintf(b, "  source_arn    = aws_cloudwatch_event_rule.poller[0].arn\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-pipeline auto-trigger (ADR-016 §6) — one EventBridge rule per
+// upstream producer pipeline. Fires this pipeline's state machine when
+// the producer's Step Functions execution succeeds.
+//
+// ARN construction: state-machine names follow the
+// `clavesa-<pipeline_name>` convention emitted by emitStateMachine, so
+// the producer's ARN is well-known at plan time without a cross-
+// pipeline remote-state lookup. EventBridge matches the literal string,
+// so producer-creation order doesn't matter — the rule sits inert until
+// the producer's state machine exists, then starts firing.
+// ---------------------------------------------------------------------------
+
+func emitUpstreamTriggers(b *strings.Builder, p Pipeline) {
+	if len(p.UpstreamPipelines) == 0 {
+		return
+	}
+
+	// data sources for account + region — built once even with multiple
+	// producers. `data.aws_caller_identity.current` and
+	// `data.aws_region.current` already exist at workspace level in the
+	// generated workspace main.tf, but emitting them again here is a
+	// no-op (Terraform deduplicates by address); cheaper than threading
+	// the workspace declarations through.
+	fmt.Fprintf(b, "# Cross-pipeline auto-trigger — one EventBridge rule per upstream\n")
+	fmt.Fprintf(b, "# producer pipeline (derived from `external_inputs` references at\n")
+	fmt.Fprintf(b, "# sync time). Each rule starts this pipeline's state machine when\n")
+	fmt.Fprintf(b, "# the producer's Step Functions execution reaches SUCCEEDED.\n")
+	fmt.Fprintf(b, "data \"aws_caller_identity\" \"clavesa_upstream\" {}\n")
+	fmt.Fprintf(b, "data \"aws_region\" \"clavesa_upstream\" {}\n\n")
+
+	for _, producer := range p.UpstreamPipelines {
+		// Terraform resource addresses require [A-Za-z_][A-Za-z0-9_]*;
+		// the state-machine name itself can carry the dash (SFN allows
+		// hyphens). Mirrors safeCatalogLiteral's hyphen→underscore fold.
+		safe := strings.ReplaceAll(producer, "-", "_")
+		arnExpr := fmt.Sprintf(
+			"arn:aws:states:${data.aws_region.clavesa_upstream.region}:${data.aws_caller_identity.clavesa_upstream.account_id}:stateMachine:clavesa-%s",
+			producer,
+		)
+
+		// EventBridge rule on the producer's state machine.
+		fmt.Fprintf(b, "resource \"aws_cloudwatch_event_rule\" \"upstream_%s\" {\n", safe)
+		fmt.Fprintf(b, "  name        = \"clavesa-${%s}-from-%s\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  description = \"Auto-start ${%s} when upstream pipeline %s succeeds\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  event_pattern = jsonencode({\n")
+		fmt.Fprintf(b, "    source        = [\"aws.states\"]\n")
+		fmt.Fprintf(b, "    \"detail-type\" = [\"Step Functions Execution Status Change\"]\n")
+		fmt.Fprintf(b, "    detail = {\n")
+		fmt.Fprintf(b, "      stateMachineArn = [\"%s\"]\n", arnExpr)
+		fmt.Fprintf(b, "      status          = [\"SUCCEEDED\"]\n")
+		fmt.Fprintf(b, "    }\n")
+		fmt.Fprintf(b, "  })\n")
+		fmt.Fprintf(b, "  tags = local.clavesa_tags\n")
+		fmt.Fprintf(b, "}\n\n")
+
+		// IAM role for EventBridge → SFN StartExecution. Role per
+		// producer keeps the resource set self-contained and avoids
+		// permission drift across multiple targets sharing one role.
+		fmt.Fprintf(b, "resource \"aws_iam_role\" \"upstream_trigger_%s\" {\n", safe)
+		fmt.Fprintf(b, "  name = \"clavesa-${%s}-from-%s\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  assume_role_policy = jsonencode({\n")
+		fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
+		fmt.Fprintf(b, "    Statement = [{ Effect = \"Allow\", Action = \"sts:AssumeRole\", Principal = { Service = \"events.amazonaws.com\" } }]\n")
+		fmt.Fprintf(b, "  })\n")
+		fmt.Fprintf(b, "  tags = local.clavesa_tags\n")
+		fmt.Fprintf(b, "}\n\n")
+
+		fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"upstream_trigger_%s\" {\n", safe)
+		fmt.Fprintf(b, "  name = \"clavesa-${%s}-from-%s\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  role = aws_iam_role.upstream_trigger_%s.id\n", safe)
+		fmt.Fprintf(b, "  policy = jsonencode({\n")
+		fmt.Fprintf(b, "    Version   = \"2012-10-17\"\n")
+		fmt.Fprintf(b, "    Statement = [{ Sid = \"StartExecution\", Effect = \"Allow\", Action = [\"states:StartExecution\"], Resource = [aws_sfn_state_machine.pipeline.arn] }]\n")
+		fmt.Fprintf(b, "  })\n")
+		fmt.Fprintf(b, "}\n\n")
+
+		// Target wires rule → our state machine. role_arn at target
+		// level (mirrors the schedule pattern) gives EventBridge the
+		// permission to call StartExecution.
+		fmt.Fprintf(b, "resource \"aws_cloudwatch_event_target\" \"upstream_%s\" {\n", safe)
+		fmt.Fprintf(b, "  rule     = aws_cloudwatch_event_rule.upstream_%s.name\n", safe)
+		fmt.Fprintf(b, "  arn      = aws_sfn_state_machine.pipeline.arn\n")
+		fmt.Fprintf(b, "  role_arn = aws_iam_role.upstream_trigger_%s.arn\n", safe)
+		fmt.Fprintf(b, "  # _trigger is read by runs_writer (see runner/runner.py\n")
+		fmt.Fprintf(b, "  # :_RUNS_TRIGGER_VALUES) and stored on runs.trigger; the\n")
+		fmt.Fprintf(b, "  # producer pipeline name is carried separately in case a\n")
+		fmt.Fprintf(b, "  # future runs column wants to surface it directly.\n")
+		fmt.Fprintf(b, "  input = jsonencode({\n")
+		fmt.Fprintf(b, "    pipeline           = %s\n", p.PipelineNameExpr)
+		fmt.Fprintf(b, "    _trigger           = \"upstream\"\n")
+		fmt.Fprintf(b, "    _upstream_pipeline = \"%s\"\n", producer)
+		fmt.Fprintf(b, "  })\n")
+		fmt.Fprintf(b, "}\n\n")
+	}
 }
 
 // ---------------------------------------------------------------------------

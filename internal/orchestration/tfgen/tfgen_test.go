@@ -115,6 +115,93 @@ func TestEmit_PollerEnabled(t *testing.T) {
 	}
 }
 
+// TestEmit_UpstreamTriggers asserts that when UpstreamPipelines is
+// populated, the emitter produces one EventBridge rule + role + role
+// policy + target per producer, all with consistent naming and the
+// correct cross-account-style ARN literal pointing at the producer's
+// state machine.
+func TestEmit_UpstreamTriggers(t *testing.T) {
+	t.Parallel()
+	sm, _ := aslgen.Build([]string{"a"}, []aslgen.Edge{})
+	out, err := Emit(Pipeline{
+		PipelineNameExpr:  "var.pipeline_name",
+		Catalog:           "c",
+		SchemaExpr:        "var.schema",
+		SystemCatalog:     "c_system",
+		BucketExpr:        "data.x.outputs.b",
+		RunnerImageExpr:   "data.x.outputs.r",
+		UpstreamPipelines: []string{"bronze", "silver-team"},
+		StateMachine:      sm,
+		NodeMeta: map[string]NodeMeta{
+			"a": {LambdaARNExpr: "module.a.lambda_function_arn", InputsExpr: "{}", OutputsExpr: "{}", TimeoutSeconds: 300},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	wants := []string{
+		// Shared data sources for account + region (one pair, not per producer).
+		`data "aws_caller_identity" "clavesa_upstream"`,
+		`data "aws_region" "clavesa_upstream"`,
+		// bronze producer: rule + IAM role + policy + target.
+		`resource "aws_cloudwatch_event_rule" "upstream_bronze"`,
+		`stateMachineArn = ["arn:aws:states:${data.aws_region.clavesa_upstream.region}:${data.aws_caller_identity.clavesa_upstream.account_id}:stateMachine:clavesa-bronze"]`,
+		`status          = ["SUCCEEDED"]`,
+		`resource "aws_iam_role" "upstream_trigger_bronze"`,
+		`resource "aws_iam_role_policy" "upstream_trigger_bronze"`,
+		`Action = ["states:StartExecution"], Resource = [aws_sfn_state_machine.pipeline.arn]`,
+		`resource "aws_cloudwatch_event_target" "upstream_bronze"`,
+		`_trigger           = "upstream"`,
+		`_upstream_pipeline = "bronze"`,
+		// silver-team producer: dashes survive in the literal ARN and
+		// rule name but the Terraform resource address uses underscores.
+		`resource "aws_cloudwatch_event_rule" "upstream_silver_team"`,
+		`stateMachine:clavesa-silver-team"]`,
+		`_upstream_pipeline = "silver-team"`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Emit output missing %q\n--- output ---\n%s", w, out)
+		}
+	}
+}
+
+// TestEmit_NoUpstreamTriggers asserts emitUpstreamTriggers is a no-op
+// when UpstreamPipelines is empty — the shared data sources and per-
+// producer resources must NOT appear, since their presence would
+// otherwise force every pipeline (most have no cross-pipeline reads)
+// to compute aws_caller_identity at plan time for nothing.
+func TestEmit_NoUpstreamTriggers(t *testing.T) {
+	t.Parallel()
+	sm, _ := aslgen.Build([]string{"a"}, []aslgen.Edge{})
+	out, err := Emit(Pipeline{
+		PipelineNameExpr: "var.pipeline_name",
+		Catalog:          "c",
+		SchemaExpr:       "var.schema",
+		SystemCatalog:    "c_system",
+		BucketExpr:       "data.x.outputs.b",
+		RunnerImageExpr:  "data.x.outputs.r",
+		StateMachine:     sm,
+		NodeMeta: map[string]NodeMeta{
+			"a": {LambdaARNExpr: "module.a.lambda_function_arn", InputsExpr: "{}", OutputsExpr: "{}", TimeoutSeconds: 300},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	doesNotContain := []string{
+		`"clavesa_upstream"`,
+		`"upstream_`,
+		`_upstream_pipeline`,
+	}
+	for _, w := range doesNotContain {
+		if strings.Contains(out, w) {
+			t.Errorf("Emit output unexpectedly contains %q with empty UpstreamPipelines", w)
+		}
+	}
+}
+
 // TestEmit_CatchOnlyAtTopLevel is the v1.1.5→v1.1.6 regression pin.
 // AWS Step Functions rejects a Catch.Next that targets a state outside
 // the same States map (MISSING_TRANSITION_TARGET). Tasks and Parallels

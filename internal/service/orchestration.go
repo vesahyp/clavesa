@@ -137,6 +137,15 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		queueExprs = append(queueExprs, fmt.Sprintf("module.%s.trigger_queue_arn", srcModuleName(src.Name)))
 	}
 
+	// Cross-pipeline auto-trigger producers (ADR-016 §6, this slice). For
+	// each transform reading another pipeline's table via
+	// `external_inputs`, find the producer pipeline so tfgen can emit one
+	// EventBridge rule per producer that starts this pipeline's state
+	// machine on the producer's SUCCEEDED execution event. Unresolved
+	// refs (external Glue tables, typos) are skipped — there's no state
+	// machine to listen to.
+	upstreamProducers := s.upstreamProducerPipelines(g, pipelineName, resolvePipelineSchema(abs, pipelineName))
+
 	// Bucket for runs_writer / Athena results. Workspace-rooted pipelines
 	// read it from remote state; the standalone fallback path points at
 	// the in-pipeline aws_s3_bucket resource the user wires up by hand.
@@ -168,6 +177,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		ScheduleExpr:      "var.trigger_schedule",
 		BatchWindowExpr:   "var.trigger_batch_window",
 		TriggerQueueExprs: queueExprs,
+		UpstreamPipelines: upstreamProducers,
 		StateMachine:      sm,
 		NodeMeta:          nodeMeta,
 	})
@@ -635,4 +645,103 @@ func outputMergeKeys(n graph.Node, key string) []string {
 		}
 	}
 	return keys
+}
+
+// upstreamProducerPipelines returns the deduplicated, sorted list of
+// sibling pipeline names that produce any table this pipeline reads via
+// `external_inputs`. Best-effort: a workspace-scan failure returns an
+// empty list rather than blocking the emit (mirrors the lineage and
+// schema-ownership reuse of `workspacePipelineScan`).
+//
+// References to tables in the same schema (`refSchema == thisSchema`)
+// are skipped — those are intra-pipeline edges already covered by the
+// regular module-ref path. References that resolve to no producer
+// (external Glue tables, typos) are also skipped: nothing to listen to.
+//
+// Producer resolution accepts both the bare `<node>` form (ADR-019
+// single-default-output) and the legacy `<node>__<key>` form so old
+// pipelines authored before the rename still resolve.
+func (s *Service) upstreamProducerPipelines(g graph.PipelineGraph, thisName, thisSchema string) []string {
+	siblings, err := s.workspacePipelineScan()
+	if err != nil || len(siblings) == 0 {
+		return nil
+	}
+
+	// schema → table-name → producer pipeline name. Each transform
+	// contributes both the bare and `__<key>` forms (default-only
+	// transforms write the bare form per ADR-019; multi-output
+	// transforms write the suffixed form per output).
+	bySchemaTable := map[string]map[string]string{}
+	for _, p := range siblings {
+		if p.name == thisName {
+			continue
+		}
+		tbl, ok := bySchemaTable[p.schema]
+		if !ok {
+			tbl = map[string]string{}
+			bySchemaTable[p.schema] = tbl
+		}
+		for _, n := range p.graph.Nodes {
+			if n.Type != "transform" {
+				continue
+			}
+			bare := identutil.Sanitize(n.ID)
+			outs, _ := n.Config["output_definitions"].(map[string]interface{})
+			if len(outs) == 0 {
+				// default-only, implicit
+				tbl[bare] = p.name
+				tbl[bare+"__default"] = p.name
+				continue
+			}
+			if len(outs) == 1 {
+				if _, defaultOnly := outs["default"]; defaultOnly {
+					tbl[bare] = p.name
+					tbl[bare+"__default"] = p.name
+					continue
+				}
+			}
+			for k := range outs {
+				tbl[bare+"__"+k] = p.name
+			}
+		}
+	}
+
+	seen := map[string]struct{}{}
+	for _, n := range g.Nodes {
+		if n.Type != "transform" {
+			continue
+		}
+		ext, _ := n.Config["external_inputs"].(map[string]interface{})
+		for _, refRaw := range ext {
+			refStr, ok := refRaw.(string)
+			if !ok {
+				continue
+			}
+			dot := strings.Index(refStr, ".")
+			if dot < 0 {
+				continue
+			}
+			refSchema := refStr[:dot]
+			refTable := refStr[dot+1:]
+			if refSchema == thisSchema {
+				continue
+			}
+			tbl, ok := bySchemaTable[refSchema]
+			if !ok {
+				continue
+			}
+			producer, ok := tbl[refTable]
+			if !ok {
+				continue
+			}
+			seen[producer] = struct{}{}
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -10,6 +10,17 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.1.2] — 2026-05-28
+
+### Added
+
+- Cross-pipeline auto-trigger: pipelines that read another pipeline's
+  output via `<schema>.<table>` references now emit an EventBridge rule
+  that auto-starts them when the producer pipeline's Step Functions
+  execution succeeds. No knob — the cross-pipeline reference is the
+  opt-in. Runs from this path stamp `runs.trigger = "upstream"` and
+  carry the producer name in `_upstream_pipeline` on the SFN input.
+
 ## [v2.1.1] — 2026-05-28
 
 ### Fixed
