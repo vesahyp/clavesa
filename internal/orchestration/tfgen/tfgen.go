@@ -302,8 +302,10 @@ func emitIAMRole(b *strings.Builder, p Pipeline) {
 // CLAVESA_MODULE_VERSION. The orchestration emitter doesn't have access
 // to internal/service/version.go (cyclic import), and pushing it through
 // Pipeline as a field has no other consumer today — hardcoded for
-// v2.2.0; bump alongside ModuleVersion in version.go.
-const moduleVersionLiteral = "v2.2.0"
+// v2.2.2; bump alongside ModuleVersion in version.go. (v2.2.1 missed
+// this bump; threading the value through Pipeline would prevent the
+// next miss — filed in TODO.md.)
+const moduleVersionLiteral = "v2.2.2"
 
 func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	safeCatalog := safeCatalogLiteral(p.Catalog)
@@ -431,15 +433,16 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 
 	// Lambda. Mirrors emitRunsWriter's image-based shape; differs in
 	// handler (pipeline_handler vs runs_writer_handler), timeout (15min
-	// vs 2min), memory (10GB vs 1.5GB — multi-transform sessions can
-	// accumulate broadcast hashtables), and env (per-pipeline knobs).
+	// vs 2min), memory (3008MB vs 1.5GB — new AWS accounts cap per-function
+	// memory at 3008MB; users with a raised quota can bump this in the
+	// generated .tf), and env (per-pipeline knobs).
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"pipeline_runner\" {\n")
 	fmt.Fprintf(b, "  function_name = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
 	fmt.Fprintf(b, "  role          = aws_iam_role.pipeline_runner.arn\n")
 	fmt.Fprintf(b, "  package_type  = \"Image\"\n")
 	fmt.Fprintf(b, "  image_uri     = \"${local.pipeline_runner_repo_uri}@${data.aws_ecr_image.pipeline_runner.image_digest}\"\n")
 	fmt.Fprintf(b, "  timeout       = 900   # 15min — the Lambda max; one container handles every transform\n")
-	fmt.Fprintf(b, "  memory_size   = 10240 # 10GB — Spark + Delta + accumulated broadcast tables across transforms\n\n")
+	fmt.Fprintf(b, "  memory_size   = 3008  # New AWS accounts default to a 3008MB per-function quota; bump via Service Quotas + raise this if you need more headroom for Spark broadcast tables\n\n")
 	fmt.Fprintf(b, "  image_config {\n")
 	fmt.Fprintf(b, "    command = [\"runner.pipeline_handler\"]\n")
 	fmt.Fprintf(b, "  }\n\n")

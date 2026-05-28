@@ -392,6 +392,9 @@ func newWorkspacePlanCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := tfInit(root, os.Stdout, os.Stderr); err != nil {
+				return fmt.Errorf("terraform init: %w", err)
+			}
 			c := exec.Command("terraform", "plan")
 			c.Dir = root
 			c.Stdout = os.Stdout

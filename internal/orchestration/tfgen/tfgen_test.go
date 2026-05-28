@@ -54,7 +54,7 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`command = ["runner.pipeline_handler"]`,
 		`package_type  = "Image"`,
 		`timeout       = 900`,
-		`memory_size   = 10240`,
+		`memory_size   = 3008`,
 
 		// Env vars — workspace-level invariants. pipeline_handler sets
 		// per-transform CLAVESA_NODE / CLAVESA_LANGUAGE / CLAVESA_LOGIC_S3_PATH
@@ -67,7 +67,7 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`CLAVESA_SYSTEM_WAREHOUSE    = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/_system/pipelines/"`,
 		`CLAVESA_WATERMARKS          = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_watermarks/"`,
 		`CLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest`,
-		`CLAVESA_MODULE_VERSION      = "v2.2.0"`,
+		`CLAVESA_MODULE_VERSION      = "v2.2.2"`,
 
 		// IAM role + assume policy + at least the write statement
 		// targeting the warehouse prefix.

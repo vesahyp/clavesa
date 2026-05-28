@@ -10,6 +10,37 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.2.2] — 2026-05-28
+
+### Fixed
+
+- `clavesa workspace plan`, `clavesa pipeline plan`, and `clavesa
+  pipeline destroy` now run `terraform init -input=false` before
+  shelling out, so a fresh checkout or a tree after `pipeline
+  upgrade` (which rewrites module versions and invalidates
+  `.terraform/`) no longer fails with `Initialization required`.
+  Idempotent when `.terraform/` is current. Matches what
+  `workspace deploy` / `pipeline deploy` have always done.
+- Pipeline Lambda's `CLAVESA_MODULE_VERSION` env var now reports
+  the actual module version (v2.2.2). v2.2.1 missed bumping the
+  emitter's hardcoded literal, so newly-deployed pipelines stamped
+  the stale `"v2.2.0"` string into Lambda env and into provenance
+  observability output. Architectural follow-up to thread the value
+  through `Pipeline` so this can't be missed again is filed in
+  TODO.md.
+
+### Changed
+
+- Pipeline-runner Lambda's default `memory_size` is now 3008MB,
+  down from 10240MB. New AWS accounts cap per-function memory at
+  3008MB until the Service Quotas limit is raised, so the previous
+  default made every new-account deploy fail at `terraform apply`
+  with a quota error. Users with a raised quota can edit the
+  emitted `orchestration.tf` to bump it back up for headroom on
+  Spark broadcast tables. Existing pipelines pick up the new
+  default on the next `pipeline upgrade` (which re-runs
+  `SyncOrchestration`).
+
 ## [v2.2.1] — 2026-05-28
 
 ### Fixed

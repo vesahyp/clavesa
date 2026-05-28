@@ -412,6 +412,9 @@ deleting anything.
 				}
 			}
 
+			if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
+				return fmt.Errorf("terraform init: %w", err)
+			}
 			c := exec.Command("terraform", "destroy")
 			c.Dir = dir
 			c.Stdout = os.Stdout
@@ -438,6 +441,9 @@ func newPipelineTerraformCmd(tfSubcmd, short string) *cobra.Command {
 			dir, _, _, err := resolvePipelineDir(cmd, args, 0)
 			if err != nil {
 				return err
+			}
+			if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
+				return fmt.Errorf("terraform init: %w", err)
 			}
 			c := exec.Command("terraform", tfSubcmd)
 			c.Dir = dir

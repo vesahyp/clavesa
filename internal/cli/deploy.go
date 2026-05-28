@@ -192,6 +192,19 @@ func (d deployFlow) tf(args ...string) error {
 	return c.Run()
 }
 
+// tfInit runs `terraform init -input=false` in dir before a raw `terraform
+// <cmd>` shell-out (plan / destroy from outside the deployFlow). Idempotent
+// when `.terraform/` is current; on a fresh checkout or after `pipeline
+// upgrade` rewrites module versions it pulls the providers so the next
+// command doesn't fail with "Initialization required".
+func tfInit(dir string, stdout, stderr io.Writer) error {
+	c := exec.Command("terraform", "init", "-input=false")
+	c.Dir = dir
+	c.Stdout = stdout
+	c.Stderr = stderr
+	return c.Run()
+}
+
 func (d deployFlow) confirm() error {
 	fmt.Fprintf(d.stdout(), "\nApply this plan? Type 'yes' to confirm (anything else cancels): ")
 	r := bufio.NewReader(d.stdin())
