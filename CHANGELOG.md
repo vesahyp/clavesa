@@ -14,16 +14,38 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ### Changed
 
-- Local `clavesa pipeline run` now executes every transform in one
-  runner container with a single shared Spark session, instead of
-  starting one container per transform. JVM cold start is paid once
-  per pipeline run rather than once per node — pipelines with many
-  small transforms see large wallclock wins (a 14-transform pipeline
-  saves 50–70 s of pure JVM boot on first run after idle). Per-node
-  observability (progress, status, output rows, error class, node_runs
-  rows) is preserved via JSON-line progress events the runner emits to
-  stdout as each transform completes. Cloud Lambda execution is
-  unchanged in this release — see TODO.md for the Phase B follow-up.
+- Pipeline runs (local AND cloud Lambda) now share one container/Lambda
+  and one Spark session across every transform in a pipeline. JVM cold
+  start is paid once per pipeline run instead of once per transform —
+  pipelines with many small transforms see large wallclock wins (a
+  14-transform pipeline saves 50–70 s of pure JVM boot on first run
+  after idle). Per-node observability (progress, status, output rows,
+  error class, node_runs rows) is preserved.
+- Cloud: the orchestration emitter now creates one
+  `aws_lambda_function "pipeline_runner"` per pipeline (image-based,
+  invokes `runner.pipeline_handler`) and a single-Task Step Functions
+  state machine that hands the topo-ordered transform list to it as
+  the Lambda payload. Per-transform Lambda functions are no longer
+  created — the next `terraform apply` after upgrade destroys them and
+  creates the pipeline-level Lambda. The 15-minute Lambda cap now
+  applies to the whole pipeline.
+- Local: `clavesa pipeline run` boots one runner container per
+  invocation; transforms execute sequentially via the runner's
+  shared `_SPARK` singleton. Per-transform progress streams to stdout
+  as JSON-line `_event` markers the Go side dispatches to the run
+  channel in real time, so the UI's state.json updates per node as
+  before.
+
+### Removed
+
+- The Step Functions PipelineFailed state and per-state Retry/Catch.
+  Terminal failures bubble through SFN itself; runs_writer's
+  EventBridge rule still captures status changes.
+- Multi-task ASL emission paths in `internal/orchestration/aslgen` /
+  `tfgen` (`emitStates`, `emitTask`, `emitParallel`, `emitRetryCatch`).
+  Side benefit: the multi-root DAG limitation filed after v2.1.2 is
+  gone — the runner sees the topo order in the event payload and the
+  ASL is always a single Task.
 
 ## [v2.1.2] — 2026-05-28
 

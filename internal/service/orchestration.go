@@ -11,7 +11,6 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
-	"github.com/vesahyp/clavesa/internal/orchestration/aslgen"
 	"github.com/vesahyp/clavesa/internal/orchestration/sidecar"
 	"github.com/vesahyp/clavesa/internal/orchestration/tfgen"
 	"github.com/vesahyp/clavesa/internal/sources"
@@ -68,52 +67,32 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		return err
 	}
 
-	transformIDs := make([]string, 0)
 	nodeByID := make(map[string]graph.Node, len(g.Nodes))
 	for _, n := range g.Nodes {
 		nodeByID[n.ID] = n
-		if n.Type == "transform" {
-			transformIDs = append(transformIDs, n.ID)
+	}
+	// v2.2.0 bundle execution: pipeline_handler iterates the emitted
+	// transforms list in order, so the order MUST be topological — a
+	// downstream transform cannot precede its parents in the slice.
+	// (Alphabetical was fine for the v2.1.x multi-state ASL because the
+	// state transitions encoded dependency order independently of slice
+	// position.)
+	topoOrder, err := topoSort(&g)
+	if err != nil {
+		return fmt.Errorf("orchestration: %w", err)
+	}
+	transformIDs := make([]string, 0, len(topoOrder))
+	for _, id := range topoOrder {
+		if nodeByID[id].Type == "transform" {
+			transformIDs = append(transformIDs, id)
 		}
 	}
-	sort.Strings(transformIDs)
 
 	edgesByToNode := make(map[string][]graph.Edge)
 	edgesByFromNode := make(map[string][]graph.Edge)
 	for _, e := range g.Edges {
 		edgesByToNode[e.ToNode] = append(edgesByToNode[e.ToNode], e)
 		edgesByFromNode[e.FromNode] = append(edgesByFromNode[e.FromNode], e)
-	}
-
-	// Per-node Lambda payload pieces — inputs + outputs as HCL map literals
-	// inlined into each Task's Payload by tfgen.
-	nodeMeta := make(map[string]tfgen.NodeMeta, len(transformIDs))
-	for _, id := range transformIDs {
-		inputsExpr, err := s.buildNodeInputsExpr(id, catalog, nodeByID, edgesByToNode)
-		if err != nil {
-			return err
-		}
-		outputsExpr := buildNodeOutputsExpr(id, nodeByID, edgesByFromNode)
-		nodeMeta[id] = tfgen.NodeMeta{
-			LambdaARNExpr:  fmt.Sprintf("module.%s.lambda_function_arn", id),
-			InputsExpr:     inputsExpr,
-			OutputsExpr:    outputsExpr,
-			TimeoutSeconds: 300,
-		}
-	}
-
-	// Build the transform-only edge list for aslgen.
-	aslEdges := make([]aslgen.Edge, 0)
-	for _, e := range g.Edges {
-		if nodeByID[e.FromNode].Type != "transform" || nodeByID[e.ToNode].Type != "transform" {
-			continue
-		}
-		aslEdges = append(aslEdges, aslgen.Edge{From: e.FromNode, To: e.ToNode})
-	}
-
-	sm, err := aslgen.Build(transformIDs, aslEdges)
-	if err != nil {
-		return fmt.Errorf("orchestration: build ASL: %w", err)
 	}
 
 	// Trigger queue ARN expressions from source modules (legacy inline +
@@ -167,6 +146,56 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		emitS3SourceModule(&sourceBlocks, sourceModuleSrc, src)
 	}
 
+	// Per-transform invocation payloads — tfgen renders one entry per
+	// transform into the pipeline Lambda's event payload. Order matches
+	// transformIDs (topo-sorted upstream), and Parents drives the runner's
+	// cascade-skip on upstream failure.
+	transforms := make([]tfgen.TransformConfig, 0, len(transformIDs))
+	for _, id := range transformIDs {
+		n := nodeByID[id]
+		language, _ := n.Config["language"].(string)
+		if language == "" {
+			language = "sql"
+		}
+		ext := "sql"
+		if language == "python" {
+			ext = "py"
+		}
+		// Logic key mirrors modules/transform/aws/main.tf's _logic_key:
+		//   "${var.pipeline_name}/${var.name}/_runtime/logic.${_logic_ext}"
+		// The per-transform module still emits aws_s3_object "logic" at
+		// this exact path; the pipeline Lambda reads via _read_text("s3://...").
+		logicURI := fmt.Sprintf(
+			`"s3://${%s}/${var.pipeline_name}/%s/_runtime/logic.%s"`,
+			bucketExpr, id, ext,
+		)
+
+		inputsExpr, err := s.buildNodeInputsExpr(id, catalog, nodeByID, edgesByToNode)
+		if err != nil {
+			return err
+		}
+		outputsExpr := buildNodeOutputsExpr(id, nodeByID, edgesByFromNode)
+
+		// Parents = intra-pipeline upstream transform node ids (cascade-
+		// skip input for pipeline_handler).
+		var parents []string
+		for _, e := range edgesByToNode[id] {
+			if nodeByID[e.FromNode].Type == "transform" {
+				parents = append(parents, e.FromNode)
+			}
+		}
+		sort.Strings(parents)
+
+		transforms = append(transforms, tfgen.TransformConfig{
+			NodeID:      id,
+			Language:    language,
+			LogicS3URI:  logicURI,
+			InputsExpr:  inputsExpr,
+			OutputsExpr: outputsExpr,
+			Parents:     parents,
+		})
+	}
+
 	tfBody, err := tfgen.Emit(tfgen.Pipeline{
 		PipelineNameExpr:  "var.pipeline_name",
 		Catalog:           catalog,
@@ -178,8 +207,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		BatchWindowExpr:   "var.trigger_batch_window",
 		TriggerQueueExprs: queueExprs,
 		UpstreamPipelines: upstreamProducers,
-		StateMachine:      sm,
-		NodeMeta:          nodeMeta,
+		Transforms:        transforms,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestration: emit tf: %w", err)

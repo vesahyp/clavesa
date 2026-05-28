@@ -13,7 +13,3 @@ output "outputs" {
   }
 }
 
-output "lambda_function_arn" {
-  description = "ARN of the Lambda function (compute = lambda only). Empty string for other compute targets."
-  value       = var.compute == "lambda" ? aws_lambda_function.runner[0].arn : ""
-}

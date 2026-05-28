@@ -1,16 +1,13 @@
 # Fixture: single-input SQL transform
 #
 # Validates that the module creates:
-#   - aws_iam_role.lambda_exec
-#   - aws_iam_role_policy.lambda_exec_policy
-#   - aws_s3_object.logic                  (SQL body uploaded for the runner)
-#   - aws_lambda_function.runner           (PySpark runner container)
+#   - aws_s3_object.logic   (SQL body uploaded; the pipeline-level Lambda
+#                            emitted by internal/orchestration/tfgen fetches
+#                            this at runtime via _read_text("s3://...")).
 #
-# The runner_image must be a private ECR URI (Lambda image-digest pinning
-# requires `aws_ecr_image`, which only resolves private repos). Pre-push
-# the runner image to your workspace's ECR — `clavesa workspace init`
-# does this for you. The placeholder URI here is enough for
-# `terraform validate`; `terraform apply` would need a real one.
+# Per-transform Lambda / IAM resources were collapsed in v0.30+ — the
+# pipeline Lambda handles every node, so this module is config-only
+# for `compute = "lambda"`.
 
 terraform {
   required_version = ">= 1.3"
@@ -70,9 +67,4 @@ module "validate" {
 output "outputs" {
   description = "Named output map keyed by output_definitions. Downstream nodes reference module.validate.outputs[\"default\"]."
   value       = module.validate.outputs
-}
-
-output "lambda_function_arn" {
-  description = "Pass to the orchestration module's nodes[*].lambda_function_arn."
-  value       = module.validate.lambda_function_arn
 }

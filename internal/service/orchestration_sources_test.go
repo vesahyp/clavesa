@@ -252,10 +252,11 @@ func TestSyncOrchestrationKeepsLegacyBareStringForDefaultReplace(t *testing.T) {
 		t.Fatalf("SyncOrchestration: %v", err)
 	}
 	got, _ := os.ReadFile(filepath.Join(ws, dir, "orchestration.tf"))
-	// v1.1.5+: outputs live inside the SFN Payload (no column alignment).
-	// The bare-string compact form for single-default-replace is preserved
-	// — the test is that the dict shape isn't gratuitously emitted.
-	if !strings.Contains(string(got), `outputs = { default = "" }`) {
+	// v2.2.0: outputs live inside the per-pipeline Lambda transforms[]
+	// payload; tfgen column-aligns the keys (`outputs    = ...`). The bare-
+	// string compact form for single-default-replace is still preserved —
+	// the test is that the dict shape isn't gratuitously emitted.
+	if !strings.Contains(string(got), `outputs    = { default = "" }`) {
 		t.Errorf("compact single-default-replace emit shape regressed:\n%s", got)
 	}
 }

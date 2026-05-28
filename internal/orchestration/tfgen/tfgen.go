@@ -1,26 +1,26 @@
 // Package tfgen emits the full orchestration.tf body for a clavesa pipeline.
 //
-// Replaces the v1.1.4 `module "orchestration"` indirection with standard
-// Terraform: the Step Functions state machine + IAM + log group + Glue DB +
-// runs_writer + optional poller + optional schedule, all spelled out as
-// direct resources. The ASL definition is inlined via jsonencode({...}) so
-// references like `module.bronze.lambda_function_arn` stay as HCL
-// expressions that Terraform's dependency graph still tracks.
+// v2.2.0: replaces the v2.1.x "multi-state ASL — one Task per transform,
+// each invoking its own Lambda" with a single per-pipeline Lambda invoked
+// by a single SFN Task. Phase A of v2.2.0 already landed the local mirror
+// (`clavesa pipeline run` runs one container that loops every transform
+// in one Spark session via `runner.pipeline_handler`); ADR-014 local-cloud
+// parity demands cloud Lambda mirrors the same shape. The runner's
+// `_SPARK` singleton amortises JVM + Glue catalog init across transforms
+// inside one invocation, and the SFN graph collapses to a single Task
+// that hands the full ordered transform list to the runner.
 //
-// Why inline: HCL can't recurse, so the previous HCL-side ASL builder
-// (modules/orchestration/aws/main.tf:1-247) couldn't represent nested
-// fanouts or multi-hop branches, leaving downstream states orphaned and
-// failing AWS's MISSING_TRANSITION_TARGET validator. Doing it in Go also
-// improves the exit story: a user dropping clavesa keeps idiomatic
-// Terraform with no module dependency.
+// Why we still bother with Step Functions for a single Task: the
+// EventBridge → runs_writer wiring keyed off SFN execution status change
+// remains the source of truth for the runs Delta table, and the
+// scheduled/upstream/SQS triggers all start SFN executions. Keeping the
+// state machine preserves that observability spine; only the ASL shape
+// shrinks.
 package tfgen
 
 import (
 	"fmt"
-	"sort"
 	"strings"
-
-	"github.com/vesahyp/clavesa/internal/orchestration/aslgen"
 )
 
 // Pipeline carries everything tfgen needs to emit orchestration.tf.
@@ -46,10 +46,9 @@ type Pipeline struct {
 	// RunnerImageExpr is the HCL expression for the workspace's runner
 	// image ECR URI (e.g.
 	// `data.terraform_remote_state.workspace.outputs.runner_image`).
-	// ADR-018: runs_writer deploys as an image-based Lambda using this
-	// same image because Athena's Delta support is read-only and the
-	// Iceberg `INSERT INTO` path is gone; Spark+Delta from inside the
-	// runner image is the proven write path. Required.
+	// Both the per-pipeline runner Lambda and runs_writer pin to this
+	// image at plan time via aws_ecr_image; pushing a new image under
+	// the same tag is picked up on the next apply.
 	RunnerImageExpr string
 
 	// ScheduleExpr is the HCL expression for an EventBridge schedule
@@ -74,26 +73,45 @@ type Pipeline struct {
 	// pipeline's `inputs` is the opt-in (no separate knob).
 	UpstreamPipelines []string
 
-	// StateMachine is the graph-derived ASL shape; tfgen materialises it
-	// into the resource's `definition = jsonencode({...})` block.
-	StateMachine aslgen.StateMachine
-
-	// NodeMeta carries per-transform-node data (Lambda ARN, timeout,
-	// already-rendered inputs/outputs HCL expressions). Keyed by node
-	// name (matches StateMachine state names for Task states).
-	NodeMeta map[string]NodeMeta
+	// Transforms is the ordered list of transform invocations the per-
+	// pipeline Lambda will iterate through inside one Spark session.
+	// Order matters: pipeline_handler executes them sequentially, with
+	// downstream skips driven by `Parents`. Replaces the v2.1.x
+	// StateMachine + NodeMeta pair.
+	Transforms []TransformConfig
 }
 
-// NodeMeta describes one transform node for ASL Task emission.
-// InputsExpr and OutputsExpr are pre-rendered HCL map literals — the same
-// strings the historical orchestration.go emitter already built for the
-// `nodes = { ... }` block. They get inlined verbatim inside the Lambda
-// Payload as HCL values.
-type NodeMeta struct {
-	LambdaARNExpr  string // e.g. "module.bronze.lambda_function_arn"
-	InputsExpr     string // e.g. "{ bronze = \"<db>.<table>\" }"
-	OutputsExpr    string // e.g. "{ default = { kind = \"delta_table\", … } }"
-	TimeoutSeconds int    // typically 300
+// TransformConfig describes one transform invocation rendered into the
+// per-pipeline Lambda's input payload. Inputs/Outputs are pre-rendered
+// HCL map literals — the same shape the historical NodeMeta carried —
+// because they contain `module.X.outputs[...]` references that must
+// resolve at plan time, not at runtime inside the Lambda.
+type TransformConfig struct {
+	// NodeID is the bare node id (e.g. "enriched"). Mirrors what the
+	// runner sets as CLAVESA_NODE per-iteration.
+	NodeID string
+
+	// Language is "sql" or "python".
+	Language string
+
+	// LogicS3URI is a pre-rendered HCL string expression for the S3 URI
+	// of the transform's logic.{sql,py}, e.g.
+	// `"s3://${var.bucket}/${var.pipeline_name}/enriched/_runtime/logic.sql"`.
+	LogicS3URI string
+
+	// InputsExpr is a pre-rendered HCL map literal — same shape today's
+	// NodeMeta.InputsExpr produces, e.g. `{ bronze = "<db>.<table>" }`.
+	InputsExpr string
+
+	// OutputsExpr is a pre-rendered HCL map literal — same shape today's
+	// NodeMeta.OutputsExpr produces.
+	OutputsExpr string
+
+	// Parents lists the intra-pipeline upstream node ids. pipeline_handler
+	// uses this to cascade-skip downstream nodes when a parent fails (so
+	// a broken bronze short-circuits silver+gold without surprise
+	// behaviour from stale upstream data).
+	Parents []string
 }
 
 // Emit returns the full orchestration.tf body (excluding the `module "src_*"`
@@ -109,6 +127,7 @@ func Emit(p Pipeline) (string, error) {
 	emitGlueCatalogDB(&b, p)
 	emitLogGroup(&b, p)
 	emitIAMRole(&b, p)
+	emitPipelineLambda(&b, p)
 	emitStateMachine(&b, p)
 	emitSchedule(&b, p)
 	emitPoller(&b, p)
@@ -144,31 +163,20 @@ func (p Pipeline) validate() error {
 		return fmt.Errorf("tfgen: BucketExpr is required (runs_writer needs a bucket)")
 	}
 	if p.RunnerImageExpr == "" {
-		return fmt.Errorf("tfgen: RunnerImageExpr is required (runs_writer deploys as the runner image since ADR-018)")
+		return fmt.Errorf("tfgen: RunnerImageExpr is required (pipeline Lambda + runs_writer deploy as the runner image)")
 	}
-	for _, s := range p.StateMachine.States {
-		if s.Type == aslgen.Task {
-			if _, ok := p.NodeMeta[s.Name]; !ok {
-				return fmt.Errorf("tfgen: NodeMeta missing for task state %q", s.Name)
-			}
+	if len(p.Transforms) == 0 {
+		return fmt.Errorf("tfgen: at least one transform is required")
+	}
+	for i, t := range p.Transforms {
+		if t.NodeID == "" {
+			return fmt.Errorf("tfgen: Transforms[%d].NodeID is required", i)
 		}
-	}
-	return checkInnerTasks(p.StateMachine.States, p.NodeMeta)
-}
-
-func checkInnerTasks(states []aslgen.State, meta map[string]NodeMeta) error {
-	for _, s := range states {
-		switch s.Type {
-		case aslgen.Task:
-			if _, ok := meta[s.Name]; !ok {
-				return fmt.Errorf("tfgen: NodeMeta missing for task state %q", s.Name)
-			}
-		case aslgen.Parallel:
-			for _, br := range s.Branches {
-				if err := checkInnerTasks(br.States, meta); err != nil {
-					return err
-				}
-			}
+		if t.Language == "" {
+			return fmt.Errorf("tfgen: Transforms[%d].Language is required (transform %q)", i, t.NodeID)
+		}
+		if t.LogicS3URI == "" {
+			return fmt.Errorf("tfgen: Transforms[%d].LogicS3URI is required (transform %q)", i, t.NodeID)
 		}
 	}
 	return nil
@@ -220,6 +228,10 @@ func emitLogGroup(b *strings.Builder, p Pipeline) {
 
 // ---------------------------------------------------------------------------
 // IAM execution role for the Step Functions state machine
+//
+// v2.2.0: the state machine only invokes one Lambda (the per-pipeline
+// runner), so the Lambda invoke statement is scoped to that ARN instead
+// of "*".
 // ---------------------------------------------------------------------------
 
 func emitIAMRole(b *strings.Builder, p Pipeline) {
@@ -247,7 +259,8 @@ func emitIAMRole(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
 	fmt.Fprintf(b, "    Statement = [\n")
-	fmt.Fprintf(b, "      { Sid = \"LambdaInvoke\", Effect = \"Allow\", Action = [\"lambda:InvokeFunction\"], Resource = \"*\" },\n")
+	// v2.2.0: only the per-pipeline runner Lambda is invoked from this SFN.
+	fmt.Fprintf(b, "      { Sid = \"LambdaInvoke\", Effect = \"Allow\", Action = [\"lambda:InvokeFunction\"], Resource = [aws_lambda_function.pipeline_runner.arn] },\n")
 	fmt.Fprintf(b, "      { Sid = \"CloudWatchLogsDelivery\", Effect = \"Allow\", Action = [\n")
 	fmt.Fprintf(b, "          \"logs:CreateLogDelivery\", \"logs:GetLogDelivery\", \"logs:UpdateLogDelivery\",\n")
 	fmt.Fprintf(b, "          \"logs:DeleteLogDelivery\", \"logs:ListLogDeliveries\", \"logs:PutResourcePolicy\",\n")
@@ -259,28 +272,226 @@ func emitIAMRole(b *strings.Builder, p Pipeline) {
 }
 
 // ---------------------------------------------------------------------------
-// Step Functions state machine — the actual ASL definition
+// Per-pipeline runner Lambda (v2.2.0)
+//
+// One image-based Lambda per pipeline, hosting runner.pipeline_handler.
+// Receives the full ordered transform list in its event payload and runs
+// every transform inside one Spark session (the runner's `_SPARK`
+// singleton). Replaces the v2.1.x "one Lambda per transform" shape.
+//
+// IAM is the union of what each transform's module previously asked for
+// (modules/transform/aws/main.tf:84-238), aggregated to pipeline scope —
+// every input bucket the workspace can see, this pipeline's warehouse
+// + watermarks + system warehouse prefixes for writes, the workspace
+// catalog DBs for reads, this pipeline's catalog DB + system pipelines DB
+// for writes.
+// ---------------------------------------------------------------------------
+
+// moduleVersionLiteral is baked into the pipeline Lambda env as
+// CLAVESA_MODULE_VERSION. The orchestration emitter doesn't have access
+// to internal/service/version.go (cyclic import), and pushing it through
+// Pipeline as a field has no other consumer today — hardcoded for
+// v2.2.0; bump alongside ModuleVersion in version.go.
+const moduleVersionLiteral = "v2.2.0"
+
+func emitPipelineLambda(b *strings.Builder, p Pipeline) {
+	safeCatalog := safeCatalogLiteral(p.Catalog)
+	sysCatalogSafe := safeCatalogLiteral(p.SystemCatalog)
+
+	fmt.Fprintf(b, "# Per-pipeline runner Lambda — image-based, hosts runner.pipeline_handler.\n")
+	fmt.Fprintf(b, "# v2.2.0: one Lambda per pipeline runs every transform sequentially in\n")
+	fmt.Fprintf(b, "# one Spark session via the runner's `_SPARK` singleton, mirroring the\n")
+	fmt.Fprintf(b, "# local bundle execution Phase A landed (ADR-014 local-cloud parity).\n")
+
+	// Pin to the runner image digest at plan time — same content-
+	// addressed pattern emitRunsWriter and modules/transform/aws use.
+	fmt.Fprintf(b, "locals {\n")
+	fmt.Fprintf(b, "  pipeline_runner_image_match = regex(\"^([^:]+):(.+)$\", %s)\n", p.RunnerImageExpr)
+	fmt.Fprintf(b, "  pipeline_runner_repo_uri    = local.pipeline_runner_image_match[0]\n")
+	fmt.Fprintf(b, "  pipeline_runner_tag         = local.pipeline_runner_image_match[1]\n")
+	fmt.Fprintf(b, "  pipeline_runner_repo_name   = regex(\"^[^/]+/(.+)$\", local.pipeline_runner_repo_uri)[0]\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "data \"aws_ecr_image\" \"pipeline_runner\" {\n")
+	fmt.Fprintf(b, "  repository_name = local.pipeline_runner_repo_name\n")
+	fmt.Fprintf(b, "  image_tag       = local.pipeline_runner_tag\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "data \"aws_iam_policy_document\" \"pipeline_runner_assume\" {\n")
+	fmt.Fprintf(b, "  statement {\n")
+	fmt.Fprintf(b, "    actions = [\"sts:AssumeRole\"]\n")
+	fmt.Fprintf(b, "    principals {\n")
+	fmt.Fprintf(b, "      type        = \"Service\"\n")
+	fmt.Fprintf(b, "      identifiers = [\"lambda.amazonaws.com\"]\n")
+	fmt.Fprintf(b, "    }\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_iam_role\" \"pipeline_runner\" {\n")
+	fmt.Fprintf(b, "  name               = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  assume_role_policy = data.aws_iam_policy_document.pipeline_runner_assume.json\n")
+	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	// Aggregated IAM. Mirrors modules/transform/aws/main.tf:84-238 but
+	// scoped to the whole pipeline. Reads are intentionally broad
+	// (whole workspace bucket — ADR-016 cross-pipeline reads + every
+	// transform's input bucket); writes stay scoped to this pipeline's
+	// own warehouse / watermarks / system pipelines DB.
+	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"pipeline_runner\" {\n")
+	fmt.Fprintf(b, "  name = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  role = aws_iam_role.pipeline_runner.id\n\n")
+	fmt.Fprintf(b, "  policy = jsonencode({\n")
+	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
+	fmt.Fprintf(b, "    Statement = [\n")
+
+	// S3 read — workspace bucket + everything inside. Logic uploads,
+	// every transform's inputs (including same-account s3 sources), and
+	// cross-pipeline warehouse reads all land in this bucket.
+	fmt.Fprintf(b, "      { Sid = \"S3Read\", Effect = \"Allow\", Action = [\"s3:GetObject\", \"s3:ListBucket\", \"s3:GetBucketLocation\"], Resource = [\n")
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}\",\n", p.BucketExpr)
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/*\",\n", p.BucketExpr)
+	fmt.Fprintf(b, "      ]},\n")
+
+	// S3 write — this pipeline's prefixes only.
+	fmt.Fprintf(b, "      { Sid = \"S3Write\", Effect = \"Allow\", Action = [\n")
+	fmt.Fprintf(b, "          \"s3:PutObject\", \"s3:DeleteObject\", \"s3:AbortMultipartUpload\", \"s3:ListMultipartUploadParts\",\n")
+	fmt.Fprintf(b, "      ], Resource = [\n")
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/${%s}/_warehouse/*\",\n", p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/${%s}/_watermarks/*\",\n", p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/${%s}/*/*\",\n", p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/_system/pipelines/*\",\n", p.BucketExpr)
+	fmt.Fprintf(b, "      ]},\n")
+
+	// Glue read — workspace catalog + system catalog + `default` DB
+	// (Hive metastore probes it during session init).
+	fmt.Fprintf(b, "      { Sid = \"GlueCatalogRead\", Effect = \"Allow\", Action = [\n")
+	fmt.Fprintf(b, "          \"glue:GetDatabase\", \"glue:GetDatabases\", \"glue:GetTable\", \"glue:GetTables\",\n")
+	fmt.Fprintf(b, "          \"glue:GetPartition\", \"glue:GetPartitions\",\n")
+	fmt.Fprintf(b, "      ], Resource = [\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:catalog\",\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/default\",\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__*\",\n", safeCatalog)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:table/%s__*/*\",\n", safeCatalog)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__*\",\n", sysCatalogSafe)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:table/%s__*/*\",\n", sysCatalogSafe)
+	fmt.Fprintf(b, "      ]},\n")
+
+	// Glue write — this pipeline's user-schema DB plus the system
+	// pipelines DB (node_runs / runs / tables append from every pipeline).
+	fmt.Fprintf(b, "      { Sid = \"GlueCatalogWrite\", Effect = \"Allow\", Action = [\n")
+	fmt.Fprintf(b, "          \"glue:CreateTable\", \"glue:UpdateTable\", \"glue:DeleteTable\",\n")
+	fmt.Fprintf(b, "          \"glue:CreatePartition\", \"glue:UpdatePartition\", \"glue:DeletePartition\",\n")
+	fmt.Fprintf(b, "          \"glue:BatchCreatePartition\", \"glue:BatchDeletePartition\",\n")
+	fmt.Fprintf(b, "      ], Resource = [\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:catalog\",\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__${replace(%s, \"-\", \"_\")}\",\n", safeCatalog, p.SchemaExpr)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:table/%s__${replace(%s, \"-\", \"_\")}/*\",\n", safeCatalog, p.SchemaExpr)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__pipelines\",\n", sysCatalogSafe)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:table/%s__pipelines/*\",\n", sysCatalogSafe)
+	fmt.Fprintf(b, "      ]},\n")
+
+	// First-run database creation — Hive metastore's `CREATE DATABASE
+	// IF NOT EXISTS` path on first write goes through glue:CreateDatabase.
+	fmt.Fprintf(b, "      { Sid = \"GlueDatabaseCreate\", Effect = \"Allow\", Action = [\"glue:CreateDatabase\"], Resource = [\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:catalog\",\n")
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__${replace(%s, \"-\", \"_\")}\",\n", safeCatalog, p.SchemaExpr)
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__pipelines\",\n", sysCatalogSafe)
+	fmt.Fprintf(b, "      ]},\n")
+
+	fmt.Fprintf(b, "      { Sid = \"Logs\", Effect = \"Allow\", Action = [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"], Resource = [\"arn:aws:logs:*:*:*\"] },\n")
+	fmt.Fprintf(b, "    ]\n")
+	fmt.Fprintf(b, "  })\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	// Lambda. Mirrors emitRunsWriter's image-based shape; differs in
+	// handler (pipeline_handler vs runs_writer_handler), timeout (15min
+	// vs 2min), memory (10GB vs 1.5GB — multi-transform sessions can
+	// accumulate broadcast hashtables), and env (per-pipeline knobs).
+	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"pipeline_runner\" {\n")
+	fmt.Fprintf(b, "  function_name = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  role          = aws_iam_role.pipeline_runner.arn\n")
+	fmt.Fprintf(b, "  package_type  = \"Image\"\n")
+	fmt.Fprintf(b, "  image_uri     = \"${local.pipeline_runner_repo_uri}@${data.aws_ecr_image.pipeline_runner.image_digest}\"\n")
+	fmt.Fprintf(b, "  timeout       = 900   # 15min — the Lambda max; one container handles every transform\n")
+	fmt.Fprintf(b, "  memory_size   = 10240 # 10GB — Spark + Delta + accumulated broadcast tables across transforms\n\n")
+	fmt.Fprintf(b, "  image_config {\n")
+	fmt.Fprintf(b, "    command = [\"runner.pipeline_handler\"]\n")
+	fmt.Fprintf(b, "  }\n\n")
+	fmt.Fprintf(b, "  environment {\n")
+	fmt.Fprintf(b, "    variables = {\n")
+	// pipeline_handler sets per-transform CLAVESA_NODE / CLAVESA_LANGUAGE
+	// / CLAVESA_LOGIC_S3_PATH from the event payload before each iteration;
+	// only workspace-level invariants live here.
+	fmt.Fprintf(b, "      CLAVESA_PIPELINE            = %s\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "      CLAVESA_CATALOG             = \"%s\"\n", safeCatalog)
+	fmt.Fprintf(b, "      CLAVESA_SCHEMA              = %s\n", p.SchemaExpr)
+	fmt.Fprintf(b, "      CLAVESA_SYSTEM_CATALOG      = \"%s\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "      CLAVESA_WAREHOUSE           = \"s3://${%s}/${%s}/_warehouse/\"\n", p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "      CLAVESA_SYSTEM_WAREHOUSE    = \"s3://${%s}/_system/pipelines/\"\n", p.BucketExpr)
+	fmt.Fprintf(b, "      CLAVESA_WATERMARKS          = \"s3://${%s}/${%s}/_watermarks/\"\n", p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "      CLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest\n")
+	fmt.Fprintf(b, "      CLAVESA_MODULE_VERSION      = \"%s\"\n", moduleVersionLiteral)
+	fmt.Fprintf(b, "    }\n")
+	fmt.Fprintf(b, "  }\n\n")
+	fmt.Fprintf(b, "  tags = local.clavesa_tags\n")
+	fmt.Fprintf(b, "}\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Step Functions state machine — single Task ASL.
+//
+// v2.2.0: collapses to one Task that invokes the per-pipeline runner
+// Lambda with the full ordered transform list. No per-state Retry/Catch
+// + no PipelineFailed terminal state — runs_writer's EventBridge rule
+// already captures terminal SFN execution status changes and writes
+// FAILED/TIMED_OUT/ABORTED rows to the runs table. A Lambda-side error
+// surfaces as Task failure → SFN execution FAILED → runs_writer row.
 // ---------------------------------------------------------------------------
 
 func emitStateMachine(b *strings.Builder, p Pipeline) {
-	fmt.Fprintf(b, "# Step Functions state machine — pipeline DAG executor.\n")
-	fmt.Fprintf(b, "# ASL definition built by internal/orchestration/aslgen + tfgen; HCL\n")
-	fmt.Fprintf(b, "# expressions like `module.<node>.lambda_function_arn` resolve at plan\n")
-	fmt.Fprintf(b, "# time so Terraform's dependency graph still tracks each transform.\n")
+	fmt.Fprintf(b, "# Step Functions state machine — single Task that hands the full\n")
+	fmt.Fprintf(b, "# ordered transform list to the per-pipeline runner Lambda.\n")
+	fmt.Fprintf(b, "# v2.2.0: was multi-state (one Task per transform); collapsed because\n")
+	fmt.Fprintf(b, "# pipeline_handler now loops transforms inside one Spark session.\n")
 	fmt.Fprintf(b, "resource \"aws_sfn_state_machine\" \"pipeline\" {\n")
 	fmt.Fprintf(b, "  name     = \"clavesa-${%s}\"\n", p.PipelineNameExpr)
 	fmt.Fprintf(b, "  role_arn = aws_iam_role.sfn_exec.arn\n")
 	fmt.Fprintf(b, "  type     = \"STANDARD\"\n\n")
 	fmt.Fprintf(b, "  definition = jsonencode({\n")
 	fmt.Fprintf(b, "    Comment = \"Clavesa pipeline: ${%s}\"\n", p.PipelineNameExpr)
-	fmt.Fprintf(b, "    StartAt = %q\n", p.StateMachine.StartAt)
+	fmt.Fprintf(b, "    StartAt = \"RunPipeline\"\n")
 	fmt.Fprintf(b, "    States = {\n")
-	emitStates(b, p.StateMachine.States, p.NodeMeta, "      ", true)
-	// Plus the terminal Fail state every pipeline shares.
-	fmt.Fprintf(b, "      PipelineFailed = {\n")
-	fmt.Fprintf(b, "        Type  = \"Fail\"\n")
-	fmt.Fprintf(b, "        Error = \"PipelineFailed\"\n")
-	fmt.Fprintf(b, "        Cause = \"A pipeline node failed. Check CloudWatch Logs for execution details.\"\n")
+	fmt.Fprintf(b, "      RunPipeline = {\n")
+	fmt.Fprintf(b, "        Type           = \"Task\"\n")
+	fmt.Fprintf(b, "        Resource       = \"arn:aws:states:::lambda:invoke\"\n")
+	fmt.Fprintf(b, "        TimeoutSeconds = 900\n")
+	fmt.Fprintf(b, "        Parameters = {\n")
+	fmt.Fprintf(b, "          FunctionName = aws_lambda_function.pipeline_runner.arn\n")
+	fmt.Fprintf(b, "          Payload = {\n")
+	fmt.Fprintf(b, "            _pipeline_run = true\n")
+	fmt.Fprintf(b, "            pipeline      = %s\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "            transforms = [\n")
+	for _, t := range p.Transforms {
+		fmt.Fprintf(b, "              {\n")
+		fmt.Fprintf(b, "                node       = %q\n", t.NodeID)
+		fmt.Fprintf(b, "                language   = %q\n", t.Language)
+		fmt.Fprintf(b, "                logic_path = %s\n", t.LogicS3URI)
+		fmt.Fprintf(b, "                inputs     = %s\n", t.InputsExpr)
+		fmt.Fprintf(b, "                outputs    = %s\n", t.OutputsExpr)
+		fmt.Fprintf(b, "                parents    = %s\n", renderParents(t.Parents))
+		fmt.Fprintf(b, "              },\n")
+	}
+	fmt.Fprintf(b, "            ]\n")
+	// SFN context-object substitutions — runner attributes node_runs
+	// rows to the parent execution. Same three fields the multi-state
+	// ASL used; pipeline_handler propagates them through every node.
+	fmt.Fprintf(b, "            \"_sf_execution_arn.$\"        = \"$$.Execution.Id\"\n")
+	fmt.Fprintf(b, "            \"_sf_execution_started_at.$\" = \"$$.Execution.StartTime\"\n")
+	fmt.Fprintf(b, "            \"_execution_input.$\"         = \"$$.Execution.Input\"\n")
+	fmt.Fprintf(b, "          }\n")
+	fmt.Fprintf(b, "        }\n")
+	fmt.Fprintf(b, "        End = true\n")
 	fmt.Fprintf(b, "      }\n")
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  })\n\n")
@@ -294,90 +505,18 @@ func emitStateMachine(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "}\n\n")
 }
 
-// emitStates recursively writes the `key = { … }` entries for an ASL
-// States map. atTopLevel is true only for the outermost States map (the
-// one containing PipelineFailed); inside a Parallel branch's States map
-// it's false so the inner Tasks and Parallels skip the Catch — ASL
-// rejects a Catch.Next that targets a state outside the same States map.
-// Errors from inner Tasks propagate up to the enclosing Parallel state,
-// which carries the Catch in scope of PipelineFailed (v1.1.5 bug fix).
-func emitStates(b *strings.Builder, states []aslgen.State, meta map[string]NodeMeta, indent string, atTopLevel bool) {
-	// Sort states alphabetically so emit is byte-stable across runs.
-	sorted := make([]aslgen.State, len(states))
-	copy(sorted, states)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
-	for _, s := range sorted {
-		switch s.Type {
-		case aslgen.Task:
-			emitTask(b, s, meta[s.Name], indent, atTopLevel)
-		case aslgen.Parallel:
-			emitParallel(b, s, meta, indent, atTopLevel)
-		}
+// renderParents renders a []string as an HCL list literal — `[]` when
+// empty (must be explicit; jsonencode rejects a Go nil slice mid-tree
+// silently turning into null on the ASL side).
+func renderParents(parents []string) string {
+	if len(parents) == 0 {
+		return "[]"
 	}
-}
-
-func emitTask(b *strings.Builder, s aslgen.State, m NodeMeta, indent string, atTopLevel bool) {
-	fmt.Fprintf(b, "%s%s = {\n", indent, s.Name)
-	fmt.Fprintf(b, "%s  Type           = \"Task\"\n", indent)
-	fmt.Fprintf(b, "%s  Resource       = \"arn:aws:states:::lambda:invoke\"\n", indent)
-	fmt.Fprintf(b, "%s  TimeoutSeconds = %d\n", indent, m.TimeoutSeconds)
-	fmt.Fprintf(b, "%s  Parameters = {\n", indent)
-	fmt.Fprintf(b, "%s    FunctionName = %s\n", indent, m.LambdaARNExpr)
-	fmt.Fprintf(b, "%s    Payload = {\n", indent)
-	// inputs / outputs are pre-formatted HCL map literals.
-	fmt.Fprintf(b, "%s      inputs  = %s\n", indent, m.InputsExpr)
-	fmt.Fprintf(b, "%s      outputs = %s\n", indent, m.OutputsExpr)
-	// Three SFN context-object fields the runner uses to attribute
-	// node_runs rows to the parent execution.
-	fmt.Fprintf(b, "%s      \"_sf_execution_arn.$\"        = \"$$.Execution.Id\"\n", indent)
-	fmt.Fprintf(b, "%s      \"_sf_execution_started_at.$\" = \"$$.Execution.StartTime\"\n", indent)
-	fmt.Fprintf(b, "%s      \"_execution_input.$\"         = \"$$.Execution.Input\"\n", indent)
-	fmt.Fprintf(b, "%s    }\n", indent)
-	fmt.Fprintf(b, "%s  }\n", indent)
-	fmt.Fprintf(b, "%s  ResultPath = \"$.runner_results.%s\"\n", indent, s.Name)
-	emitRetryCatch(b, indent+"  ", atTopLevel)
-	if s.End {
-		fmt.Fprintf(b, "%s  End = true\n", indent)
-	} else {
-		fmt.Fprintf(b, "%s  Next = %q\n", indent, s.Next)
+	quoted := make([]string, len(parents))
+	for i, p := range parents {
+		quoted[i] = fmt.Sprintf("%q", p)
 	}
-	fmt.Fprintf(b, "%s}\n", indent)
-}
-
-func emitParallel(b *strings.Builder, s aslgen.State, meta map[string]NodeMeta, indent string, atTopLevel bool) {
-	fmt.Fprintf(b, "%s%s = {\n", indent, s.Name)
-	fmt.Fprintf(b, "%s  Type = \"Parallel\"\n", indent)
-	fmt.Fprintf(b, "%s  Branches = [\n", indent)
-	for _, br := range s.Branches {
-		fmt.Fprintf(b, "%s    {\n", indent)
-		fmt.Fprintf(b, "%s      StartAt = %q\n", indent, br.StartAt)
-		fmt.Fprintf(b, "%s      States = {\n", indent)
-		// Branch's States map is always its own ASL scope — not top-level.
-		emitStates(b, br.States, meta, indent+"        ", false)
-		fmt.Fprintf(b, "%s      }\n", indent)
-		fmt.Fprintf(b, "%s    },\n", indent)
-	}
-	fmt.Fprintf(b, "%s  ]\n", indent)
-	emitRetryCatch(b, indent+"  ", atTopLevel)
-	if s.End {
-		fmt.Fprintf(b, "%s  End = true\n", indent)
-	} else {
-		fmt.Fprintf(b, "%s  Next = %q\n", indent, s.Next)
-	}
-	fmt.Fprintf(b, "%s}\n", indent)
-}
-
-// emitRetryCatch writes the Retry policy unconditionally and the Catch
-// only when the surrounding state lives at the top-level States map
-// (where PipelineFailed is in scope). Inside a Parallel branch the Catch
-// is intentionally omitted — branch-internal errors propagate up to the
-// enclosing Parallel state, whose own Catch (also at the top level) sends
-// control to PipelineFailed.
-func emitRetryCatch(b *strings.Builder, indent string, atTopLevel bool) {
-	fmt.Fprintf(b, "%sRetry = [{ ErrorEquals = [\"States.TaskFailed\"], IntervalSeconds = 5, MaxAttempts = 3, BackoffRate = 2.0, MaxDelaySeconds = 60 }]\n", indent)
-	if atTopLevel {
-		fmt.Fprintf(b, "%sCatch = [{ ErrorEquals = [\"States.ALL\"], Next = \"PipelineFailed\" }]\n", indent)
-	}
+	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
 // ---------------------------------------------------------------------------
