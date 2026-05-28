@@ -10,6 +10,15 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.1.1] — 2026-05-28
+
+### Fixed
+
+- Pipeline editor now draws edges from cross-pipeline source nodes
+  (`<schema>.<table>` references) to their consuming transforms.
+- Clicking a cross-pipeline source node in the editor no longer
+  crashes the inspector drawer.
+
 ## [v2.1.0] — 2026-05-28
 
 ### Added

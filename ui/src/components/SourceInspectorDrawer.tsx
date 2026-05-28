@@ -74,7 +74,7 @@ export function SourceInspectorDrawer({
         {kind === "source" ? (
           <RegistrySourceBody name={name} />
         ) : kind === "external" ? (
-          <ExternalTableBody ref={name} />
+          <ExternalTableBody tableRef={name} />
         ) : (
           <div className="px-4 py-3 text-xs text-muted-foreground">
             Unknown node kind.
@@ -207,26 +207,26 @@ function RegistrySourceBody({ name }: { name: string }) {
   );
 }
 
-function ExternalTableBody({ ref }: { ref: string }) {
+function ExternalTableBody({ tableRef }: { tableRef: string }) {
   const catalog = useCatalogTables();
 
   // Resolve the schema.table reference against the workspace catalog so
   // we can show the producing pipeline + a deep link.
   const match = useMemo(() => {
-    const dot = ref.indexOf(".");
+    const dot = tableRef.indexOf(".");
     if (dot <= 0) return null;
-    const schema = ref.slice(0, dot);
-    const table = ref.slice(dot + 1);
+    const schema = tableRef.slice(0, dot);
+    const table = tableRef.slice(dot + 1);
     for (const t of catalog.data?.tables ?? []) {
       if (t.schema === schema && t.name === table) return t;
     }
     return null;
-  }, [catalog.data, ref]);
+  }, [catalog.data, tableRef]);
 
   return (
     <>
       <Section label="Reference">
-        <Field label="Schema.table" value={ref} />
+        <Field label="Schema.table" value={tableRef} />
         {match?.owning_pipeline && (
           <Field label="Produced by" value={match.owning_pipeline} />
         )}
@@ -237,7 +237,7 @@ function ExternalTableBody({ ref }: { ref: string }) {
           <span className="text-xs text-muted-foreground">Loading…</span>
         ) : !match ? (
           <span className="text-xs text-muted-foreground">
-            Table <code className="font-mono">{ref}</code> is not in the
+            Table <code className="font-mono">{tableRef}</code> is not in the
             workspace catalog yet. It will resolve once the producing
             pipeline runs.
           </span>

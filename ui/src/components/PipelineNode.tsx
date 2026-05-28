@@ -451,24 +451,28 @@ export function PipelineNode({ data, selected }: NodeProps) {
         </div>
       )}
 
-      {nodeType === "source" && (sourceKind || sourceFormat || sourceLocation) && (
+      {nodeType === "source" && (
         <div className={cn(hasColumns ? "pb-1.5" : "py-2")}>
           {hasColumns && <div className="mb-1 border-t border-border/60" />}
           <div className="relative px-3 pr-7">
-            <div className="mb-0.5 flex items-center justify-between gap-2 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
-              <span>Source</span>
-              <div className="flex items-center gap-1">
-                {sourceKind && <SourceMetaChip text={sourceKind} />}
-                {sourceFormat && <SourceMetaChip text={sourceFormat} muted />}
-              </div>
-            </div>
-            {sourceLocation && (
-              <div
-                className="truncate font-mono text-[10px] text-muted-foreground"
-                title={sourceLocation}
-              >
-                {sourceLocation}
-              </div>
+            {(sourceKind || sourceFormat || sourceLocation) && (
+              <>
+                <div className="mb-0.5 flex items-center justify-between gap-2 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
+                  <span>Source</span>
+                  <div className="flex items-center gap-1">
+                    {sourceKind && <SourceMetaChip text={sourceKind} />}
+                    {sourceFormat && <SourceMetaChip text={sourceFormat} muted />}
+                  </div>
+                </div>
+                {sourceLocation && (
+                  <div
+                    className="truncate font-mono text-[10px] text-muted-foreground"
+                    title={sourceLocation}
+                  >
+                    {sourceLocation}
+                  </div>
+                )}
+              </>
             )}
             <Handle
               type="source"
