@@ -204,15 +204,16 @@ func (s *Service) UpgradePipeline(dir, targetRef string) (currentRef, finalRef s
 		updated += n
 	}
 
-	// Re-sync orchestration.tf — the emitter's output shape can change
+	// Sync orchestration.tf — the emitter's output shape can change
 	// between versions. Run whenever we touched source lines OR migrated
 	// a compute attribute, since the orchestration emit also encodes the
-	// rewritten compute structure.
+	// rewritten compute structure. Unconditional: pipelines whose
+	// directory never had an orchestration.tf (older `pipeline create`
+	// flows, or hand-authored directories) get one generated, instead of
+	// the silent skip that left them deploy-broken (GH #3).
 	if updated > 0 || migrated > 0 {
-		if _, statErr := os.Stat(filepath.Join(abs, "orchestration.tf")); statErr == nil {
-			if syncErr := s.SyncOrchestration(dir, ""); syncErr != nil {
-				return currentRef, finalRef, updated, migrated, fmt.Errorf("re-sync orchestration.tf: %w", syncErr)
-			}
+		if syncErr := s.SyncOrchestration(dir, ""); syncErr != nil {
+			return currentRef, finalRef, updated, migrated, fmt.Errorf("sync orchestration.tf: %w", syncErr)
 		}
 	}
 	return currentRef, finalRef, updated, migrated, nil

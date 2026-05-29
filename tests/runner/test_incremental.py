@@ -279,6 +279,38 @@ def test_resolve_input_partitioned_skips_when_no_new():
     spark.read.parquet.assert_not_called()
 
 
+def test_resolve_input_partitioned_skip_bypassed_when_forced():
+    """`--force` plumbed into _resolve_input(forced=True) — even with the
+    watermark already at the max partition, the runner re-reads the full
+    source range instead of returning (None, None). Watermark still
+    advances on success (pinned to the same value here, a no-op)."""
+    runner = _load_runner()
+    s3 = runner._FAKE_S3
+    _seed_cloudfront_partitions(s3, "logs", "year=2026/month=04/", [
+        ("2026-04-26", "00"),
+        ("2026-04-27", "01"),
+    ])
+    os.environ["CLAVESA_WATERMARKS"] = "s3://wm/pipe/_watermarks/"
+    runner._write_watermark("s3://wm/pipe/_watermarks/cloudfront.json", ("2026-04-27", "01"))
+
+    spark = MagicMock()
+    spark.read.option.return_value.parquet.return_value = "<df>"
+
+    src = {
+        "kind": "partitioned_path",
+        "path": "s3://logs/year=2026/month=04/",
+        "partitions": ["day", "hour"],
+        "start_from": "all",
+    }
+    df, advance = runner._resolve_input(spark, "cloudfront", src, forced=True)
+    # Did NOT skip — got back a df and read every partition under the prefix.
+    assert df is not None
+    assert advance is not None
+    spark.read.option.return_value.parquet.assert_called_once()
+    paths = spark.read.option.return_value.parquet.call_args.args
+    assert len(paths) == 2  # both partitions re-read
+
+
 def test_resolve_input_partitioned_reads_only_new():
     """Watermark mid-range: read only partitions strictly above it."""
     runner = _load_runner()

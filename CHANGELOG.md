@@ -10,6 +10,25 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [Unreleased]
+
+## [v2.3.0] — 2026-05-29
+
+### Added
+
+- `clavesa node edit --set sql=…`, the UI SQL editor, `clavesa dashboards apply`, and `clavesa node preview` now parse SQL before persisting or dispatching — bad SQL is rejected with the parser's pointer-into-SQL message instead of failing after a Spark cold start.
+- `clavesa sql lint <file>` — parse-only check for use in pre-commit hooks and CI.
+- `clavesa pipeline run --force` (and `--force-node <id>`) bypasses the runner's incremental-skip checks for one run (partitioned source cursor + Delta upstream version cursor). Watermarks still advance on success. Append-mode outputs without `merge_keys` get a duplicate-warning before dispatch.
+
+### Fixed
+
+- Lake Formation-gated AWS accounts (default on accounts created after Aug 2023) now provision cleanly: orchestration emits `aws_lakeformation_permissions` alongside every Glue database it creates, so the runner Lambda no longer hits `Required Describe on clavesa_<workspace>__<schema>` on first read. Deploying principal must be a `DataLakeAdmin`; see the README "Lake Formation-enabled accounts" callout.
+- Step Functions executions now fail when any transform in the bundle fails — previously the runner returned a `{status: failed}` payload that SFN treated as success, leaving downstream pipelines silently triggered on hidden failures and the `runs` system table polluted with false-positive successes.
+- `clavesa pipeline upgrade` now generates `orchestration.tf` when missing instead of silently skipping the re-sync. Pipelines that ended up without an `orchestration.tf` (older `pipeline create` flows, hand-authored directories) no longer deploy as data-only stacks with no Lambda or Step Function.
+- `clavesa pipeline deploy` fails fast with a clear message when `orchestration.tf` is missing, pointing at `pipeline upgrade` or `pipeline orchestration sync` instead of letting terraform emit a cryptic error.
+- Append + merge transform outputs now tolerate additive schema drift (default `mergeSchema=true` on append; `MERGE WITH SCHEMA EVOLUTION` on merge). The runner emits one stderr line per run when a new column actually landed.
+- Cloud observability and dashboard endpoints return an empty result instead of 500 when the system Delta tables don't exist yet (fresh deploy before first run, or after a system-catalog Glue DB rebuild).
+
 ## [v2.2.2] — 2026-05-28
 
 ### Fixed

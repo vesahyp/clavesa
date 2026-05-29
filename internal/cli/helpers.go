@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/graph"
+	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/service"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -194,14 +195,51 @@ func walkUpForManifest() string {
 	}
 }
 
+// cliCloseables holds Close functions registered by newService so the
+// CLI can shut down warm-worker containers spawned during a one-shot
+// command. Each `clavesa <cmd>` invocation that touches the SQL parser
+// would otherwise leave a ~1GB container behind.
+var cliCloseables []func()
+
+// registerCloseable appends a teardown to run after the current CLI
+// command finishes. Safe to call from any newService /
+// newDashboardService path.
+func registerCloseable(fn func()) {
+	cliCloseables = append(cliCloseables, fn)
+}
+
+// runCloseables stops every registered teardown. Called by Execute /
+// Run after the root command returns (success or failure). Idempotent
+// — resets the slice afterward so a future Execute call starts clean
+// (relevant for unit tests that invoke Run() repeatedly).
+func runCloseables() {
+	for _, fn := range cliCloseables {
+		fn()
+	}
+	cliCloseables = nil
+}
+
 // newService builds a service.Service after resolving the workspace from the
 // command's flags.
+//
+// The service gets a lazy SQL parser wired (Slice 3): the underlying
+// persistent runner only spawns a docker container the first time
+// Parse is called, so commands that never validate SQL stay
+// docker-free. Commands that do hit the parser (node edit, node
+// preview, dashboards apply, sql lint) pay one ~30s cold spawn per
+// CLI invocation; the container is torn down by runCloseables() at
+// command exit.
 func newService(cmd *cobra.Command) (*service.Service, string, error) {
 	workspace, err := resolveWorkspace(cmd)
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve workspace: %w", err)
 	}
-	return service.New(workspace), workspace, nil
+	svc := service.New(workspace)
+	warm := observability.NewPersistentQueryRunner(workspace)
+	parser := warm.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
+	registerCloseable(warm.Close)
+	svc = svc.WithSQLParser(parser)
+	return svc, workspace, nil
 }
 
 // pipelineDirHelp documents the <pipeline-dir> positional shared by every

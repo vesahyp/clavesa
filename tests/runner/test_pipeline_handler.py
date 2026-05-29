@@ -198,9 +198,43 @@ def test_partial_skip_then_continue():
     assert result["transforms"][2]["status"] == "ok"
 
 
+def test_failure_reraises_under_lambda():
+    """GH #2: under Lambda (AWS_LAMBDA_FUNCTION_NAME set), pipeline_handler
+    must raise after building the failed-status payload so the SFN task
+    fails — otherwise the cross-pipeline EventBridge rule (filtered on
+    detail.status = SUCCEEDED) fires downstream pipelines on a hidden
+    failure. Local mode (env unset) still returns the dict so
+    `clavesa pipeline run` parses it.
+    """
+    import os as _os
+    mod = _load_runner()
+    transforms = [
+        {"node": "a", "language": "sql", "logic_path": "/tmp/a.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+    ]
+    responses = {"a": RuntimeError("boom")}
+
+    prev = _os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    _os.environ["AWS_LAMBDA_FUNCTION_NAME"] = "clavesa-test-runner"
+    try:
+        raised = False
+        try:
+            _drive(mod, transforms, responses)
+        except RuntimeError as exc:
+            raised = True
+            assert "a" in str(exc), f"raised message should name the failed node: {exc}"
+            assert "RuntimeError" in str(exc) or "boom" in str(exc), str(exc)
+        assert raised, "expected pipeline_handler to raise under Lambda env"
+    finally:
+        if prev is None:
+            _os.environ.pop("AWS_LAMBDA_FUNCTION_NAME", None)
+        else:
+            _os.environ["AWS_LAMBDA_FUNCTION_NAME"] = prev
+
+
 if __name__ == "__main__":
     test_three_transforms_all_succeed()
     test_cascade_skip_when_all_parents_skip()
     test_failure_stops_pipeline()
     test_partial_skip_then_continue()
+    test_failure_reraises_under_lambda()
     print("PASS")

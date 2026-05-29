@@ -106,6 +106,57 @@ func TestStripLocalCompute(t *testing.T) {
 	}
 }
 
+// TestUpgradePipelineRegeneratesMissingOrchestration — `pipeline upgrade`
+// generates orchestration.tf when the directory has none, instead of
+// silently skipping the sync. Reproduces GH #3, where pipelines whose
+// orchestration.tf was never created (older `pipeline create` flows or
+// hand-authored directories) deployed as data-only stacks with no SFN.
+func TestUpgradePipelineRegeneratesMissingOrchestration(t *testing.T) {
+	svc, dir, id := initComputeTestWorkspace(t)
+	abs := svc.resolveDir(dir)
+	orchPath := filepath.Join(abs, "orchestration.tf")
+
+	// CreatePipeline emits an initial orchestration.tf; delete it to
+	// simulate a pipeline that never had one. Also inject the legacy
+	// compute = "local" attribute so the migrated > 0 branch fires
+	// (upgrade only syncs when something actually changed).
+	if err := os.Remove(orchPath); err != nil {
+		t.Fatalf("remove orchestration.tf: %v", err)
+	}
+	tfFiles, _ := filepath.Glob(filepath.Join(abs, "*.tf"))
+	injected := false
+	for _, f := range tfFiles {
+		data, _ := os.ReadFile(f)
+		marker := "module \"" + id + "\" {"
+		if !strings.Contains(string(data), marker) {
+			continue
+		}
+		patched := strings.Replace(string(data), marker, marker+"\n  compute = \"local\"", 1)
+		if err := os.WriteFile(f, []byte(patched), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		injected = true
+		break
+	}
+	if !injected {
+		t.Fatalf("could not find the transform module block to inject into")
+	}
+
+	if _, _, _, migrated, err := svc.UpgradePipeline(dir, ModuleVersion); err != nil {
+		t.Fatalf("UpgradePipeline: %v", err)
+	} else if migrated != 1 {
+		t.Fatalf("migrated = %d, want 1", migrated)
+	}
+
+	body, err := os.ReadFile(orchPath)
+	if err != nil {
+		t.Fatalf("orchestration.tf not regenerated: %v", err)
+	}
+	if !strings.Contains(string(body), "aws_sfn_state_machine") {
+		t.Errorf("regenerated orchestration.tf missing state machine resource:\n%s", body)
+	}
+}
+
 // TestUpgradePipelineStripsLocalCompute — `pipeline upgrade` migrates a
 // legacy pipeline by removing the dead compute = "local" attribute, even
 // when the module ref does not change.

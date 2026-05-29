@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +17,7 @@ import (
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
 	"github.com/spf13/cobra"
+	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -294,6 +297,8 @@ func newPipelineUpgradeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			_, orchStatErr := os.Stat(filepath.Join(dir, "orchestration.tf"))
+			orchExistedBefore := orchStatErr == nil
 			currentRef, targetRef, updated, migrated, err := svc.UpgradePipeline(dir, version)
 			if err != nil {
 				return err
@@ -304,8 +309,10 @@ func newPipelineUpgradeCmd() *cobra.Command {
 			}
 			if updated > 0 {
 				fmt.Printf("Upgraded %d module source(s): %s → %s\n", updated, currentRef, targetRef)
-				if _, statErr := os.Stat(filepath.Join(dir, "orchestration.tf")); statErr == nil {
+				if orchExistedBefore {
 					fmt.Println("Re-synced orchestration.tf to match the new emitter shape.")
+				} else {
+					fmt.Println("Generated missing orchestration.tf.")
 				}
 			}
 			if migrated > 0 {
@@ -357,6 +364,10 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 			}
 			if err := svc.ValidateSchemaOwnership(dir); err != nil {
 				return err
+			}
+			if _, statErr := os.Stat(filepath.Join(dir, "orchestration.tf")); os.IsNotExist(statErr) {
+				return fmt.Errorf("orchestration.tf missing in %s — run `clavesa pipeline upgrade %s` (regenerates it) or `clavesa pipeline orchestration sync %s`",
+					displayDir(ws, dir), filepath.Base(dir), filepath.Base(dir))
 			}
 			return deployFlow{
 				WorkspaceRoot:     ws,
@@ -458,6 +469,8 @@ func newPipelineRunCmd() *cobra.Command {
 	var jsonOut bool
 	var wait bool
 	var envOverride string
+	var force bool
+	var forceNodes []string
 	cmd := &cobra.Command{
 		Use:   "run <pipeline-dir>",
 		Short: "Execute the pipeline (local: runner container; cloud: SFN StartExecution)",
@@ -484,7 +497,8 @@ dispatch.
 			if err != nil {
 				return err
 			}
-			if _, err := hclparser.Parse(dir); err != nil {
+			g, err := hclparser.Parse(dir)
+			if err != nil {
 				return fmt.Errorf("parse pipeline at %s: %w", displayDir(ws, dir), err)
 			}
 
@@ -497,30 +511,87 @@ dispatch.
 				mode = m
 			}
 
+			// --force-node implies a scoped --force; defend in depth.
+			effectiveForce := force || len(forceNodes) > 0
+			if effectiveForce {
+				warnForceAppendWithoutMergeKeys(&g, forceNodes)
+			}
+
 			if !jsonOut {
 				printTargetContext("run "+filepath.Base(dir), ws, mode)
 			}
 			if mode == workspace.ModeLocal {
-				return runLocalPipeline(cmd, dir, jsonOut)
+				return runLocalPipeline(cmd, dir, jsonOut, effectiveForce, forceNodes)
 			}
-			return runCloudPipeline(cmd.Context(), dir, jsonOut, wait)
+			return runCloudPipeline(cmd.Context(), dir, jsonOut, wait, effectiveForce, forceNodes)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable output")
 	cmd.Flags().StringVar(&envOverride, "env", "", "override the workspace environment mode for this run: local | cloud")
 	cmd.Flags().BoolVar(&wait, "wait", false, "(cloud only) block until the SFN execution terminates")
+	cmd.Flags().BoolVar(&force, "force", false, "Bypass incremental-skip checks for this run; the runner reads the full source range. Watermarks still advance on success.")
+	cmd.Flags().StringSliceVar(&forceNodes, "force-node", nil, "Bypass incremental-skip for the named node only. Repeatable. Implies --force scoped to that node.")
 	return cmd
+}
+
+// warnForceAppendWithoutMergeKeys prints one stderr line per node in the
+// force set that has an append-mode output without merge_keys. A forced
+// run re-reads the full source range; an append+no-keys output writes
+// duplicates. Don't refuse — the operator may want exactly this; just
+// surface the risk so it can't surprise them.
+func warnForceAppendWithoutMergeKeys(g *graph.PipelineGraph, forceNodes []string) {
+	scope := map[string]bool{}
+	for _, n := range forceNodes {
+		scope[n] = true
+	}
+	for i := range g.Nodes {
+		n := &g.Nodes[i]
+		if n.Type != "transform" {
+			continue
+		}
+		if len(scope) > 0 && !scope[n.ID] {
+			continue
+		}
+		defs, _ := n.Config["output_definitions"].(map[string]interface{})
+		var risky []string
+		for key, raw := range defs {
+			def, _ := raw.(map[string]interface{})
+			if def == nil {
+				continue
+			}
+			mode, _ := def["mode"].(string)
+			if mode != "append" {
+				continue
+			}
+			hasKeys := false
+			if mk, ok := def["merge_keys"].([]interface{}); ok && len(mk) > 0 {
+				hasKeys = true
+			}
+			if !hasKeys {
+				risky = append(risky, key)
+			}
+		}
+		if len(risky) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"warning: --force on node %q has append outputs without merge_keys (%q); a re-read of the full source range may write duplicates. Consider mode=replace or mode=merge for keyed outputs.\n",
+				n.ID, strings.Join(risky, ", "),
+			)
+		}
+	}
 }
 
 // runLocalPipeline preserves the pre-dispatch behavior — DAG walk + runner
 // container per transform — for compute=local pipelines. Returns the same
 // shape (table rows + workdir) the command always has.
-func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut bool) error {
+func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut, force bool, forceNodes []string) error {
 	svc, _, err := newService(cmd)
 	if err != nil {
 		return err
 	}
-	result, err := svc.RunPipeline(cmd.Context(), dir)
+	result, err := svc.RunPipelineWithOpts(cmd.Context(), dir, service.RunOpts{
+		Force:      force,
+		ForceNodes: forceNodes,
+	})
 	if err != nil {
 		if result != nil && jsonOut {
 			_ = printJSON(os.Stdout, result)
@@ -552,7 +623,7 @@ func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut bool) error {
 //
 // `wait=true` polls DescribeExecution until status leaves RUNNING. Polls
 // once every 5s; cap is the cobra context (which honors Ctrl-C).
-func runCloudPipeline(ctx context.Context, abs string, jsonOut, wait bool) error {
+func runCloudPipeline(ctx context.Context, abs string, jsonOut, wait, force bool, forceNodes []string) error {
 	pipelineName := filepath.Base(abs)
 	stateMachineName := "clavesa-" + pipelineName
 
@@ -567,9 +638,25 @@ func runCloudPipeline(ctx context.Context, abs string, jsonOut, wait bool) error
 		return err
 	}
 
+	// SFN ASL passes the execution input forward to the per-transform
+	// Lambda invocation payload. The runner reads `_force` / `_force_nodes`
+	// from the event and threads them through to its incremental-skip
+	// bypass check (runner.py:_is_forced).
+	inputPayload := map[string]any{"_trigger": "manual"}
+	if force {
+		inputPayload["_force"] = true
+		if len(forceNodes) > 0 {
+			inputPayload["_force_nodes"] = forceNodes
+		}
+	}
+	inputJSON, err := json.Marshal(inputPayload)
+	if err != nil {
+		return fmt.Errorf("marshal execution input: %w", err)
+	}
+
 	startOut, err := client.StartExecution(ctx, &sfn.StartExecutionInput{
 		StateMachineArn: aws.String(arn),
-		Input:           aws.String(`{"_trigger":"manual"}`),
+		Input:           aws.String(string(inputJSON)),
 	})
 	if err != nil {
 		return fmt.Errorf("StartExecution: %w", err)

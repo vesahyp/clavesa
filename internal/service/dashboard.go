@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -254,6 +255,9 @@ func (s *Service) SaveDashboard(ctx context.Context, d Dashboard) (Dashboard, er
 	if err := validateDashboard(d); err != nil {
 		return Dashboard{}, err
 	}
+	if err := s.validateDashboardSQL(ctx, d); err != nil {
+		return Dashboard{}, err
+	}
 	prov, err := s.dashboardProvider()
 	if err != nil {
 		return Dashboard{}, err
@@ -265,6 +269,46 @@ func (s *Service) SaveDashboard(ctx context.Context, d Dashboard) (Dashboard, er
 		return Dashboard{}, err
 	}
 	return s.GetDashboard(ctx, d.Slug)
+}
+
+// validateDashboardSQL parse-checks every dataset's SQL (and any
+// select-control SQL) via the wired parser (Slice 3). Aggregates
+// failures so the user sees every bad dataset in one shot — saving a
+// dashboard with three broken datasets one-by-one would be
+// infuriating. No-op when no parser is wired (CLI integration tests).
+// Transport failures (warm worker dead, missing image) are logged but
+// don't block the save — render-time will surface real parse errors.
+func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
+	if s.sqlParser == nil {
+		return nil
+	}
+	var failures []string
+	checkOne := func(label, sql string) {
+		if err := s.ValidateSQL(ctx, sql); err != nil {
+			var pe *ParseError
+			if errors.As(err, &pe) {
+				failures = append(failures, label+": "+pe.Message)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped for %s: %v\n", label, err)
+		}
+	}
+	for _, ds := range d.Datasets {
+		if strings.TrimSpace(ds.SQL) == "" {
+			continue
+		}
+		checkOne(fmt.Sprintf("dataset %q", ds.Name), ds.SQL)
+	}
+	for _, c := range d.Controls {
+		if c.Type != "select" || strings.TrimSpace(c.SQL) == "" {
+			continue
+		}
+		checkOne(fmt.Sprintf("control %q", c.Name), c.SQL)
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	return &ParseError{Message: "SQL parse failed:\n  " + strings.Join(failures, "\n  ")}
 }
 
 // ApplyDashboardFile parses a dashboard JSON document (legacy or

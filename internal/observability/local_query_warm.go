@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -118,6 +119,85 @@ func (p *persistentDockerQueryRunner) resolveImage() string {
 	return runner.LocalImageName("") + ":latest"
 }
 
+// ParseError is returned by Parse when the warm worker's SQL parser
+// rejected the input. The Message is the parser's pointer-into-SQL
+// hint — surface it directly to the user. Transport/runner failures
+// return a different error type; callers use errors.As(&ParseError{})
+// to distinguish "your SQL is broken" from "the runner is broken".
+type ParseError struct {
+	Message string
+}
+
+func (e *ParseError) Error() string { return e.Message }
+
+// Parse satisfies SQLParser. First call per warehouse spawns the
+// container and blocks until /healthz responds (~30s); subsequent
+// calls reuse the warm worker, so a parse is a single round-trip
+// POST /parse — milliseconds, not seconds.
+//
+// On parse failure (parser rejects the SQL) Parse returns *ParseError
+// carrying the parser's message. Any other return is a transport or
+// runner failure (worker dead, docker gone, network) — callers must
+// not surface those as parse errors.
+func (p *persistentDockerQueryRunner) Parse(ctx context.Context, warehouse, sql string) error {
+	w, err := p.getOrSpawn(ctx, warehouse)
+	if err != nil {
+		return err
+	}
+	err = p.parseAt(ctx, w, sql)
+	if err != nil && shouldRespawn(err) {
+		// Mirror Run()'s one-shot respawn: container died, JVM died,
+		// Connect gRPC dead. Drop and try once.
+		p.evict(warehouse, w)
+		w2, err2 := p.getOrSpawn(ctx, warehouse)
+		if err2 != nil {
+			return err2
+		}
+		return p.parseAt(ctx, w2, sql)
+	}
+	return err
+}
+
+func (p *persistentDockerQueryRunner) parseAt(ctx context.Context, w *warmWorker, sql string) error {
+	body, _ := json.Marshal(map[string]string{"sql": sql})
+	url := fmt.Sprintf("http://127.0.0.1:%d/parse", w.port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.httpC.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read warm-worker /parse response: %w", err)
+	}
+	// /parse returns 400 on a missing/empty SQL body, 200 in every other
+	// shape (ok=true on success, ok=false on parse failure). Treat both
+	// 200 and 400 as "envelope present"; everything else is transport.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
+		return fmt.Errorf("warm worker /parse HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+	var env struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("decode /parse response: %w (body: %s)", err, string(raw))
+	}
+	if env.OK {
+		return nil
+	}
+	msg := env.Error
+	if msg == "" {
+		msg = "SQL parse failed (no message)"
+	}
+	return &ParseError{Message: msg}
+}
+
 // Run satisfies QueryRunner. First call per warehouse spawns the container
 // and blocks until /healthz responds (~30s). Subsequent calls reuse the
 // warm worker.
@@ -141,6 +221,45 @@ func (p *persistentDockerQueryRunner) Run(ctx context.Context, warehouse, sql st
 		return p.query(ctx, w2, sql)
 	}
 	return res, err
+}
+
+// SQLParserFor returns a Service-compatible SQL parser bound to the
+// given workspace warehouse. The returned value satisfies
+// service.SQLParser — its Parse(ctx, sql) routes to the warm worker's
+// /parse endpoint. Translates *observability.ParseError into
+// *service.ParseError at the seam so callers in internal/cli +
+// internal/api can `errors.As(&service.ParseError{})` without
+// reaching into the observability package.
+func (p *persistentDockerQueryRunner) SQLParserFor(warehouse string) *boundSQLParser {
+	return &boundSQLParser{runner: p, warehouse: warehouse}
+}
+
+// boundSQLParser binds a persistentDockerQueryRunner to one warehouse
+// so it satisfies the service-layer SQLParser shape (no warehouse
+// parameter). The translation to *service.ParseError happens at the
+// caller (cli/api) by detecting the *observability.ParseError this
+// returns — keeps the observability package free of an import cycle.
+type boundSQLParser struct {
+	runner    *persistentDockerQueryRunner
+	warehouse string
+}
+
+// Parse satisfies service.SQLParser (and is the parse seam Slice 3
+// wires across CLI / UI / dashboards / preview). The underlying
+// runner returns *ParseError on parser rejection; we re-return the
+// same value so callers can `errors.As(&observability.ParseError{})`
+// to detect parser-vs-transport without depending on a separate
+// service-layer type. service.ValidateSQL's wrapping turns it into a
+// *service.ParseError at the api / cli boundary.
+func (b *boundSQLParser) Parse(ctx context.Context, sql string) error {
+	err := b.runner.Parse(ctx, b.warehouse, sql)
+	if err == nil {
+		return nil
+	}
+	// Sanity: confirm the error is one shape the caller understands.
+	var pe *ParseError
+	_ = errors.As(err, &pe)
+	return err
 }
 
 // Warmup spawns the warm worker for `warehouse` in the background, without
@@ -423,28 +542,51 @@ func SweepWarmWorkers(workspaceRoot string) {
 // dockerHostPort returns the host-side port docker bound for a container's
 // exposed port (e.g. "8765/tcp"). Output line shape: "0.0.0.0:54321" plus
 // often an IPv6 sibling on a second line; we take the first IPv4 line.
+//
+// Retries briefly on transient failure: `docker run -d` returns when the
+// container is created, not when the port mapping is wired up. The
+// first one-or-two `docker port` calls race the runtime's
+// network-namespace setup and exit non-zero with an empty body. We poll
+// for up to ~3 seconds, which is long after every container observed in
+// dev/CI but well under the eventual /healthz wait.
 func dockerHostPort(ctx context.Context, containerID, containerPort string) (int, error) {
-	out, err := exec.CommandContext(ctx, "docker", "port", containerID, containerPort).Output()
-	if err != nil {
-		return 0, fmt.Errorf("docker port %s %s: %w", containerID[:12], containerPort, err)
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	var lastOut string
+	for {
+		out, err := exec.CommandContext(ctx, "docker", "port", containerID, containerPort).Output()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				// "0.0.0.0:54321" or "[::]:54321" — split on the LAST
+				// colon so IPv6 brackets don't confuse us.
+				idx := strings.LastIndex(line, ":")
+				if idx < 0 {
+					continue
+				}
+				p, perr := strconv.Atoi(line[idx+1:])
+				if perr == nil && p > 0 {
+					return p, nil
+				}
+			}
+			lastErr = fmt.Errorf("no usable host port in %q", string(out))
+			lastOut = string(out)
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// "0.0.0.0:54321" or "[::]:54321" — split on the LAST colon so
-		// IPv6 brackets don't confuse us.
-		idx := strings.LastIndex(line, ":")
-		if idx < 0 {
-			continue
-		}
-		p, err := strconv.Atoi(line[idx+1:])
-		if err == nil && p > 0 {
-			return p, nil
-		}
-	}
-	return 0, fmt.Errorf("docker port %s %s: no usable host port in %q", containerID[:12], containerPort, string(out))
+	return 0, fmt.Errorf("docker port %s %s: %w (last output: %q)", containerID[:12], containerPort, lastErr, lastOut)
 }
 
 // isConnRefused recognizes the family of errors net/http returns when the

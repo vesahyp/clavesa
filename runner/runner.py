@@ -486,7 +486,45 @@ def _read_path_format(spark, path: str, fmt: str):
     raise RuntimeError(f"unsupported source format {fmt!r} for path {path!r}")
 
 
-def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None = None) -> tuple[Any, dict[str, Any] | None]:
+def _is_forced(event: Any, node_id: str) -> bool:
+    """Decide whether this node's incremental-skip checks are bypassed for
+    this run.
+
+    Sources of truth (in priority order):
+      - Cloud: ``event["_force"]`` truthy. Optional ``event["_force_nodes"]``
+        narrows the bypass to a subset; empty/missing means "every node".
+      - Local: ``CLAVESA_FORCE=1`` env var. Optional ``CLAVESA_FORCE_NODES``
+        CSV narrows the bypass; empty means "every node".
+
+    Returns False when neither is set — normal incremental dispatch.
+
+    Forced runs still advance watermarks on success. The bypass is one-off;
+    the next unforced run resumes normal incremental behavior.
+    """
+    if os.environ.get("CLAVESA_FORCE") == "1":
+        nodes_csv = os.environ.get("CLAVESA_FORCE_NODES", "")
+        if not nodes_csv:
+            return True
+        return node_id in [n.strip() for n in nodes_csv.split(",") if n.strip()]
+    if isinstance(event, dict):
+        force = event.get("_force")
+        force_nodes = event.get("_force_nodes") or []
+        if not force:
+            # Cloud path: SFN execution input lands under _execution_input
+            # on the per-Lambda event (see tfgen.go:519).
+            exec_input = event.get("_execution_input")
+            if isinstance(exec_input, dict):
+                force = exec_input.get("_force")
+                if not force_nodes:
+                    force_nodes = exec_input.get("_force_nodes") or []
+        if force:
+            if not force_nodes:
+                return True
+            return node_id in force_nodes
+    return False
+
+
+def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None = None, forced: bool = False) -> tuple[Any, dict[str, Any] | None]:
     """Returns (DataFrame, watermark_advance_record).
 
     watermark_advance_record is None when the input doesn't track a watermark
@@ -499,6 +537,11 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
     incremental window. The watermark is NEITHER read nor advanced — backfill
     runs go to a parallel staging table that the user inspects + promotes
     separately, leaving production state untouched.
+
+    `forced=True` (set by the caller when the node is in this run's force
+    set) bypasses the no-new-data skip on both incremental kinds
+    (``partitioned_path`` cursor + ``delta_table_cdf`` version). A forced run
+    re-reads the full source range; watermarks still advance on success.
     """
     if isinstance(src, str):
         if _looks_like_path(src):
@@ -595,6 +638,19 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
                 "new_cursor": (str(current_version),),
             }
         if last_version == current_version:
+            if forced:
+                print(
+                    f'[clavesa] node "{os.environ.get("CLAVESA_NODE", "")}": force-run, ignoring incremental cursor (Delta upstream {table} unchanged at version {current_version}); re-reading full snapshot',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # Full re-read; watermark stays pinned to current_version
+                # (advancing to the same value is a no-op but the writer
+                # tolerates it — keeps the post-success path uniform).
+                return spark.table(table), {
+                    "uri": watermark_uri,
+                    "new_cursor": (str(current_version),),
+                }
             print(
                 f"[clavesa] input {alias!r}: upstream {table} unchanged since version {current_version}; skipping run",
                 file=sys.stderr,
@@ -701,8 +757,20 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
             new_partitions = [(c, p) for c, p in all_partitions if c > cursor]
 
         if not new_partitions:
-            print(f"[clavesa] input {alias!r}: 0 new partitions since cursor {cursor!r}; skipping run", file=sys.stderr)
-            return None, None
+            if forced and all_partitions:
+                print(
+                    f'[clavesa] node "{os.environ.get("CLAVESA_NODE", "")}": force-run, ignoring incremental cursor (0 new partitions since {cursor!r}); re-reading full source range',
+                    file=sys.stderr,
+                    flush=True,
+                )
+                # Re-read everything under the prefix; watermark advances to
+                # the latest known partition so the next unforced run resumes
+                # normally from there. If there are literally zero partitions
+                # at all we still skip (nothing to read).
+                new_partitions = all_partitions
+            else:
+                print(f"[clavesa] input {alias!r}: 0 new partitions since cursor {cursor!r}; skipping run", file=sys.stderr)
+                return None, None
 
         new_max = new_partitions[-1][0]
         paths = [f"s3://{bucket}/{leaf}" for _, leaf in new_partitions]
@@ -1151,10 +1219,11 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
     input_dfs: dict[str, Any] = {}
     pending_watermarks: list[dict[str, Any]] = []
     saw_partitioned = False
+    forced = _is_forced(event, my_node)
     for alias, src in inputs.items():
         if isinstance(src, dict) and src.get("kind") == "partitioned_path":
             saw_partitioned = True
-        df, advance = _resolve_input(spark, alias, src, backfill=backfill)
+        df, advance = _resolve_input(spark, alias, src, backfill=backfill, forced=forced)
         if df is None:
             # Empty partitioned input — skip the entire run.
             return {"status": "skipped", "reason": f"input {alias!r} has no new partitions"}
@@ -1201,13 +1270,20 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                 if not spark.catalog.tableExists(table_id):
                     df.write.format("delta").mode("overwrite").saveAsTable(table_id)
                 else:
+                    try:
+                        existing = set(spark.table(table_id).schema.fieldNames())
+                        new_cols = [c for c in df.schema.fieldNames() if c not in existing]
+                        if new_cols:
+                            print(f"[clavesa] output {key!r}: schema evolved, +{','.join(new_cols)}", file=sys.stderr, flush=True)
+                    except Exception:  # table may not exist yet on first append; skip silently
+                        pass
                     staging = f"__merge_src_{key}"
                     df.createOrReplaceTempView(staging)
                     on_clause = " AND ".join(
                         f"t.{col} = s.{col}" for col in spec["merge_keys"]
                     )
                     spark.sql(
-                        f"MERGE INTO {table_id} t USING {staging} s "
+                        f"MERGE WITH SCHEMA EVOLUTION INTO {table_id} t USING {staging} s "
                         f"ON {on_clause} "
                         f"WHEN MATCHED THEN UPDATE SET * "
                         f"WHEN NOT MATCHED THEN INSERT *"
@@ -1215,7 +1291,14 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             elif spec["mode"] == "append":
                 # Delta's mode("append").saveAsTable auto-creates if the
                 # table doesn't exist yet; no need to branch on tableExists.
-                df.write.format("delta").mode("append").saveAsTable(table_id)
+                try:
+                    existing = set(spark.table(table_id).schema.fieldNames())
+                    new_cols = [c for c in df.schema.fieldNames() if c not in existing]
+                    if new_cols:
+                        print(f"[clavesa] output {key!r}: schema evolved, +{','.join(new_cols)}", file=sys.stderr, flush=True)
+                except Exception:  # table may not exist yet on first append; skip silently
+                    pass
+                df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
             else:
                 df.write.format("delta").mode("overwrite").saveAsTable(table_id)
         written[key] = spec["target"]
@@ -2350,6 +2433,10 @@ def pipeline_handler(event, context):
     }
     sf_execution_arn = str(event.get("_sf_execution_arn", "") or "")
     trigger = str(event.get("_trigger", "") or "")
+    # Forward force flags into every sub_event so handler() / _resolve_input
+    # see them on a per-node basis (force_nodes scopes the bypass when set).
+    force_flag = bool(event.get("_force"))
+    force_nodes = list(event.get("_force_nodes") or [])
 
     results: list[dict[str, Any]] = []
     skipped_set: set[str] = set()
@@ -2395,6 +2482,10 @@ def pipeline_handler(event, context):
             "_sf_execution_arn": sf_execution_arn,
             "_trigger": trigger,
         }
+        if force_flag:
+            sub_event["_force"] = True
+            if force_nodes:
+                sub_event["_force_nodes"] = force_nodes
 
         print(json.dumps({"_event": "entered", "node": node}), flush=True)
         try:
@@ -2450,11 +2541,30 @@ def pipeline_handler(event, context):
                 "output_rows": output_rows,
             })
 
-    return {
+    result = {
         "status": overall_status,
         "transforms": results,
         "failed_node": failed_node,
     }
+
+    # GH #2: returning a clean dict makes the Lambda invocation "succeed"
+    # at the AWS API layer, so Step Functions marks the execution
+    # SUCCEEDED regardless of payload. Re-raise after the node_runs rows
+    # are written so SFN sees a real task failure and the cross-pipeline
+    # EventBridge rule (filtered on detail.status = SUCCEEDED) does NOT
+    # fire downstream pipelines. Local mode (`clavesa pipeline run`)
+    # parses the dict directly via internal/service/run.go — keep
+    # returning it there.
+    if overall_status == "failed" and os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        last = results[-1] if results else {}
+        raise RuntimeError(
+            "clavesa runner: {node} failed ({cls}: {msg})".format(
+                node=failed_node,
+                cls=last.get("error_class", "Error"),
+                msg=last.get("error_msg", "no error message"),
+            )
+        )
+    return result
 
 
 def run_local() -> None:
@@ -2555,6 +2665,12 @@ def _start_connect_plugin() -> None:
         builder = builder.config(k, v)
     session = builder.getOrCreate()
     session.sparkContext.setLogLevel("ERROR")
+    # Stash the py4j session so /parse can reach the JVM-side SqlParser
+    # directly. parsePlan needs sessionState().sqlParser(), which Spark
+    # Connect's client session does not expose — it lives in the host
+    # JVM that owns this Connect plugin.
+    global _SPARK
+    _SPARK = session
 
 
 def _connect_session():
@@ -2590,6 +2706,42 @@ def _query_to_payload(sql: str) -> dict:
     records = json.loads(pdf.to_json(orient="records", date_format="iso"))
     rows = [[r.get(c) for c in columns] for r in records]
     return {"columns": columns, "column_types": column_types, "rows": rows}
+
+
+def _parse_sql(sql: str) -> dict:
+    """Parse-only check via the JVM-side Catalyst SqlParser.
+
+    Returns {"ok": True} on success or {"ok": False, "error": "<msg>"} on
+    parse failure. Uses the py4j SparkSession stashed by
+    ``_start_connect_plugin`` so we go straight to the JVM's
+    ``sessionState().sqlParser().parsePlan(sql)`` — Spark Connect's
+    client session does not expose this seam.
+    """
+    if _SPARK is None:
+        # /parse should only be called after the worker is healthy, which
+        # implies _start_connect_plugin has populated _SPARK. Defensive
+        # fallback: build the session lazily.
+        _spark()
+    try:
+        _SPARK._jsparkSession.sessionState().sqlParser().parsePlan(sql)
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        # py4j.protocol.Py4JJavaError carries the JVM exception's message
+        # on .java_exception.getMessage(); other shapes (transient gateway
+        # errors) fall back to str(exc). Spark's parse errors are the
+        # most useful — they include a pointer-into-SQL hint that
+        # surfaces the offending token.
+        java_exc = getattr(exc, "java_exception", None)
+        if java_exc is not None:
+            try:
+                msg = java_exc.getMessage()
+            except Exception:  # noqa: BLE001
+                msg = str(exc)
+        else:
+            msg = str(exc)
+        if not msg:
+            msg = str(exc)
+        return {"ok": False, "error": msg}
 
 
 def run_query_server() -> None:
@@ -2667,7 +2819,7 @@ def run_query_server() -> None:
             if self.path.startswith("/repl/") or self.path == "/repls":
                 self._proxy_supervisor("POST")
                 return
-            if self.path != "/query":
+            if self.path not in ("/query", "/parse"):
                 self._respond(404, b"", content_type="text/plain")
                 return
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -2679,7 +2831,17 @@ def run_query_server() -> None:
                 self._json(400, {"error": f"bad request body: {exc}"})
                 return
             if not sql:
-                self._json(400, {"error": "missing sql"})
+                if self.path == "/parse":
+                    self._json(400, {"ok": False, "error": "empty SQL"})
+                else:
+                    self._json(400, {"error": "missing sql"})
+                return
+            if self.path == "/parse":
+                # _parse_sql never raises — it returns the {ok,error}
+                # envelope. The HTTP layer just forwards it as 200; the
+                # client (Go side) inspects ``ok`` to distinguish parse
+                # failure from transport failure.
+                self._json(200, _parse_sql(sql))
                 return
             try:
                 payload = _query_to_payload(sql)

@@ -215,6 +215,40 @@ func emitGlueCatalogDB(b *strings.Builder, p Pipeline) {
 		p.BucketExpr, p.PipelineNameExpr, safeCatalogLiteral(p.Catalog), p.SchemaExpr)
 	fmt.Fprintf(b, "  tags         = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
+
+	// Lake Formation grants — required on accounts where Lake Formation
+	// governs the Glue Catalog (default on accounts created after
+	// Aug 2023). Without these, the runner Lambda's IAM principal has
+	// zero LF grants on the DB we just created, so the Hive metastore
+	// client gets `AccessDeniedException: Required Describe on …` on
+	// the first `saveAsTable` (GH #1).
+	//
+	// On accounts that pre-date the LF default, these grants pass
+	// through to IAM (the DB still carries IAMAllowedPrincipals); LF
+	// acts as a transparent layer and the IAM-only path keeps working.
+	//
+	// Deploying principal must be a Lake Formation DataLakeAdmin —
+	// `aws_lakeformation_permissions` requires it. See README "Lake
+	// Formation-enabled accounts" callout.
+	fmt.Fprintf(b, "# Lake Formation grants — pipeline runner role on this DB and its tables.\n")
+	fmt.Fprintf(b, "# Mirrors the IAM grants in aws_iam_role_policy.pipeline_runner so LF\n")
+	fmt.Fprintf(b, "# doesn't override IAM on LF-gated accounts (GH #1).\n")
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"pipeline_runner_db\" {\n")
+	fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"DESCRIBE\", \"CREATE_TABLE\", \"ALTER\", \"DROP\"]\n")
+	fmt.Fprintf(b, "  database {\n")
+	fmt.Fprintf(b, "    name = aws_glue_catalog_database.pipeline.name\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"pipeline_runner_tables\" {\n")
+	fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"INSERT\", \"DELETE\", \"ALTER\", \"DROP\", \"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  table {\n")
+	fmt.Fprintf(b, "    database_name = aws_glue_catalog_database.pipeline.name\n")
+	fmt.Fprintf(b, "    wildcard      = true\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
 }
 
 // safeCatalogLiteral applies the same hyphen→underscore replacement the
@@ -883,6 +917,50 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "      { Sid = \"Logs\", Effect = \"Allow\", Action = [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"], Resource = [\"arn:aws:logs:*:*:*\"] },\n")
 	fmt.Fprintf(b, "    ]\n")
 	fmt.Fprintf(b, "  })\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	// Lake Formation grants on the system catalog DB — same shape as the
+	// per-pipeline DB grants in emitGlueCatalogDB, but here both the
+	// runs_writer role AND the pipeline runner role need access (the
+	// runner appends node_runs rows to <system_catalog>__pipelines). The
+	// system DB itself is created in modules/workspace/aws/main.tf; we
+	// reference its name by string, not by resource (this orchestration
+	// stack doesn't own the workspace module).
+	fmt.Fprintf(b, "# Lake Formation grants on the workspace system catalog (GH #1).\n")
+	fmt.Fprintf(b, "# References the system DB by name string since it's created in the\n")
+	fmt.Fprintf(b, "# workspace module's state, not this pipeline's.\n")
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"runs_writer_system_db\" {\n")
+	fmt.Fprintf(b, "  principal   = aws_iam_role.runs_writer.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"DESCRIBE\", \"CREATE_TABLE\", \"ALTER\"]\n")
+	fmt.Fprintf(b, "  database {\n")
+	fmt.Fprintf(b, "    name = \"%s__pipelines\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"runs_writer_system_tables\" {\n")
+	fmt.Fprintf(b, "  principal   = aws_iam_role.runs_writer.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"INSERT\", \"ALTER\", \"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  table {\n")
+	fmt.Fprintf(b, "    database_name = \"%s__pipelines\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "    wildcard      = true\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"pipeline_runner_system_db\" {\n")
+	fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"DESCRIBE\", \"CREATE_TABLE\", \"ALTER\"]\n")
+	fmt.Fprintf(b, "  database {\n")
+	fmt.Fprintf(b, "    name = \"%s__pipelines\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"pipeline_runner_system_tables\" {\n")
+	fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"INSERT\", \"ALTER\", \"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  table {\n")
+	fmt.Fprintf(b, "    database_name = \"%s__pipelines\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "    wildcard      = true\n")
+	fmt.Fprintf(b, "  }\n")
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"runs_writer\" {\n")

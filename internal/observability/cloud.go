@@ -102,6 +102,32 @@ func (c *CloudProvider) WithS3(s3c s3fs.S3API) *CloudProvider {
 // a 500 (TODO bucket 16).
 func (c *CloudProvider) undeployed() bool { return c.athenaOutputBucket == "" }
 
+// isAthenaMissingTableErr classifies an Athena error as "table or
+// database does not exist yet" so the provider can return an empty
+// result with a nil error — matching the Provider contract documented
+// at provider.go and the local-side `isMissingTableErr` precedent.
+// Triggered by a workspace that's been deployed but never run, or one
+// whose system-catalog Glue DB was rebuilt: the system Delta tables
+// (runs / node_runs / tables / column_stats / dashboard datasets)
+// haven't been created yet, and Athena 500s the SELECT.
+func isAthenaMissingTableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"TABLE_NOT_FOUND",
+		"Table not found",
+		"does not exist",
+		"database does not exist",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	athenaMaxPollAttempts = 60
 	athenaPollInterval    = 500 * time.Millisecond
@@ -198,6 +224,9 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 
 	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
 	if err != nil {
+		if isAthenaMissingTableErr(err) {
+			return &NodeRunsResult{Rows: []NodeRun{}}, nil
+		}
 		return nil, err
 	}
 
@@ -288,6 +317,9 @@ LIMIT %d`, dbName, safePipeline, q.Limit+1)
 
 	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
 	if err != nil {
+		if isAthenaMissingTableErr(err) {
+			return &RunsResult{Rows: []Run{}}, nil
+		}
 		return nil, err
 	}
 
@@ -370,6 +402,9 @@ LIMIT %d`, dbName, safePipeline, q.Limit+1)
 
 	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
 	if err != nil {
+		if isAthenaMissingTableErr(err) {
+			return &TablesResult{Rows: []TableInfo{}}, nil
+		}
 		return nil, err
 	}
 
@@ -650,7 +685,7 @@ ORDER BY column_name`, q.Database, safeIdent)
 		// Athena returns SYNTAX_ERROR for "no such table" — surface as
 		// empty so a workspace that's never run a stats-on transform
 		// renders cleanly instead of flashing a 500.
-		if strings.Contains(err.Error(), "Table") && strings.Contains(err.Error(), "not found") {
+		if isAthenaMissingTableErr(err) {
 			return &ColumnStatsResult{Stats: []ColumnStat{}}, nil
 		}
 		return nil, err
@@ -790,6 +825,13 @@ func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 
 	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, q.SQL)
 	if err != nil {
+		if isAthenaMissingTableErr(err) {
+			// Dashboards widget against a workspace that's been deployed
+			// but never run — system Delta tables don't exist yet.
+			// Surface as an empty result so the widget renders cleanly
+			// instead of 500-ing the whole dashboard.
+			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}}, nil
+		}
 		return nil, err
 	}
 

@@ -61,6 +61,12 @@ type runPrep struct {
 	schema        string
 	runID         string
 	channel       *runChannel
+	// force / forceNodes carry the operator's --force / --force-node intent
+	// from the CLI into runPipelineBundle, which embeds them in the bundle
+	// event so the runner's per-transform _is_forced() check fires.
+	// force=true with forceNodes empty == every node in this dispatch.
+	force      bool
+	forceNodes []string
 }
 
 // ErrRunInFlight is returned by StartRun when the pipeline already has a
@@ -85,10 +91,38 @@ var ErrRunInFlight = errs.ErrRunInFlight
 // Local FS only — S3-style source paths return an error. Remote S3 sources
 // will land when scheduled-remote support is wired.
 func (s *Service) RunPipeline(ctx context.Context, dir string) (*RunResult, error) {
+	return s.RunPipelineWithOpts(ctx, dir, RunOpts{})
+}
+
+// RunOpts carries optional run-time controls for RunPipeline /
+// RunPipelineWithOpts. Zero-value behaves identically to the legacy
+// signature.
+//
+//   - Force      — bypass incremental-skip checks for this run. The runner
+//                  re-reads the full source range on partitioned_path inputs
+//                  and Delta CDF inputs that otherwise would have skipped
+//                  because the cursor didn't advance. Watermarks still
+//                  advance on success — the next unforced run resumes
+//                  normal incremental dispatch.
+//   - ForceNodes — narrows Force to the named node IDs. Empty (with Force
+//                  true) means "every node in this dispatch."
+type RunOpts struct {
+	Force      bool
+	ForceNodes []string
+}
+
+// RunPipelineWithOpts is RunPipeline with operator-controlled bypass
+// switches. Used by `clavesa pipeline run --force / --force-node`.
+func (s *Service) RunPipelineWithOpts(ctx context.Context, dir string, opts RunOpts) (*RunResult, error) {
 	prep, err := s.prepareRun(dir)
 	if err != nil {
 		return nil, err
 	}
+	// ForceNodes implies Force. The CLI normalizes this too, but the
+	// service layer is the only contract entrypoint with HCL access, so
+	// defend in depth.
+	prep.force = opts.Force || len(opts.ForceNodes) > 0
+	prep.forceNodes = append([]string(nil), opts.ForceNodes...)
 	return s.executeRun(ctx, prep)
 }
 
@@ -344,7 +378,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	// in real time. Returns the per-transform terminal statuses for
 	// the destination-pass loop below.
 	if len(bundle) > 0 {
-		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, channel)
+		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, channel, prep.force, prep.forceNodes)
 		// Even on bundle error, walk whatever per-node results we got
 		// before the failure so result.Nodes carries the partial picture
 		// (the UI uses this for the per-node breakdown).
@@ -1140,7 +1174,7 @@ type bundleTransformConfig struct {
 // failed (docker exit non-zero, unparseable response, transform
 // failure). On a transform failure the bundle stops; statuses for
 // downstream transforms are not returned (they never ran).
-func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, channel *runChannel) ([]NodeRunStatus, error) {
+func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, channel *runChannel, force bool, forceNodes []string) ([]NodeRunStatus, error) {
 	pipelineName := filepath.Base(pipelineDir)
 	warehouse := workspace.LocalWarehouseDir(s.workspace)
 	if err := os.MkdirAll(warehouse, 0o755); err != nil {
@@ -1172,6 +1206,15 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		"transforms":        transforms,
 		"_sf_execution_arn": runID,
 		"_trigger":          "manual",
+	}
+	if force {
+		// pipeline_handler unpacks these into each per-transform sub_event;
+		// the runner's _is_forced() check fires when a node is in the set
+		// (or always, when force_nodes is empty).
+		event["_force"] = true
+		if len(forceNodes) > 0 {
+			event["_force_nodes"] = forceNodes
+		}
 	}
 	eventJSON, _ := json.Marshal(event)
 

@@ -200,6 +200,17 @@ A dashboard is just a spec of datasets and widgets, so the CLI authors the same 
 
 Each workspace's `main.tf` creates its own S3 bucket and ECR repo and pushes the runner image. Nothing centrally hosted; nothing leaves your account.
 
+**Lake Formation-enabled accounts** (default on AWS accounts created after Aug 2023): the deploying principal must be a Lake Formation `DataLakeAdmin` before the first `workspace deploy`, otherwise the per-pipeline Glue database grants will fail to apply. One-time setup per account:
+
+```bash
+ACCT=$(aws sts get-caller-identity --query Account --output text)
+ME=$(aws sts get-caller-identity --query Arn --output text)
+aws lakeformation put-data-lake-settings --data-lake-settings \
+  "{\"DataLakeAdmins\":[{\"DataLakePrincipalIdentifier\":\"$ME\"}]}"
+```
+
+If `aws lakeformation get-data-lake-settings` shows `CreateDatabaseDefaultPermissions: []`, your account is LF-gated and the step above is required. Older accounts (`IAMAllowedPrincipals` in the default permissions) inherit the IAM-only path and don't need it.
+
 ```bash
 # Deploy the workspace (S3 bucket, ECR repo, runner image push, system catalog).
 AWS_PROFILE=my-account bin/clavesa workspace deploy --workspace $WS

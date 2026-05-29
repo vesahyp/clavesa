@@ -50,6 +50,7 @@ Quick start:
 		newDashboardsCmd(),
 		newNotebookCmd(),
 		newQueryCmd(),
+		newSQLCmd(),
 		newVersionCmd(),
 	)
 
@@ -68,7 +69,13 @@ func requireSubcommand() func(*cobra.Command, []string) error {
 // Execute runs the CLI with os.Args.
 func Execute() error {
 	cmd := newRootCmd()
-	if err := cmd.Execute(); err != nil {
+	err := cmd.Execute()
+	// Tear down any per-invocation resources (warm-worker containers
+	// spawned by the Slice 3 SQL parser, etc) before returning. Always
+	// runs, even on error — leaking a ~1GB container on every failed
+	// `clavesa node edit` would shred Docker Desktop's memory budget.
+	runCloseables()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "clavesa: %v\n", err)
 		os.Exit(1)
 	}
@@ -80,5 +87,7 @@ func Execute() error {
 func Run(args []string) error {
 	cmd := newRootCmd()
 	cmd.SetArgs(args)
-	return cmd.Execute()
+	err := cmd.Execute()
+	runCloseables()
+	return err
 }

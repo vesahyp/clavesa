@@ -334,6 +334,24 @@ func (h *Handler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Parse-check inline SQL before the write (Slice 3). The UI's SQL
+	// editor sends a literal string in req.Attributes["sql"]; file()-
+	// referenced or expression SQL arrives as a non-string and bypasses
+	// the check (file refs are out of scope here, parsed at preview /
+	// run time). Reject with 400 so the editor can render the parser
+	// message inline above the Save button. Transport failures (warm
+	// worker dead, docker gone) are logged but don't block the write —
+	// the run path will surface a real parse error anyway.
+	if rawSQL, ok := req.Attributes["sql"].(string); ok && rawSQL != "" {
+		if err := h.service().ValidateSQL(r.Context(), rawSQL); err != nil {
+			var pe *service.ParseError
+			if errors.As(err, &pe) {
+				httputil.WriteError(w, http.StatusBadRequest, pe.Message)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped on PUT /pipeline/node: %v\n", err)
+		}
+	}
 	attrs := normalizeAttributes(req.Attributes)
 	if _, err := h.fo.UpdateBlock(file, "module."+id, attrs); err != nil {
 		httputil.WriteError(w, fileOpsStatus(err), err.Error())

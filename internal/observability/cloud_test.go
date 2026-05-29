@@ -499,3 +499,30 @@ func TestSnapshotsTableNotFoundIsEmpty(t *testing.T) {
 		t.Errorf("Snapshots(missing table) = (%v, %v), want empty + nil err", res, err)
 	}
 }
+
+// TestIsAthenaMissingTableErr exercises the Athena error-string classifier
+// that turns "system Delta tables don't exist yet" into an empty result
+// instead of a 500. Matches the contract documented at provider.go.
+func TestIsAthenaMissingTableErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"table_not_found", errors.New("SYNTAX_ERROR: TABLE_NOT_FOUND: line 1:15"), true},
+		{"table_not_found_text", errors.New("Athena: Table not found 'runs'"), true},
+		{"does_not_exist", errors.New("Schema clavesa_demo does not exist"), true},
+		{"database_does_not_exist", errors.New("database does not exist"), true},
+		{"access_denied", errors.New("AccessDeniedException: user is not authorized"), false},
+		{"unrelated", errors.New("ThrottlingException: rate exceeded"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isAthenaMissingTableErr(tc.err)
+			if got != tc.want {
+				t.Errorf("isAthenaMissingTableErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}

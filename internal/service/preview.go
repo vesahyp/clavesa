@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,6 +105,21 @@ func (s *Service) PreviewTransform(ctx context.Context, dir, nodeID string, rowC
 		}
 		if sqlStr == "" {
 			return nil, fmt.Errorf("node %s has no SQL configuration", nodeID)
+		}
+		// Parse-check before dispatch (Slice 3). A bad SELECT * EXCEPT
+		// (…) used to fail after the runner container spun up + Spark
+		// booted — 30+ seconds of latency for a syntax error. Catch it
+		// here so the CLI / UI's "Preview" button returns in tens of
+		// milliseconds with the parser's pointer-into-SQL message.
+		// Transport failures (warm worker dead) are logged and don't
+		// block — preview will then fall through to the runner and
+		// surface a real parse error at dispatch time.
+		if err := s.ValidateSQL(ctx, sqlStr); err != nil {
+			var pe *ParseError
+			if errors.As(err, &pe) {
+				return nil, fmt.Errorf("SQL parse failed:\n  %s", pe.Message)
+			}
+			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped before preview: %v\n", err)
 		}
 	}
 

@@ -76,7 +76,13 @@ func newDashboardService(cmd *cobra.Command) (*service.Service, string, error) {
 	}
 	local := observability.NewLocalProvider(workspace)
 	resolver := observability.NewResolver(workspace, cloud, local)
-	return service.New(workspace).WithResolver(resolver), workspace, nil
+	// Lazy SQL parser (Slice 3) — `dashboards apply` parse-checks every
+	// dataset's SQL before persisting, so users see all bad datasets in
+	// one shot instead of after a Spark cold start at first render.
+	warm := observability.NewPersistentQueryRunner(workspace)
+	parser := warm.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
+	registerCloseable(warm.Close)
+	return service.New(workspace).WithResolver(resolver).WithSQLParser(parser), workspace, nil
 }
 
 func newDashboardsListCmd() *cobra.Command {

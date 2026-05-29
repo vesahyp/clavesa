@@ -650,10 +650,16 @@ Examples:
 			nbRunner := observability.NewNotebookSessionRunner(warmQuery)
 
 			fo := fileops.New()
+			// Slice 3: parse-validate authoring SQL before persistence /
+			// dispatch. The warm worker is the same one /query rides on,
+			// so /parse is a single in-JVM call (~milliseconds) instead
+			// of a fresh container spawn.
+			sqlParser := warmQuery.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
 			svc := tuiservice.New(workspace).
 				WithEvictor(nbRunner).
 				WithResolver(resolver).
-				WithNotebookRunner(nbRunner)
+				WithNotebookRunner(nbRunner).
+				WithSQLParser(sqlParser)
 			// lineageAdapter shims the JSON shape the api package owns onto the
 			// derivation owned by service. Two shapes mirror each other field-
 			// for-field; the adapter is the seam keeping api.Handler from

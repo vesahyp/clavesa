@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 
@@ -149,6 +150,29 @@ type WarehouseEvictor interface {
 	EvictWarehouse(warehouse string)
 }
 
+// SQLParser parse-checks one SparkSQL statement against the warm Spark
+// worker (Slice 3). Implementations route to the JVM-side Catalyst
+// SqlParser via POST /parse — the seam that turns "any string" into a
+// rejection-with-message at author time instead of after a Spark cold
+// start. Returns *ParseError when the parser rejected the input; any
+// other error means transport/runner failure (do not surface to the
+// user as a parse error). Nil-safe at the service-method level:
+// ValidateSQL no-ops when no parser is wired so CLI integration tests
+// stay docker-free.
+type SQLParser interface {
+	Parse(ctx context.Context, sql string) error
+}
+
+// ParseError is the service-layer representation of a parser
+// rejection. Mirrors observability.ParseError so callers in
+// internal/cli + internal/api can `errors.As(&service.ParseError{})`
+// without depending on the observability package.
+type ParseError struct {
+	Message string
+}
+
+func (e *ParseError) Error() string { return e.Message }
+
 // Service provides direct access to pipeline operations without HTTP.
 type Service struct {
 	workspace string
@@ -157,6 +181,7 @@ type Service struct {
 	s3Once    sync.Once
 	s3Err     error
 	evictor   WarehouseEvictor
+	sqlParser SQLParser
 
 	// runsInFlight tracks pipelines with an async StartRun executing,
 	// keyed by absolute dir. Guards against a double-dispatch the
@@ -206,6 +231,41 @@ func New(workspace string) *Service {
 func (s *Service) WithEvictor(e WarehouseEvictor) *Service {
 	s.evictor = e
 	return s
+}
+
+// WithSQLParser wires a parse-only SparkSQL validator (Slice 3) so
+// authoring-time entry points (`node edit --set sql=…`, the UI's
+// pipeline-node PUT, `dashboards apply`, `node preview`, `sql lint`)
+// reject bad SQL before persisting or dispatching. Without it,
+// ValidateSQL is a no-op — keeps unit-test Service instances free of
+// docker / warm-worker dependencies.
+func (s *Service) WithSQLParser(p SQLParser) *Service {
+	s.sqlParser = p
+	return s
+}
+
+// ValidateSQL parse-checks a single SparkSQL statement via the wired
+// parser. Returns *ParseError when the parser rejected the input; any
+// other error means transport/runner failure. Returns nil when no
+// parser is wired (CLI integration tests, dry runs) — those paths
+// already accept any string, and forcing a parser dependency here
+// would block test runs that don't have docker.
+func (s *Service) ValidateSQL(ctx context.Context, sql string) error {
+	if s.sqlParser == nil {
+		return nil
+	}
+	err := s.sqlParser.Parse(ctx, sql)
+	if err == nil {
+		return nil
+	}
+	// Translate the observability-layer parser rejection into the
+	// service-layer one so callers in cli / api can detect it without
+	// reaching into the observability package.
+	var oe *observability.ParseError
+	if errors.As(err, &oe) {
+		return &ParseError{Message: oe.Message}
+	}
+	return err
 }
 
 func (s *Service) resolveDir(dir string) string {

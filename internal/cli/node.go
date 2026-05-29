@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -367,6 +368,23 @@ Examples:
 					attrs = map[string]interface{}{}
 				}
 				attrs["incremental_inputs"] = ordered
+			}
+			// Parse-check inline SQL before persisting (Slice 3). file()-
+			// referenced SQL is wrapped as a service.Ref above so the
+			// type assertion misses it intentionally — only literal
+			// strings flow through here. The check is a no-op when no
+			// parser is wired (CLI integration tests). Transport
+			// failures (no docker, missing image) become warnings —
+			// the user can still author; the runner surfaces real
+			// parse errors at dispatch time.
+			if newSQL, ok := attrs["sql"].(string); ok && newSQL != "" {
+				if err := svc.ValidateSQL(cmd.Context(), newSQL); err != nil {
+					var pe *service.ParseError
+					if errors.As(err, &pe) {
+						return fmt.Errorf("SQL parse failed:\n  %s", pe.Message)
+					}
+					fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped: %v\n", err)
+				}
 			}
 			if _, err := svc.UpdateNode(dir, nodeID, attrs); err != nil {
 				return fmt.Errorf("update node: %w", err)
