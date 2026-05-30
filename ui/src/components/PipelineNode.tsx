@@ -70,6 +70,19 @@ export type PipelineNodeData = {
    */
   runStatus?: "running" | "succeeded" | "failed";
   /**
+   * Live in-flight Spark progress for a RUNNING node, polled from
+   * /pipeline/execution/states. Drives a thin task progress bar under the
+   * node header. Absent unless the node is running and the runner has
+   * emitted at least one progress tick (tasksTotal > 0).
+   */
+  progress?: {
+    stagesTotal: number;
+    stagesCompleted: number;
+    tasksTotal: number;
+    tasksCompleted: number;
+    tasksFailed: number;
+  };
+  /**
    * Guided (+) authoring affordance on the output handle. Present only in
    * the editor — the read-only dashboard / run-detail DAGs omit it, so the
    * (+) button doesn't render there. `onCreate` / `onConnect` are already
@@ -346,6 +359,43 @@ function QuickAddMenu({ quickAdd }: { quickAdd: NonNullable<PipelineNodeData["qu
   );
 }
 
+/**
+ * NodeProgressBar — thin task-progress bar shown under a RUNNING node's
+ * header. Fill = tasksCompleted / tasksTotal; the label reads
+ * "<done>/<total> tasks · stage <n>/<m>" with a failed-task indicator when
+ * tasksFailed > 0. Lightweight by design — it lives inside a 200px node.
+ */
+function NodeProgressBar({
+  progress,
+}: {
+  progress: NonNullable<PipelineNodeData["progress"]>;
+}) {
+  const { tasksTotal, tasksCompleted, tasksFailed, stagesTotal, stagesCompleted } =
+    progress;
+  const pct = tasksTotal > 0 ? Math.min(100, (tasksCompleted / tasksTotal) * 100) : 0;
+  return (
+    <div className="mt-1.5">
+      <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full bg-status-running transition-all"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="mt-0.5 flex items-center justify-between gap-2 font-mono text-[9px] text-muted-foreground">
+        <span className="truncate">
+          {tasksCompleted}/{tasksTotal} tasks
+          {stagesTotal > 0 && ` · stage ${stagesCompleted}/${stagesTotal}`}
+        </span>
+        {tasksFailed > 0 && (
+          <span className="flex-shrink-0 font-semibold text-status-failed">
+            {tasksFailed} failed
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function PipelineNode({ data, selected }: NodeProps) {
   const nodeData = data as PipelineNodeData;
   const {
@@ -362,8 +412,14 @@ export function PipelineNode({ data, selected }: NodeProps) {
     loading,
     previewed,
     runStatus,
+    progress,
     quickAdd,
   } = nodeData;
+  // Only show the in-flight bar while RUNNING and once the runner has
+  // reported a non-zero task total — a node that finished before any
+  // progress tick (or a fast node) shows no bar rather than an empty one.
+  const showProgress =
+    runStatus === "running" && !!progress && progress.tasksTotal > 0;
   // compute is a transform-only concept and an explicit cloud override —
   // an absent attribute means "no override, run wherever the env mode
   // dispatches you" (the ADR-014 env-mode shift), so the badge stays
@@ -430,6 +486,7 @@ export function PipelineNode({ data, selected }: NodeProps) {
         <div className="overflow-hidden truncate font-mono text-sm font-semibold">
           {label}
         </div>
+        {showProgress && <NodeProgressBar progress={progress!} />}
       </div>
 
       {hasColumns && (

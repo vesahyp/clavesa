@@ -149,6 +149,35 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
     return m;
   }, [states.data, perNode]);
 
+  // In-flight Spark progress per node, fed to the DAG's task-progress bar.
+  // Only RUNNING nodes with a non-zero task total carry an entry; finished
+  // nodes drop out so the bar disappears at completion.
+  const nodeProgress = useMemo(() => {
+    const m = new Map<
+      string,
+      {
+        stagesTotal: number;
+        stagesCompleted: number;
+        tasksTotal: number;
+        tasksCompleted: number;
+        tasksFailed: number;
+      }
+    >();
+    for (const [node, st] of Object.entries(states.data?.states ?? {})) {
+      if (st.status !== "RUNNING") continue;
+      const tasksTotal = st.tasks_total ?? 0;
+      if (tasksTotal <= 0) continue;
+      m.set(node, {
+        stagesTotal: st.stages_total ?? 0,
+        stagesCompleted: st.stages_completed ?? 0,
+        tasksTotal,
+        tasksCompleted: st.tasks_completed ?? 0,
+        tasksFailed: st.tasks_failed ?? 0,
+      });
+    }
+    return m;
+  }, [states.data]);
+
   const lineage = useLineage(dir);
   const nodeOutputs = useMemo(
     () =>
@@ -261,6 +290,7 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
                     setInspectedSyntheticId(null);
                   }}
                   nodeStatuses={nodeStatuses}
+                  nodeProgress={nodeProgress}
                   nodeOutputs={nodeOutputs}
                   showSources
                 />
@@ -288,6 +318,7 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
           }}
           isLocal={!!isLocal}
           dir={dir}
+          pipelineName={pipelineName}
           onClose={() => setSelectedNodeId(null)}
         />
       )}

@@ -12,6 +12,18 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.4.0] — 2026-05-30
+
+### Added
+
+- Per-run Spark job stats on every node run: peak process memory (`peak_rss_mb`), peak execution memory, memory/disk spill, shuffle read/write, input rows/bytes, stage/task counts (incl. failed tasks), GC time, and executor CPU/run time. Captured by the runner via the Spark event log + `/proc` and stored on the `node_runs` table, so they work for local and cloud pipelines alike. The run-detail node drawer now shows a "Peak memory" reading (with utilization vs allocated) and a "Spark metrics" panel.
+- Live in-flight task progress for local and cloud runs: while a transform runs, its stage/task counts stream into the run-detail node (a "124/300 tasks · stage 3/9" progress bar) and the `clavesa pipeline status [dir] [--json]` command. Captured by a Spark statusTracker poller in the runner. Cloud runs surface the same per-node progress, read from the `_progress` objects the runner publishes to S3.
+- Rightsizing recommendations (recommend-only): `clavesa pipeline rightsize [dir] [--json] [--last N]` and a "Rightsizing" card in the run-detail node drawer recommend a per-node Lambda memory allocation from the p95 of recent peak RSS, factoring spill. Reads the same `node_runs` metrics for local and cloud pipelines; never re-deploys.
+
+### Fixed
+
+- `clavesa ui` no longer intermittently fails to start its warm Spark worker with `warm Spark spawn failed … docker port … exit status 1 (last output: "")`. Docker Desktop sometimes accepts a port-publish request but never wires the host-side forwarding; the warm-worker spawn now retries with a fresh container, binds the worker to loopback only, and surfaces the real container state + logs when it does fail.
+
 ## [v2.3.1] — 2026-05-30
 
 ### Added

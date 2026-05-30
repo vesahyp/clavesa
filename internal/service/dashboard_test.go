@@ -20,6 +20,12 @@ type fakeProvider struct {
 	queryRes  *observability.QueryResult
 	queryErr  error
 	execErr   error
+
+	// nodeRuns is returned by NodeRuns when set (tests that exercise the
+	// rightsize path). nodeRunsQ records the last query so the test can
+	// assert IncludeMetrics is forced on.
+	nodeRuns  []observability.NodeRun
+	nodeRunsQ observability.NodeRunsQuery
 }
 
 func (f *fakeProvider) Query(_ context.Context, q observability.QueryQuery) (*observability.QueryResult, error) {
@@ -36,8 +42,9 @@ func (f *fakeProvider) Exec(_ context.Context, q observability.ExecQuery) error 
 	f.execSQLs = append(f.execSQLs, q.SQL)
 	return f.execErr
 }
-func (f *fakeProvider) NodeRuns(context.Context, observability.NodeRunsQuery) (*observability.NodeRunsResult, error) {
-	panic("unused")
+func (f *fakeProvider) NodeRuns(_ context.Context, q observability.NodeRunsQuery) (*observability.NodeRunsResult, error) {
+	f.nodeRunsQ = q
+	return &observability.NodeRunsResult{Rows: f.nodeRuns}, nil
 }
 func (f *fakeProvider) Runs(context.Context, observability.RunsQuery) (*observability.RunsResult, error) {
 	panic("unused")

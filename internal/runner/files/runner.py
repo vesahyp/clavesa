@@ -35,14 +35,132 @@ import datetime as _dt
 import json
 import os
 import sys
+import threading
 import time
 import types
 import uuid
-from typing import Any
+from typing import Any, Iterable
+
+# Directory Spark writes its event log into (see spark_conf.py:
+# spark.eventLog.dir). The runner tails the single log file in here after
+# each transform to aggregate per-invocation task metrics onto node_runs.
+# Created in _spark() right before the session builds.
+EVENTLOG_DIR = "/tmp/clavesa-eventlog"
+
+# Spark task-metric column names appended to node_runs (after output_rows).
+# Order matches _node_runs_schema(); _aggregate_event_log() returns a dict
+# keyed by exactly these names. Kept as a module constant so the schema,
+# the aggregator, and the all-None failure paths can't drift apart.
+_SPARK_METRIC_KEYS = (
+    "peak_execution_memory_mb",
+    "memory_spilled_bytes",
+    "disk_spilled_bytes",
+    "shuffle_read_bytes",
+    "shuffle_write_bytes",
+    "input_bytes",
+    "input_records",
+    "num_stages",
+    "num_tasks",
+    "num_failed_tasks",
+    "jvm_gc_time_ms",
+    "executor_cpu_time_ms",
+    "executor_run_time_ms",
+    "max_task_duration_ms",
+)
 
 # Module-level SparkSession so warm starts (UI preview server reusing the
 # container, Lambda warm invocations) skip the ~3-5s JVM boot.
 _SPARK = None
+
+
+def _progress_snapshot(active_stage_infos, seen_stage_ids):
+    """Fold the currently-active Spark stages into a flat counter dict.
+
+    ``active_stage_infos`` is the list of stage-info objects for the stages
+    Spark reports as active right now (from
+    ``statusTracker().getStageInfo(sid)`` per ``getActiveStageIds()``).
+    Each object is read by ATTRIBUTE — ``.numTasks``, ``.numActiveTasks``,
+    ``.numCompletedTasks``, ``.numFailedTasks``, ``.stageId`` — because the
+    PySpark ``StatusTracker`` python wrapper returns ``SparkStageInfo``
+    namedtuples, not py4j JavaObjects with method accessors. Reading
+    attributes (never calling) also tolerates a plain object/class fake in
+    tests.
+
+    ``seen_stage_ids`` is a running set the caller threads across polls; this
+    function MUTATES it to include every active stage id seen so far so that
+    ``stages_total`` is monotonic even after a stage finishes and drops out
+    of the active list. Returns all-int counters.
+    """
+    active = list(active_stage_infos or [])
+    for info in active:
+        seen_stage_ids.add(int(getattr(info, "stageId")))
+    tasks_total = sum(int(getattr(i, "numTasks")) for i in active)
+    tasks_completed = sum(int(getattr(i, "numCompletedTasks")) for i in active)
+    tasks_failed = sum(int(getattr(i, "numFailedTasks")) for i in active)
+    return {
+        "stages_total": len(seen_stage_ids),
+        "stages_completed": len(seen_stage_ids) - len(active),
+        "tasks_total": tasks_total,
+        "tasks_completed": tasks_completed,
+        "tasks_failed": tasks_failed,
+    }
+
+
+class _ProgressPoller(threading.Thread):
+    """Daemon thread that polls the Spark statusTracker while a single node's
+    transform runs and feeds per-poll snapshots to an ``emit`` callback.
+
+    Best-effort: the whole poll body is wrapped so a py4j hiccup (or Spark
+    not yet built) never surfaces — the poller exists only to enrich
+    progress output, it must never affect the transform outcome. Daemon so
+    it can't block process exit. Scoped to one ``node`` with its own ``seen``
+    set; ``pipeline_handler`` creates a fresh poller per node.
+    """
+
+    _IDLE_SLEEP = 0.5  # waiting for the transform to build _SPARK
+    _POLL_SLEEP = 1.5  # between live polls
+
+    def __init__(self, node, emit):
+        super().__init__(daemon=True)
+        self._node = node
+        self._emit = emit
+        # NB: must NOT be named ``_stop`` — that shadows threading.Thread._stop
+        # (a CPython internal). threading._after_fork() calls thread._stop() on
+        # every thread after an os.fork(); with the name shadowed by an Event,
+        # that raises "'Event' object is not callable" inside Spark's worker
+        # fork and corrupts the transform.
+        self._stop_event = threading.Event()
+        self._seen = set()
+
+    def _poll_once(self):
+        # Don't build Spark from the poller thread — wait for the transform
+        # to populate the module singleton.
+        if _SPARK is None:
+            return False
+        tracker = _SPARK.sparkContext.statusTracker()
+        active_ids = tracker.getActiveStageIds() or []
+        infos = []
+        for sid in active_ids:
+            info = tracker.getStageInfo(sid)
+            if info is not None:
+                infos.append(info)
+        snapshot = _progress_snapshot(infos, self._seen)
+        self._emit({"node": self._node, **snapshot})
+        return True
+
+    def run(self):
+        while not self._stop_event.is_set():
+            polled = False
+            try:
+                polled = self._poll_once()
+            except Exception:  # noqa: BLE001 — best-effort, never crash
+                polled = False
+            self._stop_event.wait(self._POLL_SLEEP if polled else self._IDLE_SLEEP)
+
+    def stop(self):
+        self._stop_event.set()
+        if self.is_alive():
+            self.join(timeout=2.0)
 
 # Module-level Spark Connect client used by the warm-worker query server
 # (CLAVESA_QUERY_SERVER mode). Lazily built once the embedded Connect plugin
@@ -74,6 +192,10 @@ def _spark():
         )
         for k, v in clavesa_spark_conf().items():
             builder = builder.config(k, v)
+        # NB: clavesa_spark_conf() creates EVENTLOG_DIR and only then enables
+        # spark.eventLog — so every session-build path (handler, preview, warm
+        # query/Connect servers) gets the dir created before SparkContext init,
+        # which otherwise throws FileNotFoundException on a missing log dir.
         _SPARK = builder.getOrCreate()
         _SPARK.sparkContext.setLogLevel("ERROR")
     return _SPARK
@@ -83,6 +205,228 @@ def _load_script(source: str) -> types.ModuleType:
     mod = types.ModuleType("_user_transform")
     exec(compile(source, "<clavesa_script>", "exec"), mod.__dict__)  # noqa: S102
     return mod
+
+
+# ---------------------------------------------------------------------------
+# Resource / Spark-metric capture (observability — node_runs columns)
+#
+# Two layers: pure stdlib parsers (testable without Spark / /proc) and thin
+# impure wrappers that read /proc and the event-log file. The pure layer is
+# the warm-worker-critical part: _aggregate_event_log must scope to exactly
+# one invocation's events, so the impure wrapper seeks past the prior tail.
+# ---------------------------------------------------------------------------
+
+
+def _read_peak_rss_mb(status_text: str | None = None) -> int | None:
+    """Process peak RSS (VmHWM) in MB, or None when unavailable.
+
+    Parses the ``VmHWM:`` line of ``/proc/self/status`` (Linux only). VmHWM
+    is the process-lifetime high-water mark, so under warm-worker reuse it is
+    monotonic across invocations rather than per-invocation. Off-Linux (no
+    /proc) or on any parse failure returns None — the column is nullable.
+
+    ``status_text`` lets tests pass the file body directly; when None the
+    function reads ``/proc/self/status``.
+    """
+    if status_text is None:
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                status_text = f.read()
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        for line in status_text.splitlines():
+            if line.startswith("VmHWM:"):
+                # "VmHWM:\t  123456 kB" → kB int → MB.
+                kb = int(line.split()[1])
+                return kb // 1024
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _aggregate_event_log(lines: Iterable[str]) -> dict[str, int | None]:
+    """Aggregate Spark task metrics from newline-delimited event-log JSON.
+
+    Pure / stdlib-only / side-effect-free — the warm-worker-critical core.
+    Callers pass only the slice of event-log lines belonging to the current
+    invocation (see _read_spark_metrics seeking past the prior tail) so the
+    sums scope to one transform run under session reuse.
+
+    Returns a dict with every key in ``_SPARK_METRIC_KEYS`` present. Values
+    are None when no relevant event was seen (e.g. an empty input that
+    launched no tasks); otherwise the aggregate per the column contract:
+      - bytes summed in bytes; memory_mb fields are bytes ÷ 1048576
+      - cpu time converted ns → ms; run time already ms
+      - max_task_duration_ms = max(FinishTime - LaunchTime) over tasks
+    Malformed / blank lines are ignored. Nested keys are read defensively.
+    """
+    saw_task = False
+    num_stages = 0
+    num_tasks = 0
+    num_failed_tasks = 0
+
+    peak_exec_mem_bytes = 0  # max over tasks
+    memory_spilled = 0
+    disk_spilled = 0
+    shuffle_read = 0
+    shuffle_write = 0
+    input_bytes = 0
+    input_records = 0
+    jvm_gc_time = 0
+    executor_cpu_ns = 0
+    executor_run_ms = 0
+    max_task_duration = 0  # max over tasks
+
+    for raw in lines:
+        if not raw or not raw.strip():
+            continue
+        try:
+            ev = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(ev, dict):
+            continue
+        event = ev.get("Event")
+        if event == "SparkListenerStageCompleted":
+            num_stages += 1
+            continue
+        if event != "SparkListenerTaskEnd":
+            continue
+
+        saw_task = True
+        num_tasks += 1
+
+        reason = (ev.get("Task End Reason") or {})
+        if not isinstance(reason, dict) or reason.get("Reason") != "Success":
+            num_failed_tasks += 1
+
+        tm = ev.get("Task Metrics") or {}
+        if isinstance(tm, dict):
+            pem = tm.get("Peak Execution Memory") or 0
+            if isinstance(pem, (int, float)) and pem > peak_exec_mem_bytes:
+                peak_exec_mem_bytes = int(pem)
+            memory_spilled += int(tm.get("Memory Bytes Spilled") or 0)
+            disk_spilled += int(tm.get("Disk Bytes Spilled") or 0)
+            jvm_gc_time += int(tm.get("JVM GC Time") or 0)
+            executor_cpu_ns += int(tm.get("Executor CPU Time") or 0)
+            executor_run_ms += int(tm.get("Executor Run Time") or 0)
+
+            srm = tm.get("Shuffle Read Metrics") or {}
+            if isinstance(srm, dict):
+                shuffle_read += int(srm.get("Remote Bytes Read") or 0)
+                shuffle_read += int(srm.get("Local Bytes Read") or 0)
+            swm = tm.get("Shuffle Write Metrics") or {}
+            if isinstance(swm, dict):
+                shuffle_write += int(swm.get("Shuffle Bytes Written") or 0)
+            im = tm.get("Input Metrics") or {}
+            if isinstance(im, dict):
+                input_bytes += int(im.get("Bytes Read") or 0)
+                input_records += int(im.get("Records Read") or 0)
+
+        ti = ev.get("Task Info") or {}
+        if isinstance(ti, dict):
+            launch = ti.get("Launch Time")
+            finish = ti.get("Finish Time")
+            if isinstance(launch, (int, float)) and isinstance(finish, (int, float)):
+                dur = int(finish) - int(launch)
+                if dur > max_task_duration:
+                    max_task_duration = dur
+
+    if not saw_task and num_stages == 0:
+        return dict.fromkeys(_SPARK_METRIC_KEYS, None)
+
+    return {
+        "peak_execution_memory_mb": (peak_exec_mem_bytes // 1048576) if saw_task else None,
+        "memory_spilled_bytes": memory_spilled if saw_task else None,
+        "disk_spilled_bytes": disk_spilled if saw_task else None,
+        "shuffle_read_bytes": shuffle_read if saw_task else None,
+        "shuffle_write_bytes": shuffle_write if saw_task else None,
+        "input_bytes": input_bytes if saw_task else None,
+        "input_records": input_records if saw_task else None,
+        "num_stages": num_stages,
+        "num_tasks": num_tasks,
+        "num_failed_tasks": num_failed_tasks if saw_task else None,
+        "jvm_gc_time_ms": jvm_gc_time if saw_task else None,
+        "executor_cpu_time_ms": (executor_cpu_ns // 1_000_000) if saw_task else None,
+        "executor_run_time_ms": executor_run_ms if saw_task else None,
+        "max_task_duration_ms": max_task_duration if saw_task else None,
+    }
+
+
+def _event_log_data_file() -> str | None:
+    """Path to Spark's current event-log DATA file, or None if not written yet.
+
+    Spark 4 writes the *rolling v2* layout: a per-application directory
+    ``eventlog_v2_<appId>/`` holding an ``appstatus_<appId>.inprogress``
+    marker plus one or more ``events_<n>_<appId>`` data files. Single-file
+    mode (older Spark / ``spark.eventLog.rolling.enabled=false``) writes a
+    flat ``<appId>(.inprogress)`` file directly in EVENTLOG_DIR. Handle both:
+    prefer the rolling layout, and within it the newest ``events_*`` file
+    (the one currently being appended). Best-effort — returns None on any
+    error so metric capture never trips the node_runs write.
+    """
+    import glob  # noqa: PLC0415
+
+    try:
+        v2_dirs = sorted(
+            (d for d in glob.glob(os.path.join(EVENTLOG_DIR, "eventlog_v2_*"))
+             if os.path.isdir(d)),
+            key=os.path.getmtime,
+        )
+        if v2_dirs:
+            events = [
+                p for p in glob.glob(os.path.join(v2_dirs[-1], "events_*"))
+                if os.path.isfile(p)
+            ]
+            if events:
+                return max(events, key=os.path.getmtime)
+        flat = glob.glob(os.path.join(EVENTLOG_DIR, "*.inprogress"))
+        if not flat:
+            flat = [
+                p for p in glob.glob(os.path.join(EVENTLOG_DIR, "*"))
+                if os.path.isfile(p)
+            ]
+        return flat[0] if flat else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _event_log_offset() -> int:
+    """Byte size of the current event-log data file, captured at handler entry.
+
+    The post-run read seeks past everything a prior warm invocation already
+    wrote, scoping the metric aggregate to this invocation. Best-effort: any
+    error returns 0 (the whole tail is then read, which over-counts only on
+    the first invocation, when there is nothing prior anyway).
+    """
+    path = _event_log_data_file()
+    if not path:
+        return 0
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _read_spark_metrics(offset: int) -> dict[str, int | None]:
+    """Read the event-log tail from ``offset`` to EOF and aggregate it.
+
+    Impure wrapper around the pure _aggregate_event_log. Seeks past the bytes
+    a prior invocation wrote, reads the new tail, and aggregates. Any failure
+    (no file yet, read error) returns an all-None dict so the node_runs write
+    never trips on metric capture.
+    """
+    path = _event_log_data_file()
+    if not path:
+        return dict.fromkeys(_SPARK_METRIC_KEYS, None)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(offset)
+            tail = f.read()
+        return _aggregate_event_log(tail.splitlines())
+    except Exception:  # noqa: BLE001
+        return dict.fromkeys(_SPARK_METRIC_KEYS, None)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +524,44 @@ def _read_text(path: str) -> str:
         return body.decode("utf-8")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+_S3_CLIENT = None
+
+
+def _s3_client():
+    """Lazily-built, reused boto3 S3 client for the cloud progress sink.
+
+    Reused across progress PUTs within one Lambda invocation so the poller
+    doesn't pay client-construction cost on every 1.5s tick.
+    """
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        import boto3  # noqa: PLC0415
+
+        _S3_CLIENT = boto3.client("s3")
+    return _S3_CLIENT
+
+
+def _progress_s3_target(env, arn, node):
+    """Resolve the (bucket, key) the cloud progress sink writes to, or None.
+
+    The bucket is derived from CLAVESA_SYSTEM_WAREHOUSE (an
+    ``s3://<bucket>/_system/pipelines/`` URI); the key is
+    ``_progress/<arn>/<node>.json`` at the bucket root — the same bucket
+    the Go CloudProvider reads back via its workspace S3 client. Returns
+    None when any of the inputs is missing or the warehouse URI isn't S3,
+    so the caller can skip the sink without a live cloud channel.
+
+    Pure (no boto3, no env reads of its own) so it's unit-testable.
+    """
+    warehouse = (env or {}).get("CLAVESA_SYSTEM_WAREHOUSE", "")
+    if not warehouse or not _is_s3(warehouse) or not arn or not node:
+        return None
+    bucket, _ = _split_s3(warehouse)
+    if not bucket:
+        return None
+    return bucket, f"_progress/{arn}/{node}.json"
 
 
 def _looks_like_path(s: str) -> bool:
@@ -1359,6 +1741,8 @@ def _build_node_run_row(
     sf_execution_arn: str | None = None,
     env: dict[str, str] | None = None,
     output_rows: int | None = None,
+    peak_rss_mb: int | None = None,
+    spark_metrics: dict | None = None,
 ) -> dict[str, Any]:
     """Pure helper: construct one node_runs row from invocation telemetry.
 
@@ -1414,7 +1798,7 @@ def _build_node_run_row(
     runner_image_digest = env_map.get("CLAVESA_RUNNER_IMAGE_DIGEST", "")
     module_version = env_map.get("CLAVESA_MODULE_VERSION", "")
 
-    return {
+    row = {
         "run_id": run_id,
         "pipeline": pipeline,
         "node": node,
@@ -1438,6 +1822,15 @@ def _build_node_run_row(
         # runs) or when summary capture failed.
         "output_rows": output_rows,
     }
+    # Resource + Spark task-metric columns. peak_rss_mb is process-lifetime
+    # high-water (monotonic across warm-worker reuse); the rest are
+    # per-invocation aggregates from the event-log tail. All nullable — None
+    # when capture was unavailable (off-Linux, no tasks, read failure).
+    row["peak_rss_mb"] = peak_rss_mb
+    sm = spark_metrics or {}
+    for k in _SPARK_METRIC_KEYS:
+        row[k] = sm.get(k)
+    return row
 
 
 def _system_table_location(table_name: str) -> str | None:
@@ -1505,6 +1898,29 @@ def _node_runs_schema():
         # invocation. Nullable: path-mode-only runs and skipped runs leave
         # it null; older tables not carrying the column read as null too.
         StructField("output_rows", LongType(), True),
+        # Resource + Spark task-metric columns (Spark-observability slice).
+        # All nullable LongType. `peak_rss_mb` is the process-lifetime
+        # high-water mark (VmHWM) — monotonic across warm-worker
+        # invocations, not per-invocation. The remaining 14 are
+        # per-invocation aggregates parsed from the event-log tail written
+        # by this run (sums/max/counts over its tasks + stages). Null when
+        # capture was unavailable: off-Linux (no /proc), a run that
+        # launched no tasks, or an event-log read failure.
+        StructField("peak_rss_mb", LongType(), True),
+        StructField("peak_execution_memory_mb", LongType(), True),
+        StructField("memory_spilled_bytes", LongType(), True),
+        StructField("disk_spilled_bytes", LongType(), True),
+        StructField("shuffle_read_bytes", LongType(), True),
+        StructField("shuffle_write_bytes", LongType(), True),
+        StructField("input_bytes", LongType(), True),
+        StructField("input_records", LongType(), True),
+        StructField("num_stages", LongType(), True),
+        StructField("num_tasks", LongType(), True),
+        StructField("num_failed_tasks", LongType(), True),
+        StructField("jvm_gc_time_ms", LongType(), True),
+        StructField("executor_cpu_time_ms", LongType(), True),
+        StructField("executor_run_time_ms", LongType(), True),
+        StructField("max_task_duration_ms", LongType(), True),
     ])
 
 
@@ -2297,6 +2713,10 @@ def handler(event, context):
 
     started_ms = int(time.time() * 1000)
     is_cold_start = _SPARK is None
+    # Byte offset into the Spark event log at handler entry. The post-run
+    # metric read seeks past this so a warm-worker reuse aggregates only
+    # this invocation's task events, not the prior run's tail.
+    eventlog_offset = _event_log_offset()
     run_id = uuid.uuid4().hex
     # Threaded by the orchestration emitter (v0.13+) — empty string for
     # runs outside Step Functions (local CLI, ad-hoc invocations).
@@ -2313,6 +2733,39 @@ def handler(event, context):
     # NULL, not 0, so analytics queries can distinguish "0 rows produced"
     # from "no Iceberg outputs").
     output_rows_total: int | None = None
+
+    # Cloud live in-flight progress: each node is its own Lambda invocation
+    # under Step Functions, so stdout is NOT a live channel (that path is
+    # the local bundle's pipeline_handler). Instead, a per-node poller pushes
+    # Spark stage/task snapshots to s3://<bucket>/_progress/<arn>/<node>.json,
+    # which the Go CloudProvider reads back for RUNNING nodes. Gated on the
+    # AWS Lambda runtime env var so the local bundle path (which invokes
+    # handler() WITHOUT AWS_LAMBDA_FUNCTION_NAME set) never double-starts a
+    # poller on top of pipeline_handler's stdout poller.
+    cloud_poller = None
+    is_cloud = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    node = os.environ.get("CLAVESA_NODE", "")
+    progress_target = (
+        _progress_s3_target(os.environ, sf_execution_arn, node) if is_cloud else None
+    )
+    if progress_target is not None:
+        prog_bucket, prog_key = progress_target
+
+        def _emit_progress_s3(payload, _bucket=prog_bucket, _key=prog_key):
+            # Best-effort: a PUT failure must never affect the transform.
+            try:
+                _s3_client().put_object(
+                    Bucket=_bucket,
+                    Key=_key,
+                    Body=json.dumps(
+                        {**payload, "updated_ms": int(time.time() * 1000)}
+                    ).encode("utf-8"),
+                )
+            except Exception:  # noqa: BLE001 — sink is enrichment-only
+                pass
+
+        cloud_poller = _ProgressPoller(node, _emit_progress_s3)
+        cloud_poller.start()
 
     try:
         response = _run_transform(event, context, run_id=run_id)
@@ -2363,8 +2816,15 @@ def handler(event, context):
         error_msg = str(exc) or repr(exc)
         raise
     finally:
+        if cloud_poller is not None:
+            cloud_poller.stop()
         ended_ms = int(time.time() * 1000)
         try:
+            # Resource + Spark task-metric capture. Both are best-effort and
+            # already inside this try, so a failure here logs and is
+            # swallowed below without ever masking the transform outcome.
+            peak_rss = _read_peak_rss_mb()
+            spark_metrics = _read_spark_metrics(eventlog_offset)
             row = _build_node_run_row(
                 run_id=run_id,
                 started_ms=started_ms,
@@ -2376,6 +2836,8 @@ def handler(event, context):
                 context=context,
                 sf_execution_arn=sf_execution_arn,
                 output_rows=output_rows_total,
+                peak_rss_mb=peak_rss,
+                spark_metrics=spark_metrics,
             )
             _record_node_run(row)
         except Exception as record_exc:  # noqa: BLE001
@@ -2545,6 +3007,19 @@ def pipeline_handler(event, context):
                 sub_event["_force_nodes"] = force_nodes
 
         print(json.dumps({"_event": "entered", "node": node}), flush=True)
+
+        # Live in-flight progress: a per-node daemon poller reads the Spark
+        # statusTracker and emits {"_event": "progress", ...} lines on the
+        # same stdout channel the Go scanner already reads for
+        # entered/succeeded. Fresh poller + fresh seen set per node.
+        def _emit_progress(payload, _node=node):
+            print(
+                json.dumps({"_event": "progress", **payload}),
+                flush=True,
+            )
+
+        poller = _ProgressPoller(node, _emit_progress)
+        poller.start()
         try:
             resp = handler(sub_event, context)
         except Exception as exc:  # noqa: BLE001
@@ -2570,6 +3045,8 @@ def pipeline_handler(event, context):
             overall_status = "failed"
             failed_node = node
             break
+        finally:
+            poller.stop()
 
         node_status = (
             resp.get("status") if isinstance(resp, dict) else None

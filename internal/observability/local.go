@@ -84,8 +84,13 @@ func (p *LocalProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	}
 	for nodeID, s := range st.States {
 		out.States[nodeID] = StateStatus{
-			Status:    s.Status,
-			EnteredAt: s.EnteredAt,
+			Status:          s.Status,
+			EnteredAt:       s.EnteredAt,
+			StagesTotal:     s.StagesTotal,
+			StagesCompleted: s.StagesCompleted,
+			TasksTotal:      s.TasksTotal,
+			TasksCompleted:  s.TasksCompleted,
+			TasksFailed:     s.TasksFailed,
 		}
 	}
 	return out, nil
@@ -203,7 +208,7 @@ func (p *LocalProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
 	// down (arn-filtered) still goes through Spark below to pick up the
 	// richer columns (image digest, module version, output rows) that
 	// state.json doesn't carry.
-	if q.SfExecutionARN == "" {
+	if q.SfExecutionARN == "" && !q.IncludeMetrics {
 		return p.nodeRunsFromState(q)
 	}
 
@@ -246,7 +251,22 @@ func (p *LocalProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
   runner_image_digest,
   module_version,
   output_rows,
-  sf_execution_arn
+  sf_execution_arn,
+  peak_rss_mb,
+  peak_execution_memory_mb,
+  memory_spilled_bytes,
+  disk_spilled_bytes,
+  shuffle_read_bytes,
+  shuffle_write_bytes,
+  input_bytes,
+  input_records,
+  num_stages,
+  num_tasks,
+  num_failed_tasks,
+  jvm_gc_time_ms,
+  executor_cpu_time_ms,
+  executor_run_time_ms,
+  max_task_duration_ms
 FROM %s.node_runs
 %s
 ORDER BY started_at DESC
@@ -293,6 +313,22 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 			ModuleVersion:     stringValue(rowAt(r, idx, "module_version")),
 			OutputRows:        int64Pointer(rowAt(r, idx, "output_rows")),
 			SfExecutionARN:    stringValue(rowAt(r, idx, "sf_execution_arn")),
+
+			PeakRSSMB:             int64Pointer(rowAt(r, idx, "peak_rss_mb")),
+			PeakExecutionMemoryMB: int64Pointer(rowAt(r, idx, "peak_execution_memory_mb")),
+			MemorySpilledBytes:    int64Pointer(rowAt(r, idx, "memory_spilled_bytes")),
+			DiskSpilledBytes:      int64Pointer(rowAt(r, idx, "disk_spilled_bytes")),
+			ShuffleReadBytes:      int64Pointer(rowAt(r, idx, "shuffle_read_bytes")),
+			ShuffleWriteBytes:     int64Pointer(rowAt(r, idx, "shuffle_write_bytes")),
+			InputBytes:            int64Pointer(rowAt(r, idx, "input_bytes")),
+			InputRecords:          int64Pointer(rowAt(r, idx, "input_records")),
+			NumStages:             int64Pointer(rowAt(r, idx, "num_stages")),
+			NumTasks:              int64Pointer(rowAt(r, idx, "num_tasks")),
+			NumFailedTasks:        int64Pointer(rowAt(r, idx, "num_failed_tasks")),
+			JVMGCTimeMs:           int64Pointer(rowAt(r, idx, "jvm_gc_time_ms")),
+			ExecutorCPUTimeMs:     int64Pointer(rowAt(r, idx, "executor_cpu_time_ms")),
+			ExecutorRunTimeMs:     int64Pointer(rowAt(r, idx, "executor_run_time_ms")),
+			MaxTaskDurationMs:     int64Pointer(rowAt(r, idx, "max_task_duration_ms")),
 		})
 	}
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
@@ -468,9 +504,9 @@ func (p *LocalProvider) tablesFromMetadata(q TablesQuery) (*TablesResult, bool) 
 	return &TablesResult{Rows: out, Truncated: truncated}, true
 }
 
-// splitCatalogSchema decodes a ``<catalog>__<schema>`` Glue-flat
+// splitCatalogSchema decodes a “<catalog>__<schema>“ Glue-flat
 // database string back into its catalog + schema parts. Returns
-// (_, _, false) when the input doesn't carry the ``__`` boundary —
+// (_, _, false) when the input doesn't carry the “__“ boundary —
 // caller falls back to the legacy single-segment path.
 func splitCatalogSchema(database string) (catalog, schema string, ok bool) {
 	idx := strings.Index(database, "__")
@@ -483,12 +519,12 @@ func splitCatalogSchema(database string) (catalog, schema string, ok bool) {
 // resolveLocalTablePath returns the on-disk path for a Delta table under
 // the workspace's local warehouse. Probes three layouts in order:
 //
-//  1. ADR-019 V2 (Slice 4): ``<warehouse>/<catalog>/<schema>/<table>/``
-//  2. Legacy Hive ADR-016: ``<warehouse>/<catalog>__<schema>.db/<table>/``
-//  3. Legacy + ``__default`` suffix (pre-Slice-3 single-output tables)
+//  1. ADR-019 V2 (Slice 4): “<warehouse>/<catalog>/<schema>/<table>/“
+//  2. Legacy Hive ADR-016: “<warehouse>/<catalog>__<schema>.db/<table>/“
+//  3. Legacy + “__default“ suffix (pre-Slice-3 single-output tables)
 //
 // Returns the V2 layout path when none of the probes find a
-// ``_delta_log/`` so downstream errors point at the canonical location.
+// “_delta_log/“ so downstream errors point at the canonical location.
 func resolveLocalTablePath(warehouse, database, table string) string {
 	if catalog, schema, ok := splitCatalogSchema(database); ok {
 		v2 := filepath.Join(warehouse, catalog, schema, table)
@@ -526,7 +562,7 @@ func resolveLocalTablePath(warehouse, database, table string) string {
 // resolveLocalTableName picks the on-disk table-name variant for SQL.
 // Same back-compat rule as resolveLocalTablePath: prefer the asked name,
 // fall back to `<asked>__default` when only the legacy directory exists.
-// The asked name is correct under the V2 layout (no ``__default`` peer
+// The asked name is correct under the V2 layout (no “__default“ peer
 // on writes after Slice 3), so the legacy probe is the only fallback.
 func resolveLocalTableName(workspaceRoot, database, table string) string {
 	warehouse := workspace.LocalWarehouseDir(workspaceRoot)
@@ -1226,9 +1262,20 @@ func splitExecRef(s string) (dir, runID string) {
 // FormatExecRef encodes (dir, runID) back into the on-the-wire format. The
 // HTTP handler uses this when constructing dispatch references for local
 // providers; cloud uses raw SFN ARNs for the same field.
+//
+// Cloud runs are addressed by their full SFN execution ARN (the value
+// `pipeline run` prints and the UI carries in the `run=` query param). Such
+// a runID is already self-contained: prefixing it with `dir:` would shift
+// the colon-split in StateMachineNameFromExecutionARN, so the ARN no longer
+// parses and the cloud provider returns an empty result. Pass a full
+// execution ARN through unchanged. Local run IDs are never ARN-shaped, so
+// this branch never affects the local round-trip with splitExecRef.
 func FormatExecRef(dir, runID string) string {
 	if runID == "" {
 		return dir
+	}
+	if StateMachineNameFromExecutionARN(runID) != "" {
+		return runID
 	}
 	return dir + ":" + runID
 }

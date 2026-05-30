@@ -79,6 +79,8 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`"arn:aws:s3:::${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_warehouse/*"`,
 		`"arn:aws:s3:::${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_watermarks/*"`,
 		`"arn:aws:s3:::${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/_system/pipelines/*"`,
+		// Live in-flight progress sink prefix (bucket root).
+		`"arn:aws:s3:::${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/_progress/*"`,
 		// Glue read includes the workspace catalog wildcard + default DB +
 		// system catalog wildcard.
 		`"arn:aws:glue:*:*:database/default"`,

@@ -394,7 +394,14 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 	args := []string{
 		"run", "-d", "--rm",
 		"--label", p.labelKV,
-		"-p", "0:8765/tcp",
+		// Bind only to loopback (the Go side always dials 127.0.0.1, and the
+		// warm Spark worker has no business being reachable from the LAN) and
+		// request an ephemeral host port via the empty-host-port form
+		// `127.0.0.1::CONTAINER`. This is the canonical "give me a random
+		// port" spelling; the literal `0:CONTAINER` form we used before is
+		// what Docker Desktop occasionally fails to forward (see the spawn
+		// retry below).
+		"-p", "127.0.0.1::8765/tcp",
 		// Spark Connect gRPC binding. Exposed so future Slice-1 notebook
 		// REPL subprocesses (which connect via gRPC) and host-side debug
 		// tools (`grpcurl`) can reach the in-container Connect server.
@@ -402,7 +409,7 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		// same container, so this port isn't strictly required today —
 		// but exposing it is free and avoids a respawn churn when Slice 1
 		// lands.
-		"-p", "0:15002/tcp",
+		"-p", "127.0.0.1::15002/tcp",
 		"-e", "CLAVESA_QUERY_SERVER=1",
 		"-e", "CLAVESA_QUERY_SERVER_PORT=8765",
 		"-e", "CLAVESA_CONNECT_PORT=15002",
@@ -418,29 +425,72 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+m.SystemCatalogIdentifier())
 	}
 	args = append(args, "-v", warehouse+":"+warehouse, p.resolveImage())
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", 0, fmt.Errorf("docker run warm worker: %w\nstderr: %s", err, stderr.String())
-	}
-	containerID := strings.TrimSpace(stdout.String())
-	if containerID == "" {
-		return "", 0, fmt.Errorf("docker run warm worker: empty container id")
-	}
 
-	port, err := dockerHostPort(ctx, containerID, "8765/tcp")
+	// Docker Desktop intermittently accepts a `-p` publish request but never
+	// wires up the host-side forwarding: the container runs fine, Spark boots,
+	// yet NetworkSettings.Ports comes back empty and `docker port` exits 1
+	// with "no public port '8765/tcp' published". A fresh `docker run` almost
+	// always clears the glitch, so retry the whole spawn a couple of times
+	// before giving up rather than failing the whole UI session on a
+	// transient daemon hiccup.
+	const spawnAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= spawnAttempts; attempt++ {
+		cmd := exec.CommandContext(ctx, "docker", args...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return "", 0, fmt.Errorf("docker run warm worker: %w\nstderr: %s", err, stderr.String())
+		}
+		containerID := strings.TrimSpace(stdout.String())
+		if containerID == "" {
+			return "", 0, fmt.Errorf("docker run warm worker: empty container id")
+		}
+
+		port, err := dockerHostPort(ctx, containerID, "8765/tcp")
+		if err != nil {
+			// Port never got published — the Docker Desktop forwarding glitch.
+			// Record what we saw, tear this container down, and try a fresh one.
+			lastErr = fmt.Errorf("attempt %d/%d: %w (container %s %s)",
+				attempt, spawnAttempts, err, containerID[:12], dockerContainerState(ctx, containerID))
+			_ = exec.Command("docker", "stop", containerID).Run()
+			select {
+			case <-ctx.Done():
+				return "", 0, ctx.Err()
+			case <-time.After(300 * time.Millisecond):
+			}
+			continue
+		}
+
+		if err := p.pollHealthz(ctx, port); err != nil {
+			logs := dockerTailLogs(containerID, 20)
+			_ = exec.Command("docker", "stop", containerID).Run()
+			return "", 0, fmt.Errorf("warm worker %s: %w\ncontainer logs (tail):\n%s", containerID[:12], err, logs)
+		}
+		return containerID, port, nil
+	}
+	return "", 0, fmt.Errorf("warm worker: docker never published a host port across %d attempts: %w", spawnAttempts, lastErr)
+}
+
+// dockerContainerState returns a short "running exit=N" summary for a
+// container, or "is gone (--rm reaped it)" when it no longer exists — the
+// signal that distinguishes a crash-on-boot (gone) from the forwarding
+// glitch (still running but unpublished).
+func dockerContainerState(ctx context.Context, containerID string) string {
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "is {{.State.Status}} exit={{.State.ExitCode}}", containerID).Output()
 	if err != nil {
-		_ = exec.Command("docker", "stop", containerID).Run()
-		return "", 0, err
+		return "is gone (--rm reaped it)"
 	}
+	return strings.TrimSpace(string(out))
+}
 
-	if err := p.pollHealthz(ctx, port); err != nil {
-		_ = exec.Command("docker", "stop", containerID).Run()
-		return "", 0, fmt.Errorf("warm worker %s: %w", containerID[:12], err)
-	}
-	return containerID, port, nil
+// dockerTailLogs returns the last n lines of a container's combined logs,
+// best-effort (empty string if the container or daemon is unreachable). Used
+// to make a /healthz timeout actionable instead of an opaque "not healthy".
+func dockerTailLogs(containerID string, n int) string {
+	out, _ := exec.Command("docker", "logs", "--tail", strconv.Itoa(n), containerID).CombinedOutput()
+	return strings.TrimSpace(string(out))
 }
 
 func (p *persistentDockerQueryRunner) pollHealthz(ctx context.Context, port int) error {
@@ -576,6 +626,14 @@ func dockerHostPort(ctx context.Context, containerID, containerPort string) (int
 			lastOut = string(out)
 		} else {
 			lastErr = err
+			// `docker port` writes "no public port '8765/tcp' published" to
+			// stderr, not stdout, so .Output()'s empty stdout left the old
+			// message blank. Pull stderr off the ExitError so the failure is
+			// diagnosable.
+			var ee *exec.ExitError
+			if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+				lastOut = strings.TrimSpace(string(ee.Stderr))
+			}
 		}
 		if time.Now().After(deadline) {
 			break

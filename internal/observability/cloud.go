@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
@@ -65,6 +67,11 @@ type CloudProvider struct {
 	// `undeployed()` above.
 	glue GlueClient
 	s3   s3fs.S3API
+	// clock returns "now" for freshness windowing of live progress
+	// snapshots. Overridable in tests for deterministic assertions;
+	// defaults to time.Now (set in NewCloudProvider, and defended against
+	// nil via nowFn for providers built by struct literal).
+	clock func() time.Time
 }
 
 // NewCloudProvider wires a provider against AWS SDK clients. Any subset of
@@ -77,7 +84,18 @@ func NewCloudProvider(athenaC AthenaClient, athenaOutputBucket string, sfnC SFNC
 		athenaOutputBucket: athenaOutputBucket,
 		sfn:                sfnC,
 		cwl:                cwlC,
+		clock:              time.Now,
 	}
+}
+
+// nowFn returns the provider's clock, falling back to time.Now when
+// unset. Providers built via NewCloudProvider always have clock wired;
+// the fallback covers struct-literal construction in tests.
+func (c *CloudProvider) nowFn() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
 }
 
 // WithGlue attaches a Glue client for table-location lookup. Required
@@ -216,7 +234,22 @@ func (c *CloudProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
   runner_image_digest,
   module_version,
   output_rows,
-  sf_execution_arn
+  sf_execution_arn,
+  peak_rss_mb,
+  peak_execution_memory_mb,
+  memory_spilled_bytes,
+  disk_spilled_bytes,
+  shuffle_read_bytes,
+  shuffle_write_bytes,
+  input_bytes,
+  input_records,
+  num_stages,
+  num_tasks,
+  num_failed_tasks,
+  jvm_gc_time_ms,
+  executor_cpu_time_ms,
+  executor_run_time_ms,
+  max_task_duration_ms
 FROM "%s"."node_runs"
 %s
 ORDER BY started_at DESC
@@ -242,7 +275,7 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 
 	out := make([]NodeRun, 0, len(rows))
 	for _, row := range rows {
-		if len(row.Data) < 17 {
+		if len(row.Data) < 32 {
 			continue
 		}
 		out = append(out, NodeRun{
@@ -263,6 +296,22 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 			ModuleVersion:     stringDatum(row.Data[14]),
 			OutputRows:        intDatum(row.Data[15]),
 			SfExecutionARN:    stringDatum(row.Data[16]),
+
+			PeakRSSMB:             intDatum(row.Data[17]),
+			PeakExecutionMemoryMB: intDatum(row.Data[18]),
+			MemorySpilledBytes:    intDatum(row.Data[19]),
+			DiskSpilledBytes:      intDatum(row.Data[20]),
+			ShuffleReadBytes:      intDatum(row.Data[21]),
+			ShuffleWriteBytes:     intDatum(row.Data[22]),
+			InputBytes:            intDatum(row.Data[23]),
+			InputRecords:          intDatum(row.Data[24]),
+			NumStages:             intDatum(row.Data[25]),
+			NumTasks:              intDatum(row.Data[26]),
+			NumFailedTasks:        intDatum(row.Data[27]),
+			JVMGCTimeMs:           intDatum(row.Data[28]),
+			ExecutorCPUTimeMs:     intDatum(row.Data[29]),
+			ExecutorRunTimeMs:     intDatum(row.Data[30]),
+			MaxTaskDurationMs:     intDatum(row.Data[31]),
 		})
 	}
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
@@ -916,23 +965,137 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	if err != nil {
 		return nil, fmt.Errorf("describe execution: %w", err)
 	}
-	hist, err := c.sfn.GetExecutionHistory(ctx, &sfn.GetExecutionHistoryInput{
-		ExecutionArn:         aws.String(q.ExecutionRef),
-		IncludeExecutionData: aws.Bool(false),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get history: %w", err)
-	}
 	startedAt := ""
 	if desc.StartDate != nil {
 		startedAt = desc.StartDate.UTC().Format("2006-01-02T15:04:05.000Z")
 	}
+	// Since v2.2.0 the cloud machine is a single bundled RunPipeline Task
+	// running the whole DAG in one Lambda, so SFN history only carries that
+	// one synthetic state name, never per-node. Per-node progress comes
+	// instead from the `_progress/<execARN>/<node>.json` objects the runner
+	// writes per poll tick. While the execution is RUNNING, LIST those and
+	// surface a RUNNING StateStatus per fresh node so the UI's progress bars
+	// (ADR-014 parity with local) light up. Once the execution reaches a
+	// terminal status there is nothing in flight, so we return an empty map.
+	var states map[string]StateStatus
+	if string(desc.Status) == string(sfntypes.ExecutionStatusRunning) {
+		states = c.liveProgressStates(ctx, q.ExecutionRef, c.nowFn())
+	} else {
+		states = map[string]StateStatus{}
+	}
 	return &ExecutionStatesResult{
 		Status:    string(desc.Status),
-		States:    StateStatusesFromHistory(hist.Events),
+		States:    states,
 		RunID:     q.ExecutionRef,
 		StartedAt: startedAt,
 	}, nil
+}
+
+// progressSnapshot is the JSON the runner writes to
+// _progress/<execARN>/<node>.json each poll tick. Fields mirror the
+// StateStatus progress counters; all optional. UpdatedMs is the epoch
+// millisecond the runner stamped the snapshot, used to filter out stale
+// objects left behind by a previous node or a crashed run.
+type progressSnapshot struct {
+	StagesTotal     *int64 `json:"stages_total"`
+	StagesCompleted *int64 `json:"stages_completed"`
+	TasksTotal      *int64 `json:"tasks_total"`
+	TasksCompleted  *int64 `json:"tasks_completed"`
+	TasksFailed     *int64 `json:"tasks_failed"`
+	UpdatedMs       int64  `json:"updated_ms"`
+}
+
+// freshnessWindowMs bounds how recent a `_progress/<node>.json` snapshot
+// must be (relative to now) to count as "currently in flight". The runner
+// rewrites the object every few seconds while a node runs; an object older
+// than this window belongs to a node that already finished (or a stale run)
+// and is dropped so the UI doesn't show a ghost progress bar.
+const freshnessWindowMs = 12000
+
+// liveProgressStates LISTs the per-node `_progress/<execARN>/<node>.json`
+// objects the runner writes each poll tick and returns a RUNNING StateStatus
+// per node whose snapshot is fresh (updated within freshnessWindowMs of now).
+// This is the per-node progress source for the bundled single-Task cloud
+// machine (v2.2.0+), where SFN history no longer carries per-node states.
+//
+// Best-effort throughout: a missing S3 client or bucket, a LIST error, or any
+// per-object GET/parse failure yields whatever was accumulated so far (an
+// empty, non-nil map at worst) and never returns an error to the caller.
+func (c *CloudProvider) liveProgressStates(ctx context.Context, execARN string, now time.Time) map[string]StateStatus {
+	states := map[string]StateStatus{}
+	if c.s3 == nil || c.athenaOutputBucket == "" {
+		return states
+	}
+	prefix := fmt.Sprintf("_progress/%s/", execARN)
+	nowMs := now.UnixMilli()
+
+	var token *string
+	for {
+		resp, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.athenaOutputBucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			// LIST failed mid-walk; return whatever we already gathered.
+			return states
+		}
+		for _, obj := range resp.Contents {
+			key := aws.ToString(obj.Key)
+			if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, ".json") {
+				continue
+			}
+			node := strings.TrimSuffix(key[len(prefix):], ".json")
+			if node == "" {
+				continue
+			}
+			snap := c.fetchProgress(ctx, execARN, node)
+			if snap == nil {
+				continue
+			}
+			if nowMs-snap.UpdatedMs >= freshnessWindowMs {
+				// Stale object from a node that already finished — skip it.
+				continue
+			}
+			states[node] = StateStatus{
+				Status:          "RUNNING",
+				StagesTotal:     snap.StagesTotal,
+				StagesCompleted: snap.StagesCompleted,
+				TasksTotal:      snap.TasksTotal,
+				TasksCompleted:  snap.TasksCompleted,
+				TasksFailed:     snap.TasksFailed,
+			}
+		}
+		if resp.IsTruncated == nil || !*resp.IsTruncated || resp.NextContinuationToken == nil {
+			break
+		}
+		token = resp.NextContinuationToken
+	}
+	return states
+}
+
+// fetchProgress reads s3://<bucket>/_progress/<execARN>/<node>.json. Returns
+// nil on a missing object or any error — the counters stay nil and the
+// progress bar simply doesn't render for that node.
+func (c *CloudProvider) fetchProgress(ctx context.Context, execARN, node string) *progressSnapshot {
+	key := fmt.Sprintf("_progress/%s/%s.json", execARN, node)
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(c.athenaOutputBucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil
+	}
+	defer out.Body.Close()
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil
+	}
+	var snap progressSnapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		return nil
+	}
+	return &snap
 }
 
 // StateStatusesFromHistory walks SFN history events in order and computes the

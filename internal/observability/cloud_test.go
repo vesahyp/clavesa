@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 )
 
@@ -525,4 +527,144 @@ func TestIsAthenaMissingTableErr(t *testing.T) {
 			}
 		})
 	}
+}
+
+// progressJSON renders a `_progress/<node>.json` body with the given
+// counters and updated_ms timestamp. Helper for the live-progress tests.
+func progressJSON(updatedMs int64) []byte {
+	return []byte(fmt.Sprintf(
+		`{"stages_total":3,"stages_completed":1,"tasks_total":40,"tasks_completed":18,"tasks_failed":2,"updated_ms":%d}`,
+		updatedMs))
+}
+
+// TestLiveProgressStates asserts that LISTing the per-node `_progress`
+// objects yields a RUNNING StateStatus per fresh node with its counters
+// populated, and that a stale object (older than the freshness window) is
+// dropped so the UI doesn't render a ghost progress bar.
+func TestLiveProgressStates(t *testing.T) {
+	const arn = "arn:aws:states:eu-west-1:111122223333:execution:clavesa-demo:run-1"
+	const bucket = "demo-bucket"
+	now := time.UnixMilli(1700000000000)
+	s3stub := &stubS3Snap{
+		objects: map[string][]byte{
+			// Fresh: stamped right at now.
+			bucket + "/_progress/" + arn + "/a.json": progressJSON(now.UnixMilli()),
+			// Stale: far older than now - freshnessWindowMs (12s).
+			bucket + "/_progress/" + arn + "/b.json": progressJSON(now.UnixMilli() - 60000),
+		},
+	}
+	c := NewCloudProvider(nil, bucket, nil, nil).WithS3(s3stub)
+
+	states := c.liveProgressStates(context.Background(), arn, now)
+
+	a, ok := states["a"]
+	if !ok {
+		t.Fatalf("fresh node a missing from states: %v", states)
+	}
+	if a.Status != "RUNNING" {
+		t.Errorf("a.Status = %q, want RUNNING", a.Status)
+	}
+	if a.TasksTotal == nil || *a.TasksTotal != 40 {
+		t.Errorf("a.TasksTotal = %v, want 40", a.TasksTotal)
+	}
+	if a.StagesTotal == nil || *a.StagesTotal != 3 {
+		t.Errorf("a.StagesTotal = %v, want 3", a.StagesTotal)
+	}
+	if a.TasksFailed == nil || *a.TasksFailed != 2 {
+		t.Errorf("a.TasksFailed = %v, want 2", a.TasksFailed)
+	}
+	if _, ok := states["b"]; ok {
+		t.Errorf("stale node b must be dropped, got %v", states["b"])
+	}
+}
+
+// TestLiveProgressStatesNoS3 is a safety check: a provider with no bucket
+// and no S3 client returns an empty, non-nil map without panicking.
+func TestLiveProgressStatesNoS3(t *testing.T) {
+	c := NewCloudProvider(nil, "", nil, nil) // no bucket, no WithS3
+	states := c.liveProgressStates(context.Background(), "arn", time.Now())
+	if states == nil {
+		t.Fatal("liveProgressStates returned nil map, want empty non-nil")
+	}
+	if len(states) != 0 {
+		t.Errorf("liveProgressStates(no s3) = %v, want empty", states)
+	}
+}
+
+// stubSFN is a minimal SFNClient for the ExecutionStates branch test.
+// DescribeExecution returns a fixed status + start date; GetExecutionHistory
+// returns an empty history (the single-Task machine no longer drives
+// per-node states from history).
+type stubSFN struct {
+	status sfntypes.ExecutionStatus
+	arn    string
+	start  time.Time
+}
+
+func (s *stubSFN) DescribeExecution(_ context.Context, in *sfn.DescribeExecutionInput, _ ...func(*sfn.Options)) (*sfn.DescribeExecutionOutput, error) {
+	return &sfn.DescribeExecutionOutput{
+		Status:       s.status,
+		StartDate:    &s.start,
+		ExecutionArn: aws.String(s.arn),
+	}, nil
+}
+
+func (s *stubSFN) GetExecutionHistory(_ context.Context, _ *sfn.GetExecutionHistoryInput, _ ...func(*sfn.Options)) (*sfn.GetExecutionHistoryOutput, error) {
+	return &sfn.GetExecutionHistoryOutput{}, nil
+}
+
+// TestExecutionStatesRunningVsTerminal proves the RUNNING-vs-terminal
+// branch: a RUNNING execution surfaces fresh per-node `_progress` objects,
+// while a terminal one returns an empty state map even when a fresh object
+// still sits in the bucket.
+func TestExecutionStatesRunningVsTerminal(t *testing.T) {
+	const arn = "arn:aws:states:eu-west-1:111122223333:execution:clavesa-demo:run-1"
+	const bucket = "demo-bucket"
+	now := time.UnixMilli(1700000000000)
+	s3stub := &stubS3Snap{
+		objects: map[string][]byte{
+			bucket + "/_progress/" + arn + "/a.json": progressJSON(now.UnixMilli()),
+		},
+	}
+
+	t.Run("running surfaces fresh node", func(t *testing.T) {
+		sfnStub := &stubSFN{status: sfntypes.ExecutionStatusRunning, arn: arn, start: now}
+		c := NewCloudProvider(nil, bucket, sfnStub, nil).WithS3(s3stub)
+		c.clock = func() time.Time { return now }
+
+		res, err := c.ExecutionStates(context.Background(), ExecutionStatesQuery{ExecutionRef: arn})
+		if err != nil {
+			t.Fatalf("ExecutionStates: %v", err)
+		}
+		if res.Status != "RUNNING" {
+			t.Errorf("Status = %q, want RUNNING", res.Status)
+		}
+		a, ok := res.States["a"]
+		if !ok || a.Status != "RUNNING" {
+			t.Fatalf("expected fresh node a RUNNING, got states=%v", res.States)
+		}
+		if a.TasksTotal == nil || *a.TasksTotal != 40 {
+			t.Errorf("a.TasksTotal = %v, want 40", a.TasksTotal)
+		}
+	})
+
+	t.Run("terminal returns empty states", func(t *testing.T) {
+		sfnStub := &stubSFN{status: sfntypes.ExecutionStatusSucceeded, arn: arn, start: now}
+		c := NewCloudProvider(nil, bucket, sfnStub, nil).WithS3(s3stub)
+		c.clock = func() time.Time { return now }
+
+		res, err := c.ExecutionStates(context.Background(), ExecutionStatesQuery{ExecutionRef: arn})
+		if err != nil {
+			t.Fatalf("ExecutionStates: %v", err)
+		}
+		if res.Status != "SUCCEEDED" {
+			t.Errorf("Status = %q, want SUCCEEDED", res.Status)
+		}
+		if res.States == nil {
+			t.Fatal("States is nil, want empty non-nil map")
+		}
+		if len(res.States) != 0 {
+			t.Errorf("terminal States = %v, want empty", res.States)
+		}
+	})
 }

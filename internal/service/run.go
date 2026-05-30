@@ -1423,6 +1423,14 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 			}
 			st.Status = "ok"
 			statusByNode[node] = st
+		case "progress":
+			channel.nodeProgress(node, NodeProgress{
+				StagesTotal:     msgInt64(msg, "stages_total"),
+				StagesCompleted: msgInt64(msg, "stages_completed"),
+				TasksTotal:      msgInt64(msg, "tasks_total"),
+				TasksCompleted:  msgInt64(msg, "tasks_completed"),
+				TasksFailed:     msgInt64(msg, "tasks_failed"),
+			})
 		case "skipped":
 			note, _ := msg["note"].(string)
 			channel.nodeSkipped(node, note)
@@ -1466,6 +1474,23 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		return statuses, fmt.Errorf("pipeline failed at node %q", failed)
 	}
 	return statuses, nil
+}
+
+// msgInt64 reads an integer field out of a decoded runner event. JSON
+// numbers decode as float64 into map[string]any; this mirrors the
+// output_rows conversion above. Returns nil when the key is absent, null,
+// or not a number so a partial event decodes cleanly.
+func msgInt64(msg map[string]any, key string) *int64 {
+	v, ok := msg[key]
+	if !ok || v == nil {
+		return nil
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return nil
+	}
+	n := int64(f)
+	return &n
 }
 
 // recordLocalRun invokes the runner image once with CLAVESA_RECORD_RUN=1
@@ -1757,6 +1782,38 @@ func (c *runChannel) nodeEntered(nodeID string) {
 		Status:    "RUNNING",
 		EnteredAt: now.Format(time.RFC3339Nano),
 	}
+	_ = observability.WriteRunState(c.pipelineDir, c.state)
+}
+
+// NodeProgress carries the in-flight Spark counters the runner emits on a
+// `progress` event. All fields nullable so a partial event (or a future
+// runner that drops a field) decodes cleanly.
+type NodeProgress struct {
+	StagesTotal     *int64
+	StagesCompleted *int64
+	TasksTotal      *int64
+	TasksCompleted  *int64
+	TasksFailed     *int64
+}
+
+// nodeProgress folds an in-flight progress tick onto the node's RUNNING
+// state and rewrites state.json. Defensive: only applies when the node
+// entry exists and is still RUNNING, so a late tick arriving after
+// succeeded/failed (or before entered) is dropped rather than resurrecting
+// a terminal node.
+func (c *runChannel) nodeProgress(nodeID string, p NodeProgress) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, ok := c.state.States[nodeID]
+	if !ok || prev.Status != "RUNNING" {
+		return
+	}
+	prev.StagesTotal = p.StagesTotal
+	prev.StagesCompleted = p.StagesCompleted
+	prev.TasksTotal = p.TasksTotal
+	prev.TasksCompleted = p.TasksCompleted
+	prev.TasksFailed = p.TasksFailed
+	c.state.States[nodeID] = prev
 	_ = observability.WriteRunState(c.pipelineDir, c.state)
 }
 

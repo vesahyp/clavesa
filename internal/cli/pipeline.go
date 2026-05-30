@@ -56,6 +56,8 @@ Examples:
 		newPipelineDeployCmd(),
 		newPipelineDestroyCmd(),
 		newPipelineRunCmd(),
+		newPipelineStatusCmd(),
+		newPipelineRightsizeCmd(),
 		newOrchestrationCmd(),
 		newPipelineBackfillCmd(),
 	)

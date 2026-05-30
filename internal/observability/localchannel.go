@@ -48,6 +48,16 @@ type NodeRunState struct {
 	// state.json so the dashboard's node-detail drawer can read it
 	// without going through Spark / Iceberg.
 	OutputRows *int64 `json:"output_rows,omitempty"`
+	// In-flight Spark progress, emitted periodically by the runner while a
+	// node is RUNNING (the `progress` event). All nullable: nil until the
+	// first progress tick arrives, and absent for nodes that finish before
+	// any tick. Cleared on terminal transitions (the succeeded/failed
+	// writers build a fresh NodeRunState).
+	StagesTotal     *int64 `json:"stages_total,omitempty"`
+	StagesCompleted *int64 `json:"stages_completed,omitempty"`
+	TasksTotal      *int64 `json:"tasks_total,omitempty"`
+	TasksCompleted  *int64 `json:"tasks_completed,omitempty"`
+	TasksFailed     *int64 `json:"tasks_failed,omitempty"`
 }
 
 // runsRoot returns <pipelineDir>/.clavesa/runs (the parent of every run's

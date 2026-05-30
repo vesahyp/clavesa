@@ -467,6 +467,10 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/${%s}/_watermarks/*\",\n", p.BucketExpr, p.PipelineNameExpr)
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/${%s}/*/*\",\n", p.BucketExpr, p.PipelineNameExpr)
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/_system/pipelines/*\",\n", p.BucketExpr)
+	// Live in-flight progress sink: the runner PUTs Spark stage/task
+	// counters to _progress/<execARN>/<node>.json (bucket root, outside
+	// the per-pipeline prefix), which the UI's CloudProvider reads back.
+	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/_progress/*\",\n", p.BucketExpr)
 	fmt.Fprintf(b, "      ]},\n")
 
 	// Glue read — workspace catalog + system catalog + `default` DB

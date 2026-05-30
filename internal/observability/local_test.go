@@ -721,3 +721,22 @@ func TestSplitAndFormatExecRef(t *testing.T) {
 		_ = ref
 	}
 }
+
+// TestFormatExecRefARNPassthrough pins the cloud dispatch contract: a runID
+// that is already a full SFN execution ARN must pass through unchanged so the
+// cloud provider can parse it, while a plain local run ID still gets the
+// "dir:runID" prefix. The bug this guards: prefixing an ARN with "dir:"
+// shifted the colon-split in StateMachineNameFromExecutionARN, so cloud live
+// progress never surfaced.
+func TestFormatExecRefARNPassthrough(t *testing.T) {
+	const arn = "arn:aws:states:eu-north-1:699166197771:execution:clavesa-bigagg:bcf294d6-dc5f-413f-a2f0-a103aefb22ff"
+	if got := observability.FormatExecRef("bigagg", arn); got != arn {
+		t.Errorf("ARN runID must pass through unchanged; got %q", got)
+	}
+	if observability.StateMachineNameFromExecutionARN(observability.FormatExecRef("bigagg", arn)) != "clavesa-bigagg" {
+		t.Errorf("formatted ARN ref must still parse to its state machine name")
+	}
+	if got := observability.FormatExecRef("bigagg", "run-1"); got != "bigagg:run-1" {
+		t.Errorf("local run ID must keep the dir prefix; got %q", got)
+	}
+}

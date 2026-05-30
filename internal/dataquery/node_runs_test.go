@@ -36,6 +36,12 @@ func nodeRunsHeader() athenatypes.Row {
 		"cold_start", "lambda_request_id", "error_class", "error_msg",
 		"runner_image_digest", "module_version", "output_rows",
 		"sf_execution_arn",
+		// Spark-observability columns (appended after sf_execution_arn).
+		"peak_rss_mb", "peak_execution_memory_mb", "memory_spilled_bytes",
+		"disk_spilled_bytes", "shuffle_read_bytes", "shuffle_write_bytes",
+		"input_bytes", "input_records", "num_stages", "num_tasks",
+		"num_failed_tasks", "jvm_gc_time_ms", "executor_cpu_time_ms",
+		"executor_run_time_ms", "max_task_duration_ms",
 	)
 }
 
@@ -71,6 +77,10 @@ func TestNodeRunsBasic(t *testing.T) {
 						"true", "req-xyz", "", "",
 						"sha256:abc123", "v0.13.0", "1234",
 						"exec-1",
+						// Spark metrics: peak_rss + 14 aggregates.
+						"512", "2", "0", "0", "12577", "12577",
+						"6133", "14", "9", "124", "0", "1083", "11605",
+						"43346", "2462",
 					),
 					nodeRunsRow(
 						"run-def", "my_pipeline", "filter_complete",
@@ -79,6 +89,8 @@ func TestNodeRunsBasic(t *testing.T) {
 						"false", "req-uvw", "AnalysisException", "Table not found",
 						"sha256:abc123", "v0.13.0", "",
 						"exec-0",
+						// Older row without Spark metrics — all null.
+						"", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
 					),
 				},
 			},
@@ -106,6 +118,20 @@ func TestNodeRunsBasic(t *testing.T) {
 	}
 	if r.Rows[0].ColdStart == nil || *r.Rows[0].ColdStart != true {
 		t.Errorf("rows[0].ColdStart = %v, want true", r.Rows[0].ColdStart)
+	}
+	// Spark metrics flow through the appended columns.
+	if r.Rows[0].PeakRSSMB == nil || *r.Rows[0].PeakRSSMB != 512 {
+		t.Errorf("rows[0].PeakRSSMB = %v, want 512", r.Rows[0].PeakRSSMB)
+	}
+	if r.Rows[0].ShuffleReadBytes == nil || *r.Rows[0].ShuffleReadBytes != 12577 {
+		t.Errorf("rows[0].ShuffleReadBytes = %v, want 12577", r.Rows[0].ShuffleReadBytes)
+	}
+	if r.Rows[0].NumTasks == nil || *r.Rows[0].NumTasks != 124 {
+		t.Errorf("rows[0].NumTasks = %v, want 124", r.Rows[0].NumTasks)
+	}
+	// Null Spark columns on the older row stay nil.
+	if r.Rows[1].PeakRSSMB != nil {
+		t.Errorf("rows[1].PeakRSSMB = %v, want nil", r.Rows[1].PeakRSSMB)
 	}
 	if r.Rows[1].Status != "failed" || r.Rows[1].ErrorClass != "AnalysisException" {
 		t.Errorf("rows[1] unexpected: %+v", r.Rows[1])
@@ -174,6 +200,7 @@ func TestNodeRunsTruncated(t *testing.T) {
 			"r", "p", "n", "2026-05-06T10:00:00.000Z", "",
 			"100", "ok", "lambda", "1024", "false", "", "", "",
 			"sha256:abc123", "v0.13.0", "", "exec-trunc",
+			"", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
 		))
 	}
 	athc := &mockAthenaClient{

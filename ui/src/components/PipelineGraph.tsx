@@ -139,6 +139,12 @@ export type PipelineGraphProps = {
    */
   nodeStatuses?: Map<string, "running" | "succeeded" | "failed">;
   /**
+   * Live in-flight Spark progress per node, keyed by node id. Drives the
+   * thin task-progress bar on a RUNNING node. Absent / empty when no
+   * execution is in flight; nodes without a tick are omitted.
+   */
+  nodeProgress?: Map<string, import("./PipelineNode").PipelineNodeData["progress"]>;
+  /**
    * When true, surface a transform's upstream data as synthetic nodes in
    * the DAG: ADR-017 registered sources (`config.source_inputs`) and
    * cross-pipeline reads (`config.external_inputs`). Neither is a real
@@ -277,6 +283,7 @@ export function PipelineGraph({
   loadingNodeId,
   previewedNodeId,
   nodeStatuses,
+  nodeProgress,
   showSources,
   focusNodeId,
 }: PipelineGraphProps) {
@@ -575,6 +582,7 @@ export function PipelineGraph({
           loading: loadingChain.has(node.id),
           previewed: previewedChain.has(node.id),
           runStatus: nodeStatuses?.get(node.id),
+          progress: nodeProgress?.get(node.id),
           quickAdd,
         },
       };
@@ -627,7 +635,7 @@ export function PipelineGraph({
     });
 
     return { nodes: rfNodes, edges: rfEdges };
-  }, [graph, nodeSchemas, nodeOutputs, loadingNodeId, previewedNodeId, nodeStatuses, showSources, enableQuickAdd, handleQuickCreate, handleQuickConnect, handleSourceCreate, handleSourceConnect, selectedEdgeId, sourceSpecsByName]);
+  }, [graph, nodeSchemas, nodeOutputs, loadingNodeId, previewedNodeId, nodeStatuses, nodeProgress, showSources, enableQuickAdd, handleQuickCreate, handleQuickConnect, handleSourceCreate, handleSourceConnect, selectedEdgeId, sourceSpecsByName]);
 
   return (
     <div className="h-full w-full" data-testid="pipeline-graph" tabIndex={0}>

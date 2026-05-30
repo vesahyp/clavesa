@@ -52,6 +52,10 @@ type NodeRunsQuery struct {
 	// Limit caps how many rows are returned (cloudProvider bumps by 1
 	// internally to detect truncation).
 	Limit int
+	// IncludeMetrics forces the metrics-bearing SQL scan even with no arn
+	// filter; the dashboard grid's state.json fast path omits the
+	// Spark-metric columns.
+	IncludeMetrics bool
 }
 
 // NodeRun is one parsed row from <pipeline>.node_runs. Nullable fields use
@@ -82,6 +86,25 @@ type NodeRun struct {
 	// runs leave it null, and rows from older runners that didn't write
 	// the column read as null too.
 	OutputRows *int64 `json:"output_rows,omitempty"`
+	// Spark-observability metrics (v0.14.x). peak_rss_mb is a process-lifetime
+	// high-water mark; the rest are per-invocation aggregates over the run's
+	// Spark stages/tasks. All nullable: older runners and skipped/path-mode
+	// runs read as null.
+	PeakRSSMB             *int64 `json:"peak_rss_mb,omitempty"`
+	PeakExecutionMemoryMB *int64 `json:"peak_execution_memory_mb,omitempty"`
+	MemorySpilledBytes   *int64 `json:"memory_spilled_bytes,omitempty"`
+	DiskSpilledBytes     *int64 `json:"disk_spilled_bytes,omitempty"`
+	ShuffleReadBytes     *int64 `json:"shuffle_read_bytes,omitempty"`
+	ShuffleWriteBytes    *int64 `json:"shuffle_write_bytes,omitempty"`
+	InputBytes           *int64 `json:"input_bytes,omitempty"`
+	InputRecords         *int64 `json:"input_records,omitempty"`
+	NumStages            *int64 `json:"num_stages,omitempty"`
+	NumTasks             *int64 `json:"num_tasks,omitempty"`
+	NumFailedTasks       *int64 `json:"num_failed_tasks,omitempty"`
+	JVMGCTimeMs          *int64 `json:"jvm_gc_time_ms,omitempty"`
+	ExecutorCPUTimeMs    *int64 `json:"executor_cpu_time_ms,omitempty"`
+	ExecutorRunTimeMs    *int64 `json:"executor_run_time_ms,omitempty"`
+	MaxTaskDurationMs    *int64 `json:"max_task_duration_ms,omitempty"`
 }
 
 // NodeRunsResult is the body of GET /data/node-runs.
@@ -363,6 +386,16 @@ type StateStatus struct {
 	Status string `json:"status"`
 	// EnteredAt is the latest time the state was entered (ISO 8601 UTC).
 	EnteredAt string `json:"entered_at,omitempty"`
+	// In-flight Spark progress for a RUNNING node, mirrored from the
+	// runner's periodic `progress` event. All nullable: nil until the
+	// first tick, and absent once the node reaches a terminal state.
+	// Cloud doesn't populate these yet (a later slice fills them from SFN
+	// map-run metadata); local copies them from NodeRunState.
+	StagesTotal     *int64 `json:"stages_total,omitempty"`
+	StagesCompleted *int64 `json:"stages_completed,omitempty"`
+	TasksTotal      *int64 `json:"tasks_total,omitempty"`
+	TasksCompleted  *int64 `json:"tasks_completed,omitempty"`
+	TasksFailed     *int64 `json:"tasks_failed,omitempty"`
 }
 
 // ExecutionStatesResult is the body of GET /pipeline/execution/states.

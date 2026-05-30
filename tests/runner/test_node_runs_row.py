@@ -336,6 +336,91 @@ def test_build_row_output_rows_passes_through():
     assert row["output_rows"] == 42
 
 
+def test_build_row_resource_metrics_default_none():
+    """When peak_rss_mb / spark_metrics aren't passed, every new column is
+    present on the row and None — older callers and capture failures leave
+    the columns null rather than absent."""
+    runner = _load_runner()
+    row = runner._build_node_run_row(
+        run_id="r",
+        started_ms=0,
+        ended_ms=0,
+        status="ok",
+        error_class=None,
+        error_msg=None,
+        cold_start=False,
+        context=None,
+        env={"CLAVESA_PIPELINE": "p", "CLAVESA_NODE": "n"},
+    )
+    assert "peak_rss_mb" in row
+    assert row["peak_rss_mb"] is None
+    for k in runner._SPARK_METRIC_KEYS:
+        assert k in row, f"missing column {k}"
+        assert row[k] is None
+
+
+def test_build_row_resource_metrics_pass_through():
+    """peak_rss_mb and each spark_metrics key are splatted onto the row.
+    Keys absent from the spark_metrics dict still land as None."""
+    runner = _load_runner()
+    spark_metrics = {
+        "peak_execution_memory_mb": 256,
+        "memory_spilled_bytes": 1024,
+        "disk_spilled_bytes": 2048,
+        "shuffle_read_bytes": 4096,
+        "shuffle_write_bytes": 8192,
+        "input_bytes": 100,
+        "input_records": 10,
+        "num_stages": 3,
+        "num_tasks": 12,
+        "num_failed_tasks": 1,
+        "jvm_gc_time_ms": 55,
+        "executor_cpu_time_ms": 999,
+        "executor_run_time_ms": 1500,
+        # max_task_duration_ms deliberately omitted → should land None.
+    }
+    row = runner._build_node_run_row(
+        run_id="r",
+        started_ms=0,
+        ended_ms=0,
+        status="ok",
+        error_class=None,
+        error_msg=None,
+        cold_start=False,
+        context=None,
+        env={"CLAVESA_PIPELINE": "p", "CLAVESA_NODE": "n"},
+        peak_rss_mb=2048,
+        spark_metrics=spark_metrics,
+    )
+    assert row["peak_rss_mb"] == 2048
+    assert row["peak_execution_memory_mb"] == 256
+    assert row["num_tasks"] == 12
+    assert row["num_failed_tasks"] == 1
+    assert row["executor_cpu_time_ms"] == 999
+    # Omitted key splats to None, not KeyError.
+    assert row["max_task_duration_ms"] is None
+
+
+def test_build_row_spark_metrics_none_is_safe():
+    """spark_metrics=None must not crash — every spark key becomes None."""
+    runner = _load_runner()
+    row = runner._build_node_run_row(
+        run_id="r",
+        started_ms=0,
+        ended_ms=0,
+        status="ok",
+        error_class=None,
+        error_msg=None,
+        cold_start=False,
+        context=None,
+        env={"CLAVESA_PIPELINE": "p", "CLAVESA_NODE": "n"},
+        peak_rss_mb=None,
+        spark_metrics=None,
+    )
+    for k in runner._SPARK_METRIC_KEYS:
+        assert row[k] is None
+
+
 def test_glue_db_three_level_encoding():
     """Post-ADR-016 workspace: both CLAVESA_CATALOG and CLAVESA_SCHEMA
     set. The runner emits ``<catalog>__<schema>`` with double-underscore

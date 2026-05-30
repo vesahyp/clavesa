@@ -175,6 +175,8 @@ export interface NodesGridProps {
   /** Local pipeline — selects the execution-logs addressing mode. */
   isLocal: boolean;
   dir: string;
+  /** SQL pipeline name, threaded to the drawer's rightsizing query. */
+  pipelineName: string;
   /**
    * Click on a run column header. Parent owns URL state; this lets the
    * dashboard open the RunDetail Sheet (and persist `?run=…`) instead of
@@ -192,6 +194,7 @@ export function NodesGrid({
   liveStates,
   isLocal,
   dir,
+  pipelineName,
   onRunSelect,
 }: NodesGridProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -603,6 +606,7 @@ export function NodesGrid({
           }
           isLocal={isLocal}
           dir={dir}
+          pipelineName={pipelineName}
           onClose={() => setSelected(null)}
         />
       )}

@@ -376,6 +376,14 @@ export function usePipelineStatus(dir: string) {
 const StateStatus = z.object({
   status: z.string(),
   entered_at: z.string().optional().default(""),
+  // In-flight Spark progress for a RUNNING node (local pipelines today;
+  // cloud fills these in a later slice). Nullish: absent until the first
+  // progress tick and once the node reaches a terminal state.
+  stages_total: z.number().nullish(),
+  stages_completed: z.number().nullish(),
+  tasks_total: z.number().nullish(),
+  tasks_completed: z.number().nullish(),
+  tasks_failed: z.number().nullish(),
 });
 export type StateStatus = z.infer<typeof StateStatus>;
 
@@ -464,6 +472,24 @@ const NodeRun = z.object({
   // the run had no Delta outputs (path-mode-only, skipped) or when
   // the producing runner pre-dated this column.
   output_rows: z.number().nullish(),
+  // Spark-observability metrics (v0.14.x). peak_rss_mb is a process-lifetime
+  // high-water mark; the rest are per-invocation Spark aggregates. Null on
+  // older runners and skipped/path-mode runs.
+  peak_rss_mb: z.number().nullish(),
+  peak_execution_memory_mb: z.number().nullish(),
+  memory_spilled_bytes: z.number().nullish(),
+  disk_spilled_bytes: z.number().nullish(),
+  shuffle_read_bytes: z.number().nullish(),
+  shuffle_write_bytes: z.number().nullish(),
+  input_bytes: z.number().nullish(),
+  input_records: z.number().nullish(),
+  num_stages: z.number().nullish(),
+  num_tasks: z.number().nullish(),
+  num_failed_tasks: z.number().nullish(),
+  jvm_gc_time_ms: z.number().nullish(),
+  executor_cpu_time_ms: z.number().nullish(),
+  executor_run_time_ms: z.number().nullish(),
+  max_task_duration_ms: z.number().nullish(),
 });
 export type NodeRun = z.infer<typeof NodeRun>;
 
@@ -518,6 +544,63 @@ export function useNodeRuns(
         throw new Error(`GET node-runs → ${res.status}: ${text}`);
       }
       return NodeRunsResult.parse(await res.json());
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// rightsize — recommend-only per-node memory recommendation
+// ---------------------------------------------------------------------------
+
+const NodeRightsize = z.object({
+  node: z.string(),
+  // Allocated memory_mb of the newest run; null for local rows (no
+  // allocation on record).
+  current_mb: z.number().nullish(),
+  // Recommended memory_mb; null when confidence is "n/a".
+  recommended_mb: z.number().nullish(),
+  p95_peak_rss_mb: z.number().nullish(),
+  samples: z.number(),
+  spill_rate: z.number(),
+  reason: z.string(),
+  // "high" | "medium" | "low" | "n/a".
+  confidence: z.string(),
+});
+export type NodeRightsize = z.infer<typeof NodeRightsize>;
+
+const RightsizeResult = z.object({
+  rows: z.array(NodeRightsize),
+});
+export type RightsizeResult = z.infer<typeof RightsizeResult>;
+
+/**
+ * GET /api/data/rightsize?pipeline=…[&dir=…&last=…] — per-node memory
+ * recommendations from the pipeline's recent runner invocations. Recommend-
+ * only: the backend reads node_runs and returns advice, never mutating the
+ * pipeline. Local and cloud return the same shape (ADR-014); a fresh
+ * pipeline with no metric-bearing runs returns empty rows.
+ */
+export function useRightsize(
+  pipeline: string,
+  dir: string,
+  opts: { last?: number; enabled?: boolean } = {},
+) {
+  const last = opts.last ?? 50;
+  return useQuery({
+    queryKey: ["rightsize", pipeline, dir, last],
+    enabled: Boolean(pipeline) && (opts.enabled ?? true),
+    retry: false,
+    staleTime: 30_000,
+    queryFn: async () => {
+      const params = new URLSearchParams({ pipeline, last: String(last) });
+      if (dir) params.set("dir", dir);
+      const url = `${BASE_URL}/data/rightsize?${params.toString()}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new Error(`GET rightsize → ${res.status}: ${text}`);
+      }
+      return RightsizeResult.parse(await res.json());
     },
   });
 }

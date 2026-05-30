@@ -14,9 +14,9 @@ import { ArrowDown, ArrowUpRight, X } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { formatDuration, formatRelative } from "@/lib/format";
+import { formatBytes, formatDuration, formatRelative } from "@/lib/format";
 import { nodeVariant } from "@/lib/runStatus";
-import { useExecutionLogs } from "@/lib/queries";
+import { useExecutionLogs, useRightsize } from "@/lib/queries";
 import type { NodeRun } from "@/lib/queries";
 
 /** One upstream this node reads, derived from the lineage graph. */
@@ -57,6 +57,11 @@ export interface NodeDetailDrawerProps {
   /** Local pipeline — selects the execution-logs addressing mode. */
   isLocal: boolean;
   dir: string;
+  /**
+   * SQL pipeline name for the rightsizing query (the dir basename, same
+   * value used for node-runs). Empty disables the rightsizing card.
+   */
+  pipelineName: string;
   onClose: () => void;
 }
 
@@ -136,6 +141,169 @@ function Field({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
+/** Compact integer formatter (1,234,567) with em-dash fallback. */
+function num(n: number | null | undefined): string {
+  return n != null ? n.toLocaleString() : "—";
+}
+
+/**
+ * Per-invocation Spark aggregates. Only rendered when at least one metric is
+ * non-null — older runners and skipped/path-mode runs leave them all nil, and
+ * an empty card would just be noise.
+ */
+function SparkMetrics({ nr }: { nr: NodeRun }) {
+  const has =
+    nr.memory_spilled_bytes != null ||
+    nr.disk_spilled_bytes != null ||
+    nr.shuffle_read_bytes != null ||
+    nr.shuffle_write_bytes != null ||
+    nr.jvm_gc_time_ms != null ||
+    nr.num_tasks != null ||
+    nr.num_failed_tasks != null ||
+    nr.num_stages != null ||
+    nr.input_records != null ||
+    nr.input_bytes != null;
+  if (!has) return null;
+
+  const spill =
+    (nr.memory_spilled_bytes ?? 0) + (nr.disk_spilled_bytes ?? 0);
+  const spillKnown =
+    nr.memory_spilled_bytes != null || nr.disk_spilled_bytes != null;
+
+  return (
+    <Section label="Spark metrics">
+      {spillKnown && (
+        <Field
+          label="Spill"
+          value={
+            spill === 0 ? (
+              <span className="text-muted-foreground">none</span>
+            ) : (
+              `${formatBytes(nr.memory_spilled_bytes ?? 0)} mem · ${formatBytes(
+                nr.disk_spilled_bytes ?? 0,
+              )} disk`
+            )
+          }
+        />
+      )}
+      {(nr.shuffle_read_bytes != null || nr.shuffle_write_bytes != null) && (
+        <Field
+          label="Shuffle"
+          value={`${formatBytes(nr.shuffle_read_bytes)} read · ${formatBytes(
+            nr.shuffle_write_bytes,
+          )} write`}
+        />
+      )}
+      {(nr.input_records != null || nr.input_bytes != null) && (
+        <Field
+          label="Input"
+          value={`${num(nr.input_records)} rows · ${formatBytes(
+            nr.input_bytes,
+          )}`}
+        />
+      )}
+      {(nr.num_tasks != null || nr.num_failed_tasks != null) && (
+        <Field
+          label="Tasks"
+          value={
+            <>
+              {num(nr.num_tasks)} total
+              {nr.num_failed_tasks != null && nr.num_failed_tasks > 0 && (
+                <span className="text-status-failed">
+                  {" "}
+                  · {num(nr.num_failed_tasks)} failed
+                </span>
+              )}
+            </>
+          }
+        />
+      )}
+      {nr.num_stages != null && (
+        <Field label="Stages" value={num(nr.num_stages)} />
+      )}
+      {nr.jvm_gc_time_ms != null && (
+        <Field label="GC time" value={`${num(nr.jvm_gc_time_ms)} ms`} />
+      )}
+    </Section>
+  );
+}
+
+/** Badge color for a rightsize confidence label. */
+function confidenceVariant(
+  c: string,
+): "default" | "secondary" | "outline" {
+  if (c === "high") return "default";
+  if (c === "medium") return "secondary";
+  return "outline";
+}
+
+/**
+ * Rightsizing recommendation for this node, computed across its recent runs
+ * (p95 peak RSS vs allocated memory, factoring spill). Recommend-only — it
+ * surfaces advice, nothing here re-deploys. Renders muted when confidence is
+ * "n/a" (no allocation on record, or no metric-bearing runs yet) and hides
+ * entirely until the query resolves with a row for this node.
+ */
+function Rightsizing({
+  node,
+  pipelineName,
+  dir,
+}: {
+  node: string;
+  pipelineName: string;
+  dir: string;
+}) {
+  const rs = useRightsize(pipelineName, dir, {
+    enabled: Boolean(pipelineName),
+  });
+  const row = rs.data?.rows.find((r) => r.node === node);
+  if (!row) return null;
+
+  const na = row.confidence === "n/a";
+  return (
+    <Section label="Rightsizing">
+      <div className="mb-1.5 flex items-center gap-2">
+        <Badge
+          variant={confidenceVariant(row.confidence)}
+          className="text-[9px] uppercase"
+        >
+          {row.confidence}
+        </Badge>
+        <span className="text-[10px] text-muted-foreground">
+          {row.samples} sample{row.samples === 1 ? "" : "s"}
+        </span>
+      </div>
+      <Field
+        label="Current"
+        value={row.current_mb != null ? `${row.current_mb} MB` : "—"}
+      />
+      <Field
+        label="Recommended"
+        value={
+          row.recommended_mb != null ? (
+            <span className={na ? "text-muted-foreground" : "text-foreground"}>
+              {row.recommended_mb} MB
+            </span>
+          ) : (
+            "—"
+          )
+        }
+      />
+      {row.p95_peak_rss_mb != null && (
+        <Field label="p95 peak" value={`${row.p95_peak_rss_mb} MB`} />
+      )}
+      <div
+        className={cn(
+          "mt-1.5 text-[11px] leading-snug",
+          na ? "text-muted-foreground/70" : "text-muted-foreground",
+        )}
+      >
+        {row.reason}
+      </div>
+    </Section>
+  );
+}
+
 /** The chosen run's invocation facts — what the run actually did. */
 function RunFacts({ nr, outputMode }: { nr: NodeRun; outputMode: string }) {
   const rowsHint =
@@ -179,6 +347,24 @@ function RunFacts({ nr, outputMode }: { nr: NodeRun; outputMode: string }) {
           }
         />
       )}
+      {nr.peak_rss_mb != null && (
+        <Field
+          label="Peak memory"
+          value={
+            nr.memory_mb != null ? (
+              <>
+                {nr.peak_rss_mb.toLocaleString()} /{" "}
+                {nr.memory_mb.toLocaleString()} MB{" "}
+                <span className="text-muted-foreground">
+                  ({Math.round((nr.peak_rss_mb / nr.memory_mb) * 100)}%)
+                </span>
+              </>
+            ) : (
+              `${nr.peak_rss_mb.toLocaleString()} MB`
+            )
+          }
+        />
+      )}
       {nr.cold_start != null && (
         <Field label="Cold start" value={nr.cold_start ? "yes" : "no"} />
       )}
@@ -215,6 +401,7 @@ export function NodeDetailDrawer({
   onSelectRun,
   isLocal,
   dir,
+  pipelineName,
   onClose,
 }: NodeDetailDrawerProps) {
   useEffect(() => {
@@ -322,6 +509,13 @@ export function NodeDetailDrawer({
               />
             </Section>
           )}
+
+          {/* Per-invocation Spark aggregates (renders nothing if all nil). */}
+          {selected && <SparkMetrics nr={selected.nodeRun} />}
+
+          {/* Per-node memory recommendation across recent runs (renders
+              nothing until the query returns a row for this node). */}
+          <Rightsizing node={node} pipelineName={pipelineName} dir={dir} />
 
           {/* Step logs for the chosen run. */}
           {selected && (

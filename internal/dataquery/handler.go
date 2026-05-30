@@ -94,6 +94,14 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 		}
 		handleRuns(w, r, p, h.systemGlueDBFor(r))
 	})
+
+	mux.HandleFunc("GET /data/rightsize", func(w http.ResponseWriter, r *http.Request) {
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handleRightsize(w, r, p, h.systemGlueDBFor(r))
+	})
 	mux.HandleFunc("GET /data/tables-state", func(w http.ResponseWriter, r *http.Request) {
 		p, ok := h.providerFor(w, r)
 		if !ok {
@@ -553,6 +561,51 @@ func handleRuns(w http.ResponseWriter, r *http.Request, p observability.Provider
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
+}
+
+// handleRightsize serves GET /data/rightsize?pipeline=<name>[&dir=<dir>][&last=N].
+//
+// Computes a per-node memory recommendation from the pipeline's recent
+// runner invocations (p95 peak RSS vs allocated memory, factoring spill).
+// Recommend-only. IncludeMetrics forces the metrics-bearing scan — the
+// local provider's state.json fast path omits the Spark-metric columns this
+// reads. Same shape from both providers (ADR-014); the run-detail node
+// drawer consumes it.
+func handleRightsize(w http.ResponseWriter, r *http.Request, p observability.Provider, database string) {
+	pipeline := r.URL.Query().Get("pipeline")
+	if pipeline == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: pipeline")
+		return
+	}
+	if !observability.IsValidPipelineName(pipeline) {
+		httputil.WriteError(w, http.StatusBadRequest, "pipeline must match [A-Za-z_][A-Za-z0-9_-]*")
+		return
+	}
+
+	last := nodeRunsDefaultLimit
+	if s := r.URL.Query().Get("last"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 || n > nodeRunsMaxLimit {
+			httputil.WriteError(w, http.StatusBadRequest, "last must be a positive integer ≤ 500")
+			return
+		}
+		last = n
+	}
+
+	res, err := p.NodeRuns(r.Context(), observability.NodeRunsQuery{
+		PipelineName:   pipeline,
+		Database:       database,
+		PipelineDir:    r.URL.Query().Get("dir"),
+		Limit:          last,
+		IncludeMetrics: true,
+	})
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, map[string]any{
+		"rows": observability.Rightsize(res.Rows),
+	})
 }
 
 // handleTables serves GET /data/tables-state?pipeline=<name>[&dir=<dir>][&limit=N].

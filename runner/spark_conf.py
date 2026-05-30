@@ -33,6 +33,12 @@ from __future__ import annotations
 
 import os
 
+# Local directory Spark writes its event log to (one file per Spark
+# application). Owned here because clavesa_spark_conf() is the single seam
+# every session-build path goes through; the runner imports this constant
+# for its post-run event-log tail-parse.
+EVENTLOG_DIR = "/tmp/clavesa-eventlog"
+
 
 def clavesa_spark_conf(
     warehouse: str | None = None,
@@ -84,6 +90,9 @@ def clavesa_spark_conf(
         "spark.ui.enabled": "false",
         "spark.sql.session.timeZone": "UTC",
         "spark.ui.showConsoleProgress": "false",
+        # (Spark event log is enabled conditionally near the end of this
+        # function — see the EVENTLOG_DIR block — so a missing/unwritable
+        # /tmp can never crash SparkContext init.)
         # Delta SQL extensions — enables MERGE INTO, time-travel syntax,
         # OPTIMIZE/VACUUM, and Change Data Feed reads.
         "spark.sql.extensions": "io.delta.sql.DeltaSparkSessionExtension",
@@ -215,6 +224,29 @@ def clavesa_spark_conf(
     # V2 cutover will mirror.
     _ = catalog
     _ = system_catalog
+
+    # Spark event log: SparkListenerTaskEnd / StageCompleted events land as
+    # newline-delimited JSON that the runner tails after each transform to
+    # aggregate per-invocation task metrics (peak execution memory, spill,
+    # shuffle, GC/CPU time) onto node_runs. Uncompressed + no block-update
+    # events so the tail is plain, byte-seekable JSON.
+    #
+    # Spark's EventLoggingListener fails SparkContext init outright if
+    # `spark.eventLog.dir` does not exist (FileNotFoundException). EVERY
+    # session built from this conf — the Lambda/local handler, preview, AND
+    # the warm query / Spark Connect servers — would crash on a missing dir,
+    # so create it here and only enable eventLog if that succeeds. A
+    # read-only /tmp degrades to "no metrics" instead of "no Spark".
+    try:
+        os.makedirs(EVENTLOG_DIR, exist_ok=True)
+        eventlog_ok = os.path.isdir(EVENTLOG_DIR)
+    except OSError:
+        eventlog_ok = False
+    if eventlog_ok:
+        conf["spark.eventLog.enabled"] = "true"
+        conf["spark.eventLog.dir"] = "file://" + EVENTLOG_DIR
+        conf["spark.eventLog.logBlockUpdates.enabled"] = "false"
+        conf["spark.eventLog.compress"] = "false"
 
     return conf
 

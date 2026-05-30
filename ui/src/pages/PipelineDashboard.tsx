@@ -727,6 +727,7 @@ export function PipelineDashboard() {
                     liveStates={nodeStatuses}
                     isLocal={isLocal}
                     dir={dir}
+                    pipelineName={pipelineName}
                     onRunSelect={openRunDetail}
                   />
                 )}
