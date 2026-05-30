@@ -8,7 +8,7 @@
 
 import { useNavigate } from "react-router-dom";
 import { useMemo, useState } from "react";
-import { FileWarning, Plus, Trash2, Workflow } from "lucide-react";
+import { ArrowUpCircle, FileWarning, Loader2, Plus, Trash2, Workflow } from "lucide-react";
 import { toast } from "sonner";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -20,7 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { usePipelines, useRuns } from "@/lib/queries";
-import { createPipeline, deletePipeline } from "@/api/workspace";
+import { createPipeline, deletePipeline, upgradeWorkspace } from "@/api/workspace";
 import { formatRelative } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -112,6 +112,31 @@ export function PipelinesList() {
     );
   }, [data, q]);
 
+  // "Upgrade all" — one-shot workspace upgrade (shell + every pipeline).
+  // Empty version => the running CLI's embedded module version.
+  const upgradeAll = useMutation({
+    mutationFn: () => upgradeWorkspace(),
+    onSuccess: (r) => {
+      const changed = r.pipelines.filter(
+        (p) => p.updated > 0 || p.migrated > 0,
+      ).length;
+      const unchanged = r.pipelines.length - changed;
+      toast.success(
+        `Upgraded workspace ${r.prev_version} -> ${r.target_version} · ` +
+          `${changed} pipeline${changed === 1 ? "" : "s"} updated, ${unchanged} unchanged`,
+      );
+      const failed = r.pipelines.filter((p) => p.err);
+      if (failed.length > 0) {
+        toast.error(
+          `Failed: ${failed.map((p) => p.name).join(", ")}`,
+        );
+      }
+      qc.invalidateQueries({ queryKey: ["pipelines"] });
+      qc.invalidateQueries({ queryKey: ["module-version"] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : String(e)),
+  });
+
   async function handleDelete(dir: string, name: string) {
     if (
       !window.confirm(
@@ -140,13 +165,29 @@ export function PipelinesList() {
       () => ({
         breadcrumbs: [{ label: "Pipelines", to: "/pipelines" }],
         trailing: (
-          <Button onClick={() => setShowNew(true)} size="sm">
-            <Plus className="h-4 w-4" />
-            New pipeline
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              onClick={() => upgradeAll.mutate()}
+              size="sm"
+              variant="outline"
+              disabled={upgradeAll.isPending}
+              title="Upgrade the workspace shell and every pipeline to the running CLI's module version"
+            >
+              {upgradeAll.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <ArrowUpCircle className="h-4 w-4" />
+              )}
+              Upgrade all
+            </Button>
+            <Button onClick={() => setShowNew(true)} size="sm">
+              <Plus className="h-4 w-4" />
+              New pipeline
+            </Button>
+          </div>
         ),
       }),
-      [],
+      [upgradeAll.isPending, upgradeAll],
     ),
   );
 

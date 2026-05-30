@@ -65,9 +65,18 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	// ADR-016 §5: refuse to emit if this pipeline's schema is already owned
 	// by another pipeline in the workspace.
 	pipelineName := filepath.Base(abs)
-	if err := s.validateSchemaOwnership(pipelineName, resolvePipelineSchema(abs, pipelineName)); err != nil {
+	pipelineSchema := resolvePipelineSchema(abs, pipelineName)
+	if err := s.validateSchemaOwnership(pipelineName, pipelineSchema); err != nil {
 		return err
 	}
+
+	// GH #6: rewrite string-form intra-pipeline input refs
+	// ("<own-schema>.<sibling-table>") into real graph edges before the topo
+	// sort and before upstreamProducerPipelines runs. This keeps the emitted
+	// transforms list topo-ordered with populated parents, resolves the ref as
+	// an intra-pipeline read, and prevents a spurious cross-pipeline
+	// EventBridge trigger / Lake Formation grant for what is really a sibling.
+	reclassifyIntraPipelineEdges(&g, pipelineSchema)
 
 	nodeByID := make(map[string]graph.Node, len(g.Nodes))
 	for _, n := range g.Nodes {
@@ -155,6 +164,12 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	// machine to listen to.
 	upstreamProducers := s.upstreamProducerPipelines(g, pipelineName, resolvePipelineSchema(abs, pipelineName))
 
+	// Lake Formation read grants on upstream schemas (GH #4). Distinct
+	// sanitized schemas this pipeline reads cross-pipeline, own schema
+	// excluded — runs after edge reclassification so only genuine
+	// cross-pipeline refs remain.
+	upstreamSchemas := upstreamReadSchemas(g, pipelineSchema)
+
 	// Bucket for runs_writer / Athena results. Workspace-rooted pipelines
 	// read it from remote state; the standalone fallback path points at
 	// the in-pipeline aws_s3_bucket resource the user wires up by hand.
@@ -239,6 +254,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		UpstreamPipelines: upstreamProducers,
 		Transforms:        transforms,
 		ExternalBuckets:   externalBuckets,
+		UpstreamSchemas:   upstreamSchemas,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestration: emit tf: %w", err)
@@ -800,6 +816,55 @@ func (s *Service) upstreamProducerPipelines(g graph.PipelineGraph, thisName, thi
 	out := make([]string, 0, len(seen))
 	for p := range seen {
 		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// upstreamReadSchemas returns the deduplicated, sorted set of sanitized
+// schema identifiers this pipeline reads CROSS-pipeline via `external_inputs`
+// (GH #4). The own schema (`refSchema == thisSchema`) is excluded — the
+// pipeline_runner_db / pipeline_runner_tables LF grants already cover it.
+// These feed tfgen.Pipeline.UpstreamSchemas so the consumer's
+// orchestration.tf grants the runner role Lake Formation DESCRIBE on each
+// upstream Glue DB + SELECT/DESCRIBE on its tables.
+//
+// Run AFTER reclassifyIntraPipelineEdges so string-form intra-pipeline refs
+// have already been rewritten into graph edges and no longer appear as
+// external_inputs; what remains here is genuine cross-pipeline reads.
+//
+// Unlike upstreamProducerPipelines this needs no workspace scan: the schema
+// segment of the ref is enough to name the Glue DB (one catalog per
+// workspace, ADR-016), and the grant is harmless even if the schema has no
+// in-workspace producer (external Glue tables registered out-of-band still
+// want the read grant).
+func upstreamReadSchemas(g graph.PipelineGraph, thisSchema string) []string {
+	thisSanitized := identutil.Sanitize(thisSchema)
+	seen := map[string]struct{}{}
+	for _, n := range g.Nodes {
+		if n.Type != "transform" {
+			continue
+		}
+		ext, _ := n.Config["external_inputs"].(map[string]interface{})
+		for _, refRaw := range ext {
+			refStr, ok := refRaw.(string)
+			if !ok {
+				continue
+			}
+			dot := strings.Index(refStr, ".")
+			if dot < 0 {
+				continue
+			}
+			refSchema := identutil.Sanitize(refStr[:dot])
+			if refSchema == "" || refSchema == thisSanitized {
+				continue
+			}
+			seen[refSchema] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
 	}
 	sort.Strings(out)
 	return out

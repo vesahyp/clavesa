@@ -195,12 +195,26 @@ export interface RunPipelineResult {
  * Local runs dispatch asynchronously: the call returns a `run_id` as
  * soon as the run is prepared, not after it finishes. A 409 means the
  * pipeline already has a run in flight — surfaced as its clean message.
+ *
+ * `opts.force` / `opts.forceNodes` mirror the CLI's `--force` /
+ * `--force-node` — bypass the runner's incremental-skip check for this
+ * run. Explicit forceNodes scope the bypass down to the listed nodes
+ * (matches `--force-node`'s CLI semantics); an empty/missing list with
+ * `force=true` applies to every node in the dispatch.
  */
-export async function runPipeline(dir: string): Promise<RunPipelineResult> {
+export async function runPipeline(
+  dir: string,
+  opts?: { force?: boolean; forceNodes?: string[] },
+): Promise<RunPipelineResult> {
+  const body: Record<string, unknown> = { dir };
+  if (opts?.force) body.force = true;
+  if (opts?.forceNodes && opts.forceNodes.length > 0) {
+    body.force_nodes = opts.forceNodes;
+  }
   const res = await fetch(`${BASE_URL}/pipeline/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dir }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);

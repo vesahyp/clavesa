@@ -90,6 +90,18 @@ type Pipeline struct {
 	// (the IAM merge wouldn't widen anything but it'd be confusing in
 	// the emitted .tf).
 	ExternalBuckets []string
+
+	// UpstreamSchemas is the list of DISTINCT sanitized schema identifiers
+	// this pipeline reads cross-pipeline via `external_inputs` (GH #4). Each
+	// schema gets one pair of aws_lakeformation_permissions in the consumer's
+	// orchestration.tf — a DESCRIBE on the upstream Glue DB and a
+	// SELECT+DESCRIBE wildcard on its tables — so the runner role can read
+	// the upstream schema's tables on LF-gated accounts. The pipeline's OWN
+	// schema is excluded (already covered by the pipeline_runner_db /
+	// pipeline_runner_tables grants). ADR-016 puts one catalog per workspace,
+	// so the upstream DB lives under the SAME catalog as this pipeline;
+	// p.Catalog is used for the DB-name encoding. Empty list emits nothing.
+	UpstreamSchemas []string
 }
 
 // TransformConfig describes one transform invocation rendered into the
@@ -249,6 +261,39 @@ func emitGlueCatalogDB(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "    wildcard      = true\n")
 	fmt.Fprintf(b, "  }\n")
 	fmt.Fprintf(b, "}\n\n")
+
+	// Lake Formation grants on UPSTREAM schemas this pipeline reads
+	// cross-pipeline (GH #4). The own-DB grants above only cover this
+	// pipeline's schema; a downstream pipeline reading an upstream schema's
+	// tables (silver reading `bronze.cloudfront_raw`) needs DESCRIBE on the
+	// upstream Glue DB + SELECT/DESCRIBE on its tables or the runner trips
+	// `Insufficient Lake Formation permission(s): Required Describe on
+	// <catalog>__<upstream>` at read time. One catalog per workspace
+	// (ADR-016), so the upstream DB lives under p.Catalog — the same catalog
+	// this pipeline writes to. Cross-pipeline WRITES are forbidden, so these
+	// are read-only grants. The schema identifiers arrive deduped + sorted +
+	// sanitized + own-schema-excluded from the service layer.
+	for _, schema := range p.UpstreamSchemas {
+		db := safeCatalogLiteral(p.Catalog) + "__" + safeCatalogLiteral(schema)
+		label := safeCatalogLiteral(schema)
+		fmt.Fprintf(b, "# Lake Formation read grants — upstream schema %q (cross-pipeline read, GH #4).\n", schema)
+		fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"input_%s_db\" {\n", label)
+		fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
+		fmt.Fprintf(b, "  permissions = [\"DESCRIBE\"]\n")
+		fmt.Fprintf(b, "  database {\n")
+		fmt.Fprintf(b, "    name = %q\n", db)
+		fmt.Fprintf(b, "  }\n")
+		fmt.Fprintf(b, "}\n\n")
+
+		fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"input_%s_tables\" {\n", label)
+		fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
+		fmt.Fprintf(b, "  permissions = [\"SELECT\", \"DESCRIBE\"]\n")
+		fmt.Fprintf(b, "  table {\n")
+		fmt.Fprintf(b, "    database_name = %q\n", db)
+		fmt.Fprintf(b, "    wildcard      = true\n")
+		fmt.Fprintf(b, "  }\n")
+		fmt.Fprintf(b, "}\n\n")
+	}
 }
 
 // safeCatalogLiteral applies the same hyphen→underscore replacement the

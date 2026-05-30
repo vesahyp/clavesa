@@ -41,6 +41,12 @@ type ModuleVersionInfo struct {
 	CurrentRef string `json:"current_ref"`
 	LatestRef  string `json:"latest_ref"`
 	RepoURL    string `json:"repo_url"`
+	// CLIVersion is the embedded ModuleVersion of the running binary —
+	// the exact ref a `workspace upgrade` / `pipeline upgrade` will
+	// target. The UI reads this for its "upgrade to X" chip. Distinct
+	// from LatestRef, which for legacy github-form pipelines can report a
+	// newer upstream tag the binary itself doesn't yet ship.
+	CLIVersion string `json:"cli_version"`
 }
 
 // PipelineModuleVersion inspects a pipeline's .tf files and returns the
@@ -69,6 +75,7 @@ func (s *Service) PipelineModuleVersion(dir string) (*ModuleVersionInfo, error) 
 		return &ModuleVersionInfo{
 			CurrentRef: currentRef,
 			LatestRef:  ModuleVersion,
+			CLIVersion: ModuleVersion,
 		}, nil
 	}
 	// Legacy github pipeline — probe upstream so the UI can show "newer
@@ -79,12 +86,14 @@ func (s *Service) PipelineModuleVersion(dir string) (*ModuleVersionInfo, error) 
 			CurrentRef: currentRef,
 			LatestRef:  ModuleVersion,
 			RepoURL:    repoURL,
+			CLIVersion: ModuleVersion,
 		}, nil
 	}
 	return &ModuleVersionInfo{
 		CurrentRef: currentRef,
 		LatestRef:  latest,
 		RepoURL:    repoURL,
+		CLIVersion: ModuleVersion,
 	}, nil
 }
 

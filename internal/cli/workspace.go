@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,72 +51,112 @@ Examples:
 }
 
 func newWorkspaceUpgradeCmd() *cobra.Command {
-	return &cobra.Command{
+	var shellOnly bool
+	cmd := &cobra.Command{
 		Use:   "upgrade",
-		Short: "Upgrade the workspace to the binary's module version",
-		Long: `Refresh the workspace's embedded module tree and the local runner image
-to match the running ` + "`clavesa`" + ` binary's ModuleVersion.
+		Short: "Upgrade the workspace shell and every pipeline to the binary's module version",
+		Long: `Upgrade the workspace shell AND every pipeline in it to match the
+running ` + "`clavesa`" + ` binary's ModuleVersion, then refresh the local
+runner image. One shot — no need to walk pipelines by hand.
 
 Mechanics:
   - Re-extracts the embedded Terraform modules to .clavesa/modules/<version>/
     (idempotent; skips when the SHA stamp already matches).
   - Rewrites the workspace's ` + "`module \"workspace\"`" + ` source line to
     the new version with the leading "./" prefix Terraform 1.x requires.
+  - Bumps ` + "`runner_version`" + `'s default in variables.tf so the next
+    deploy pushes the matching runner image.
+  - Upgrades every pipeline (rewrites module sources, strips deprecated
+    module arguments, re-syncs orchestration.tf). Continue-on-error: a
+    pipeline that fails is reported and the rest still run.
   - Refreshes the local Docker runner image (retag or rebuild from the
     embedded runner sources).
 
-Does NOT touch clavesa.json, variables.tf, or the rest of main.tf — your
-provider blocks and any extra resources are preserved.
+Pass --shell-only to upgrade just the workspace shell and skip the
+pipeline walk — the pre-one-shot behaviour.
+
+Does NOT touch clavesa.json or the rest of main.tf — your provider
+blocks and any extra resources are preserved.
 
 Run this after upgrading ` + "`clavesa`" + ` itself (` + "`brew upgrade clavesa`" + ` or
-swapping the binary). The per-pipeline counterpart is
-` + "`clavesa pipeline upgrade <dir>`" + ` — it rewrites pipeline module
-sources and strips deprecated module arguments.`,
+swapping the binary).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root, err := resolveWorkspace(cmd)
 			if err != nil {
 				return err
 			}
+			svc, _, err := newService(cmd)
+			if err != nil {
+				return err
+			}
 			target := tuiservice.ModuleVersion
-			prev, rewritten, err := workspace.Upgrade(root, target)
+			res, err := svc.UpgradeWorkspace(target, !shellOnly)
 			if err != nil {
 				return fmt.Errorf("workspace upgrade: %w", err)
 			}
-			// Image refresh is a separate step — Upgrade is pure-TF so
-			// pure-Go tests can exercise it without Docker. Surface the
-			// image refresh error but don't abort: the TF rewrite is
-			// already on disk and useful on its own.
+			// Image refresh is a separate step — UpgradeWorkspace is
+			// pure-TF so pure-Go tests can exercise it without Docker.
+			// Surface the image refresh error but don't abort: the TF
+			// rewrites are already on disk and useful on their own.
 			runnerRefreshed := false
 			if _, refreshed, imgErr := workspace.EnsureLocalRunnerImageStatus(root); imgErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: refresh local runner image: %v\n", imgErr)
 			} else {
 				runnerRefreshed = refreshed
 			}
-			// Compose the post-action summary from what actually
-			// happened. "runner refreshed" only fires when a retag or
-			// rebuild actually occurred — otherwise it's "runner
-			// unchanged" so the user sees the truth and doesn't trust a
-			// stale image.
+			// "runner refreshed" only fires when a retag or rebuild
+			// actually occurred — otherwise it's "runner unchanged" so the
+			// user sees the truth and doesn't trust a stale image.
 			runnerNote := "runner unchanged"
 			if runnerRefreshed {
 				runnerNote = "runner refreshed"
 			}
+			prev := res.PrevVersion
 			switch {
 			case prev == "":
 				fmt.Printf("Workspace at %s: module source line not found in main.tf; modules refreshed, %s.\n", root, runnerNote)
-			case prev == target && rewritten == 0:
+			case prev == target && res.WorkspaceRewritten == 0:
 				fmt.Printf("Workspace at %s: already on %s; modules refreshed, %s.\n", root, target, runnerNote)
 			default:
-				fmt.Printf("Upgraded workspace at %s: %s → %s (%s)\n", root, prev, target, runnerNote)
-				if rewritten > 0 {
-					fmt.Printf("  main.tf: rewrote `module \"workspace\"` source\n")
+				fmt.Printf("Upgraded workspace at %s: %s -> %s (%s)\n", root, prev, target, runnerNote)
+				if res.WorkspaceRewritten > 0 {
+					fmt.Printf("  shell: rewrote %d file(s) (main.tf / variables.tf)\n", res.WorkspaceRewritten)
 				}
 			}
-			fmt.Println("\nNext: run `clavesa pipeline upgrade <pipeline>` on each pipeline in this workspace.")
+			if shellOnly {
+				fmt.Println("\nNext: run `clavesa pipeline upgrade <pipeline>` on each pipeline in this workspace.")
+				return nil
+			}
+			// Per-pipeline roll-up. Empty when the workspace has no
+			// pipelines yet.
+			if len(res.Pipelines) == 0 {
+				fmt.Println("\nNo pipelines to upgrade.")
+				return nil
+			}
+			fmt.Printf("\nPipelines (%d):\n", len(res.Pipelines))
+			failures := 0
+			for _, p := range res.Pipelines {
+				if p.Err != "" {
+					failures++
+					fmt.Printf("  %s: FAILED %s\n", p.Name, p.Err)
+					continue
+				}
+				cur := p.CurrentRef
+				if cur == "" {
+					cur = "(none)"
+				}
+				fmt.Printf("  %s: %s -> %s (%d sources, %d migrated)\n",
+					p.Name, cur, p.TargetRef, p.Updated, p.Migrated)
+			}
+			if failures > 0 {
+				return fmt.Errorf("%d pipeline(s) failed to upgrade", failures)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&shellOnly, "shell-only", false, "upgrade only the workspace shell; skip the per-pipeline walk")
+	return cmd
 }
 
 func newWorkspaceInitCmd() *cobra.Command {
@@ -443,6 +484,7 @@ Use --plan-only to stop after plan without applying.`,
 
 func newWorkspaceDestroyCmd() *cobra.Command {
 	var skipSweep bool
+	var autoApprove bool
 	cmd := &cobra.Command{
 		Use:   "destroy",
 		Short: "terraform destroy on the workspace (sweeping system-catalog Glue tables first)",
@@ -458,8 +500,15 @@ Tear down individual pipelines first via ` + "`clavesa pipeline destroy`" + `
 — this command does not chain into per-pipeline destroys. The sweep
 targets the system DB only (` + "`<system_catalog>__pipelines`" + ` per ADR-016).
 
+Workspace destroy also pre-empties the versioned workspace S3 bucket
+and drains the Athena workgroup with RecursiveDeleteOption=true so
+terraform destroy doesn't 409 on bucket / workgroup state.
+
 --skip-sweep bypasses the sweep step; the sweep itself asks for explicit
-'yes' confirmation before deleting anything.`,
+'yes' confirmation before deleting anything.
+Use --yes to skip both the sweep confirmation and the terraform destroy
+prompt (for CI / scripted use). The workspace name + path are still
+echoed to stderr before any AWS calls.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root, err := resolveWorkspace(cmd)
@@ -468,11 +517,42 @@ targets the system DB only (` + "`<system_catalog>__pipelines`" + ` per ADR-016)
 			}
 			printTargetContext("workspace destroy", root, "")
 			if !skipSweep {
-				if err := sweepWorkspaceSystemGlueTables(cmd.Context(), root, os.Stdout, os.Stdin); err != nil {
+				var sweepIn io.Reader = os.Stdin
+				if autoApprove {
+					sweepIn = autoYesReader()
+				}
+				if err := sweepWorkspaceSystemGlueTables(cmd.Context(), root, os.Stdout, sweepIn); err != nil {
 					return err
 				}
 			}
-			c := exec.Command("terraform", "destroy")
+
+			// Pre-flight: empty the versioned workspace bucket and drain
+			// the Athena workgroup. Both block `terraform destroy` if
+			// they still carry runtime-written state. The workspace
+			// module names them deterministically — see
+			// `modules/workspace/aws/main.tf` (bucket: `<name>-clavesa`,
+			// workgroup: `clavesa-<name>`).
+			m, mErr := workspace.Load(root)
+			if mErr != nil {
+				return fmt.Errorf("load manifest: %w", mErr)
+			}
+			if m == nil {
+				return fmt.Errorf("not a clavesa workspace at %s (no clavesa.json)", root)
+			}
+			bucketName := m.Name + "-clavesa"
+			workgroupName := "clavesa-" + m.Name
+			if err := emptyVersionedBucket(cmd.Context(), bucketName, os.Stderr); err != nil {
+				return err
+			}
+			if err := drainAthenaWorkgroup(cmd.Context(), workgroupName, os.Stderr); err != nil {
+				return err
+			}
+
+			args2 := []string{"destroy"}
+			if autoApprove {
+				args2 = append(args2, "-auto-approve")
+			}
+			c := exec.Command("terraform", args2...)
 			c.Dir = root
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
@@ -481,5 +561,6 @@ targets the system DB only (` + "`<system_catalog>__pipelines`" + ` per ADR-016)
 		},
 	}
 	cmd.Flags().BoolVar(&skipSweep, "skip-sweep", false, "skip the Glue-table sweep preflight")
+	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive confirmation prompt")
 	return cmd
 }

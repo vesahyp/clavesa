@@ -7,7 +7,7 @@ output "outputs" {
     for k, v in var.output_definitions : k => {
       table_path    = "s3://${var.bucket}/${var.pipeline_name}/${var.name}/${k}/"
       catalog_db    = local.catalog_db
-      catalog_table = "${replace(var.name, "-", "_")}__${k}"
+      catalog_table = (k == "default" && length(var.output_definitions) == 1) ? replace(var.name, "-", "_") : "${replace(var.name, "-", "_")}__${k}"
       schema        = v.schema
     }
   }

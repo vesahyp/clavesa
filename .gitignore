@@ -23,3 +23,4 @@ bin/
 /dist/
 e2e/.e2e-workspace
 /clavesa
+__pycache__/

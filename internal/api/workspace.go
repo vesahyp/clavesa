@@ -78,6 +78,7 @@ func (wh *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /pipelines", wh.DeletePipeline)
 	mux.HandleFunc("GET /pipeline/module-version", wh.GetPipelineModuleVersion)
 	mux.HandleFunc("POST /pipeline/upgrade", wh.UpgradePipeline)
+	mux.HandleFunc("POST /workspace/upgrade", wh.UpgradeWorkspace)
 	mux.HandleFunc("GET /pipeline/vars", wh.GetVars)
 	mux.HandleFunc("PUT /pipeline/vars", wh.PutVars)
 }
@@ -431,6 +432,71 @@ func (wh *WorkspaceHandler) UpgradePipeline(w http.ResponseWriter, r *http.Reque
 		Updated:    updated,
 		Migrated:   migrated,
 	})
+}
+
+// ---------------------------------------------------------------------------
+// POST /workspace/upgrade?version=<optional>&shell_only=<bool>
+// ---------------------------------------------------------------------------
+
+type pipelineUpgradeRow struct {
+	Name       string `json:"name"`
+	Dir        string `json:"dir"`
+	CurrentRef string `json:"current_ref"`
+	TargetRef  string `json:"target_ref"`
+	Updated    int    `json:"updated"`
+	Migrated   int    `json:"migrated"`
+	Err        string `json:"err,omitempty"`
+}
+
+type upgradeWorkspaceResponse struct {
+	PrevVersion        string `json:"prev_version"`
+	TargetVersion      string `json:"target_version"`
+	WorkspaceRewritten int    `json:"workspace_rewritten"`
+	RunnerRefreshed    bool   `json:"runner_refreshed"`
+	// Warning carries a non-fatal note (e.g. the local runner image
+	// refresh failed); the upgrade itself still succeeded.
+	Warning   string               `json:"warning,omitempty"`
+	Pipelines []pipelineUpgradeRow `json:"pipelines"`
+}
+
+// UpgradeWorkspace upgrades the workspace shell and (unless shell_only is
+// true) every pipeline in it to the requested version, then refreshes the
+// local runner image. Mirrors `clavesa workspace upgrade` — both surfaces
+// delegate to service.UpgradeWorkspace so the resulting .tf is
+// byte-identical. Per-pipeline failures are continue-on-error and surface
+// in each row's `err`; the request still returns 200.
+func (wh *WorkspaceHandler) UpgradeWorkspace(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	shellOnly := q.Get("shell_only") == "true" || q.Get("shell_only") == "1"
+	res, err := wh.service().UpgradeWorkspace(q.Get("version"), !shellOnly)
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp := upgradeWorkspaceResponse{
+		PrevVersion:        res.PrevVersion,
+		TargetVersion:      res.TargetVersion,
+		WorkspaceRewritten: res.WorkspaceRewritten,
+		Pipelines:          []pipelineUpgradeRow{},
+	}
+	for _, p := range res.Pipelines {
+		resp.Pipelines = append(resp.Pipelines, pipelineUpgradeRow{
+			Name:       p.Name,
+			Dir:        p.Dir,
+			CurrentRef: p.CurrentRef,
+			TargetRef:  p.TargetRef,
+			Updated:    p.Updated,
+			Migrated:   p.Migrated,
+			Err:        p.Err,
+		})
+	}
+	// Image refresh mirrors the CLI: best-effort, never fails the request.
+	if _, refreshed, imgErr := workspace.EnsureLocalRunnerImageStatus(wh.root); imgErr != nil {
+		resp.Warning = "refresh local runner image: " + imgErr.Error()
+	} else {
+		resp.RunnerRefreshed = refreshed
+	}
+	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------

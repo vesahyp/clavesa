@@ -2385,6 +2385,59 @@ def handler(event, context):
             )
 
 
+def _topo_sort_transforms(transforms):
+    """Defensive topological sort of a pipeline-bundle transforms list.
+
+    The event SHOULD already arrive topo-ordered from the emitter; this guards
+    against a mis-ordered payload (GH #6) so a consumer never runs before the
+    sibling that produces its input table. Kahn's algorithm over each entry's
+    declared ``parents``, with a stable tie-break by node name for determinism.
+
+    Parents naming nodes not present in this bundle are ignored (they are
+    resolved as already-materialised tables, not ordering constraints). On a
+    dependency cycle the original order is returned unchanged rather than
+    raising, so the runner still attempts execution.
+    """
+    by_node = {}
+    order_in = []
+    for t in transforms:
+        if not isinstance(t, dict):
+            # Non-dict entries can't be ordered; bail to the original list so
+            # the main loop's own isinstance guard handles them.
+            return transforms
+        node = str(t.get("node", "") or "")
+        by_node[node] = t
+        order_in.append(node)
+
+    # in-degree counts only parents that are present in this bundle.
+    indeg = {n: 0 for n in order_in}
+    children = {n: [] for n in order_in}
+    for t in transforms:
+        node = str(t.get("node", "") or "")
+        for p in t.get("parents") or []:
+            if p in by_node and p != node:
+                children[p].append(node)
+                indeg[node] += 1
+
+    ready = sorted(n for n in order_in if indeg[n] == 0)
+    ordered = []
+    while ready:
+        cur = ready.pop(0)
+        ordered.append(cur)
+        newly = []
+        for c in children[cur]:
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                newly.append(c)
+        if newly:
+            ready = sorted(ready + newly)
+
+    if len(ordered) != len(order_in):
+        # Cycle (or duplicate node names): fall back to the input order.
+        return transforms
+    return [by_node[n] for n in ordered]
+
+
 def pipeline_handler(event, context):
     """Pipeline-bundle entry point: run every transform in a pipeline
     sequentially in one Spark session, reusing the module-level ``_SPARK``
@@ -2426,6 +2479,10 @@ def pipeline_handler(event, context):
     anyway with missing input tables.
     """
     transforms = event.get("transforms", []) or []
+    # Defensive: the emitter SHOULD already topo-order this list, but a
+    # mis-ordered payload (GH #6) would otherwise run a consumer before its
+    # parent's table exists. Re-sort by declared parents before executing.
+    transforms = _topo_sort_transforms(transforms)
     parents_by_node = {
         t.get("node"): list(t.get("parents") or [])
         for t in transforms

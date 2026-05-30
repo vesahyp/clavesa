@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"time"
@@ -639,7 +640,72 @@ func parseSvcCSV(r io.Reader, limit int) (*dataquery.QueryResult, error) {
 		}
 		rows = append(rows, rec)
 	}
+	// Per-column type inference. csv.NewReader hands us strings only, but
+	// downstream Convert ships these rows to the runner via JSON, where
+	// `spark.createDataFrame(rows)` infers Python-side types from each
+	// value. Without type hints here every column lands as STRING in the
+	// runner; a SQL predicate like `WHERE amount > 0` then fails with
+	// CAST_INVALID_INPUT because Spark won't widen STRING to numeric.
+	// Mirrors `spark.read.option("inferSchema", "true").csv(...)` in
+	// runner/runner.py for the `pipeline run` path.
+	//
+	// Cost: one extra walk over the parsed rows. Tiny vs the network /
+	// disk I/O the CSV already paid. Large-CSV users who want to skip
+	// inference can pin an explicit schema on the source spec (TODO —
+	// `schema` field on CSV sources not yet implemented; see TODO.md).
+	inferCSVColumnTypes(cols, rows)
 	return &dataquery.QueryResult{Columns: cols, Rows: rows, RowCount: len(rows), Truncated: truncated}, nil
+}
+
+// inferCSVColumnTypes mutates cols[*].Type from "string" to "long" or
+// "double" when every non-empty value in that column parses cleanly as
+// that type. Empty cells are treated as null and don't disqualify a
+// column. A column with no non-empty cells stays "string".
+//
+// Conservative on purpose — partial successes (some rows parse as int,
+// some don't) stay "string" so we never silently drop data. Date
+// inference is deliberately not attempted; Spark's date parser is
+// format-sensitive and we'd need to thread a format option to do it
+// safely. SQL `WHERE amount > 0` over numeric columns is the dominant
+// failure mode worth fixing here.
+func inferCSVColumnTypes(cols []graph.Column, rows [][]string) {
+	for i := range cols {
+		hasAny := false
+		allInt := true
+		allFloat := true
+		for _, row := range rows {
+			if i >= len(row) {
+				continue
+			}
+			s := strings.TrimSpace(row[i])
+			if s == "" {
+				continue
+			}
+			hasAny = true
+			if allInt {
+				if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+					allInt = false
+				}
+			}
+			if allFloat {
+				if _, err := strconv.ParseFloat(s, 64); err != nil {
+					allFloat = false
+				}
+			}
+			if !allInt && !allFloat {
+				break
+			}
+		}
+		if !hasAny {
+			continue
+		}
+		switch {
+		case allInt:
+			cols[i].Type = "long"
+		case allFloat:
+			cols[i].Type = "double"
+		}
+	}
 }
 
 func parseSvcJSON(r io.Reader, jsonPath string, limit int) (*dataquery.QueryResult, error) {

@@ -2,8 +2,8 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -322,7 +322,7 @@ func newPipelineUpgradeCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&version, "version", "", "target version tag (default: latest from remote)")
+	cmd.Flags().StringVar(&version, "version", "", "target version tag (default: this CLI's module version)")
 
 	return cmd
 }
@@ -386,6 +386,7 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 func newPipelineDestroyCmd() *cobra.Command {
 	var skipSweep bool
 	var glueDB string
+	var autoApprove bool
 	cmd := &cobra.Command{
 		Use:   "destroy <pipeline-dir>",
 		Short: "terraform destroy on a pipeline (sweeping runtime-created Glue tables first)",
@@ -406,6 +407,9 @@ workgroup. They stay around after destroy as historical context.
 --skip-sweep skips the sweep step (faster when you know the DB is already
 empty); the sweep itself asks for explicit 'yes' confirmation before
 deleting anything.
+Use --yes to skip both the sweep confirmation and the terraform destroy
+prompt (for CI / scripted use). The pipeline name + workspace path are
+still echoed to stderr before any AWS calls.
 
 ` + pipelineDirHelp,
 		Args: cobra.RangeArgs(0, 1),
@@ -418,7 +422,11 @@ deleting anything.
 			printTargetContext("destroy "+pipelineName, ws, "")
 
 			if !skipSweep {
-				if err := sweepPipelineGlueTables(cmd.Context(), ws, pipelineName, glueDB, os.Stdout, os.Stdin); err != nil {
+				var sweepIn io.Reader = os.Stdin
+				if autoApprove {
+					sweepIn = autoYesReader()
+				}
+				if err := sweepPipelineGlueTables(cmd.Context(), ws, pipelineName, glueDB, os.Stdout, sweepIn); err != nil {
 					return err
 				}
 			}
@@ -426,7 +434,11 @@ deleting anything.
 			if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
 				return fmt.Errorf("terraform init: %w", err)
 			}
-			c := exec.Command("terraform", "destroy")
+			args2 := []string{"destroy"}
+			if autoApprove {
+				args2 = append(args2, "-auto-approve")
+			}
+			c := exec.Command("terraform", args2...)
 			c.Dir = dir
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
@@ -436,6 +448,7 @@ deleting anything.
 	}
 	cmd.Flags().BoolVar(&skipSweep, "skip-sweep", false, "skip the Glue-table sweep preflight")
 	cmd.Flags().StringVar(&glueDB, "glue-db", "", "explicit Glue DB to sweep (default: <catalog>__sanitize(<pipeline>))")
+	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive confirmation prompt")
 	return cmd
 }
 
@@ -523,7 +536,7 @@ dispatch.
 			if mode == workspace.ModeLocal {
 				return runLocalPipeline(cmd, dir, jsonOut, effectiveForce, forceNodes)
 			}
-			return runCloudPipeline(cmd.Context(), dir, jsonOut, wait, effectiveForce, forceNodes)
+			return runCloudPipeline(cmd, dir, jsonOut, wait, effectiveForce, forceNodes)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable output")
@@ -615,60 +628,36 @@ func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut, force bool, force
 	return nil
 }
 
-// runCloudPipeline starts an SFN execution against the deployed state
-// machine for this pipeline. State machine name is the orchestration
-// module's convention: clavesa-<pipeline_name>. Looks it up by name
-// rather than reading the pipeline's tfstate so this works even when the
-// caller isn't sitting on the apply machine.
+// runCloudPipeline is the CLI cloud-run shell. The actual work — looking up
+// the state machine by name, building the execution input payload, and
+// calling StartExecution — lives in service.RunPipelineCloud so the HTTP
+// handler at POST /api/pipeline/run can share the same code path
+// (ADR-015). What stays here is CLI-only concerns: text/JSON output
+// formatting and `--wait` polling of DescribeExecution until status
+// leaves RUNNING.
 //
-// `wait=true` polls DescribeExecution until status leaves RUNNING. Polls
-// once every 5s; cap is the cobra context (which honors Ctrl-C).
-func runCloudPipeline(ctx context.Context, abs string, jsonOut, wait, force bool, forceNodes []string) error {
-	pipelineName := filepath.Base(abs)
-	stateMachineName := "clavesa-" + pipelineName
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("load AWS config: %w", err)
-	}
-	client := sfn.NewFromConfig(cfg)
-
-	arn, err := findStateMachineByName(ctx, client, stateMachineName)
+// Polls once every 5s; cap is the cobra context (which honors Ctrl-C).
+func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait, force bool, forceNodes []string) error {
+	ctx := cmd.Context()
+	svc, _, err := newService(cmd)
 	if err != nil {
 		return err
 	}
-
-	// SFN ASL passes the execution input forward to the per-transform
-	// Lambda invocation payload. The runner reads `_force` / `_force_nodes`
-	// from the event and threads them through to its incremental-skip
-	// bypass check (runner.py:_is_forced).
-	inputPayload := map[string]any{"_trigger": "manual"}
-	if force {
-		inputPayload["_force"] = true
-		if len(forceNodes) > 0 {
-			inputPayload["_force_nodes"] = forceNodes
-		}
-	}
-	inputJSON, err := json.Marshal(inputPayload)
-	if err != nil {
-		return fmt.Errorf("marshal execution input: %w", err)
-	}
-
-	startOut, err := client.StartExecution(ctx, &sfn.StartExecutionInput{
-		StateMachineArn: aws.String(arn),
-		Input:           aws.String(string(inputJSON)),
+	execARN, err := svc.RunPipelineCloud(ctx, abs, service.RunOpts{
+		Force:      force,
+		ForceNodes: forceNodes,
 	})
 	if err != nil {
-		return fmt.Errorf("StartExecution: %w", err)
+		return err
 	}
-	execARN := aws.ToString(startOut.ExecutionArn)
+	pipelineName := filepath.Base(abs)
+	stateMachineName := "clavesa-" + pipelineName
 
 	if !wait {
 		if jsonOut {
 			return printJSON(os.Stdout, map[string]string{
-				"execution_arn":     execARN,
-				"state_machine":     stateMachineName,
-				"state_machine_arn": arn,
+				"execution_arn": execARN,
+				"state_machine": stateMachineName,
 			})
 		}
 		fmt.Printf("Started execution: %s\n", execARN)
@@ -676,6 +665,15 @@ func runCloudPipeline(ctx context.Context, abs string, jsonOut, wait, force bool
 		return nil
 	}
 
+	// --wait: build a thin SFN client just for DescribeExecution polling.
+	// Service is intentionally not the right home for the polling loop
+	// (it's a CLI-shell concern; the UI uses the existing
+	// /pipeline/execution/states channel instead).
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("load AWS config: %w", err)
+	}
+	client := sfn.NewFromConfig(cfg)
 	if !jsonOut {
 		fmt.Printf("Started execution: %s\n", execARN)
 		fmt.Printf("Waiting for terminal status…\n")
@@ -702,31 +700,6 @@ func runCloudPipeline(ctx context.Context, abs string, jsonOut, wait, force bool
 		return fmt.Errorf("execution did not succeed")
 	}
 	return nil
-}
-
-// findStateMachineByName paginates ListStateMachines until it finds an exact
-// name match. Errors with a clear message if not found — usually means the
-// pipeline isn't deployed yet (no `terraform apply`).
-func findStateMachineByName(ctx context.Context, client *sfn.Client, name string) (string, error) {
-	var nextToken *string
-	for {
-		out, err := client.ListStateMachines(ctx, &sfn.ListStateMachinesInput{
-			MaxResults: 1000,
-			NextToken:  nextToken,
-		})
-		if err != nil {
-			return "", fmt.Errorf("ListStateMachines: %w", err)
-		}
-		for _, sm := range out.StateMachines {
-			if aws.ToString(sm.Name) == name {
-				return aws.ToString(sm.StateMachineArn), nil
-			}
-		}
-		if out.NextToken == nil {
-			return "", fmt.Errorf("state machine %q not found in account/region — has the pipeline been deployed (terraform apply)?", name)
-		}
-		nextToken = out.NextToken
-	}
 }
 
 // waitForExecution polls every 5s until the execution leaves RUNNING.

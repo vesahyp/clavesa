@@ -26,15 +26,35 @@ import (
 	"github.com/vesahyp/clavesa/internal/pathutil"
 )
 
+// RunOpts mirrors service.RunOpts at this package boundary. Force /
+// ForceNodes thread through to the runner's _is_forced() check (Slice
+// 4) — exposed to the HTTP body so the UI's Run button can pass the
+// force-checkbox + force-nodes-input the same way `clavesa pipeline run
+// --force / --force-node` does (ADR-015).
+type RunOpts struct {
+	Force      bool
+	ForceNodes []string
+}
+
 // LocalPipelineRunner is the local-execution path used when a pipeline has
-// any `compute = "local"` transform. StartRun begins the run
+// any `compute = "local"` transform. StartRunWithOpts begins the run
 // asynchronously and returns a run id immediately so the UI can navigate
 // to the run page without blocking; it returns ErrRunInFlight when the
 // pipeline already has a run executing. Implemented by service.Service;
 // the interface lives here so internal/pipelinestatus stays free of an
 // internal/service import — ui.go wires a bridge.
 type LocalPipelineRunner interface {
-	StartRun(dir string) (string, error)
+	StartRunWithOpts(dir string, opts RunOpts) (string, error)
+}
+
+// CloudPipelineRunner is the cloud-execution path used when the
+// inspected pipeline's compute attr is not "local". RunPipelineCloud
+// looks up the deployed SFN state machine by name, starts an execution
+// with the optional force payload, and returns the execution ARN.
+// Implemented by service.Service; the interface lives here so
+// internal/pipelinestatus stays free of an internal/service import.
+type CloudPipelineRunner interface {
+	RunPipelineCloud(ctx context.Context, dir string, opts RunOpts) (string, error)
 }
 
 // ErrRunInFlight is re-exported from internal/errs so callers comparing
@@ -67,6 +87,16 @@ type Handler struct {
 	// code path `clavesa pipeline run` uses). Without it, all run
 	// requests fall through to the SFN StartExecution path.
 	localRunner LocalPipelineRunner
+
+	// cloudRunner, when set, lets POST /pipeline/run dispatch cloud
+	// pipelines through service.RunPipelineCloud — the same path
+	// `clavesa pipeline run` follows for compute != local. Threads the
+	// optional force flags through to SFN's execution input so the UI's
+	// Force checkbox / force-nodes input land at the runner's
+	// _is_forced() check (ADR-015). Without it, the handler builds an
+	// SFN client lazily and dispatches inline without execution input
+	// (legacy behaviour; preserves pre-Slice-C tests).
+	cloudRunner CloudPipelineRunner
 }
 
 // NewHandler returns a new Handler rooted at the given workspace directory.
@@ -88,6 +118,15 @@ func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 // handler cloud-only.
 func (h *Handler) WithLocalRunner(r LocalPipelineRunner) *Handler {
 	h.localRunner = r
+	return h
+}
+
+// WithCloudRunner enables POST /pipeline/run to dispatch cloud pipelines
+// through service.RunPipelineCloud — the same path the CLI uses. Tests
+// can leave this unset; the handler then falls back to the inline SFN
+// StartExecution dispatch (legacy behaviour, no force payload).
+func (h *Handler) WithCloudRunner(r CloudPipelineRunner) *Handler {
+	h.cloudRunner = r
 	return h
 }
 
@@ -508,6 +547,13 @@ func writeProviderError(w http.ResponseWriter, err error) {
 
 type runRequest struct {
 	Dir string `json:"dir"`
+	// Force + ForceNodes mirror `clavesa pipeline run --force` /
+	// `--force-node` — bypass the runner's incremental-skip check for
+	// this run. Both optional; absent = false / empty. Threaded into
+	// either StartRunWithOpts (local) or RunPipelineCloud (cloud)
+	// without payload duplication.
+	Force      bool     `json:"force,omitempty"`
+	ForceNodes []string `json:"force_nodes,omitempty"`
 }
 
 type runResponse struct {
@@ -534,17 +580,19 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 	}
 	abs := pathutil.ResolveDir(h.root, req.Dir)
 
+	opts := RunOpts{Force: req.Force, ForceNodes: req.ForceNodes}
+
 	// Local-first dispatch: if the resolver says this pipeline is local-
 	// compute and a runner is wired, fire the in-process path. Same code
 	// `clavesa pipeline run` uses. Falls through to cloud (SFN start)
 	// when the resolver returns cloud or isn't wired.
 	if h.localRunner != nil && h.isLocalCompute(abs) {
-		// StartRun dispatches asynchronously: it prepares the run (so the
-		// run id + RUNNING progress channel exist) and returns the id
-		// immediately, then walks the DAG in the background. The UI
-		// navigates to /pipelines/run with this id and polls the
+		// StartRunWithOpts dispatches asynchronously: it prepares the run
+		// (so the run id + RUNNING progress channel exist) and returns
+		// the id immediately, then walks the DAG in the background. The
+		// UI navigates to /pipelines/run with this id and polls the
 		// progress channel — no more blocking for the whole run.
-		runID, err := h.localRunner.StartRun(abs)
+		runID, err := h.localRunner.StartRunWithOpts(abs, opts)
 		if err != nil {
 			if errors.Is(err, ErrRunInFlight) {
 				httputil.WriteError(w, http.StatusConflict, err.Error())
@@ -554,6 +602,22 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		httputil.WriteJSON(w, http.StatusOK, runResponse{RunID: runID})
+		return
+	}
+
+	// Cloud dispatch. Prefer the wired CloudPipelineRunner (production
+	// path) — it lifts the SFN client construction + execution-input
+	// payload into the service so CLI and UI share one code path and
+	// the force flags flow through. Falls back to the inline SFN call
+	// only when no runner is wired (preserves pre-Slice-C handler tests
+	// that don't construct a full service).
+	if h.cloudRunner != nil {
+		execARN, err := h.cloudRunner.RunPipelineCloud(r.Context(), abs, opts)
+		if err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, "start execution: "+err.Error())
+			return
+		}
+		httputil.WriteJSON(w, http.StatusOK, runResponse{ExecutionARN: execARN})
 		return
 	}
 

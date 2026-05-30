@@ -133,6 +133,14 @@ func (s *Service) RunPipelineWithOpts(ctx context.Context, dir string, opts RunO
 // with this id instead of blocking for the whole run. Returns
 // ErrRunInFlight if the pipeline already has a run executing.
 func (s *Service) StartRun(dir string) (string, error) {
+	return s.StartRunWithOpts(dir, RunOpts{})
+}
+
+// StartRunWithOpts is StartRun with operator-controlled bypass switches
+// (force / force-node). Used by POST /api/pipeline/run when the UI's
+// Run button passes through the force-checkbox / force-nodes input —
+// keeps CLI and UI calling the same execution-input shape (ADR-015).
+func (s *Service) StartRunWithOpts(dir string, opts RunOpts) (string, error) {
 	abs := s.resolveDir(dir)
 	s.runsMu.Lock()
 	if s.runsInFlight[abs] {
@@ -154,6 +162,9 @@ func (s *Service) StartRun(dir string) (string, error) {
 		clear()
 		return "", err
 	}
+	// ForceNodes implies Force (mirrors RunPipelineWithOpts).
+	prep.force = opts.Force || len(opts.ForceNodes) > 0
+	prep.forceNodes = append([]string(nil), opts.ForceNodes...)
 	go func() {
 		defer clear()
 		// context.Background(): the run outlives the HTTP request that
@@ -177,6 +188,12 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	if len(g.Validation.Errors) > 0 {
 		return nil, fmt.Errorf("pipeline has validation errors: %s", g.Validation.Errors[0].Message)
 	}
+
+	// GH #6: a string-form input ref "<own-schema>.<sibling-table>" parses into
+	// external_inputs with no graph edge. Rewrite those into real edges before
+	// the topo sort so the consumer is ordered after its sibling producer and
+	// resolves the table as an intra-pipeline read.
+	reclassifyIntraPipelineEdges(&g, resolvePipelineSchema(abs, filepath.Base(abs)))
 
 	order, err := topoSort(&g)
 	if err != nil {
@@ -251,6 +268,36 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	schema := prep.schema
 	runID := prep.runID
 	channel := prep.channel
+
+	// Belt-and-suspenders: every reachable exit from executeRun runs the
+	// `done:` block (channel.finish + recordLocalRun), but a panic inside
+	// the bundle walker or any other unexpected early return would skip
+	// it — leaving the run's state.json frozen at RUNNING and no terminal
+	// row in the `runs` Iceberg table. The dashboard then paints a
+	// phantom Running row with `—` duration until the OrphanThreshold
+	// timer (60s) downgrades it to FAILED on the next read. The defer
+	// closes that gap by force-finishing the channel and writing the
+	// terminal row on panic. channel.finish is idempotent on endedMs
+	// (the explicit `done:` call still wins when it ran first).
+	var terminalFired bool
+	defer func() {
+		if r := recover(); r != nil {
+			if !terminalFired {
+				channel.finish(fmt.Errorf("pipeline runner panicked: %v", r))
+				recordLocalRun(ctx, image, abs, channel, nil)
+			}
+			panic(r) // re-raise so the caller / Go runtime sees it
+		}
+		if !terminalFired {
+			// Reached only when an unexpected return path bypasses
+			// `done:`. Synthesise a SUCCEEDED terminal row to match
+			// the cloud runs_writer Lambda's shape (ADR-014 parity);
+			// channel.state.Status stays "RUNNING" until finish() is
+			// called.
+			channel.finish(nil)
+			recordLocalRun(ctx, image, abs, channel, nil)
+		}
+	}()
 
 	result := &RunResult{Workdir: workdir, RunID: runID}
 	outputPath := map[string]string{}   // nodeID -> path containing this node's output data
@@ -424,6 +471,7 @@ done:
 	// a failure here logs to stderr but doesn't change the run's outcome — the
 	// data the user cares about already landed via runTransform.
 	recordLocalRun(ctx, image, abs, channel, cascadeSkipped)
+	terminalFired = true
 	if finalErr != nil {
 		return result, finalErr
 	}

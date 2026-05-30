@@ -292,10 +292,10 @@ output "system_catalog" {
 // workspaceModuleSourceRE matches the workspace's own `module "workspace"`
 // source line. Two historical forms exist:
 //
-//   1. Bare local path:     `source = ".clavesa/modules/vX/workspace/aws"`
-//      (v1.1.5 and earlier; Terraform 1.x rejects this).
-//   2. Prefixed local path: `source = "./.clavesa/modules/vX/workspace/aws"`
-//      (v1.1.6+; the valid form).
+//  1. Bare local path:     `source = ".clavesa/modules/vX/workspace/aws"`
+//     (v1.1.5 and earlier; Terraform 1.x rejects this).
+//  2. Prefixed local path: `source = "./.clavesa/modules/vX/workspace/aws"`
+//     (v1.1.6+; the valid form).
 //
 // Upgrade rewrites both to the prefixed form at the target version.
 // Group 1 = `source = "`. Group 2 = optional `./` prefix in the existing
@@ -303,6 +303,23 @@ output "system_catalog" {
 // `/workspace/aws"`.
 var workspaceModuleSourceRE = regexp.MustCompile(
 	`(source\s*=\s*")(\.?/?)\.clavesa/modules/(v[^/"]+)(/workspace/aws")`)
+
+// runnerVersionDefaultRE matches the `default = "vX.Y.Z"` line inside
+// variables.tf's `runner_version` variable block, capturing the leading
+// `default     = "` prefix (group 1) and the trailing closing quote
+// (group 2) so Upgrade can swap only the version literal. The block init
+// writes is:
+//
+//	variable "runner_version" {
+//	  description = "..."
+//	  default     = "v2.2.2"
+//	}
+//
+// The pattern keys off the preceding `variable "runner_version"` block so
+// it never touches a stray `default = "v..."` belonging to some other
+// variable. The `(?s)` flag lets `.*?` span the description line.
+var runnerVersionDefaultRE = regexp.MustCompile(
+	`(?s)(variable\s+"runner_version"\s*\{.*?default\s*=\s*")v[^"]*(")`)
 
 // Upgrade refreshes a workspace's Terraform-side state to a target module
 // version. Pure file operations — no Docker, no network.
@@ -312,16 +329,19 @@ var workspaceModuleSourceRE = regexp.MustCompile(
 //     (idempotent — short-circuits when the SHA stamp already matches).
 //   - Rewrites `module "workspace" { source = ... }` in main.tf to point at
 //     the target version with the required `./` prefix.
+//   - Bumps `runner_version`'s default in variables.tf to targetVersion so
+//     a post-upgrade `terraform apply` pushes the new runner image (GH #8).
+//     Skipped silently when variables.tf is absent.
 //
-// Doesn't touch clavesa.json, variables.tf, or the user-owned parts of
-// main.tf — those are the user's content from the original `init`.
+// Doesn't touch clavesa.json or the user-owned parts of main.tf — those
+// are the user's content from the original `init`.
 // Doesn't touch the local Docker runner image — that's a separate step,
 // called explicitly by the CLI wrapper via EnsureLocalRunnerImage so a
 // CI / pure-Go test can exercise the TF rewrite without Docker.
 //
 // Returns the previous version (empty when main.tf carries no
-// recognised source line) and the count of source lines actually
-// rewritten (zero on no-op).
+// recognised source line) and the count of files actually rewritten
+// (main.tf and/or variables.tf; zero on a full no-op).
 func Upgrade(root, targetVersion string) (prevVersion string, rewritten int, err error) {
 	if _, statErr := os.Stat(filepath.Join(root, manifestFile)); statErr != nil {
 		return "", 0, fmt.Errorf("%s is not a clavesa workspace (no clavesa.json)", root)
@@ -348,9 +368,25 @@ func Upgrade(root, targetVersion string) (prevVersion string, rewritten int, err
 	updated := workspaceModuleSourceRE.ReplaceAll(data, newSource)
 	if !bytes.Equal(updated, data) {
 		if err := os.WriteFile(mainPath, updated, 0o644); err != nil {
-			return prevVersion, 0, fmt.Errorf("write main.tf: %w", err)
+			return prevVersion, rewritten, fmt.Errorf("write main.tf: %w", err)
 		}
-		rewritten = 1
+		rewritten++
+	}
+
+	// Step 3: bump runner_version's default in variables.tf so a
+	// post-upgrade deploy pushes the new runner image (GH #8). A
+	// workspace with no variables.tf (or one without the variable) is
+	// left untouched — the rewrite is best-effort, never a hard error.
+	varsPath := filepath.Join(root, "variables.tf")
+	if varsData, varsErr := os.ReadFile(varsPath); varsErr == nil {
+		newDefault := []byte("${1}" + targetVersion + "${2}")
+		updatedVars := runnerVersionDefaultRE.ReplaceAll(varsData, newDefault)
+		if !bytes.Equal(updatedVars, varsData) {
+			if err := os.WriteFile(varsPath, updatedVars, 0o644); err != nil {
+				return prevVersion, rewritten, fmt.Errorf("write variables.tf: %w", err)
+			}
+			rewritten++
+		}
 	}
 
 	return prevVersion, rewritten, nil

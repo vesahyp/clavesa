@@ -231,10 +231,59 @@ def test_failure_reraises_under_lambda():
             _os.environ["AWS_LAMBDA_FUNCTION_NAME"] = prev
 
 
+def test_reorders_misordered_payload():
+    """GH #6 defensive guard: a payload where the consumer arrives BEFORE its
+    parent must still execute the parent first. The Go emitter normally
+    topo-orders the transforms list; this proves the runner self-corrects if it
+    doesn't (e.g. a hand-built or legacy event), so the consumer never reads a
+    not-yet-produced sibling table."""
+    mod = _load_runner()
+    transforms = [
+        # consumer "b" listed first, parent "a" second.
+        {"node": "b", "language": "sql", "logic_path": "/tmp/b.txt", "inputs": {"a": "..."}, "outputs": {"default": ""}, "parents": ["a"]},
+        {"node": "a", "language": "sql", "logic_path": "/tmp/a.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+    ]
+    responses = {
+        "a": {"status": "ok", "output_rows": 1},
+        "b": {"status": "ok", "output_rows": 1},
+    }
+    result, events, calls = _drive(mod, transforms, responses)
+
+    # Parent runs first despite being last in the payload.
+    assert calls == ["a", "b"], f"expected parent-first order, got {calls}"
+    assert [t["node"] for t in result["transforms"]] == ["a", "b"], result["transforms"]
+    assert result["status"] == "ok"
+
+
+def test_topo_sort_ignores_unknown_parents():
+    """Parents naming nodes not present in the bundle are ignored (they resolve
+    as already-materialised tables, not ordering constraints) — the sort must
+    not drop or reorder the lone node."""
+    mod = _load_runner()
+    transforms = [{"node": "a", "parents": ["external_not_in_bundle"]}]
+    ordered = mod._topo_sort_transforms(transforms)
+    assert [t["node"] for t in ordered] == ["a"], ordered
+
+
+def test_topo_sort_cycle_falls_back_to_input_order():
+    """A dependency cycle returns the original order unchanged rather than
+    raising, so the runner still attempts execution."""
+    mod = _load_runner()
+    transforms = [
+        {"node": "a", "parents": ["b"]},
+        {"node": "b", "parents": ["a"]},
+    ]
+    ordered = mod._topo_sort_transforms(transforms)
+    assert ordered == transforms, ordered
+
+
 if __name__ == "__main__":
     test_three_transforms_all_succeed()
     test_cascade_skip_when_all_parents_skip()
     test_failure_stops_pipeline()
     test_partial_skip_then_continue()
     test_failure_reraises_under_lambda()
+    test_reorders_misordered_payload()
+    test_topo_sort_ignores_unknown_parents()
+    test_topo_sort_cycle_falls_back_to_input_order()
     print("PASS")

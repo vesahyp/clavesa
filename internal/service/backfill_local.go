@@ -144,7 +144,7 @@ func (s *Service) backfillStageLocal(
 		return nil, fmt.Errorf("resolve canonical target: %w", err)
 	}
 
-	var stagingTableID string // fully-qualified, e.g. clavesa.<db>.<node>__default__backfill__<id>
+	var stagingTableID string // fully-qualified, e.g. clavesa.<db>.<node>__backfill__<id> (canonical is bare for default-only outputs; see canonicalTableSegment)
 	if req.Direct {
 		stagingTableID = canonicalTable
 	} else {

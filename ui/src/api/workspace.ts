@@ -66,6 +66,11 @@ export interface ModuleVersionInfo {
   current_ref: string;
   latest_ref: string;
   repo_url: string;
+  /** The running binary's embedded ModuleVersion — the exact ref an
+   * upgrade actually targets. Always present (equals ModuleVersion).
+   * `latest_ref` is a remote git ls-remote tag that may be newer for
+   * legacy github-form pipelines but is NOT what an upgrade applies. */
+  cli_version: string;
 }
 
 /** GET /pipeline/module-version?dir= — current + latest module ref. */
@@ -85,6 +90,48 @@ export function upgradePipeline(
   const params = new URLSearchParams({ dir });
   if (version) params.set("version", version);
   return request(`/pipeline/upgrade?${params.toString()}`, { method: "POST" });
+}
+
+export interface WorkspaceUpgradePipelineResult {
+  name: string;
+  dir: string;
+  current_ref: string;
+  target_ref: string;
+  updated: number;
+  migrated: number;
+  /** Per-pipeline failure message; omitted (undefined) when the pipeline
+   * upgraded cleanly. The endpoint returns 200 even when some pipelines
+   * fail, surfacing the failures here. */
+  err?: string;
+}
+
+export interface WorkspaceUpgradeResult {
+  prev_version: string;
+  target_version: string;
+  workspace_rewritten: number;
+  runner_refreshed: boolean;
+  /** Workspace-level warning; omitted (undefined) when empty. */
+  warning?: string;
+  pipelines: WorkspaceUpgradePipelineResult[];
+}
+
+/** POST /workspace/upgrade?version=&shell_only= — upgrade the workspace
+ * shell and, by default, every pipeline in it. Empty version targets the
+ * running CLI's embedded module version. `shellOnly` true upgrades only
+ * the shell (skips the per-pipeline walk). Returns 200 even when some
+ * pipelines fail — inspect each entry's `err`. */
+export function upgradeWorkspace(
+  version = "",
+  shellOnly = false,
+): Promise<WorkspaceUpgradeResult> {
+  const params = new URLSearchParams();
+  if (version) params.set("version", version);
+  if (shellOnly) params.set("shell_only", "true");
+  const qs = params.toString();
+  return request<WorkspaceUpgradeResult>(
+    `/workspace/upgrade${qs ? `?${qs}` : ""}`,
+    { method: "POST" },
+  );
 }
 
 /** GET /pipeline/vars?dir= — read terraform.tfvars as a flat key→value map */

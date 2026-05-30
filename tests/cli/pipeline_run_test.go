@@ -86,7 +86,12 @@ func TestPipelineRunEndToEnd(t *testing.T) {
 	// (`test-ws` → `clavesa_test_ws` catalog, `orders` → `orders` schema
 	// → `clavesa_test_ws__orders` Glue DB). No leading catalog prefix —
 	// Delta lives under Spark's default session catalog.
-	wantPrefix := "clavesa_test_ws__orders." + transformID + "__default"
+	//
+	// ADR-019 Slice 3 dropped the `__default` suffix for single-output
+	// transforms — `_table_id_for` in runner/runner.py emits the bare node
+	// id when `outputs == {"default": ...}`. Don't reintroduce the suffix
+	// in the expectation here.
+	wantPrefix := "clavesa_test_ws__orders." + transformID
 	if xform.Output != wantPrefix {
 		t.Errorf("transform output = %q, want %q", xform.Output, wantPrefix)
 	}
@@ -97,12 +102,12 @@ func TestPipelineRunEndToEnd(t *testing.T) {
 	// Warehouse subdir matches the encoded Glue DB name so local and cloud
 	// layouts stay parallel.
 	pipelineDir := filepath.Join(ws, "orders")
-	wantWarehouse := filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_test_ws__orders", transformID+"__default")
+	wantWarehouse := filepath.Join(pipelineDir, ".clavesa", "warehouse", "clavesa_test_ws__orders", transformID)
 	// Use ls -d via the fact that the run was successful — if the table dir
 	// doesn't exist the runner would have errored. The path-shape assertion
 	// is enough to flag an accidental layout regression without dragging in
 	// filesystem walking; a missing dir would surface as a status != "ok".
-	if !strings.Contains(wantWarehouse, transformID+"__default") {
+	if !strings.Contains(wantWarehouse, transformID) {
 		t.Errorf("internal sanity: expected warehouse path to mention transform id, got %q", wantWarehouse)
 	}
 }

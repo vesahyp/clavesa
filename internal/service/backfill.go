@@ -183,9 +183,9 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	// rather than the pipeline .tf — the .tf carries unresolved
 	// terraform references (e.g. var.schema) that we can't statically
 	// resolve without re-running Terraform's evaluator.
-	functionName := fmt.Sprintf("%s-%s", pipelineName, req.Node)
+	functionName := pipelineRunnerLambdaName(pipelineName)
 	lc := lambda.NewFromConfig(cfg)
-	canonicalTable, glueDB, outputKey, err := canonicalFromLambdaEnv(ctx, lc, functionName, req.Node)
+	canonicalTable, glueDB, outputKey, err := canonicalFromLambdaEnv(ctx, lc, functionName, node)
 	if err != nil {
 		return nil, fmt.Errorf("resolve canonical target: %w", err)
 	}
@@ -506,7 +506,7 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	}
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
-	functionName := fmt.Sprintf("%s-%s", pipelineName, run.Node)
+	functionName := pipelineRunnerLambdaName(pipelineName)
 	body, _ := json.Marshal(payload)
 	out2, err := lc.Invoke(ctx, &lambda.InvokeInput{
 		FunctionName: aws.String(functionName),
@@ -665,7 +665,7 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error 
 	}
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
-	functionName := fmt.Sprintf("%s-%s", pipelineName, run.Node)
+	functionName := pipelineRunnerLambdaName(pipelineName)
 	body, _ := json.Marshal(payload)
 	out, err := lc.Invoke(ctx, &lambda.InvokeInput{
 		FunctionName: aws.String(functionName),
@@ -695,6 +695,17 @@ func findGraphNode(g *graph.PipelineGraph, nodeID string) *graph.Node {
 // ---------------------------------------------------------------------------
 // internals
 // ---------------------------------------------------------------------------
+
+// pipelineRunnerLambdaName returns the AWS Lambda function name for a
+// pipeline's single runner Lambda. Must match the name the orchestration
+// emitter produces in tfgen.emitPipelineLambda: `clavesa-<pipeline>-runner`
+// (the `var.pipeline_name` value, which equals the pipeline directory
+// name). v2.2.0+ is single-Lambda-per-pipeline — every transform, plus
+// the backfill_promote / backfill_discard operations, run inside this one
+// function. Earlier (v2.1.x) per-node `<schema>-<node>` Lambdas are gone.
+func pipelineRunnerLambdaName(pipelineName string) string {
+	return "clavesa-" + pipelineName + "-runner"
+}
 
 func newBackfillRunID() string {
 	var b [8]byte
@@ -743,14 +754,17 @@ func filepathBase(p string) string {
 	return p[i+1:]
 }
 
-// canonicalFromLambdaEnv resolves the transform's canonical Iceberg
-// table id by reading the deployed Lambda's environment variables
-// (CLAVESA_CATALOG, CLAVESA_SCHEMA) and applying the same
-// `clavesa.<encoded_db>.<node>__default` shape the runner uses in
-// _table_id_for(). Reading from the Lambda avoids reproducing the
-// Terraform variable-resolution dance and stays correct even when the
-// pipeline .tf carries unresolved references.
-func canonicalFromLambdaEnv(ctx context.Context, lc *lambda.Client, functionName, nodeID string) (string, string, string, error) {
+// canonicalFromLambdaEnv resolves the transform's canonical Delta table id by
+// reading the deployed Lambda's environment variables (CLAVESA_CATALOG,
+// CLAVESA_SCHEMA) for the Glue DB segment, then applying the shared
+// bare/suffixed table-name rule (canonicalTableSegment) using the node's
+// output_definitions. The Lambda env does NOT carry output_definitions, so the
+// node is threaded in by the caller; without it a default-only transform would
+// be mis-named `<node>__default` while the runner actually writes bare `<node>`
+// (issue #9). Reading the DB from the Lambda avoids reproducing the Terraform
+// variable-resolution dance and stays correct even when the pipeline .tf
+// carries unresolved references.
+func canonicalFromLambdaEnv(ctx context.Context, lc *lambda.Client, functionName string, node *graph.Node) (string, string, string, error) {
 	cfg, err := lc.GetFunctionConfiguration(ctx, &lambda.GetFunctionConfigurationInput{
 		FunctionName: aws.String(functionName),
 	})
@@ -768,15 +782,18 @@ func canonicalFromLambdaEnv(ctx context.Context, lc *lambda.Client, functionName
 	}
 	db := identutil.EncodeGlueDatabase(catalog, schema)
 	outputKey := "default"
-	target := fmt.Sprintf("%s.%s__%s", db, nodeID, outputKey)
+	defs, _ := node.Config["output_definitions"].(map[string]interface{})
+	target := fmt.Sprintf("%s.%s", db, canonicalTableSegment(node.ID, defs, outputKey))
 	return target, db, outputKey, nil
 }
 
 // canonicalTargetFor computes the canonical Delta table id (output-key
 // "default") for the named transform, plus the Glue DB it lives in.
-// Tracks the same `<glue_db>.<node>__<output>` shape the runner uses in
-// _table_id_for(key) — two-part under Spark's default session catalog
-// (ADR-018; the v1.x `clavesa.<db>.<table>` prefix is gone).
+// Tracks the same `<glue_db>.<table-segment>` shape the runner uses in
+// _table_id_for(key) via canonicalTableSegment: a default-only transform is
+// bare `<glue_db>.<node>` (no `__default` suffix; issue #9), a multi-output
+// transform is `<glue_db>.<node>__<key>`. Two-part under Spark's default
+// session catalog (ADR-018; the v1.x `clavesa.<db>.<table>` prefix is gone).
 //
 // Used by List/Diff/Promote/Discard paths that don't have a single Lambda
 // to query — they fall back to the workspace manifest + pipeline name.
@@ -805,17 +822,22 @@ func (s *Service) canonicalTargetFor(node *graph.Node, pipelineDir, pipelineName
 	}
 	db := identutil.EncodeGlueDatabase(catalog, schema)
 	outputKey := "default"
-	target := fmt.Sprintf("%s.%s__%s", db, node.ID, outputKey)
+	defs, _ := node.Config["output_definitions"].(map[string]interface{})
+	target := fmt.Sprintf("%s.%s", db, canonicalTableSegment(node.ID, defs, outputKey))
 	return target, db, outputKey, nil
 }
 
 func (s *Service) firstTransformDB(ctx context.Context, lc *lambda.Client, g *graph.PipelineGraph, pipelineName string) (string, string, string, error) {
+	// v2.2.0+ is single-Lambda-per-pipeline. CLAVESA_CATALOG / CLAVESA_SCHEMA
+	// are workspace/pipeline-level env on the one runner Lambda, so the
+	// first transform's node id is enough to compute the canonical-table
+	// shape — the function name is the same regardless of node.
 	for i := range g.Nodes {
 		if g.Nodes[i].Type != "transform" {
 			continue
 		}
-		fn := fmt.Sprintf("%s-%s", pipelineName, g.Nodes[i].ID)
-		return canonicalFromLambdaEnv(ctx, lc, fn, g.Nodes[i].ID)
+		fn := pipelineRunnerLambdaName(pipelineName)
+		return canonicalFromLambdaEnv(ctx, lc, fn, &g.Nodes[i])
 	}
 	return "", "", "", fmt.Errorf("pipeline has no transforms")
 }

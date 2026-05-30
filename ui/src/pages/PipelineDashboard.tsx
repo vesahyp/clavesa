@@ -14,9 +14,9 @@
  * this page is data the user already has — no new backend.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { ArrowUp, ChevronRight, FileWarning, History, Loader2, Play, Settings } from "lucide-react";
+import { ArrowUp, ChevronRight, FileWarning, History, Loader2, Play, Settings, Zap } from "lucide-react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -35,6 +35,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   PipelineGraph as PipelineGraphView,
   deriveNodeOutputs,
@@ -1106,12 +1108,43 @@ interface RunPipelineButtonProps {
  */
 function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonProps) {
   const [running, setRunning] = useState(false);
+  const [force, setForce] = useState(false);
+  const [forceNodesInput, setForceNodesInput] = useState("");
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+
+  // Outside-click closes the popover. The native trigger button's click
+  // is excluded by the ref check (it's inside the wrapper).
+  useEffect(() => {
+    if (!popoverOpen) return;
+    function onDocClick(e: MouseEvent) {
+      if (!popoverRef.current) return;
+      if (!popoverRef.current.contains(e.target as globalThis.Node)) {
+        setPopoverOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [popoverOpen]);
 
   async function handleClick() {
     setRunning(true);
     try {
-      const result = await runPipeline(dir);
-      // Dispatch is async now — the run is starting, not finished.
+      // Parse comma-separated node IDs; trim + drop empty entries so
+      // " a , b , " resolves to ["a","b"]. Explicit force-nodes implies
+      // force=true on the wire (server normalises again — defend in depth).
+      const forceNodes = forceNodesInput
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const effectiveForce = force || forceNodes.length > 0;
+      const result = await runPipeline(
+        dir,
+        effectiveForce
+          ? { force: true, forceNodes: forceNodes.length > 0 ? forceNodes : undefined }
+          : undefined,
+      );
+      // Dispatch is async — the run is starting, not finished.
       toast.success(
         result.execution_arn ? "Execution started" : "Run started",
       );
@@ -1123,20 +1156,78 @@ function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonP
     }
   }
 
+  const forceActive = force || forceNodesInput.trim().length > 0;
+
   return (
-    <Button
-      onClick={handleClick}
-      disabled={disabled || running}
-      size="sm"
-      data-testid="run-pipeline"
-    >
-      {running ? (
-        <Loader2 className="h-4 w-4 animate-spin" />
-      ) : (
-        <Play className="h-4 w-4" />
+    <div className="relative inline-flex items-center gap-1" ref={popoverRef}>
+      <Button
+        onClick={handleClick}
+        disabled={disabled || running}
+        size="sm"
+        data-testid="run-pipeline"
+      >
+        {running ? (
+          <Loader2 className="h-4 w-4 animate-spin" />
+        ) : (
+          <Play className="h-4 w-4" />
+        )}
+        {running ? "Running…" : forceActive ? "Force run" : "Run pipeline"}
+      </Button>
+      <Button
+        type="button"
+        size="sm"
+        variant={forceActive ? "default" : "outline"}
+        onClick={() => setPopoverOpen((v) => !v)}
+        disabled={disabled || running}
+        aria-label="Run options"
+        title="Run options"
+        data-testid="run-pipeline-options"
+      >
+        <Zap className="h-4 w-4" />
+      </Button>
+      {popoverOpen && (
+        <div
+          className="absolute right-0 top-full z-50 mt-1 w-80 rounded-md border border-border bg-popover p-3 text-popover-foreground shadow-md"
+          data-testid="run-pipeline-popover"
+        >
+          <p className="mb-2 text-xs text-muted-foreground">
+            Bypasses incremental-skip checks for this run. Watermarks
+            still advance on success. Append-without-merge_keys outputs
+            may write duplicates.
+          </p>
+          <div className="mb-3 flex items-center gap-2">
+            <input
+              id="force-checkbox"
+              type="checkbox"
+              checked={force}
+              onChange={(e) => setForce(e.target.checked)}
+              className="h-4 w-4 cursor-pointer"
+              data-testid="run-pipeline-force"
+            />
+            <Label htmlFor="force-checkbox" className="cursor-pointer text-sm">
+              Force (bypass incremental-skip)
+            </Label>
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label htmlFor="force-nodes-input" className="text-xs text-muted-foreground">
+              Force nodes (comma-separated)
+            </Label>
+            <Input
+              id="force-nodes-input"
+              type="text"
+              value={forceNodesInput}
+              onChange={(e) => setForceNodesInput(e.target.value)}
+              placeholder="e.g. trips, revenue_by_payment"
+              className="h-8 text-sm"
+              data-testid="run-pipeline-force-nodes"
+            />
+            <p className="text-[10px] text-muted-foreground">
+              Explicit list overrides the "force every node" interpretation.
+            </p>
+          </div>
+        </div>
       )}
-      {running ? "Running…" : "Run pipeline"}
-    </Button>
+    </div>
   );
 }
 
@@ -1179,22 +1270,31 @@ function ModuleVersionChip({ dir }: ModuleVersionChipProps) {
     // covers the affordance; missing-version is a non-event.
     return null;
   }
-  const upToDate = data.current_ref === data.latest_ref;
+  // The upgrade targets the running binary's embedded module version
+  // (cli_version) — the exact ref `upgradePipeline` applies, NOT the
+  // remote ls-remote tag (GH #7). latest_ref may be newer for legacy
+  // github-form pipelines but is informational only; bumping past
+  // cli_version requires updating the CLI binary itself.
+  const upToDate = data.current_ref === data.cli_version;
+  const newerCli =
+    !!data.latest_ref &&
+    data.latest_ref !== data.cli_version &&
+    data.latest_ref !== data.current_ref;
   return (
     <div className="flex items-center gap-1.5">
       <Badge
         variant="outline"
         className="font-mono text-[10px]"
-        title={`Module ref in pipeline .tf · latest tag on ${data.repo_url}`}
+        title={`Module ref in pipeline .tf · CLI targets ${data.cli_version}`}
       >
         Module: {data.current_ref}
-        {!upToDate && data.latest_ref && (
+        {!upToDate && (
           <span className="ml-1 text-muted-foreground">
-            → {data.latest_ref}
+            → {data.cli_version}
           </span>
         )}
       </Badge>
-      {!upToDate && data.latest_ref && (
+      {!upToDate && (
         <Button
           size="sm"
           variant="outline"
@@ -1202,7 +1302,7 @@ function ModuleVersionChip({ dir }: ModuleVersionChipProps) {
           disabled={mut.isPending}
           onClick={() => mut.mutate()}
           data-testid="upgrade-pipeline"
-          title={`Rewrite all module ?ref= to ${data.latest_ref} and re-sync orchestration.tf`}
+          title={`Rewrite all module ?ref= to ${data.cli_version} and re-sync orchestration.tf`}
         >
           {mut.isPending ? (
             <Loader2 className="h-3 w-3 animate-spin" />
@@ -1211,6 +1311,14 @@ function ModuleVersionChip({ dir }: ModuleVersionChipProps) {
           )}
           Upgrade
         </Button>
+      )}
+      {newerCli && (
+        <span
+          className="font-mono text-[10px] text-muted-foreground/70"
+          title={`A newer clavesa release (${data.latest_ref}) is tagged upstream. Update your CLI binary to upgrade past ${data.cli_version}.`}
+        >
+          newer CLI available: {data.latest_ref}
+        </span>
       )}
     </div>
   );

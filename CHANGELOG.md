@@ -12,6 +12,29 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.3.1] — 2026-05-30
+
+### Added
+
+- The pipeline dashboard's Run button now works for cloud pipelines (was previously local-only) and exposes a Force checkbox + force-nodes input so the UI matches `clavesa pipeline run --force` / `--force-node`.
+- `clavesa workspace destroy --yes` and `clavesa pipeline destroy --yes` skip the interactive `yes` prompt. `workspace destroy` also pre-empties the versioned workspace bucket and drains the Athena workgroup so `terraform destroy` doesn't 409 on bucket / workgroup state.
+
+### Changed
+
+- `clavesa workspace upgrade` now upgrades the workspace shell AND every pipeline in one shot; pass `--shell-only` for the previous shell-only behaviour.
+
+### Fixed
+
+- CSV sources now infer numeric column types instead of defaulting every column to STRING (which broke any `WHERE col > N` predicate with a `CAST_INVALID_INPUT` error).
+- Local-mode runs that short-circuit early (every node skips, or no work dispatched) now write a terminal `SUCCEEDED` row to the `runs` system table — fixes the phantom `Running` row + `—` duration on the pipeline dashboard.
+- `clavesa workspace upgrade` bumps `runner_version` in variables.tf so post-upgrade deploys push the new runner image.
+- `clavesa pipeline upgrade --version` help text now states the default is this CLI's module version.
+- A transform that reads another transform in the same pipeline no longer fails with `TABLE_OR_VIEW_NOT_FOUND` — a default-only output is now addressed by its bare table name everywhere (module output and runner agreed on the bare name; the module previously emitted a phantom `__default` suffix). (#5)
+- String-form intra-pipeline input refs (`inputs = { x = "<schema>.<sibling>" }`) are now ordered correctly; previously they lost their dependency edge and a downstream node could run before its upstream table existed, deadlocking the first run. (#6)
+- Cross-pipeline reads now work on Lake-Formation-gated accounts: the runner role is granted read access on each upstream schema it reads, fixing `Insufficient Lake Formation permission(s): Required Describe` that broke the EventBridge medallion cascade. (#4)
+- The pipeline dashboard no longer 502s when loading backfills against a cloud workspace (the backfill paths used a non-existent per-node Lambda name instead of the single `clavesa-<pipeline>-runner`).
+- `clavesa pipeline backfill list/diff/promote/discard` no longer report `run_id not found` for a default-only transform — the backfill bookkeeping recorded the table as `<node>__default` while the runner writes the bare `<node>`; both canonical-name paths now use the bare name. (#9)
+
 ## [v2.3.0] — 2026-05-29
 
 ### Added

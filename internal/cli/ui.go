@@ -81,8 +81,26 @@ type localPipelineRunnerBridge struct {
 	svc *tuiservice.Service
 }
 
-func (b localPipelineRunnerBridge) StartRun(dir string) (string, error) {
-	return b.svc.StartRun(dir)
+func (b localPipelineRunnerBridge) StartRunWithOpts(dir string, opts pipelinestatus.RunOpts) (string, error) {
+	return b.svc.StartRunWithOpts(dir, tuiservice.RunOpts{
+		Force:      opts.Force,
+		ForceNodes: opts.ForceNodes,
+	})
+}
+
+// cloudPipelineRunnerBridge adapts service.Service onto
+// pipelinestatus.CloudPipelineRunner. Mirrors the local bridge above —
+// translates RunOpts between the two packages so the handler stays free
+// of an internal/service import.
+type cloudPipelineRunnerBridge struct {
+	svc *tuiservice.Service
+}
+
+func (b cloudPipelineRunnerBridge) RunPipelineCloud(ctx context.Context, dir string, opts pipelinestatus.RunOpts) (string, error) {
+	return b.svc.RunPipelineCloud(ctx, dir, tuiservice.RunOpts{
+		Force:      opts.Force,
+		ForceNodes: opts.ForceNodes,
+	})
 }
 
 // sourceRegistryBridge adapts service.Service onto api.SourceRegistry —
@@ -691,7 +709,7 @@ Examples:
 				}
 			}
 			workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithRestart(restartFn)
-			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc})
+			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc}).WithCloudRunner(cloudPipelineRunnerBridge{svc: svc})
 			dataHandler := dataquery.NewHandler(s3Client, athenaClient, athenaOutputBucket).(*dataquery.Handler).WithResolver(resolver)
 			// nil-safe: catalog handler renders an empty list in local-only mode.
 			var catalogClient api.GlueClient

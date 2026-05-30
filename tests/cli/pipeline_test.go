@@ -151,6 +151,16 @@ func TestPipelineCreateAndList(t *testing.T) {
 	run(t, "source", "attach", "first-pipeline", "orders", "--to", transformID, "--as", "orders", "--workspace", ws)
 
 	run(t, "pipeline", "create", "second-pipeline", "--workspace", ws)
+	// `scanPipelines` (internal/service/pipeline.go) filters node-less
+	// pipelines out of the listing on purpose — an empty directory isn't
+	// a meaningful pipeline. Give second-pipeline a single trivial
+	// transform so it shows up. The SQL has no inputs so we don't need
+	// to wire it to a source.
+	secondTransform := addNode(t, ws, "second-pipeline", "transform")
+	run(t, "node", "edit", "second-pipeline", secondTransform,
+		"--set", "sql=SELECT 1 AS x",
+		"--workspace", ws,
+	)
 
 	listOut := run(t, "pipeline", "list", "--json", "--workspace", ws)
 	var pipelines []struct{ Name string }
