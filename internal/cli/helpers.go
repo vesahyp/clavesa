@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -238,8 +239,26 @@ func newService(cmd *cobra.Command) (*service.Service, string, error) {
 	warm := observability.NewPersistentQueryRunner(workspace)
 	parser := warm.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
 	registerCloseable(warm.Close)
-	svc = svc.WithSQLParser(parser)
+	svc = svc.WithSQLParser(parser).WithMetastoreEnsurer(metastoreEnsurer())
 	return svc, workspace, nil
+}
+
+// metastoreEnsurer returns the production shared-metastore ensurer wired
+// into the Service via WithMetastoreEnsurer (CLI + UI). It brings up (or
+// reuses) the per-workspace Derby metastore container and returns the
+// (docker network, addr) the run containers attach to. Best-effort: on
+// failure it logs to stderr and returns ("", ""), so the containers fall
+// back to embedded Derby — the exact semantics the run.go call sites had
+// before the seam was extracted.
+func metastoreEnsurer() func(ctx context.Context, workspaceRoot, workspaceName string) (string, string) {
+	return func(ctx context.Context, workspaceRoot, workspaceName string) (string, string) {
+		addr, err := observability.EnsureMetastore(ctx, workspaceRoot, workspaceName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "clavesa: falling back to embedded metastore (shared metastore unavailable): %v\n", err)
+			return "", ""
+		}
+		return observability.MetastoreNetwork(workspaceRoot), addr
+	}
 }
 
 // pipelineDirHelp documents the <pipeline-dir> positional shared by every

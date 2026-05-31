@@ -6,12 +6,16 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/vesahyp/clavesa/internal/delta"
+	"github.com/vesahyp/clavesa/internal/delta/s3fs"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -23,18 +27,78 @@ type GlueClient interface {
 	GetTables(ctx context.Context, params *glue.GetTablesInput, optFns ...func(*glue.Options)) (*glue.GetTablesOutput, error)
 }
 
+// S3API is the subset of the AWS SDK v2 S3 client used to read Delta logs
+// for column enrichment. Same two methods s3fs.S3API needs (the real
+// *s3.Client satisfies both); narrow on purpose so the cloud-enrichment
+// test stub stays small.
+type S3API interface {
+	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+}
+
+// catalogEnrichConcurrency bounds the worker pool that reads each cloud
+// Delta table's `_delta_log/` from S3. The catalog lists every table up
+// front, so serializing per-table round-trips would scale badly; a small
+// fixed cap keeps the burst on S3 polite without leaving the page slow.
+const catalogEnrichConcurrency = 8
+
+// catalogSchemaCacheTTL bounds how long a Delta-log schema read is reused
+// before being re-read from S3. The `_delta_log/` round-trip is the slow
+// part of GET /workspace/tables (every request re-reads every cloud table,
+// pushing the endpoint to ~14s with ~16 tables); a process-lifetime cache
+// keyed by S3 location makes repeat loads instant. Schema is very stable
+// (column changes are rare), so 5 minutes is safe — a stale entry just gets
+// re-read after the TTL, and a column add lands on the next miss.
+const catalogSchemaCacheTTL = 5 * time.Minute
+
+// catalogSchemaEntry is one cached Delta-log schema read. fetchedAt is the
+// wall-clock stamp the TTL check compares against; cols is the resolved
+// schema served on a hit.
+type catalogSchemaEntry struct {
+	cols      []CatalogColumn
+	fetchedAt time.Time
+}
+
 // CatalogHandler serves data-catalog endpoints — the user-facing view of
 // Iceberg tables produced by deployed and local pipelines (ADR-014).
 type CatalogHandler struct {
 	glue          GlueClient
+	s3            S3API
 	workspaceRoot string
+
+	// schemaCache memoizes per-table Delta-log schema reads keyed by the
+	// table's S3 location. Mutex-guarded for both read and write: the enrich
+	// worker pool writes different locations concurrently. Process-lifetime
+	// (TTL-invalidated, never evicted by size) — the table set is small and
+	// bounded by the workspace's pipelines.
+	schemaMu    sync.Mutex
+	schemaCache map[string]catalogSchemaEntry
+
+	// now is the clock the TTL check reads. Defaults to time.Now; overridden
+	// in tests so a seeded entry can be aged past the TTL without sleeping.
+	now func() time.Time
 }
 
 // NewCatalogHandler returns a handler. Pass a nil GlueClient when AWS is
 // unavailable — cloud tables become empty, but local pipelines still surface
 // via the workspace walk.
 func NewCatalogHandler(g GlueClient) *CatalogHandler {
-	return &CatalogHandler{glue: g}
+	return &CatalogHandler{
+		glue:        g,
+		schemaCache: map[string]catalogSchemaEntry{},
+		now:         time.Now,
+	}
+}
+
+// WithS3 wires the S3 client used to read each cloud Delta table's real
+// schema from its `_delta_log/`. Glue's StorageDescriptor.Columns is a stub
+// for Delta tables (a single `col array<string>`), so without this the cloud
+// catalog mis-reports every Delta schema; the local path already reads the
+// Delta log directly (ADR-014 parity). Nil-safe — like the nil-Glue
+// degradation, a nil client just leaves the Glue stub columns in place.
+func (h *CatalogHandler) WithS3(s S3API) *CatalogHandler {
+	h.s3 = s
+	return h
 }
 
 // WithWorkspace wires the workspace root used to enumerate local Hadoop-catalog
@@ -143,13 +207,26 @@ func (h *CatalogHandler) Tables(ctx context.Context) CatalogResponse {
 		}
 	}
 
+	// The env mode picks which world the catalog reads, the same contract
+	// every other endpoint honours (the EnvModeToggle: "the backend already
+	// dispatches by the mode"). Local mode lists the on-disk Hadoop-catalog
+	// tables; cloud mode lists Glue. Reading both double-listed every table
+	// that is deployed AND run locally (one row per materialization), and
+	// also paid the slow Glue + `_delta_log` enrichment in local mode for
+	// tables the user wasn't looking at. With no workspace root we default
+	// to cloud — the legacy AWS-only catalog.
+	mode := workspace.ModeCloud
+	if h.workspaceRoot != "" {
+		mode = workspace.LoadEnvironmentMode(h.workspaceRoot)
+	}
+
 	// Cloud half. AWS errors degrade gracefully — local-only workspaces
 	// (no AWS creds, expired SSO, IMDS lookup failing on a laptop) shouldn't
 	// 500 the whole catalog. We log to stderr and flip aws_available to
 	// false; the UI renders the "AWS unavailable" affordance and shows the
 	// local pipelines unaffected.
 	awsAvailable := h.glue != nil
-	if h.glue != nil {
+	if mode == workspace.ModeCloud && h.glue != nil {
 		dbs, err := h.listClavesaDatabases(ctx, workspaceCatalog, systemCatalog)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "catalog: skip cloud half (Glue unreachable): %v\n", err)
@@ -181,12 +258,11 @@ func (h *CatalogHandler) Tables(ctx context.Context) CatalogResponse {
 		}
 	}
 
-	// Local half — Iceberg tables under each compute=local pipeline's
-	// warehouse. Both the per-pipeline user DB and the workspace-wide
-	// system DB (ADR-016 v0.20.0) get scanned; system entries de-dup so
-	// runs/node_runs/tables surface once even in multi-pipeline
-	// workspaces.
-	if h.workspaceRoot != "" {
+	// Local half — Delta tables under the workspace warehouse. Both the
+	// per-pipeline user DB and the workspace-wide system DB (ADR-016
+	// v0.20.0) get scanned; system entries de-dup so runs/node_runs/tables
+	// surface once even in multi-pipeline workspaces.
+	if mode == workspace.ModeLocal && h.workspaceRoot != "" {
 		out = append(out, listLocalTables(h.workspaceRoot, workspaceCatalog, systemCatalog, localPipelines)...)
 	}
 
@@ -292,7 +368,147 @@ func (h *CatalogHandler) listTablesInDatabase(ctx context.Context, db string) ([
 		}
 		nextToken = resp.NextToken
 	}
+	// Glue's StorageDescriptor.Columns is a stub for Delta tables — the
+	// real schema lives in `_delta_log/`, so read it back the way the local
+	// path does (ADR-014 parity). Best-effort: failures leave the stub.
+	h.enrichDeltaColumns(ctx, out)
 	return out, nil
+}
+
+// enrichDeltaColumns replaces the stub Glue columns on each Delta table with
+// the real schema read from its `_delta_log/` on S3. Glue records Delta
+// tables with a single `col array<string>` stub (the schema is owned by the
+// transaction log, not Glue), so without this the cloud catalog mis-renders
+// every Delta table's columns. The local catalog path already reads the
+// Delta log via delta.ReadCurrentFromPath; this is the cloud mirror.
+//
+// We do NOT gate on TableType: Spark's Delta saveAsTable registers the Glue
+// table without a `table_type=DELTA` parameter (that tag is an Iceberg
+// convention), so the only reliable Delta signal is the presence of a
+// readable `_delta_log/` under the table's S3 location. We attempt the read
+// for every located table; a non-Delta table (plain-Parquet destination
+// override) simply has no `_delta_log/`, the read errors, and its Glue
+// columns survive. clavesa writes Delta by default, so nearly every table
+// hits the fast success path. A successful read also stamps TableType =
+// "DELTA" — the authoritative format signal the Glue parameter lacked.
+//
+// Best-effort by design: any error (bad Location, S3 miss, malformed log)
+// leaves the Glue stub columns untouched and logs the table name to stderr —
+// the catalog never fails because of one unreadable table.
+//
+// The per-table S3 round-trips run on a bounded worker pool; each goroutine
+// writes only its own slice index so the shared slice needs no lock. A fresh
+// cache hit is resolved synchronously in the loop before the decision to
+// spawn, so it consumes neither a worker slot nor a goroutine.
+func (h *CatalogHandler) enrichDeltaColumns(ctx context.Context, tables []CatalogTable) {
+	if h.s3 == nil {
+		return
+	}
+	sem := make(chan struct{}, catalogEnrichConcurrency)
+	var wg sync.WaitGroup
+	for i := range tables {
+		if tables[i].Location == "" {
+			continue
+		}
+		// Cache hit short-circuits the S3 read. A cached entry by definition
+		// came from a successful Delta-log read, so it both supplies the
+		// columns and re-stamps TableType = "DELTA" (it IS Delta).
+		if cols, ok := h.cachedSchema(tables[i].Location); ok {
+			tables[i].Columns = cols
+			tables[i].TableType = "DELTA"
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			cols, err := h.readDeltaColumns(ctx, tables[i].Location)
+			if err != nil {
+				// Not a Delta table (no `_delta_log/`) or an unreadable
+				// one — keep whatever columns Glue gave us. Debug-level
+				// noise, so log only the table identity, not per-table
+				// stack. Do NOT cache the failure: a transient S3 error
+				// must not pin the Glue stub for the whole TTL.
+				fmt.Fprintf(os.Stderr,
+					"catalog: keep Glue columns for %s.%s (no readable Delta log): %v\n",
+					tables[i].Database, tables[i].Name, err)
+				return
+			}
+			tables[i].Columns = cols
+			tables[i].TableType = "DELTA"
+			h.storeSchema(tables[i].Location, cols)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// cachedSchema returns the cached columns for a location when a fresh
+// (within-TTL) entry exists. Mutex-guarded read.
+func (h *CatalogHandler) cachedSchema(location string) ([]CatalogColumn, bool) {
+	h.schemaMu.Lock()
+	defer h.schemaMu.Unlock()
+	if h.schemaCache == nil {
+		return nil, false
+	}
+	e, ok := h.schemaCache[location]
+	if !ok {
+		return nil, false
+	}
+	if h.now().Sub(e.fetchedAt) >= catalogSchemaCacheTTL {
+		return nil, false
+	}
+	return e.cols, true
+}
+
+// storeSchema records a successful Delta-log read in the cache, stamped with
+// the current time for the TTL check. Mutex-guarded write.
+func (h *CatalogHandler) storeSchema(location string, cols []CatalogColumn) {
+	h.schemaMu.Lock()
+	defer h.schemaMu.Unlock()
+	if h.schemaCache == nil {
+		h.schemaCache = map[string]catalogSchemaEntry{}
+	}
+	h.schemaCache[location] = catalogSchemaEntry{cols: cols, fetchedAt: h.now()}
+}
+
+// readDeltaColumns parses an `s3://bucket/key` table root, reads the
+// `_delta_log/` under it via s3fs + delta.ReadCurrent, and projects the
+// current schema into CatalogColumns. Mirrors readLocalTable's column
+// projection so the two surfaces produce identical shapes (ADR-014).
+func (h *CatalogHandler) readDeltaColumns(ctx context.Context, location string) ([]CatalogColumn, error) {
+	bucket, key := parseCatalogS3URI(location)
+	if bucket == "" {
+		return nil, fmt.Errorf("not an s3:// location: %q", location)
+	}
+	logPrefix := strings.TrimSuffix(key, "/") + "/_delta_log/"
+	fsys := s3fs.New(ctx, h.s3, bucket, logPrefix)
+	schema, _, err := delta.ReadCurrent(fsys)
+	if err != nil {
+		return nil, err
+	}
+	cols := make([]CatalogColumn, 0, len(schema.Columns))
+	for _, c := range schema.Columns {
+		cols = append(cols, CatalogColumn{Name: c.Name, Type: c.Type})
+	}
+	return cols, nil
+}
+
+// parseCatalogS3URI splits `s3://bucket/key/path` into (bucket, key).
+// Returns empty strings for non-S3 or bucket-only URIs so callers treat
+// that as "no Delta log here". Local to this package on purpose — the
+// observability sibling keeps its own unexported parseS3URI.
+func parseCatalogS3URI(uri string) (bucket, key string) {
+	const scheme = "s3://"
+	if !strings.HasPrefix(uri, scheme) {
+		return "", ""
+	}
+	rest := uri[len(scheme):]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return rest, ""
+	}
+	return rest[:slash], rest[slash+1:]
 }
 
 func glueTableToCatalog(db string, t gluetypes.Table) CatalogTable {

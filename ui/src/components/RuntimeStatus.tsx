@@ -14,6 +14,8 @@
  * (see useRuntimeWorkers).
  */
 
+import { useIsFetching } from "@tanstack/react-query";
+
 import {
   Tooltip,
   TooltipContent,
@@ -35,6 +37,12 @@ export function RuntimeStatus() {
   const workers = data?.workers ?? [];
   const spawning = workers.find((w) => w.state === "spawning");
   const ready = workers.find((w) => w.state === "ready");
+  // Any in-flight Spark-backed query (table sample, snapshots, column
+  // stats, dashboard widget) tags its TanStack query with meta.spark.
+  // Counting them gives a live "a query is running" signal that the
+  // worker-lifecycle states (idle/spawning/ready) never expose.
+  const sparkBusy =
+    useIsFetching({ predicate: (q) => q.meta?.spark === true }) > 0;
 
   if (spawning) {
     return (
@@ -49,6 +57,22 @@ export function RuntimeStatus() {
           The local Spark worker is booting (~30s on a cold start). The
           first catalog / dashboard query waits for it; every query
           after that is near-instant.
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  if (ready && sparkBusy) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-status-running" />
+            <span>Spark · running query…</span>
+          </div>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          A query is running on the warm Spark worker.
         </TooltipContent>
       </Tooltip>
     );

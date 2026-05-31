@@ -149,9 +149,12 @@ func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 // when routing succeeded; on failure writes a 400 to w and returns
 // (nil, false) so the caller can early-out.
 //
-// In local mode the cloud provider has a nil Athena client — silently
-// falling back there 500s the request when ?dir is missing (B P1-3 from
-// 2026-05-24). Local mode now requires `dir` and surfaces a 400 instead.
+// Dir-less requests serve the workspace-wide system observability tables
+// (runs, node_runs, column_stats, tables under <system_catalog>__pipelines),
+// which have no owning pipeline. In local mode these dispatch to the
+// workspace-level local provider (Resolver.Workspace) — the provider reads
+// the workspace warehouse directly and needs no per-pipeline state, so a
+// missing dir is fine. In cloud mode they go to the cloud provider unchanged.
 // Tests without a resolver still get the legacy cloud provider.
 func (h *Handler) providerFor(w http.ResponseWriter, r *http.Request) (observability.Provider, bool) {
 	if h.resolver == nil {
@@ -160,8 +163,12 @@ func (h *Handler) providerFor(w http.ResponseWriter, r *http.Request) (observabi
 	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
 	if dir == "" {
 		if h.resolver.IsLocal() {
-			httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir (local workspaces dispatch per-pipeline)")
-			return nil, false
+			p, err := h.resolver.Workspace()
+			if err != nil {
+				httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+				return nil, false
+			}
+			return p, true
 		}
 		return h.cloud, true
 	}

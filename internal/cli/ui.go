@@ -641,6 +641,13 @@ Examples:
 			// SweepWarmWorkers cleans up any containers left behind by a
 			// prior SIGKILL'd session before we spawn fresh.
 			observability.SweepWarmWorkers(workspace)
+			// Shared local Derby metastore: a SIGKILL'd prior session can
+			// leave a stale metastore container holding the Derby DB lock,
+			// which would block a fresh EnsureMetastore. Sweep it before the
+			// startup goroutine below brings up a fresh one. (EnsureMetastore
+			// itself is in the goroutine so a cold image pull doesn't block
+			// `ui` startup.)
+			observability.SweepMetastores(workspace)
 			warmQuery := observability.NewPersistentQueryRunner(workspace)
 
 			// Eager Spark warmup: the Catalog landing page itself doesn't
@@ -654,8 +661,43 @@ Examples:
 			// Gated on the workspace being initialized; otherwise the
 			// runner image doesn't exist and `docker run` would fail
 			// against the empty-name fallback tag.
+			//
+			// Ensure the workspace runner image before warming: a workspace
+			// can be initialized yet have no `<image>:latest` tag (pruned, or
+			// only a `:<version>` tag survived a fresh checkout), in which
+			// case the warm-worker `docker run` fails with a cryptic "pull
+			// access denied" and every Spark-backed surface silently 500s.
+			// EnsureLocalRunnerImage retags from the dev image / embedded
+			// files, the same self-heal `workspace init` does. Runs in the
+			// background so a cold build (1-3 min) doesn't block `ui` startup;
+			// a failure degrades to a clear, actionable message instead of
+			// the docker error leaking through later.
 			if m, _ := wspkg.Load(workspace); m != nil {
-				go warmQuery.Warmup(context.Background(), wspkg.LocalWarehouseDir(workspace))
+				wsName := m.Name
+				go func() {
+					if _, err := wspkg.EnsureLocalRunnerImage(workspace); err != nil {
+						fmt.Fprintf(os.Stderr,
+							"clavesa: local Spark is unavailable — could not prepare the runner image: %v\n"+
+								"  Table preview, /query, and column profiles need it. Run `make build-runner` (dev) or re-run `clavesa workspace init`.\n",
+							err)
+						return
+					}
+					// Bring up the shared local Derby metastore before the
+					// first query so the warm worker connects to it as a
+					// client rather than racing to create it. Order matters:
+					// the runner image must exist first (the metastore reuses
+					// it), then the metastore, then the warm worker. The warm
+					// worker's own EnsureMetastore (in spawn) is idempotent, so
+					// this is belt-and-braces — it just makes the metastore
+					// ready before the first query rather than on first spawn.
+					// A failure degrades to embedded Derby (logged inside
+					// EnsureMetastore's callers); don't block warmup on it.
+					if _, err := observability.EnsureMetastore(context.Background(), workspace, wsName); err != nil {
+						fmt.Fprintf(os.Stderr,
+							"clavesa: shared local metastore unavailable (queries fall back to embedded Derby): %v\n", err)
+					}
+					warmQuery.Warmup(context.Background(), wspkg.LocalWarehouseDir(workspace))
+				}()
 			}
 
 			localProv := observability.NewLocalProvider(workspace).WithQueryRunner(warmQuery)
@@ -677,7 +719,8 @@ Examples:
 				WithEvictor(nbRunner).
 				WithResolver(resolver).
 				WithNotebookRunner(nbRunner).
-				WithSQLParser(sqlParser)
+				WithSQLParser(sqlParser).
+				WithMetastoreEnsurer(metastoreEnsurer())
 			// lineageAdapter shims the JSON shape the api package owns onto the
 			// derivation owned by service. Two shapes mirror each other field-
 			// for-field; the adapter is the seam keeping api.Handler from
@@ -716,7 +759,15 @@ Examples:
 			if glueClient != nil {
 				catalogClient = glueClient
 			}
+			// WithS3: the cloud catalog reads each Delta table's real schema
+			// from its `_delta_log/`; Glue only carries a stub
+			// `col array<string>` for Delta tables. Avoid handing WithS3 a
+			// typed-nil *s3.Client (which would read non-nil through the
+			// interface) — pass it only when the client actually exists.
 			catalogHandler := api.NewCatalogHandler(catalogClient).WithWorkspace(workspace)
+			if s3Client != nil {
+				catalogHandler = catalogHandler.WithS3(s3Client)
+			}
 			// Dashboards: CRUD against the `dashboards` system Iceberg table
 			// via the service layer, plus a Provider-dispatched query route
 			// for widget SQL. Cloud fallback lights up when the resolver

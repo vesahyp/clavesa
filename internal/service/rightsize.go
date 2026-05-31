@@ -3,8 +3,27 @@ package service
 import (
 	"context"
 
+	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
+
+// systemGlueDB returns the workspace system catalog DB
+// (`<system_catalog>__pipelines`) — where runs / node_runs / column_stats
+// live. Used by the rightsize aggregation to scope its node_runs scan.
+func (s *Service) systemGlueDB() string {
+	catalog := ""
+	if m, _ := workspace.Load(s.workspace); m != nil {
+		catalog = m.SystemCatalogIdentifier()
+	}
+	if catalog == "" {
+		// No manifest (bare directory) — defensive fallback. Fresh
+		// workspaces always have a manifest, so this only bites tests
+		// that skip workspace init.
+		return "clavesa_system__pipelines"
+	}
+	return identutil.EncodeGlueDatabase(catalog, "pipelines")
+}
 
 // Rightsize returns a per-node memory recommendation for the named pipeline,
 // computed from its last `lastN` runner invocations. Recommend-only: it

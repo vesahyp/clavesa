@@ -14,6 +14,7 @@ import {
   Controls,
   MiniMap,
   useReactFlow,
+  useNodesInitialized,
   type Node as RFNode,
   type Edge as RFEdge,
 } from "@xyflow/react";
@@ -36,6 +37,13 @@ import type { PipelineNodeData, NodeOutput } from "./PipelineNode";
 /** Default node dimensions passed to dagre so it can compute proper spacing. */
 const NODE_WIDTH = 200;
 const NODE_HEIGHT = 100; // approximate; dagre uses this for rank separation
+
+/**
+ * fitView options shared by the <ReactFlow fitView> prop and the
+ * post-measurement FitController re-fit, so both frame the graph the same
+ * way. Padding leaves a margin around the bounding box.
+ */
+const FIT_VIEW_OPTIONS = { padding: 0.15 };
 
 /** dagre graph options */
 const DAGRE_GRAPH_OPTS = {
@@ -210,6 +218,33 @@ function FocusController({ focusNodeId }: { focusNodeId?: string | null }) {
       { zoom, duration: 350 },
     );
   }, [focusNodeId, rf]);
+  return null;
+}
+
+/**
+ * FitController re-fits the viewport once React Flow has MEASURED every
+ * node's real dimensions. The `fitView` prop on <ReactFlow> fits on first
+ * render, before node heights are known, so a tall single-rank layout (e.g.
+ * 14 star-schema dims all reading one source) is fit to stale sizes and
+ * spills off-screen. `useNodesInitialized` flips true after measurement; we
+ * fit again then. We yield the viewport to FocusController when a node is
+ * editor-selected so the two don't fight. Re-fits when the node set changes
+ * (nodeCount in deps) so switching pipelines reframes.
+ */
+function FitController({
+  focusNodeId,
+  nodeCount,
+}: {
+  focusNodeId?: string | null;
+  nodeCount: number;
+}) {
+  const rf = useReactFlow();
+  const initialized = useNodesInitialized();
+  useEffect(() => {
+    if (focusNodeId) return;
+    if (!initialized) return;
+    rf.fitView({ ...FIT_VIEW_OPTIONS, duration: 300 });
+  }, [initialized, focusNodeId, nodeCount, rf]);
   return null;
 }
 
@@ -644,6 +679,12 @@ export function PipelineGraph({
         edges={rfEdges}
         nodeTypes={nodeTypes}
         fitView
+        fitViewOptions={FIT_VIEW_OPTIONS}
+        // React Flow's default minZoom (0.5) clamps fitView, so a wide
+        // fan-out (e.g. a star schema with 14 dims all reading one source,
+        // laid out as one tall rank) can't zoom out far enough and spills
+        // off-canvas. Allow zooming out far enough to frame the whole DAG.
+        minZoom={0.1}
         nodesConnectable={false}
         onNodeClick={(_evt, node) => {
           setSelectedEdgeId(null);
@@ -657,6 +698,7 @@ export function PipelineGraph({
         proOptions={{ hideAttribution: true }}
       >
         <FocusController focusNodeId={focusNodeId} />
+        <FitController focusNodeId={focusNodeId} nodeCount={rfNodes.length} />
         <Background />
         <Controls className="!shadow-md" />
         <MiniMap

@@ -35,6 +35,52 @@ func (f *fakeGlueClient) GetTables(_ context.Context, in *glue.GetTablesInput, _
 	return &glue.GetTablesOutput{TableList: f.tables[aws.ToString(in.DatabaseName)]}, nil
 }
 
+// writeEnvMode declares the workspace environment mode the catalog reads.
+// The catalog lists the cloud (Glue) half in cloud mode and the local
+// (warehouse) half in local mode, per the EnvModeToggle contract — so a
+// test that wants the cloud half must say so.
+func writeEnvMode(t *testing.T, workspace, mode string) {
+	t.Helper()
+	dir := filepath.Join(workspace, ".clavesa")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir .clavesa: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "environment.json"),
+		[]byte(`{"mode":"`+mode+`"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write environment.json: %v", err)
+	}
+}
+
+// TestCatalogCloudHalfSkippedInLocalMode locks the env-gating that fixes
+// double-listing: in local mode the catalog does not list Glue (cloud)
+// tables even though a Glue client is wired and would return some. Without
+// the gate, a table that is both deployed and run locally shows twice.
+func TestCatalogCloudHalfSkippedInLocalMode(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "clavesa.json"),
+		[]byte(`{"name":"test","cloud":"aws","version":1,"catalog":"clavesa_test"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	writeEnvMode(t, workspace, "local")
+	fake := &fakeGlueClient{
+		databases: []string{"clavesa_test__cloud"},
+		tables: map[string][]gluetypes.Table{
+			"clavesa_test__cloud": {{
+				Name:       aws.String("xform__default"),
+				Parameters: map[string]string{"table_type": "ICEBERG"},
+				StorageDescriptor: &gluetypes.StorageDescriptor{
+					Location: aws.String("s3://bkt/cloud/xform__default"),
+				},
+			}},
+		},
+	}
+	h := api.NewCatalogHandler(fake).WithWorkspace(workspace)
+	res := h.Tables(context.Background())
+	if len(res.Tables) != 0 {
+		t.Fatalf("local mode must skip the Glue cloud half; got %d tables", len(res.Tables))
+	}
+}
+
 // localPipelineTF is a minimal compute = "local" pipeline that the catalog
 // walker classifies as local.
 const localPipelineTF = `variable "pipeline_name" { type = string default = "demo" }
@@ -191,6 +237,10 @@ func TestCatalogStampsCloudPipelineMeta(t *testing.T) {
 		[]byte(`{"name":"test","cloud":"aws","version":1,"catalog":"clavesa_test"}`+"\n"), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+	// The catalog reads the workspace env mode (the EnvModeToggle contract):
+	// cloud mode lists Glue, local mode lists the on-disk warehouse. This
+	// test exercises the cloud half, so declare cloud mode.
+	writeEnvMode(t, workspace, "cloud")
 	// Convention: pipeline directory name == var.pipeline_name. The walker
 	// uses the dir basename for Glue DB matching, so they must agree.
 	pipelineDir := filepath.Join(workspace, "cloud")

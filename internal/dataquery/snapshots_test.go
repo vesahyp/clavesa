@@ -1,6 +1,7 @@
 package dataquery_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -55,6 +56,62 @@ func TestSnapshotsHandlerEmptyWhenNoBackend(t *testing.T) {
 	}
 	if r.Truncated {
 		t.Error("expected truncated=false for empty result")
+	}
+}
+
+// fakeLocalProvider records whether Snapshots was invoked so the test can
+// assert the request reached this provider rather than the legacy cloud one.
+type fakeLocalProvider struct{ snapshotsCalled bool }
+
+func (p *fakeLocalProvider) NodeRuns(context.Context, observability.NodeRunsQuery) (*observability.NodeRunsResult, error) {
+	return &observability.NodeRunsResult{}, nil
+}
+func (p *fakeLocalProvider) Runs(context.Context, observability.RunsQuery) (*observability.RunsResult, error) {
+	return &observability.RunsResult{}, nil
+}
+func (p *fakeLocalProvider) Tables(context.Context, observability.TablesQuery) (*observability.TablesResult, error) {
+	return &observability.TablesResult{}, nil
+}
+func (p *fakeLocalProvider) Snapshots(context.Context, observability.SnapshotsQuery) (*observability.SnapshotsResult, error) {
+	p.snapshotsCalled = true
+	return &observability.SnapshotsResult{}, nil
+}
+func (p *fakeLocalProvider) ColumnStats(context.Context, observability.ColumnStatsQuery) (*observability.ColumnStatsResult, error) {
+	return &observability.ColumnStatsResult{}, nil
+}
+func (p *fakeLocalProvider) SampleTable(context.Context, observability.SampleTableQuery) (*observability.SampleTableResult, error) {
+	return &observability.SampleTableResult{}, nil
+}
+func (p *fakeLocalProvider) Query(context.Context, observability.QueryQuery) (*observability.QueryResult, error) {
+	return &observability.QueryResult{}, nil
+}
+func (p *fakeLocalProvider) Exec(context.Context, observability.ExecQuery) error { return nil }
+func (p *fakeLocalProvider) ExecutionStates(context.Context, observability.ExecutionStatesQuery) (*observability.ExecutionStatesResult, error) {
+	return &observability.ExecutionStatesResult{}, nil
+}
+func (p *fakeLocalProvider) ExecutionLogs(context.Context, observability.ExecutionLogsQuery) (*observability.ExecutionLogsResult, error) {
+	return &observability.ExecutionLogsResult{}, nil
+}
+
+// TestSnapshotsDirlessLocalRoutesToWorkspaceProvider — the workspace-wide
+// system tables (runs, node_runs, …) carry no `dir`, so a dir-less request
+// in a local workspace must dispatch to the workspace-level local provider
+// rather than 400ing. t.TempDir has no environment.json → defaults to local
+// mode (ModeLocal).
+func TestSnapshotsDirlessLocalRoutesToWorkspaceProvider(t *testing.T) {
+	local := &fakeLocalProvider{}
+	resolver := observability.NewResolver(t.TempDir(), nil, local)
+	h := dataquery.NewHandler(&mockS3Client{}, &mockAthenaClient{}, "out").(*dataquery.Handler).WithResolver(resolver)
+
+	req := httptest.NewRequest(http.MethodGet, "/data/tables/clavesa_ws_system__pipelines/runs/snapshots?limit=1", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if !local.snapshotsCalled {
+		t.Error("expected dir-less local request to route to the workspace-level local provider")
 	}
 }
 

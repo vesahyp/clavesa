@@ -14,10 +14,11 @@ import { useSearchParams } from "react-router-dom";
 import { useChrome } from "@/components/PageChrome";
 import { AdhocQuery } from "@/components/AdhocQuery";
 
-const DEFAULT_SQL = `-- Workspace catalog query.
--- Tables live at clavesa.<workspace>__<schema>.<table>.
--- Example: SELECT * FROM clavesa.\`information_schema\`.\`tables\` LIMIT 20;
-SHOW NAMESPACES IN clavesa`;
+const DEFAULT_SQL = `-- Workspace catalog query. Tables are addressed
+-- <catalog>__<schema>.<table>, e.g.
+--   SELECT * FROM clavesa_web_traffic__gold.fact_page_views LIMIT 20
+-- Start by listing the schemas:
+SHOW DATABASES`;
 
 export function Query() {
   // Allow ?sql=... seed via URL so the table-detail "Open in /query" link

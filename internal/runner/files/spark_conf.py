@@ -142,13 +142,37 @@ def clavesa_spark_conf(
         # is_s3 block below), so there's no Derby in the picture.
         metastore_dir = warehouse.rstrip("/") + "/_metastore"
         conf["spark.sql.catalogImplementation"] = "hive"
-        conf["spark.hadoop.javax.jdo.option.ConnectionURL"] = (
-            f"jdbc:derby:;databaseName={metastore_dir}/metastore_db;create=true"
-        )
-        # Derby writes derby.log to the JVM's cwd by default. Pin it
-        # under the warehouse so it doesn't sprinkle the user's home dir
-        # / cwd with derby.log files.
-        conf["spark.driver.extraJavaOptions"] = f"-Dderby.system.home={metastore_dir}"
+
+        metastore_addr = os.environ.get("CLAVESA_METASTORE_ADDR")
+        if metastore_addr:
+            # NETWORK metastore (shared local Derby Network Server). When
+            # CLAVESA_METASTORE_ADDR is set, connect to the per-workspace
+            # Derby Network Server as a CLIENT over JDBC instead of opening
+            # the embedded single-writer DB directly. This lets the warm
+            # query worker and on-demand pipeline-run containers run
+            # side-by-side without colliding on the embedded Derby lock —
+            # the local analog of cloud's shared Glue. The server owns
+            # derby.system.home and the DB files; clients just speak JDBC,
+            # so we do NOT set derby.system.home here. ``;create=true`` is
+            # harmless on a client connect — the server auto-creates the
+            # DB (and the Hive schema on first connect) the same as the
+            # embedded path.
+            conf["spark.hadoop.javax.jdo.option.ConnectionURL"] = (
+                f"jdbc:derby://{metastore_addr}/metastore_db;create=true"
+            )
+            conf["spark.hadoop.javax.jdo.option.ConnectionDriverName"] = (
+                "org.apache.derby.jdbc.ClientDriver"
+            )
+        else:
+            # EMBEDDED metastore (today's default — back-compat for CI /
+            # pure one-shot invocations with no metastore server running).
+            conf["spark.hadoop.javax.jdo.option.ConnectionURL"] = (
+                f"jdbc:derby:;databaseName={metastore_dir}/metastore_db;create=true"
+            )
+            # Derby writes derby.log to the JVM's cwd by default. Pin it
+            # under the warehouse so it doesn't sprinkle the user's home dir
+            # / cwd with derby.log files.
+            conf["spark.driver.extraJavaOptions"] = f"-Dderby.system.home={metastore_dir}"
 
     if is_s3:
         # Single-writer log store. clavesa is single-writer per table by

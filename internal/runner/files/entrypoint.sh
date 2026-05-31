@@ -1,5 +1,10 @@
 #!/bin/sh
-# Seven modes:
+# Eight modes:
+#   CLAVESA_METASTORE_SERVER=1 — long-lived Derby Network Server. Owns
+#                                 $CLAVESA_WAREHOUSE/_metastore/metastore_db and serves it over JDBC
+#                                 on port 1527 so the warm query worker and on-demand pipeline-run
+#                                 containers share one metastore instead of fighting over the embedded
+#                                 Derby single-writer lock (the local analog of cloud's shared Glue).
 #   CLAVESA_PREVIEW=1        — UI preview path; reads inputs from env, writes JSON to stdout.
 #   CLAVESA_RUN=1            — local pipeline-run path; reads event JSON from stdin, calls handler, writes JSON to stdout.
 #   CLAVESA_QUERY=1          — Spark-SQL query path; reads SQL from stdin (or env), writes {columns,rows} JSON to stdout.
@@ -16,7 +21,7 @@
 #   CLAVESA_RECORD_RUN=1     — local pipeline-rollup path; reads one runs-table row from stdin, appends to <pipeline>.runs.
 #                                 Driven by service.RunPipeline at end-of-run; the local twin of the cloud runs_writer Lambda.
 #   default                     — Lambda runtime; hand off to the standard bootstrap.
-if [ "$CLAVESA_PREVIEW" = "1" ] || [ "$CLAVESA_RUN" = "1" ] || [ "$CLAVESA_QUERY" = "1" ] || [ "$CLAVESA_QUERY_SERVER" = "1" ] || [ "$CLAVESA_CONNECT_SERVER" = "1" ] || [ "$CLAVESA_RECORD_RUN" = "1" ]; then
+if [ "$CLAVESA_METASTORE_SERVER" = "1" ] || [ "$CLAVESA_PREVIEW" = "1" ] || [ "$CLAVESA_RUN" = "1" ] || [ "$CLAVESA_QUERY" = "1" ] || [ "$CLAVESA_QUERY_SERVER" = "1" ] || [ "$CLAVESA_CONNECT_SERVER" = "1" ] || [ "$CLAVESA_RECORD_RUN" = "1" ]; then
     exec python /var/task/runner.py
 else
     exec /lambda-entrypoint.sh "$@"

@@ -52,6 +52,25 @@ func (r *Resolver) For(dir string) (Provider, error) {
 	return r.cloud, nil
 }
 
+// Workspace returns the workspace-level Provider for dir-less queries —
+// the workspace-wide system observability tables (runs, node_runs,
+// column_stats, tables) have no owning pipeline, so the catalog stamps
+// no `dir` on them. Selection is the same as For (purely the workspace
+// mode), minus the dir guard: local mode reads the workspace warehouse
+// directly, so a missing dir costs the local provider nothing.
+func (r *Resolver) Workspace() (Provider, error) {
+	if r.IsLocal() {
+		if r.local == nil {
+			return nil, fmt.Errorf("observability: local provider not configured")
+		}
+		return r.local, nil
+	}
+	if r.cloud == nil {
+		return nil, fmt.Errorf("observability: cloud provider unavailable (no AWS credentials)")
+	}
+	return r.cloud, nil
+}
+
 // IsLocal reports whether the workspace dispatches to the local
 // provider — true iff the environment mode is local. Used by surfaces
 // that need a local-vs-cloud decision without instantiating a provider

@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus, Save, StopCircle, Eraser, Table2 } from "lucide-react";
+import { Plus, Save, StopCircle, Eraser, Table2, Play, Loader2 } from "lucide-react";
 import { EditorView } from "@codemirror/view";
 import { toast } from "sonner";
 
@@ -51,6 +51,7 @@ export function Notebook() {
   // Map cell.id → last cell_run_id so /cancel knows which tag to interrupt.
   const runningCellRef = useRef<Map<string, string>>(new Map());
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set());
+  const [runningAll, setRunningAll] = useState(false);
   const [graduatingCell, setGraduatingCell] = useState<NotebookCell | null>(null);
   const pipelines = usePipelines();
 
@@ -106,8 +107,17 @@ export function Notebook() {
     [name, qc],
   );
 
+  // While any cell run is in flight, the server owns the notebook file: each
+  // RunCell does a full read-modify-write of the .ipynb to persist the cell's
+  // outputs. A concurrent client autosave (which also writes the whole draft)
+  // races it — under "Run all"'s rapid sequential runs that clobber can drop
+  // cells. So suppress autosave during runs; the server persists every run,
+  // and when runs finish this effect re-fires (runsInFlight in deps) to flush
+  // any pending structural/source edits.
+  const runsInFlight = runningAll || runningIds.size > 0;
   useEffect(() => {
     if (!draft) return;
+    if (runsInFlight) return;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       void persist(draft);
@@ -115,7 +125,70 @@ export function Notebook() {
     return () => {
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
     };
-  }, [draft, persist]);
+  }, [draft, persist, runsInFlight]);
+
+  const setCells = useCallback(
+    (updater: (cells: NotebookCell[]) => NotebookCell[]) => {
+      setDraft((d) => (d ? { ...d, cells: updater(d.cells) } : d));
+    },
+    [],
+  );
+
+  // Run a single cell. Returns the run status ("ok" | "error" | "cancelled")
+  // so "Run all" can halt on the first failure; a transport error returns
+  // "error" too. All side effects (draft patch, toasts, runningIds tracking)
+  // are unchanged from the single-cell Run path.
+  const runCell = useCallback(
+    async (cell: NotebookCell): Promise<string> => {
+      setRunningIds((s) => new Set(s).add(cell.id));
+      runningCellRef.current.set(cell.id, cell.id);
+      try {
+        const res = await runNotebookCell(name, cell.id);
+        // Patch our local draft with the freshly persisted cell (outputs +
+        // metadata.clavesa.*). Other cells unchanged.
+        setCells((cells) => cells.map((c) => (c.id === cell.id ? res.cell : c)));
+        // Toast non-OK statuses so the user notices even if they scrolled away.
+        if (res.result.status === "error") {
+          toast.error(`Cell errored: ${res.result.error?.ename ?? "error"}`);
+        } else if (res.result.status === "cancelled") {
+          toast.info("Cell cancelled");
+        }
+        return res.result.status;
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : String(e));
+        return "error";
+      } finally {
+        setRunningIds((s) => {
+          const next = new Set(s);
+          next.delete(cell.id);
+          return next;
+        });
+        runningCellRef.current.delete(cell.id);
+      }
+    },
+    [name, setCells],
+  );
+
+  // Run every code cell top-to-bottom, sequentially (cells share one REPL/
+  // Spark session, so they must not run concurrently). Stops on the first
+  // error, leaving downstream cells un-run — Jupyter "Run All" semantics.
+  const runAll = useCallback(async () => {
+    if (runningAll) return;
+    const codeCells = (draft?.cells ?? []).filter((c) => c.cell_type === "code");
+    setRunningAll(true);
+    try {
+      for (let i = 0; i < codeCells.length; i++) {
+        const status = await runCell(codeCells[i]);
+        if (status === "error") {
+          toast.error(`Run all stopped — cell ${i + 1} failed`);
+          return;
+        }
+      }
+      toast.success(`Ran ${codeCells.length} cell${codeCells.length === 1 ? "" : "s"}`);
+    } finally {
+      setRunningAll(false);
+    }
+  }, [draft, runCell, runningAll]);
 
   useChrome(
     useMemo(
@@ -131,6 +204,25 @@ export function Notebook() {
                 <Save className="h-3 w-3" /> Saving…
               </span>
             )}
+            <Button
+              size="sm"
+              variant="ghost"
+              title="Run every code cell top to bottom (stops on the first error)"
+              onClick={() => void runAll()}
+              disabled={runningAll || runningIds.size > 0}
+            >
+              {runningAll ? (
+                <>
+                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                  Running…
+                </>
+              ) : (
+                <>
+                  <Play className="mr-1 h-4 w-4" />
+                  Run all
+                </>
+              )}
+            </Button>
             <Button
               size="sm"
               variant={showCatalog ? "secondary" : "ghost"}
@@ -176,7 +268,7 @@ export function Notebook() {
           </div>
         ),
       }),
-      [name, saving, showCatalog],
+      [name, saving, showCatalog, runAll, runningAll, runningIds.size],
     ),
   );
 
@@ -206,38 +298,6 @@ export function Notebook() {
         </Button>
       </div>
     );
-  }
-
-  function setCells(updater: (cells: NotebookCell[]) => NotebookCell[]) {
-    setDraft((d) => (d ? { ...d, cells: updater(d.cells) } : d));
-  }
-
-  async function runCell(cell: NotebookCell) {
-    setRunningIds((s) => new Set(s).add(cell.id));
-    runningCellRef.current.set(cell.id, cell.id);
-    try {
-      const res = await runNotebookCell(name, cell.id);
-      // Patch our local draft with the freshly persisted cell (outputs +
-      // metadata.clavesa.*). Other cells unchanged.
-      setCells((cells) =>
-        cells.map((c) => (c.id === cell.id ? res.cell : c)),
-      );
-      // Toast non-OK statuses so the user notices even if they scrolled away.
-      if (res.result.status === "error") {
-        toast.error(`Cell errored: ${res.result.error?.ename ?? "error"}`);
-      } else if (res.result.status === "cancelled") {
-        toast.info("Cell cancelled");
-      }
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRunningIds((s) => {
-        const next = new Set(s);
-        next.delete(cell.id);
-        return next;
-      });
-      runningCellRef.current.delete(cell.id);
-    }
   }
 
   async function cancelCell(cell: NotebookCell) {

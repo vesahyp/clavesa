@@ -139,6 +139,60 @@ func TestResolverMissingLocal(t *testing.T) {
 	}
 }
 
+func TestResolverWorkspace(t *testing.T) {
+	cloud := &stubProvider{tag: "cloud"}
+	local := &stubProvider{tag: "local"}
+
+	tests := []struct {
+		name string
+		mode workspace.Mode // "" = no environment.json → defaults to local
+		want string
+	}{
+		{"default mode (absent file) → local", "", "local"},
+		{"mode local → local", workspace.ModeLocal, "local"},
+		{"mode cloud → cloud", workspace.ModeCloud, "cloud"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.mode != "" {
+				if err := workspace.WriteEnvironmentMode(dir, tt.mode); err != nil {
+					t.Fatalf("write mode: %v", err)
+				}
+			}
+			r := observability.NewResolver(dir, cloud, local)
+
+			p, err := r.Workspace()
+			if err != nil {
+				t.Fatalf("resolver.Workspace: %v", err)
+			}
+			if got := p.(*stubProvider).tag; got != tt.want {
+				t.Errorf("dispatched %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolverWorkspaceMissingProvider(t *testing.T) {
+	// Local mode with no local provider → typed "not configured" error.
+	localDir := t.TempDir()
+	rLocal := observability.NewResolver(localDir, &stubProvider{}, nil)
+	if _, err := rLocal.Workspace(); err == nil {
+		t.Error("expected error when local provider unconfigured for local workspace")
+	}
+
+	// Cloud mode with no cloud provider → typed "unavailable" error.
+	cloudDir := t.TempDir()
+	if err := workspace.WriteEnvironmentMode(cloudDir, workspace.ModeCloud); err != nil {
+		t.Fatalf("write mode: %v", err)
+	}
+	rCloud := observability.NewResolver(cloudDir, nil, &stubProvider{})
+	if _, err := rCloud.Workspace(); err == nil {
+		t.Error("expected error when cloud provider unavailable for cloud workspace")
+	}
+}
+
 func TestResolverIsLocal(t *testing.T) {
 	tests := []struct {
 		name string

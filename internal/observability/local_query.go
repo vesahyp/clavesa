@@ -61,14 +61,25 @@ func (p *LocalProvider) runQueryFor(ctx context.Context, pipelineRef, sql string
 // runner image with CLAVESA_QUERY=1, reads JSON from stdout.
 type dockerQueryRunner struct {
 	image string
+	// workspaceRoot is kept so Run can join the shared-metastore docker
+	// network. A one-shot CLI query is a hive→Derby client too; pointing
+	// it at the metastore server (when one is up) lets it run alongside a
+	// concurrent `pipeline run` without colliding on the embedded lock.
+	workspaceRoot string
+	// workspaceName is the metastore image-resolution key for
+	// EnsureMetastore. Empty falls back to the empty-name image, same as
+	// the `image` field's fallback above.
+	workspaceName string
 }
 
 func newDockerQueryRunner(workspaceRoot string) *dockerQueryRunner {
 	image := runner.LocalImageName("") + ":latest"
+	name := ""
 	if m, _ := workspace.Load(workspaceRoot); m != nil {
 		image = runner.LocalImageName(m.Name) + ":latest"
+		name = m.Name
 	}
-	return &dockerQueryRunner{image: image}
+	return &dockerQueryRunner{image: image, workspaceRoot: workspaceRoot, workspaceName: name}
 }
 
 func (d *dockerQueryRunner) Run(ctx context.Context, warehouse, sql string) (*QueryRunnerResult, error) {
@@ -79,6 +90,17 @@ func (d *dockerQueryRunner) Run(ctx context.Context, warehouse, sql string) (*Qu
 	args := []string{"run", "--rm", "-i"}
 	args = append(args, "-e", "CLAVESA_QUERY=1")
 	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	// Shared local Derby metastore — see local_query_warm.go for the full
+	// rationale. Best-effort: on Ensure failure log and fall back to the
+	// container's embedded Derby (safe, since no server is then serving).
+	if d.workspaceRoot != "" {
+		if addr, err := EnsureMetastore(ctx, d.workspaceRoot, d.workspaceName); err != nil {
+			fmt.Fprintf(os.Stderr, "clavesa: query falling back to embedded metastore (shared metastore unavailable): %v\n", err)
+		} else {
+			args = append(args, "--network", metastoreNetworkName(d.workspaceRoot))
+			args = append(args, "-e", "CLAVESA_METASTORE_ADDR="+addr)
+		}
+	}
 	args = append(args, "-v", warehouse+":"+warehouse)
 	args = append(args, d.image)
 

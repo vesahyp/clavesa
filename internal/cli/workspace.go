@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/api"
@@ -361,12 +362,21 @@ CLI twin of the Catalog page's ?catalog=&schema= view:
 			// Glue client is best-effort: a workspace with only
 			// compute=local pipelines (or no AWS creds) still has tables
 			// worth listing. Mirrors the UI handler's nil-Glue degradation.
+			// The S3 client (built from the same config) lets the cloud half
+			// read each Delta table's real schema from its `_delta_log/` —
+			// Glue only carries a stub `col array<string>` for Delta tables.
 			var glueClient api.GlueClient
+			var s3Client api.S3API
 			if cfg, cfgErr := config.LoadDefaultConfig(ctx); cfgErr == nil {
 				glueClient = glue.NewFromConfig(cfg)
+				s3Client = s3.NewFromConfig(cfg)
 			}
 
-			resp := api.NewCatalogHandler(glueClient).WithWorkspace(root).Tables(ctx)
+			catalogHandler := api.NewCatalogHandler(glueClient).WithWorkspace(root)
+			if s3Client != nil {
+				catalogHandler = catalogHandler.WithS3(s3Client)
+			}
+			resp := catalogHandler.Tables(ctx)
 			// ADR-016: a Glue DB name encodes <catalog>__<schema>.
 			// --catalog / --schema filter on those pieces.
 			if catalogFilter != "" || schemaFilter != "" {

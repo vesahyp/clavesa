@@ -11,6 +11,18 @@ import { z } from "zod";
 
 import { request, BASE_URL } from "@/api/client";
 
+// isQueryableIdentifier mirrors the server's database/table validation
+// (`[A-Za-z_][A-Za-z0-9_]*`). The Delta/Spark per-table endpoints
+// (snapshots, column-stats, sample) reject anything else with a 400, so a
+// stray Glue/warehouse table with a dot or dash in its name (e.g. a manual
+// `foo.backup_20260530`) would otherwise spew console errors from every
+// catalog row that probes it. Gate those queries off when the name can't be
+// addressed rather than firing a request the server is guaranteed to reject.
+const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+function isQueryableIdentifier(database: string, table: string): boolean {
+  return IDENTIFIER_RE.test(database) && IDENTIFIER_RE.test(table);
+}
+
 // ---------------------------------------------------------------------------
 // Schemas (boundary-of-trust for API responses)
 // ---------------------------------------------------------------------------
@@ -139,10 +151,14 @@ export function useTableSample(
   // metadata lands. Without this gate the first render fires a cloud-path
   // request that 500s, then refires with `dir` once available — the user
   // sees an "Query failed" flash.
-  const enabled = (opts.enabled ?? true) && Boolean(database && table);
+  const enabled =
+    (opts.enabled ?? true) &&
+    Boolean(database && table) &&
+    isQueryableIdentifier(database, table);
   return useQuery({
     queryKey: ["table", database, table, "sample", limit, dir],
     enabled,
+    meta: { spark: true },
     queryFn: async () => {
       const params = new URLSearchParams({
         catalog_db: database,
@@ -177,7 +193,8 @@ export function useTableSnapshots(
   const dir = opts.dir ?? "";
   return useQuery({
     queryKey: ["table", database, table, "snapshots", limit, dir],
-    enabled: Boolean(database && table),
+    enabled: Boolean(database && table) && isQueryableIdentifier(database, table),
+    meta: { spark: true },
     // Snapshot queries hit Athena — don't refetch aggressively.
     staleTime: 60_000,
     retry: false,
@@ -245,7 +262,8 @@ export function useColumnStats(
   const dir = opts.dir ?? "";
   return useQuery({
     queryKey: ["table", database, table, "column-stats", dir],
-    enabled: Boolean(database && table),
+    enabled: Boolean(database && table) && isQueryableIdentifier(database, table),
+    meta: { spark: true },
     staleTime: 60_000,
     retry: false,
     queryFn: async () => {
@@ -1425,6 +1443,7 @@ export function useDashboardQuery(
   return useQuery({
     queryKey: ["dashboards", "query", dir, sql, paramsKey],
     enabled: Boolean(sql) && Boolean(dir),
+    meta: { spark: true },
     staleTime: 5 * 60_000,
     retry: false,
     queryFn: () => runDashboardQuery(dir, sql, params),

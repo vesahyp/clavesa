@@ -46,20 +46,28 @@ func Validate(g graph.PipelineGraph) []graph.ValidationMessage {
 		}
 	}
 
-	// DISCONNECTED_NODE — any node with no incoming or outgoing edges.
+	// DISCONNECTED_NODE — a node wired to nothing in the data flow. A
+	// node-to-node edge counts, and so does an external input: a transform
+	// that reads a workspace source (source_inputs, ADR-017) or a
+	// cross-pipeline / external table (external_inputs, ADR-016 slice 2)
+	// is fed real data even though that reference is not an edge between
+	// two nodes in THIS pipeline's graph. Without the external-input check,
+	// every terminal star-schema dim that reads `<schema>.<table>` from an
+	// upstream pipeline gets falsely flagged.
 	connected := make(map[string]bool)
 	for _, e := range g.Edges {
 		connected[e.FromNode] = true
 		connected[e.ToNode] = true
 	}
 	for _, n := range g.Nodes {
-		if !connected[n.ID] {
-			msgs = append(msgs, graph.ValidationMessage{
-				Code:    graph.CodeDisconnectedNode,
-				Message: fmt.Sprintf("node %q has no edges", n.ID),
-				Nodes:   []string{n.ID},
-			})
+		if connected[n.ID] || hasExternalInputs(n) {
+			continue
 		}
+		msgs = append(msgs, graph.ValidationMessage{
+			Code:    graph.CodeDisconnectedNode,
+			Message: fmt.Sprintf("node %q has no edges", n.ID),
+			Nodes:   []string{n.ID},
+		})
 	}
 
 	// CYCLE_DETECTED — DFS
@@ -72,6 +80,21 @@ func Validate(g graph.PipelineGraph) []graph.ValidationMessage {
 	}
 
 	return msgs
+}
+
+// hasExternalInputs reports whether a node reads from a workspace source
+// (source_inputs, ADR-017) or a cross-pipeline / external table
+// (external_inputs, ADR-016 slice 2). The parser stows these references in
+// Config under those synthetic keys because they are not node-to-node
+// edges. A node fed only by them is connected to the data flow, so it must
+// not be flagged DISCONNECTED_NODE.
+func hasExternalInputs(n graph.Node) bool {
+	for _, key := range []string{"source_inputs", "external_inputs"} {
+		if m, ok := n.Config[key].(map[string]interface{}); ok && len(m) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // detectCycles returns the set of node IDs involved in cycles using iterative DFS.

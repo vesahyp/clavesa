@@ -33,3 +33,6 @@ Each ADR follows this structure:
 | [016](016-catalog-schema-namespace.md) | Three-level catalog / schema / table namespace | Accepted |
 | [017](017-workspace-source-registry.md) | Workspace source registry (External Locations) | Accepted |
 | [018](018-delta-table-format.md) | Delta Lake as the table format (supersedes 013) | Accepted (v2.0.0 cutover) |
+| [019](019-three-level-namespace-native.md) | Native three-level namespace | Superseded before shipping (see 020) |
+| [020](020-three-level-display-normalization.md) | Three-level display normalization | Accepted (co-exists with 016) |
+| [021](021-dashboards-as-iac.md) | Dashboards as IaC (workspace dashboard registry) | Accepted |

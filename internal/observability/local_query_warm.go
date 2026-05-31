@@ -119,6 +119,17 @@ func (p *persistentDockerQueryRunner) resolveImage() string {
 	return runner.LocalImageName("") + ":latest"
 }
 
+// metastoreWorkspaceName resolves the workspace name EnsureMetastore needs
+// to pick the runner image the metastore container reuses. Empty when the
+// manifest isn't readable yet — EnsureMetastore then falls back to the
+// empty-name image, matching resolveImage's own fallback.
+func (p *persistentDockerQueryRunner) metastoreWorkspaceName() string {
+	if m, _ := workspace.Load(p.workspaceRoot); m != nil {
+		return m.Name
+	}
+	return ""
+}
+
 // ParseError is returned by Parse when the warm worker's SQL parser
 // rejected the input. The Message is the parser's pointer-into-SQL
 // hint — surface it directly to the user. Transport/runner failures
@@ -424,6 +435,27 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		args = append(args, "-e", "CLAVESA_CATALOG="+m.CatalogIdentifier())
 		args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+m.SystemCatalogIdentifier())
 	}
+	// Shared local Derby metastore (the local analog of cloud's shared
+	// Glue). EnsureMetastore brings up (or reuses) the per-workspace Derby
+	// Network Server container; on success the warm worker connects to it
+	// over JDBC (CLAVESA_METASTORE_ADDR) on the shared docker network,
+	// rather than opening the embedded single-writer DB. That is what lets
+	// this warm worker keep serving interactive queries while an on-demand
+	// `pipeline run` container is writing to the same warehouse, without
+	// either side colliding on the embedded Derby lock. Best-effort: on any
+	// failure we log and fall back to embedded Derby (safe precisely
+	// because no server is then serving the DB).
+	if addr, err := EnsureMetastore(ctx, p.workspaceRoot, p.metastoreWorkspaceName()); err != nil {
+		fmt.Fprintf(os.Stderr, "clavesa: warm worker falling back to embedded metastore (shared metastore unavailable): %v\n", err)
+	} else {
+		args = append(args, "--network", metastoreNetworkName(p.workspaceRoot))
+		args = append(args, "-e", "CLAVESA_METASTORE_ADDR="+addr)
+	}
+	// No explicit `--memory` / Spark driver heap is set here: the warm
+	// worker serves small interactive result sets, and now that the shared
+	// metastore lets it coexist with a `pipeline run` container we rely on
+	// the Docker Desktop memory budget rather than a per-container cap.
+	// Adding a cap would be a new knob with no current symptom to fix.
 	args = append(args, "-v", warehouse+":"+warehouse, p.resolveImage())
 
 	// Docker Desktop intermittently accepts a `-p` publish request but never

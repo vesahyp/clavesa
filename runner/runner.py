@@ -168,6 +168,11 @@ class _ProgressPoller(threading.Thread):
 # sessions can coexist in the same process (one py4j driver hosting the
 # plugin, one Connect client talking to it over localhost gRPC).
 _CONNECT = None
+# Spark Connect session id for the warm worker's client session. Starts as a
+# stable UUID; rotated to a fresh one by _reset_connect_session after a session
+# is closed, because Spark Connect tombstones a reaped session id (reconnecting
+# with the same id fails again with SESSION_CLOSED).
+_CONNECT_SESSION_ID = None
 
 
 def _spark():
@@ -3194,6 +3199,21 @@ def _start_connect_plugin() -> None:
         .master(spark_master())
         .config("spark.plugins", "org.apache.spark.sql.connect.SparkConnectPlugin")
         .config("spark.connect.grpc.binding.port", port)
+        # The warm worker (CLAVESA_QUERY_SERVER=1) lives for hours or days and
+        # holds a single long-lived Connect session that may sit idle between
+        # dashboard reads. Spark Connect's session manager GCs sessions with no
+        # incoming RPC after this timeout (default 60m in Spark 4.0), which
+        # invalidates our cached client handle → [INVALID_HANDLE.SESSION_CLOSED]
+        # on the next /query. Push the timeout out to several days so a warm but
+        # idle session is not reaped during normal use. The recover-once retry in
+        # _query_to_payload is the backstop if it is reaped anyway. Key/units
+        # verified against Spark 4.0 (pyspark[connect]==4.0.2): the value is a
+        # time string, default "60m". Overridable via CLAVESA_CONNECT_SESSION_TIMEOUT
+        # (used to force a short reap when exercising the recover-once path).
+        .config(
+            "spark.connect.session.manager.defaultSessionTimeout",
+            os.environ.get("CLAVESA_CONNECT_SESSION_TIMEOUT", "7d"),
+        )
     )
     for k, v in clavesa_spark_conf().items():
         builder = builder.config(k, v)
@@ -3210,29 +3230,88 @@ def _start_connect_plugin() -> None:
 def _connect_session():
     """Lazy Spark Connect client session, pinned to the in-container plugin.
 
-    Each call returns the same module-level session. session_id is a
-    stable UUID derived from the literal "_clavesa_catalog" (Spark Connect
-    requires UUID format) so reconnects after a Connect-server respawn hit
-    the same logical session and notebook REPLs (Slice 1) can rely on
-    catalog state being disjoint from theirs.
+    Each call returns the same module-level session. The session_id starts as
+    a stable UUID derived from the literal "_clavesa_catalog" (Spark Connect
+    requires UUID format), disjoint from notebook REPL ids (Slice 1). It is
+    NOT reused after a close: _reset_connect_session rotates it to a fresh
+    UUID, because Spark Connect tombstones a reaped session id and rebuilding
+    with the same id just fails again with SESSION_CLOSED.
     """
-    global _CONNECT
+    global _CONNECT, _CONNECT_SESSION_ID
     if _CONNECT is None:
         import uuid  # noqa: PLC0415
         from pyspark.sql.connect.session import SparkSession  # noqa: PLC0415
 
         port = os.environ.get("CLAVESA_CONNECT_PORT", "15002")
-        session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, "_clavesa_catalog"))
+        if _CONNECT_SESSION_ID is None:
+            _CONNECT_SESSION_ID = str(uuid.uuid5(uuid.NAMESPACE_OID, "_clavesa_catalog"))
         _CONNECT = (
             SparkSession.builder
-            .remote(f"sc://localhost:{port}/;session_id={session_id}")
+            .remote(f"sc://localhost:{port}/;session_id={_CONNECT_SESSION_ID}")
             .getOrCreate()
         )
     return _CONNECT
 
 
+def _reset_connect_session() -> None:
+    """Drop the cached Connect client so the next _connect_session() rebuilds it.
+
+    Best-effort stop of the stale handle first (it may already be dead), then
+    clear the module global AND rotate the session id. The rotation is the
+    load-bearing part: Spark Connect tombstones a reaped/closed session id, so
+    the next _connect_session() must connect with a FRESH id to get a clean
+    session — reusing the old id fails again with SESSION_CLOSED. A fresh UUID
+    stays disjoint from notebook REPL ids."""
+    global _CONNECT, _CONNECT_SESSION_ID
+    import uuid  # noqa: PLC0415
+
+    old = _CONNECT
+    _CONNECT = None
+    _CONNECT_SESSION_ID = str(uuid.uuid4())
+    if old is not None:
+        try:
+            old.stop()
+        except Exception:  # noqa: BLE001 — stale handle; nothing useful to do
+            pass
+
+
+def _is_session_closed(exc: BaseException) -> bool:
+    """True when the exception signals a GC'd / invalid Spark Connect session.
+
+    Spark Connect raises SparkConnectException / SparkSQLException whose message
+    carries the server-side error class. We match on the message text rather
+    than the exception type to stay robust across Spark versions. The real
+    message is:
+        (org.apache.spark.SparkSQLException) [INVALID_HANDLE.SESSION_CLOSED]
+        The handle ... is invalid. Session was closed."""
+    msg = str(exc).lower()
+    return (
+        "invalid_handle" in msg
+        or "session_closed" in msg
+        or "session was closed" in msg
+    )
+
+
 def _query_to_payload(sql: str) -> dict:
-    """Run one SparkSQL statement via Connect, return the warm-worker shape."""
+    """Run one SparkSQL statement via Connect, return the warm-worker shape.
+
+    If the first attempt fails because the cached Connect session was GC'd
+    server-side (idle-session reaping), reset and rebuild the session and retry
+    ONCE. Any non-session error — and a second failure of the same kind —
+    propagates to the caller, which returns it in the error envelope."""
+    try:
+        return _run_query(sql)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_session_closed(exc):
+            raise
+        # Cached handle points at a reaped session. Rebuild and retry once.
+        _reset_connect_session()
+        _connect_session()
+        return _run_query(sql)
+
+
+def _run_query(sql: str) -> dict:
+    """Single Connect round-trip → warm-worker payload shape. No retry."""
     df = _connect_session().sql(sql)
     columns = list(df.columns)
     column_types = [f.dataType.simpleString() for f in df.schema.fields]
@@ -3240,6 +3319,21 @@ def _query_to_payload(sql: str) -> dict:
     records = json.loads(pdf.to_json(orient="records", date_format="iso"))
     rows = [[r.get(c) for c in columns] for r in records]
     return {"columns": columns, "column_types": column_types, "rows": rows}
+
+
+def _connect_select1() -> None:
+    """`SELECT 1` round-trip through Connect with the same recover-once retry.
+
+    Used by the startup warmup and the /healthz probe so a session reaped while
+    the worker sat idle self-heals instead of wedging the worker — /healthz then
+    reflects true health (200) after recovery rather than 503-flapping."""
+    try:
+        _connect_session().sql("SELECT 1").collect()
+    except Exception as exc:  # noqa: BLE001
+        if not _is_session_closed(exc):
+            raise
+        _reset_connect_session()
+        _connect_session().sql("SELECT 1").collect()
 
 
 def _parse_sql(sql: str) -> dict:
@@ -3311,8 +3405,9 @@ def run_query_server() -> None:
     # process holds the SparkSession.
     _start_connect_plugin()
     # Force the Connect client to connect now so /healthz returning 200
-    # implies the next /query won't pay any handshake cost.
-    _connect_session().sql("SELECT 1").collect()
+    # implies the next /query won't pay any handshake cost. Recover-once in
+    # case the session was reaped between plugin start and first probe.
+    _connect_select1()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -3322,7 +3417,7 @@ def run_query_server() -> None:
                 # Without this probe Go never evicts because the HTTP socket
                 # stays open.
                 try:
-                    _connect_session().sql("SELECT 1").collect()
+                    _connect_select1()
                 except Exception as exc:  # noqa: BLE001
                     self._json(503, {"error": f"spark connect dead: {exc}"})
                     return
@@ -3428,7 +3523,79 @@ def run_connect_server() -> None:
     signal.pause()  # block until SIGTERM/SIGINT — clean `docker stop`
 
 
-if os.environ.get("CLAVESA_PREVIEW") == "1":
+# ---------------------------------------------------------------------------
+# Metastore-server mode (CLAVESA_METASTORE_SERVER=1) — long-lived Derby
+# Network Server, the shared local metastore (the local analog of Glue).
+# ---------------------------------------------------------------------------
+
+
+def run_metastore_server() -> None:
+    """CLAVESA_METASTORE_SERVER=1 mode — launch the Derby Network Server.
+
+    Owns ``$CLAVESA_WAREHOUSE/_metastore/metastore_db`` and serves it over
+    JDBC on port 1527 so multiple local Spark processes (the warm query
+    worker, on-demand pipeline-run containers, preview, one-shot query,
+    notebooks) connect as CLIENTS via ``jdbc:derby://<addr>/metastore_db``
+    instead of contending for embedded Derby's single-writer lock. This is
+    the local twin of cloud's shared Glue Data Catalog.
+
+    Long-lived: exec's the JVM Network Server, which blocks accepting
+    connections until ``docker stop`` (SIGTERM) tears it down. Derby's
+    ``started and ready to accept connections`` readiness line goes to
+    stdout (NOT suppressed) so the Go side can poll ``docker logs`` for it
+    before pointing clients at the server.
+
+    The derby + derbyshared engine jars and the derbynet network-server jar
+    all live in ``$SPARK_HOME/jars`` (download_jars.sh). We resolve the full
+    classpath from that directory so the launch picks up whatever Derby the
+    image ships without hardcoding versioned filenames.
+    """
+    warehouse = os.environ.get("CLAVESA_WAREHOUSE", "/tmp/clavesa-warehouse")
+    metastore_dir = warehouse.rstrip("/") + "/_metastore"
+    os.makedirs(metastore_dir, exist_ok=True)
+
+    port = os.environ.get("CLAVESA_METASTORE_PORT", "1527")
+
+    spark_home = os.environ.get(
+        "SPARK_HOME", "/var/lang/lib/python3.12/site-packages/pyspark"
+    )
+    jars_dir = os.path.join(spark_home, "jars")
+    # Whole jars dir on the classpath — the Derby Network Server only needs
+    # derby/derbyshared/derbynet, but globbing the dir keeps this resilient
+    # to version bumps and is identical to how Spark itself loads them.
+    classpath = os.path.join(jars_dir, "*")
+
+    cmd = [
+        "java",
+        "-cp",
+        classpath,
+        f"-Dderby.system.home={metastore_dir}",
+        "org.apache.derby.drda.NetworkServerControl",
+        "start",
+        "-h",
+        "0.0.0.0",
+        "-p",
+        port,
+        "-noSecurityManager",
+    ]
+    print(
+        f"clavesa metastore server: derby.system.home={metastore_dir} "
+        f"listening on 0.0.0.0:{port}",
+        flush=True,
+    )
+    # exec replaces this Python process so SIGTERM from `docker stop` reaches
+    # the JVM directly and Derby's stdout readiness line is the container's
+    # stdout (no buffering layer in between).
+    os.execvp(cmd[0], cmd)
+
+
+if os.environ.get("CLAVESA_METASTORE_SERVER") == "1":
+    try:
+        run_metastore_server()
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+        sys.exit(1)
+elif os.environ.get("CLAVESA_PREVIEW") == "1":
     try:
         run_preview()
     except Exception as exc:  # noqa: BLE001

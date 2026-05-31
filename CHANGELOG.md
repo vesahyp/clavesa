@@ -12,6 +12,31 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.5.0] — 2026-05-31
+
+### Added
+
+- Notebooks have a "Run all" action that runs every code cell top to bottom, sequentially (cells share one Spark session), stopping on the first error. To avoid clobbering the notebook file, the client no longer autosaves while a cell run is in flight: each run is persisted server-side, so a concurrent client autosave during rapid "Run all" execution could otherwise race the server's per-cell write and drop cells. Autosave resumes once runs finish.
+- In-flight Spark query feedback in the local UI. While a Spark-backed query runs, the header shows "Spark · running query…" (it previously only reflected worker boot state), the table-detail Columns card shows "querying…" with a spinner, and each column's null % / examples render a loading skeleton instead of a bare "—" — so a pending query reads as loading, not as missing data. Driven entirely client-side from the in-flight query state; "—" now unambiguously means "no data".
+- Local querying and pipeline runs now run side-by-side. A shared per-workspace Derby metastore service (the local analog of cloud's Glue) lets the UI's warm Spark query worker keep serving the Catalog, table previews, and `/query` while an on-demand `pipeline run` executes against the same warehouse, and lets a CLI `clavesa pipeline run` run while `clavesa ui` is open. Previously these collided on the single-writer embedded Derby lock and one side failed with `Unable to instantiate SessionHiveMetaStoreClient`. The metastore container is brought up automatically; no configuration needed.
+
+### Changed
+
+- Dashboards are now workspace-level IaC: each definition is a JSON file under `.clavesa/dashboards/<slug>.json`, read directly and version-controlled alongside pipelines and sources (ADR-021). Create/edit now works identically in local and cloud mode (the prior system Delta table could not be written through Athena), survives a warehouse rebuild, and loads hand-authored `*.json` dashboards. Existing dashboards in `.clavesa/dashboards.imported/` or a workspace-root `dashboards/` directory migrate into the registry automatically on first read. Widget SQL still runs through the active engine (local Spark / cloud Athena), unchanged.
+
+### Fixed
+
+- The local warm Spark worker no longer breaks after a long idle. Spark Connect garbage-collects an idle session (default 60m) and the worker cached the session handle forever, so the first query after a few hours failed with `[INVALID_HANDLE.SESSION_CLOSED]` and stayed broken until the worker was restarted. The idle-session timeout is now pushed out to 7 days, and if a session is closed anyway the worker rotates to a fresh session id and retries once (a reaped session id is tombstoned, so reusing it fails again). Queries self-heal transparently.
+- The `/query` editor's default query no longer errors on load. It seeded `SHOW NAMESPACES IN clavesa`, but there is no catalog named `clavesa` (tables are addressed `<catalog>__<schema>.<table>` under the default catalog), so it failed with `SCHEMA_NOT_FOUND`. The default is now `SHOW DATABASES`, valid on both the local Spark and cloud Athena engines.
+- Catalog no longer double-lists tables that are both deployed and run locally. It now reads only the active environment's world (the Local/Cloud toggle): local mode lists the on-disk warehouse, cloud mode lists Glue. As a bonus, local mode no longer pays the Glue + Delta-log enrichment for cloud tables you weren't viewing.
+- Catalog and table-detail no longer spew console errors for a table whose name is not a clean identifier (e.g. a manual `foo.backup_20260530` with a dot). The snapshot, column-stats, and sample queries are skipped for such names instead of firing requests the server rejects with a 400.
+- `clavesa ui` now self-heals a missing workspace runner image. If the local `<workspace>/transform-runner:latest` tag is gone (pruned, or only a versioned tag survived a fresh checkout), the warm Spark worker used to fail with a cryptic "pull access denied" and every Spark-backed surface (table preview, `/query`, column profiles) silently errored. Startup now retags the image from the dev/embedded source the same way `workspace init` does, in the background, and prints a clear actionable message if it cannot.
+- Pipeline DAG now frames the whole graph on load. A wide fan-out (e.g. a star schema with many dimensions reading one source) no longer spills off-canvas clipped at the top and bottom; the view re-fits once node sizes are measured and can zoom out far enough to show every node.
+- Terminal star-schema dimensions no longer raise false "node has no edges" warnings. A transform fed only by a workspace source or a cross-pipeline table is connected to the data flow even though that reference is not an edge between two nodes in its own pipeline.
+- Workspace-wide system tables (`runs`, `node_runs`, `column_stats`, `tables`) no longer 400 on their snapshot timeline in a local workspace. They have no owning pipeline, so they carry no `dir`; the data endpoints now dispatch dir-less requests to the workspace-level local provider instead of rejecting them. Removes a batch of console errors on the Catalog page in local mode.
+- Catalog and table-detail pages load fast again. The per-table Delta-log schema reads are now cached (5-minute TTL), so repeat catalog loads drop from ~14s to under a second. The table-detail page no longer blocks its Columns card on the whole-catalog query — it renders the schema from the table's own sample as soon as the fast pipelines list resolves, which also fixes the Columns card spinning forever on tables without a column profile.
+- Cloud Catalog now shows each Delta table's real schema instead of a single `col array<string>` stub. Glue records Delta tables with a placeholder schema (the real one lives in the Delta log), so the catalog list, the table-detail Columns card, and the editor node cards all mis-reported every cloud table as one column. The catalog now reads the schema from each table's `_delta_log/` on S3, matching the local path (ADR-014). Tables are also correctly badged `DELTA`, which lights up the format and commit-count columns that were blank.
+
 ## [v2.4.0] — 2026-05-30
 
 ### Added

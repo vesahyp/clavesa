@@ -189,9 +189,11 @@ func TestValidateDashboard(t *testing.T) {
 	}
 }
 
-func TestSaveDashboardEmitsMerge(t *testing.T) {
-	f := &fakeProvider{}
-	s := dashService(t, f)
+// TestSaveGetDeleteDashboardFile exercises the file-backed CRUD round-trip
+// (ADR-021). No Provider and no Docker — definition storage is the
+// filesystem; only RenderDashboard touches a Provider.
+func TestSaveGetDeleteDashboardFile(t *testing.T) {
+	s := dashService(t, &fakeProvider{})
 	d := Dashboard{
 		Slug:     "revenue",
 		Title:    "Revenue",
@@ -199,61 +201,71 @@ func TestSaveDashboardEmitsMerge(t *testing.T) {
 		Widgets: []DashboardWidget{
 			{ID: "w1", Type: "table", Dataset: "rev", Layout: DashboardWidgetLayout{W: 6, H: 4}},
 		},
-	}
-	// GetDashboard (the read-back) needs a row to parse.
-	f.queryRes = &observability.QueryResult{
-		Columns: []observability.SampleTableColumn{{Name: "slug"}, {Name: "title"}, {Name: "spec"}, {Name: "updated_at"}},
-		Rows: [][]string{{
-			"revenue", "Revenue",
-			`{"datasets":[{"name":"rev","dir":"demo","sql":"SELECT 1"}],"widgets":[{"id":"w1","type":"table","title":"","dataset":"rev","layout":{"x":0,"y":0,"w":6,"h":4}}]}`,
-			"2026-05-19 00:00:00",
-		}},
+		Controls: []DashboardControl{{Name: "tr", Type: "time_range", Default: "last_7d"}},
 	}
 	got, err := s.SaveDashboard(context.Background(), d)
 	if err != nil {
 		t.Fatalf("SaveDashboard: %v", err)
 	}
-	if got.Slug != "revenue" || len(got.Datasets) != 1 || len(got.Widgets) != 1 {
+	if got.Slug != "revenue" || len(got.Datasets) != 1 || len(got.Widgets) != 1 || len(got.Controls) != 1 {
 		t.Fatalf("read-back mismatch: %+v", got)
 	}
 
-	var sawCreate, sawMerge bool
-	for _, q := range f.execSQLs {
-		if strings.HasPrefix(q, "CREATE TABLE IF NOT EXISTS") {
-			sawCreate = true
-		}
-		if strings.HasPrefix(q, "MERGE INTO") && strings.Contains(q, "'revenue'") {
-			sawMerge = true
-		}
+	// The definition landed in the registry directory as a file.
+	file := filepath.Join(s.workspace, ".clavesa", "dashboards", "revenue.json")
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("expected dashboard file at %s: %v", file, err)
 	}
-	if !sawCreate {
-		t.Errorf("expected a CREATE TABLE statement, got: %v", f.execSQLs)
+
+	// List shows it.
+	list, err := s.ListDashboards(context.Background())
+	if err != nil || len(list) != 1 || list[0].Slug != "revenue" {
+		t.Fatalf("ListDashboards = %+v / %v", list, err)
 	}
-	if !sawMerge {
-		t.Errorf("expected a MERGE INTO with the slug, got: %v", f.execSQLs)
+
+	// Get reads it back with full shape.
+	rt, err := s.GetDashboard(context.Background(), "revenue")
+	if err != nil {
+		t.Fatalf("GetDashboard: %v", err)
+	}
+	if rt.Title != "Revenue" || rt.Datasets[0].SQL != "SELECT 1" || rt.Controls[0].Name != "tr" {
+		t.Fatalf("GetDashboard round-trip mismatch: %+v", rt)
+	}
+
+	// Delete removes it.
+	if err := s.DeleteDashboard(context.Background(), "revenue"); err != nil {
+		t.Fatalf("DeleteDashboard: %v", err)
+	}
+	if _, err := s.GetDashboard(context.Background(), "revenue"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Get after Delete = %v, want os.ErrNotExist", err)
 	}
 }
 
 func TestSaveDashboardRejectsInvalid(t *testing.T) {
-	f := &fakeProvider{}
-	s := dashService(t, f)
+	s := dashService(t, &fakeProvider{})
 	_, err := s.SaveDashboard(context.Background(), Dashboard{Slug: "Bad Slug"})
 	if err == nil {
 		t.Fatal("expected an invalid dashboard to be rejected before any write")
 	}
-	if len(f.execSQLs) != 0 {
-		t.Errorf("validation should fail before touching the provider, got: %v", f.execSQLs)
+	// Nothing should have been written to the registry.
+	if list, _ := s.ListDashboards(context.Background()); len(list) != 0 {
+		t.Errorf("validation should fail before writing a file, got: %+v", list)
 	}
 }
 
 func TestListDashboards(t *testing.T) {
-	f := &fakeProvider{
-		queryRes: &observability.QueryResult{
-			Columns: []observability.SampleTableColumn{{Name: "slug"}, {Name: "title"}},
-			Rows:    [][]string{{"revenue", "Revenue"}, {"pipeline-runs-demo", "Pipeline runs"}},
-		},
+	s := dashService(t, &fakeProvider{})
+	for _, slug := range []string{"revenue", "pipeline-runs-demo"} {
+		d := Dashboard{
+			Slug:     slug,
+			Title:    slug,
+			Datasets: []DashboardDataset{{Name: "ds", Dir: "demo", SQL: "SELECT 1"}},
+			Widgets:  []DashboardWidget{{ID: "w", Type: "table", Dataset: "ds", Layout: DashboardWidgetLayout{W: 6, H: 4}}},
+		}
+		if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+			t.Fatalf("SaveDashboard %q: %v", slug, err)
+		}
 	}
-	s := dashService(t, f)
 	got, err := s.ListDashboards(context.Background())
 	if err != nil {
 		t.Fatalf("ListDashboards: %v", err)
@@ -264,8 +276,7 @@ func TestListDashboards(t *testing.T) {
 }
 
 func TestGetDashboardNotFound(t *testing.T) {
-	f := &fakeProvider{queryRes: &observability.QueryResult{Rows: [][]string{}}}
-	s := dashService(t, f)
+	s := dashService(t, &fakeProvider{})
 	_, err := s.GetDashboard(context.Background(), "missing")
 	if err == nil {
 		t.Fatal("expected not-found error")
@@ -275,12 +286,11 @@ func TestGetDashboardNotFound(t *testing.T) {
 	}
 }
 
-func TestListDashboardsMissingTableIsEmpty(t *testing.T) {
-	f := &fakeProvider{queryErr: errors.New("TABLE_OR_VIEW_NOT_FOUND: dashboards")}
-	s := dashService(t, f)
+func TestListDashboardsEmptyWorkspaceIsEmpty(t *testing.T) {
+	s := dashService(t, &fakeProvider{})
 	got, err := s.ListDashboards(context.Background())
 	if err != nil {
-		t.Fatalf("a missing table should render empty, not error: %v", err)
+		t.Fatalf("a workspace with no registry should render empty, not error: %v", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("want empty list, got %+v", got)
@@ -495,14 +505,18 @@ func TestRenderDashboardSubstitutes(t *testing.T) {
 	f := &fakeProvider{}
 	s := dashService(t, f)
 
-	// Seed GetDashboard's read-back with a dashboard that has a control
-	// and a dataset referencing its placeholder.
-	spec := `{"datasets":[{"name":"rev","dir":"demo","sql":"SELECT * FROM t WHERE ts >= {{tr.start}}"}],` +
-		`"widgets":[{"id":"w1","type":"table","title":"","dataset":"rev","layout":{"x":0,"y":0,"w":6,"h":4}}],` +
-		`"controls":[{"name":"tr","type":"time_range","default":"last_7d"}]}`
-	f.queryRes = &observability.QueryResult{
-		Columns: []observability.SampleTableColumn{{Name: "slug"}, {Name: "title"}, {Name: "spec"}, {Name: "updated_at"}},
-		Rows:    [][]string{{"demo", "Demo", spec, "2026-05-23 00:00:00"}},
+	// Save a dashboard with a control and a dataset referencing its
+	// placeholder. RenderDashboard reads the definition from the file
+	// registry, then executes the widget SQL through the (fake) Provider.
+	d := Dashboard{
+		Slug:     "demo",
+		Title:    "Demo",
+		Datasets: []DashboardDataset{{Name: "rev", Dir: "demo", SQL: "SELECT * FROM t WHERE ts >= {{tr.start}}"}},
+		Widgets:  []DashboardWidget{{ID: "w1", Type: "table", Dataset: "rev", Layout: DashboardWidgetLayout{W: 6, H: 4}}},
+		Controls: []DashboardControl{{Name: "tr", Type: "time_range", Default: "last_7d"}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("SaveDashboard: %v", err)
 	}
 
 	if _, err := s.RenderDashboard(context.Background(), "demo", nil); err != nil {
@@ -523,45 +537,102 @@ func TestRenderDashboardSubstitutes(t *testing.T) {
 	}
 }
 
-func TestImportLegacyDashboards(t *testing.T) {
-	f := &fakeProvider{
-		queryRes: &observability.QueryResult{
-			Columns: []observability.SampleTableColumn{{Name: "slug"}, {Name: "title"}},
-			Rows:    [][]string{{"pipeline-runs-demo", "Pipeline runs"}},
-		},
-	}
-	s := dashService(t, f)
+// TestMigrateLegacyDashboards verifies the one-time consolidation
+// (ADR-021) seeds the registry from both legacy locations — the
+// `.clavesa/dashboards.imported/` backup the old system-table importer
+// left behind, and the workspace-root `dashboards/` authoring directory —
+// without clobbering across sources.
+func TestMigrateLegacyDashboards(t *testing.T) {
+	s := dashService(t, &fakeProvider{})
 
-	// Drop a legacy dashboard file into the workspace.
-	dir := filepath.Join(s.workspace, ".clavesa", "dashboards")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Legacy backup location (datasets-shape file).
+	imported := filepath.Join(s.workspace, ".clavesa", "dashboards.imported")
+	if err := os.MkdirAll(imported, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	legacy := `{"title":"Pipeline runs","default_pipeline_dir":"demo","widgets":[` +
+	foo := `{"title":"Foo","datasets":[{"name":"d","dir":"demo","sql":"SELECT 1"}],` +
+		`"widgets":[{"id":"w","type":"table","dataset":"d","layout":{"x":0,"y":0,"w":6,"h":4}}]}`
+	if err := os.WriteFile(filepath.Join(imported, "foo.json"), []byte(foo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Workspace-root authoring location (legacy per-widget-SQL shape).
+	rootDir := filepath.Join(s.workspace, "dashboards")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bar := `{"title":"Bar","default_pipeline_dir":"demo","widgets":[` +
 		`{"id":"a","type":"big_number","sql":"SELECT 1 AS n","value_field":"n","layout":{"x":0,"y":0,"w":3,"h":2}}]}`
-	if err := os.WriteFile(filepath.Join(dir, "pipeline-runs-demo.json"), []byte(legacy), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(rootDir, "bar.json"), []byte(bar), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := s.ListDashboards(context.Background()); err != nil {
+	list, err := s.ListDashboards(context.Background())
+	if err != nil {
 		t.Fatalf("ListDashboards (with migration): %v", err)
 	}
+	if len(list) != 2 || list[0].Slug != "bar" || list[1].Slug != "foo" {
+		t.Fatalf("want migrated [bar foo], got %+v", list)
+	}
 
-	// The legacy file was MERGEd into the table.
-	var sawMerge bool
-	for _, q := range f.execSQLs {
-		if strings.HasPrefix(q, "MERGE INTO") && strings.Contains(q, "'pipeline-runs-demo'") {
-			sawMerge = true
+	// Both now live in the canonical registry directory.
+	for _, slug := range []string{"foo", "bar"} {
+		if _, err := os.Stat(filepath.Join(s.workspace, ".clavesa", "dashboards", slug+".json")); err != nil {
+			t.Errorf("expected %s.json in the registry: %v", slug, err)
 		}
 	}
-	if !sawMerge {
-		t.Errorf("expected the legacy file to be MERGEd, exec SQLs: %v", f.execSQLs)
+	// Originals are copied, not deleted.
+	if _, err := os.Stat(filepath.Join(imported, "foo.json")); err != nil {
+		t.Errorf("legacy backup should be preserved, not moved: %v", err)
 	}
-	// The directory was moved aside so the import does not repeat.
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Errorf("legacy dashboards dir should be moved aside after import")
+	if _, err := os.Stat(filepath.Join(rootDir, "bar.json")); err != nil {
+		t.Errorf("workspace-root original should be preserved, not moved: %v", err)
 	}
-	if _, err := os.Stat(dir + ".imported"); err != nil {
-		t.Errorf("expected .imported backup dir: %v", err)
+
+	// The legacy bar dashboard normalized to the datasets shape on read.
+	got, err := s.GetDashboard(context.Background(), "bar")
+	if err != nil {
+		t.Fatalf("GetDashboard bar: %v", err)
+	}
+	if len(got.Datasets) != 1 || got.Widgets[0].Dataset == "" {
+		t.Errorf("legacy bar not normalized to datasets shape: %+v", got)
+	}
+}
+
+// TestMigrateSkipsWhenRegistryPopulated confirms the migration is a no-op
+// once the registry already holds files — a hand-authored or
+// already-migrated registry is not re-seeded from legacy locations.
+func TestMigrateSkipsWhenRegistryPopulated(t *testing.T) {
+	s := dashService(t, &fakeProvider{})
+
+	// Pre-seed the registry directly.
+	d := Dashboard{
+		Slug:     "kept",
+		Title:    "Kept",
+		Datasets: []DashboardDataset{{Name: "d", Dir: "demo", SQL: "SELECT 1"}},
+		Widgets:  []DashboardWidget{{ID: "w", Type: "table", Dataset: "d", Layout: DashboardWidgetLayout{W: 6, H: 4}}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("SaveDashboard: %v", err)
+	}
+
+	// Drop a legacy file that should be ignored because the registry is
+	// already populated.
+	rootDir := filepath.Join(s.workspace, "dashboards")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"title":"Ignored","datasets":[{"name":"d","dir":"demo","sql":"SELECT 1"}],` +
+		`"widgets":[{"id":"w","type":"table","dataset":"d","layout":{"x":0,"y":0,"w":6,"h":4}}]}`
+	if err := os.WriteFile(filepath.Join(rootDir, "ignored.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := s.ListDashboards(context.Background())
+	if err != nil {
+		t.Fatalf("ListDashboards: %v", err)
+	}
+	if len(list) != 1 || list[0].Slug != "kept" {
+		t.Errorf("populated registry should not re-seed from legacy, got %+v", list)
 	}
 }

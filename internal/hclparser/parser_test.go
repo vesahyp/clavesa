@@ -465,6 +465,43 @@ module "s3_source" {
 	}
 }
 
+// TestValidatorExternalInputNotDisconnected verifies that a transform fed
+// only by a cross-pipeline `<schema>.<table>` reference (no node-to-node
+// edge in this dir) is NOT flagged DISCONNECTED_NODE. This is the terminal
+// star-schema dim case: gold's `dim_*` read `silver.enriched` produced by
+// the upstream silver pipeline.
+func TestValidatorExternalInputNotDisconnected(t *testing.T) {
+	t.Parallel()
+	const tf = `
+module "dim_device" {
+  source = "clavesa/transform/aws"
+  name   = "dim_device"
+  inputs = {
+    enriched = "silver.enriched"
+  }
+  sql = "SELECT user_agent FROM enriched"
+}
+`
+	dir := writeFixture(t, "main.tf", tf)
+	g, err := hclparser.Parse(dir)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Sanity: the reference landed in external_inputs (not an edge).
+	node := g.Nodes[0]
+	ext, ok := node.Config["external_inputs"].(map[string]interface{})
+	if !ok || ext["enriched"] != "silver.enriched" {
+		t.Fatalf("expected external_inputs[enriched]=silver.enriched; config=%v", node.Config)
+	}
+
+	for _, m := range g.Validation.Warnings {
+		if m.Code == graph.CodeDisconnectedNode {
+			t.Errorf("dim_device reads an external input; must not be DISCONNECTED_NODE; warnings=%v", g.Validation.Warnings)
+		}
+	}
+}
+
 // TestValidatorSchemaMismatch verifies that two connected nodes with incompatible
 // schemas (different column types) produce a SCHEMA_MISMATCH warning.
 // TestValidatorSchemaMismatch verifies output_definitions attributes are

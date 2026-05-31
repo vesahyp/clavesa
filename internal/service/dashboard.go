@@ -7,32 +7,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/dashboards"
 	"github.com/vesahyp/clavesa/internal/dashboardsql"
-	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/observability"
-	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
-// Dashboards are stored as one row per dashboard in the `dashboards`
-// system Iceberg table, in the workspace system catalog DB
-// (`<system_catalog>__pipelines`, alongside runs / node_runs). Local
-// workspaces keep it in the local Iceberg warehouse; cloud workspaces in
-// S3 Iceberg. This replaced the old `.clavesa/dashboards/*.json`
-// file store, which could not be shared between teammates and had no
-// access model — a system table inherits the same Glue/Lake Formation
-// grants that govern data.
+// Dashboards are workspace-level IaC definitions (ADR-021): one JSON file
+// per dashboard under `.clavesa/dashboards/<slug>.json`, read directly
+// through the file-backed dashboards.Store. A dashboard is a definition,
+// not runtime data. It lives as code beside the source/credential
+// registries (ADR-017) and pipeline `.tf`, version-controlled and
+// promoted via the repo. This replaced the prior system Delta table,
+// whose cloud write path was Athena (which cannot write Delta).
 //
-// The dashboard spec (datasets + widgets) is a JSON document in the
-// `spec` column. A dashboard is one document and a save must be atomic;
-// Iceberg has no cross-table transaction, so normalizing widgets into
-// their own table would make a save a non-atomic multi-row write.
-// `slug` and `title` are real columns so listing is a cheap projection.
-
-const dashboardsSystemTable = "dashboards"
+// The widget-SQL execution path (RenderDashboard, the /api/dashboards/query
+// route) is unchanged. It still dispatches through the observability
+// Provider so each dataset runs on the warm Spark worker locally or on
+// Athena in the cloud (ADR-014). Only the *definition* storage moved off
+// the catalog and onto the filesystem.
 
 // dashboardWidgetTypes is the set of widget types the UI knows how to
 // render. Validation rejects anything else at save time so a typo can't
@@ -152,93 +147,71 @@ type dashboardFile struct {
 	Controls           []DashboardControl `json:"controls,omitempty"`
 }
 
-// dashboardSpecJSON is the document stored in the `spec` column.
-type dashboardSpecJSON struct {
-	Datasets []DashboardDataset `json:"datasets"`
-	Widgets  []DashboardWidget  `json:"widgets"`
-	Controls []DashboardControl `json:"controls,omitempty"`
-}
-
-// WithResolver wires the observability resolver the dashboards store
-// needs to dispatch its catalog reads/writes to the cloud (Athena) or
-// local (runner-Spark) provider. Without it the dashboard methods
-// return a configuration error.
+// WithResolver wires the observability resolver RenderDashboard uses to
+// dispatch widget SQL to the cloud (Athena) or local (runner-Spark)
+// provider (ADR-014). Definition CRUD is file-backed (ADR-021) and does
+// not need it; only RenderDashboard returns a configuration error when
+// it is absent.
 func (s *Service) WithResolver(r *observability.Resolver) *Service {
 	s.dashResolver = r
 	return s
 }
 
-// ListDashboards returns every dashboard, sorted by slug.
+// dashboardStore returns the workspace-rooted file registry. Dashboards
+// live at the workspace level (ADR-021), not per-pipeline: a dataset
+// already carries its own `dir`, so one dashboard can read across
+// pipelines.
+func (s *Service) dashboardStore() *dashboards.Store {
+	return dashboards.New(s.workspace)
+}
+
+// ListDashboards returns every dashboard, sorted by slug. Reads the
+// registry directory directly: no Provider, no catalog query.
 func (s *Service) ListDashboards(ctx context.Context) ([]DashboardSummary, error) {
-	prov, err := s.dashboardProvider()
+	s.migrateLegacyDashboards()
+	store := s.dashboardStore()
+	slugs, err := store.List()
 	if err != nil {
-		return nil, err
-	}
-	if err := s.importLegacyDashboards(ctx, prov); err != nil {
-		return nil, err
-	}
-	res, err := prov.Query(ctx, observability.QueryQuery{
-		SQL:         fmt.Sprintf("SELECT slug, title FROM %s ORDER BY slug", s.dashboardTableRef()),
-		PipelineDir: s.workspace,
-	})
-	if err != nil {
-		if isMissingDashboardsTable(err) {
-			return []DashboardSummary{}, nil
-		}
 		return nil, fmt.Errorf("list dashboards: %w", err)
 	}
-	out := make([]DashboardSummary, 0, len(res.Rows))
-	for _, row := range res.Rows {
-		if len(row) < 2 {
+	out := make([]DashboardSummary, 0, len(slugs))
+	for _, slug := range slugs {
+		data, err := store.Get(slug)
+		if err != nil {
+			// Skip an unreadable file rather than failing the whole list;
+			// GetDashboard surfaces the parse error on demand.
+			fmt.Fprintf(os.Stderr, "clavesa: skip dashboard %q in list: %v\n", slug, err)
 			continue
 		}
-		out = append(out, DashboardSummary{Slug: row[0], Title: row[1]})
+		d, err := parseDashboardFile(slug, data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "clavesa: skip dashboard %q in list: %v\n", slug, err)
+			continue
+		}
+		out = append(out, DashboardSummary{Slug: d.Slug, Title: d.Title})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	// store.List already returns slugs sorted, but parse-skips don't
+	// reorder, so the summaries stay sorted by slug.
 	return out, nil
 }
 
-// GetDashboard reads one dashboard by slug. Returns a wrapped
-// os.ErrNotExist when the slug is unknown so callers dispatch 404.
+// GetDashboard reads one dashboard by slug from the registry. Returns a
+// wrapped os.ErrNotExist when the slug is unknown so callers dispatch 404.
 func (s *Service) GetDashboard(ctx context.Context, slug string) (Dashboard, error) {
 	if !validDashboardSlug(slug) {
 		return Dashboard{}, fmt.Errorf("invalid dashboard slug %q", slug)
 	}
-	prov, err := s.dashboardProvider()
+	s.migrateLegacyDashboards()
+	data, err := s.dashboardStore().Get(slug)
 	if err != nil {
-		return Dashboard{}, err
-	}
-	if err := s.importLegacyDashboards(ctx, prov); err != nil {
-		return Dashboard{}, err
-	}
-	res, err := prov.Query(ctx, observability.QueryQuery{
-		SQL: fmt.Sprintf("SELECT slug, title, spec, CAST(updated_at AS STRING) FROM %s WHERE slug = %s",
-			s.dashboardTableRef(), s.sqlString(slug)),
-		PipelineDir: s.workspace,
-	})
-	if err != nil {
-		if isMissingDashboardsTable(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return Dashboard{}, &notRegisteredError{kind: "dashboard", name: slug}
 		}
 		return Dashboard{}, fmt.Errorf("get dashboard: %w", err)
 	}
-	if len(res.Rows) == 0 || len(res.Rows[0]) < 3 {
-		return Dashboard{}, &notRegisteredError{kind: "dashboard", name: slug}
-	}
-	row := res.Rows[0]
-	var spec dashboardSpecJSON
-	if err := json.Unmarshal([]byte(row[2]), &spec); err != nil {
-		return Dashboard{}, fmt.Errorf("parse dashboard %q spec: %w", slug, err)
-	}
-	d := Dashboard{
-		Slug:     row[0],
-		Title:    row[1],
-		Datasets: spec.Datasets,
-		Widgets:  spec.Widgets,
-		Controls: spec.Controls,
-	}
-	if len(row) > 3 {
-		d.UpdatedAt = row[3]
+	d, err := parseDashboardFile(slug, data)
+	if err != nil {
+		return Dashboard{}, fmt.Errorf("parse dashboard %q: %w", slug, err)
 	}
 	if d.Datasets == nil {
 		d.Datasets = []DashboardDataset{}
@@ -249,24 +222,26 @@ func (s *Service) GetDashboard(ctx context.Context, slug string) (Dashboard, err
 	return d, nil
 }
 
-// SaveDashboard creates or replaces a dashboard. The slug is the key —
-// a save with an existing slug overwrites. Returns the stored dashboard.
+// SaveDashboard creates or replaces a dashboard definition file. The slug
+// is the key — a save with an existing slug overwrites. Returns the
+// stored dashboard.
 func (s *Service) SaveDashboard(ctx context.Context, d Dashboard) (Dashboard, error) {
 	if err := validateDashboard(d); err != nil {
 		return Dashboard{}, err
 	}
+	// SQL parse-check is best-effort: a definition file must save even
+	// when no parser is wired or the warm worker is unavailable. A real
+	// parse error (parser present, SQL bad) still blocks. See
+	// validateDashboardSQL.
 	if err := s.validateDashboardSQL(ctx, d); err != nil {
 		return Dashboard{}, err
 	}
-	prov, err := s.dashboardProvider()
+	data, err := marshalDashboardFile(d)
 	if err != nil {
 		return Dashboard{}, err
 	}
-	if err := s.ensureDashboardTable(ctx, prov); err != nil {
-		return Dashboard{}, err
-	}
-	if err := s.writeDashboard(ctx, prov, d); err != nil {
-		return Dashboard{}, err
+	if err := s.dashboardStore().Save(d.Slug, data); err != nil {
+		return Dashboard{}, fmt.Errorf("save dashboard: %w", err)
 	}
 	return s.GetDashboard(ctx, d.Slug)
 }
@@ -322,23 +297,18 @@ func (s *Service) ApplyDashboardFile(ctx context.Context, slug string, data []by
 	return s.SaveDashboard(ctx, d)
 }
 
-// DeleteDashboard removes a dashboard. Returns a wrapped os.ErrNotExist
-// when the slug is unknown.
+// DeleteDashboard removes a dashboard's definition file. Returns a
+// wrapped os.ErrNotExist when the slug is unknown.
 func (s *Service) DeleteDashboard(ctx context.Context, slug string) error {
 	if !validDashboardSlug(slug) {
 		return fmt.Errorf("invalid dashboard slug %q", slug)
 	}
-	if _, err := s.GetDashboard(ctx, slug); err != nil {
-		return err
+	s.migrateLegacyDashboards()
+	err := s.dashboardStore().Delete(slug)
+	if errors.Is(err, os.ErrNotExist) {
+		return &notRegisteredError{kind: "dashboard", name: slug}
 	}
-	prov, err := s.dashboardProvider()
-	if err != nil {
-		return err
-	}
-	return prov.Exec(ctx, observability.ExecQuery{
-		SQL:         fmt.Sprintf("DELETE FROM %s WHERE slug = %s", s.dashboardTableRef(), s.sqlString(slug)),
-		PipelineDir: s.workspace,
-	})
+	return err
 }
 
 // RenderedWidget is one widget's executed result — the data behind a
@@ -445,31 +415,10 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string, params map[s
 	return out, nil
 }
 
-// writeDashboard MERGEs one dashboard row into the system table. MERGE
-// is supported by both Athena Iceberg and Spark Iceberg, so create and
-// replace are one atomic statement on either backend.
-func (s *Service) writeDashboard(ctx context.Context, prov observability.Provider, d Dashboard) error {
-	specBytes, err := json.Marshal(dashboardSpecJSON{Datasets: d.Datasets, Widgets: d.Widgets, Controls: d.Controls})
-	if err != nil {
-		return fmt.Errorf("encode dashboard spec: %w", err)
-	}
-	now := "current_timestamp"
-	if s.dashResolver.IsLocal() {
-		now = "current_timestamp()"
-	}
-	ref := s.dashboardTableRef()
-	sql := fmt.Sprintf(
-		"MERGE INTO %s t USING (SELECT %s AS slug, %s AS title, %s AS spec) s "+
-			"ON t.slug = s.slug "+
-			"WHEN MATCHED THEN UPDATE SET title = s.title, spec = s.spec, updated_at = %s "+
-			"WHEN NOT MATCHED THEN INSERT (slug, title, spec, updated_at, updated_by) "+
-			"VALUES (s.slug, s.title, s.spec, %s, NULL)",
-		ref, s.sqlString(d.Slug), s.sqlString(d.Title), s.sqlString(string(specBytes)), now, now)
-	return prov.Exec(ctx, observability.ExecQuery{SQL: sql, PipelineDir: s.workspace})
-}
-
 // dashboardProvider returns the cloud-or-local provider for the
-// workspace's environment mode.
+// workspace's environment mode. Used only by RenderDashboard, the widget
+// SQL execution path, which stays env-dispatched (ADR-014). Definition
+// CRUD no longer touches a Provider.
 func (s *Service) dashboardProvider() (observability.Provider, error) {
 	if s.dashResolver == nil {
 		return nil, fmt.Errorf("dashboards: observability resolver not configured")
@@ -477,156 +426,100 @@ func (s *Service) dashboardProvider() (observability.Provider, error) {
 	return s.dashResolver.For(s.workspace)
 }
 
-// systemGlueDB returns the workspace system catalog DB
-// (`<system_catalog>__pipelines`) — where runs / node_runs / dashboards
-// all live.
-func (s *Service) systemGlueDB() string {
-	catalog := ""
-	if m, _ := workspace.Load(s.workspace); m != nil {
-		catalog = m.SystemCatalogIdentifier()
+// marshalDashboardFile serializes a Dashboard into its canonical on-disk
+// JSON shape (the datasets shape parseDashboardFile reads back). Title +
+// datasets + widgets + controls are persisted; the slug is carried by the
+// filename, not the body, mirroring how sources omit Name from their JSON.
+func marshalDashboardFile(d Dashboard) ([]byte, error) {
+	f := dashboardFile{
+		Title:    d.Title,
+		Datasets: d.Datasets,
+		Widgets:  d.Widgets,
+		Controls: d.Controls,
 	}
-	if catalog == "" {
-		// No manifest (bare directory) — defensive fallback. Fresh
-		// workspaces always have a manifest, so this only bites tests
-		// that skip workspace init.
-		return "clavesa_system__pipelines"
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode dashboard: %w", err)
 	}
-	return identutil.EncodeGlueDatabase(catalog, "pipelines")
+	return data, nil
 }
 
-// dashboardTableRef is the fully-qualified `dashboards` table identifier
-// in the form each backend expects. ADR-018 dropped the legacy
-// `clavesa.<db>.<table>` Iceberg-catalog prefix; Delta tables now resolve
-// under Spark's default session catalog, so the runner identifier is
-// the two-part `<db>.<table>` Athena already used.
-func (s *Service) dashboardTableRef() string {
-	db := s.systemGlueDB()
-	if s.dashResolver != nil && s.dashResolver.IsLocal() {
-		return fmt.Sprintf("%s.%s", db, dashboardsSystemTable)
-	}
-	return fmt.Sprintf("%q.%q", db, dashboardsSystemTable)
-}
-
-// ensureDashboardTable creates the system table if it does not exist.
-// Idempotent and guarded so the DDL round-trip is paid at most once per
-// process. On the local backend the system namespace is created first
-// (the dashboards table can be the first thing written to it); on cloud
-// the Glue DB already exists from workspace deploy and the table needs
-// an explicit S3 location.
-func (s *Service) ensureDashboardTable(ctx context.Context, prov observability.Provider) error {
-	s.dashMu.Lock()
-	ready := s.dashTableReady
-	s.dashMu.Unlock()
-	if ready {
-		return nil
-	}
-
-	db := s.systemGlueDB()
-	cols := "slug STRING, title STRING, spec STRING, updated_at TIMESTAMP, updated_by STRING"
-	if s.dashResolver.IsLocal() {
-		if err := prov.Exec(ctx, observability.ExecQuery{
-			SQL:         fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", db),
-			PipelineDir: s.workspace,
-		}); err != nil {
-			return fmt.Errorf("create system namespace: %w", err)
-		}
-		if err := prov.Exec(ctx, observability.ExecQuery{
-			SQL:         fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) USING delta", s.dashboardTableRef(), cols),
-			PipelineDir: s.workspace,
-		}); err != nil {
-			return fmt.Errorf("create dashboards table: %w", err)
-		}
-	} else {
-		bucket := workspace.PipelineBucket(s.workspace)
-		if bucket == "" {
-			return fmt.Errorf("dashboards: workspace is not deployed — cannot create the dashboards table (run `clavesa workspace deploy`)")
-		}
-		loc := fmt.Sprintf("s3://%s/_system/pipelines/%s", bucket, dashboardsSystemTable)
-		// ADR-018: Athena reads the Delta external table from the same
-		// `_delta_log/` Spark writes. `USING delta` is rejected by Athena
-		// DDL (it doesn't know `USING`); the metastore form is a
-		// `TBLPROPERTIES('table_type'='DELTA')` external Glue table.
-		if err := prov.Exec(ctx, observability.ExecQuery{
-			SQL: fmt.Sprintf(
-				"CREATE EXTERNAL TABLE IF NOT EXISTS %s (%s) LOCATION '%s' TBLPROPERTIES ('table_type'='DELTA')",
-				s.dashboardTableRef(), cols, loc),
-			PipelineDir: s.workspace,
-		}); err != nil {
-			return fmt.Errorf("create dashboards table: %w", err)
-		}
-	}
-
-	s.dashMu.Lock()
-	s.dashTableReady = true
-	s.dashMu.Unlock()
-	return nil
-}
-
-// importLegacyDashboards migrates a pre-table workspace: any
-// `.clavesa/dashboards/*.json` files are written into the system
-// table once, then the directory is moved aside so the import does not
-// repeat. Best-effort per file; a malformed file is skipped with a
-// stderr note rather than blocking the whole import. Runs at most once
-// per process.
-func (s *Service) importLegacyDashboards(ctx context.Context, prov observability.Provider) error {
+// migrateLegacyDashboards is the one-time, best-effort consolidation of
+// pre-ADR-021 dashboard locations into the canonical registry directory
+// (`.clavesa/dashboards/`). Guarded so it runs at most once per process.
+//
+// If the registry already has files, it does nothing. Otherwise it seeds
+// the registry, without clobbering, from, in order:
+//   1. `.clavesa/dashboards.imported/*.json` (the backup the old
+//      importLegacyDashboards left behind when it moved the directory
+//      aside after writing to the system table), then
+//   2. `dashboards/*.json` (the workspace-root authoring location a user
+//      hand-edits, e.g. analytics/web-traffic/dashboards/heineli.json).
+//
+// Originals are copied, not deleted. A bad file is skipped with a stderr
+// note, never fatal. This recovers existing dashboards into the canonical
+// home without ever blocking a read.
+func (s *Service) migrateLegacyDashboards() {
 	s.dashMu.Lock()
 	done := s.dashImported
 	s.dashMu.Unlock()
 	if done {
-		return nil
+		return
 	}
-
-	dir := filepath.Join(s.workspace, ".clavesa", "dashboards")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		// No legacy directory — nothing to migrate.
+	defer func() {
 		s.dashMu.Lock()
 		s.dashImported = true
 		s.dashMu.Unlock()
-		return nil
+	}()
+
+	store := s.dashboardStore()
+	// Registry already populated: nothing to migrate.
+	if existing, err := store.List(); err == nil && len(existing) > 0 {
+		return
 	}
 
-	imported := 0
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
+	migrated := 0
+	for _, src := range []string{
+		filepath.Join(s.workspace, ".clavesa", "dashboards.imported"),
+		filepath.Join(s.workspace, "dashboards"),
+	} {
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			continue // source location absent; try the next
 		}
-		slug := strings.TrimSuffix(e.Name(), ".json")
-		data, readErr := os.ReadFile(filepath.Join(dir, e.Name()))
-		if readErr != nil {
-			fmt.Fprintf(os.Stderr, "clavesa: skip dashboard import %s: %v\n", e.Name(), readErr)
-			continue
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			slug := strings.TrimSuffix(e.Name(), ".json")
+			if !validDashboardSlug(slug) {
+				continue
+			}
+			// Don't clobber a slug an earlier source already seeded.
+			if _, err := store.Get(slug); err == nil {
+				continue
+			}
+			data, readErr := os.ReadFile(filepath.Join(src, e.Name()))
+			if readErr != nil {
+				fmt.Fprintf(os.Stderr, "clavesa: skip dashboard migration %s: %v\n", e.Name(), readErr)
+				continue
+			}
+			// Validate before writing so a malformed legacy file doesn't
+			// land an unreadable entry in the registry.
+			if _, parseErr := parseDashboardFile(slug, data); parseErr != nil {
+				fmt.Fprintf(os.Stderr, "clavesa: skip dashboard migration %s: %v\n", e.Name(), parseErr)
+				continue
+			}
+			if err := store.Save(slug, data); err != nil {
+				fmt.Fprintf(os.Stderr, "clavesa: skip dashboard migration %s: %v\n", e.Name(), err)
+				continue
+			}
+			migrated++
 		}
-		d, parseErr := parseDashboardFile(slug, data)
-		if parseErr != nil {
-			fmt.Fprintf(os.Stderr, "clavesa: skip dashboard import %s: %v\n", e.Name(), parseErr)
-			continue
-		}
-		if err := s.ensureDashboardTable(ctx, prov); err != nil {
-			return fmt.Errorf("import legacy dashboards: %w", err)
-		}
-		if err := s.writeDashboard(ctx, prov, d); err != nil {
-			return fmt.Errorf("import dashboard %s: %w", e.Name(), err)
-		}
-		imported++
 	}
-
-	// Move the directory aside so the next read does not re-import. The
-	// files are kept (not deleted) under `.imported` as a safety copy.
-	aside := dir + ".imported"
-	if _, statErr := os.Stat(aside); statErr == nil {
-		_ = os.RemoveAll(dir)
-	} else {
-		_ = os.Rename(dir, aside)
+	if migrated > 0 {
+		fmt.Fprintf(os.Stderr, "clavesa: migrated %d dashboard(s) into %s\n", migrated, store.Dir())
 	}
-	if imported > 0 {
-		fmt.Fprintf(os.Stderr, "clavesa: migrated %d dashboard(s) into the system table\n", imported)
-	}
-
-	s.dashMu.Lock()
-	s.dashImported = true
-	s.dashMu.Unlock()
-	return nil
 }
 
 // parseDashboardFile decodes a dashboard JSON document (legacy or
@@ -868,27 +761,4 @@ func resolveControlDefaults(controls []DashboardControl, out map[string]string, 
 // ResolveTimeRange directly.
 func resolveTimePreset(preset string, now time.Time) (start, end string) {
 	return ResolveTimeRange(preset, now)
-}
-
-// isMissingDashboardsTable classifies a query error as "the dashboards
-// table does not exist yet" so a fresh workspace renders an empty list
-// instead of a 500. The local provider already maps this to an empty
-// result; cloud surfaces the Athena error text.
-func isMissingDashboardsTable(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	for _, marker := range []string{
-		"Table or view not found",
-		"TABLE_OR_VIEW_NOT_FOUND",
-		"does not exist",
-		"NoSuchTableException",
-		"not found",
-	} {
-		if strings.Contains(s, marker) {
-			return true
-		}
-	}
-	return false
 }

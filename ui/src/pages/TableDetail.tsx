@@ -14,6 +14,7 @@ import {
   ChevronRight,
   FileWarning,
   LayoutDashboard,
+  Loader2,
   Terminal,
 } from "lucide-react";
 
@@ -99,20 +100,35 @@ export function TableDetail() {
   // attr. Falling back to the pipelines-list lookup catches the rare case
   // where the catalog stamp is missing — the API takes either form.
   const pipelines = usePipelines();
+  // Resolve the owning pipeline `dir` without blocking on the slow
+  // whole-catalog query. Priority: (a) the catalog stamp once it has
+  // loaded (most precise — carries `dir` for system tables that have no
+  // schema-owning pipeline); else (b) the fast pipelines list, matching
+  // the table's schema against the pipeline that owns it (ADR-016: a
+  // pipeline's schema identifier == its `schema` field, one schema one
+  // producing pipeline); else (c) the owning_pipeline-name fallback for
+  // catalog rows that name a pipeline but lack `dir`. (b) is what makes
+  // `dir` available as soon as the (fast) pipelines query resolves so the
+  // sample fires without waiting ~14s on the catalog.
   const owningPipelineDir = useMemo(() => {
     if (tableMeta?.dir) return tableMeta.dir;
+    if (schemaName) {
+      const bySchema = pipelines.data?.find((p) => p.schema === schemaName)?.dir;
+      if (bySchema) return bySchema;
+    }
     if (!tableMeta?.owning_pipeline) return "";
     return pipelines.data?.find((p) => p.name === tableMeta.owning_pipeline)?.dir ?? "";
-  }, [pipelines.data, tableMeta]);
-  // Gate sample-fetch on the catalog having resolved so `dir` is known
-  // before we hit /data/table — otherwise the first render fires the
-  // cloud-fallback path (no dir → Athena), 500s for local tables, and
-  // the user sees a "Query failed" flash before the second request with
-  // dir lands. Cloud tables also benefit: the catalog payload tells us
-  // whether the table even exists.
+  }, [pipelines.data, tableMeta, schemaName]);
+  // Fire the sample as soon as the (fast) pipelines list resolves and we
+  // have a `dir` — no longer gated on the slow whole-catalog query. The
+  // `dir` keeps the request on the right Provider (local vs cloud), so we
+  // don't hit the cloud-fallback "Query failed" flash. When `dir` is empty
+  // (no pipeline owns this schema — e.g. an external table), fall back to
+  // firing once pipelines resolved so the cloud path can still answer.
+  const pipelinesReady = pipelines.data !== undefined;
   const sample = useTableSample(database, tableName, SAMPLE_LIMIT, {
     dir: owningPipelineDir,
-    enabled: catalog.data !== undefined,
+    enabled: pipelinesReady,
   });
   // Every clavesa-managed table is Delta under v2.0.0. The commit timeline
   // and column-stats panels render for any Delta table; non-clavesa tables
@@ -218,7 +234,22 @@ export function TableDetail() {
             <LiteColumnsCard
               tableMeta={tableMeta}
               sample={sample.data ?? null}
-              isLoading={catalog.isLoading || sample.isLoading}
+              // Skeleton only while the schema is unavailable from BOTH
+              // sources: the sample (fast, fires on pipelines) hasn't
+              // returned yet AND the catalog (slow) hasn't either. Once
+              // either resolves the card renders real columns.
+              isLoading={
+                !sample.data &&
+                !tableMeta &&
+                (sample.isLoading || catalog.isLoading)
+              }
+              // Schema may render (from tableMeta) before the sample
+              // returns; while we're still waiting on the sample query the
+              // per-column NULL%/examples cells show a skeleton instead of
+              // "—", so "—" post-load unambiguously means "no data".
+              sampleLoading={
+                !sample.data && (sample.isLoading || sample.isFetching)
+              }
             />
           )}
         </div>
@@ -678,13 +709,35 @@ function LiteColumnsCard({
   tableMeta,
   sample,
   isLoading,
+  sampleLoading,
 }: {
   tableMeta: CatalogTable | undefined;
-  /** Row data only — we read by column index. Falsy = sample not yet loaded. */
-  sample: { rows: string[][]; row_count: number } | null;
+  /**
+   * Sample query result — `columns` is the real engine schema (used as
+   * the column source when the catalog hasn't loaded yet), `rows` the
+   * example data we read by column index. Falsy = sample not yet loaded.
+   */
+  sample: { columns: { name: string; type: string }[]; rows: string[][]; row_count: number } | null;
   isLoading: boolean;
+  /**
+   * Schema is rendered (from tableMeta) but the sample query — which feeds
+   * the per-column NULL%/examples cells — is still in flight. Drives a
+   * per-cell skeleton instead of "—" so a loading cell is distinct from a
+   * genuinely-empty column.
+   */
+  sampleLoading: boolean;
 }) {
-  if (isLoading && !tableMeta) {
+  // Column source: prefer whichever resolved first. The catalog stamp
+  // (tableMeta.columns) and the sample's engine schema (sample.columns)
+  // agree, so when only one is available we render from it — that's what
+  // lets the schema show as soon as the fast sample returns without
+  // waiting on the slow whole-catalog query.
+  const columns =
+    tableMeta && tableMeta.columns.length > 0
+      ? tableMeta.columns
+      : sample?.columns ?? [];
+
+  if (isLoading && columns.length === 0) {
     return (
       <Card>
         <CardHeader className="pb-3">
@@ -698,7 +751,7 @@ function LiteColumnsCard({
       </Card>
     );
   }
-  if (!tableMeta || tableMeta.columns.length === 0) {
+  if (columns.length === 0) {
     return (
       <Card>
         <CardHeader className="pb-3">
@@ -716,14 +769,22 @@ function LiteColumnsCard({
     <Card>
       <CardHeader className="flex-row items-center justify-between pb-3">
         <CardTitle>Columns</CardTitle>
-        <span className="text-xs text-muted-foreground">
-          {tableMeta.columns.length} column{tableMeta.columns.length === 1 ? "" : "s"}
-          {sampleN > 0 && <> · examples from first {sampleN} rows</>}
+        <span className="flex items-center text-xs text-muted-foreground">
+          {columns.length} column{columns.length === 1 ? "" : "s"}
+          {sampleLoading ? (
+            <>
+              {" · "}
+              <Loader2 className="ml-1 mr-1 h-3 w-3 animate-spin" />
+              querying…
+            </>
+          ) : (
+            sampleN > 0 && <> · examples from first {sampleN} rows</>
+          )}
         </span>
       </CardHeader>
       <CardContent className="p-0">
         <ol className="divide-y divide-border">
-          {tableMeta.columns.map((c, colIdx) => {
+          {columns.map((c, colIdx) => {
             const colValues = sampleRows.map((row) => row[colIdx] ?? "");
             const nonEmpty = colValues.filter((v) => v !== "");
             const nullCount = colValues.length - nonEmpty.length;
@@ -750,7 +811,9 @@ function LiteColumnsCard({
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
                     Null
                   </span>
-                  {nullPct == null ? (
+                  {sampleLoading ? (
+                    <Skeleton className="h-1.5 w-full" />
+                  ) : nullPct == null ? (
                     <span className="text-muted-foreground">—</span>
                   ) : (
                     <div className="flex items-center gap-2">
@@ -770,7 +833,9 @@ function LiteColumnsCard({
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
                     Examples
                   </span>
-                  {examples.length === 0 ? (
+                  {sampleLoading ? (
+                    <Skeleton className="h-4 w-32" />
+                  ) : examples.length === 0 ? (
                     <span className="text-muted-foreground">
                       {sampleN === 0 ? "—" : "(all null in sample)"}
                     </span>

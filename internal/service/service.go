@@ -190,16 +190,15 @@ type Service struct {
 	runsMu       sync.Mutex
 	runsInFlight map[string]bool
 
-	// dashResolver dispatches the dashboards system-table reads/writes
-	// to the cloud or local observability provider. Wired via
-	// WithResolver; nil for service instances that never touch
-	// dashboards. dashMu guards the two lazy-init flags below:
-	// dashTableReady (the CREATE TABLE has succeeded once) and
-	// dashImported (the one-time legacy-file migration has run).
-	dashResolver   *observability.Resolver
-	dashMu         sync.Mutex
-	dashTableReady bool
-	dashImported   bool
+	// dashResolver dispatches the widget-SQL *execution* path
+	// (RenderDashboard) to the cloud or local observability provider
+	// (ADR-014). Wired via WithResolver; nil for service instances that
+	// never render dashboards. Definition CRUD is file-backed (ADR-021)
+	// and does not use it. dashMu guards dashImported (the one-time
+	// legacy-dashboard migration has run).
+	dashResolver *observability.Resolver
+	dashMu       sync.Mutex
+	dashImported bool
 
 	// notebookRunner is the REPL pool for notebook cell execution
 	// (Slice 1). nil for CLI-only invocations that don't run cells;
@@ -207,6 +206,15 @@ type Service struct {
 	// WithNotebookRunner. RunCell / CancelCell / StopNotebookSession
 	// all early-return when this is nil.
 	notebookRunner NotebookRunner
+
+	// metastoreEnsure brings up (or reuses) the shared per-workspace
+	// Derby metastore container and returns the (docker network, addr)
+	// the run/transform/operation containers attach to. The default
+	// (set in New) is a no-op returning ("", "") so a Service with no
+	// injection — every unit test, via service.New(ws) — never touches
+	// Docker. CLI and UI wire the real ensurer via WithMetastoreEnsurer;
+	// empty results mean the containers fall back to embedded Derby.
+	metastoreEnsure func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string)
 }
 
 // Ref wraps a bare HCL expression (e.g. file("path"), var.x) as a reference
@@ -221,6 +229,10 @@ func New(workspace string) *Service {
 		workspace:    workspace,
 		fo:           fileops.New(),
 		runsInFlight: make(map[string]bool),
+		// No-op default: a Service with no injected ensurer never
+		// touches Docker. Production wires the real one via
+		// WithMetastoreEnsurer; empty results mean embedded fallback.
+		metastoreEnsure: func(context.Context, string, string) (string, string) { return "", "" },
 	}
 }
 
@@ -230,6 +242,19 @@ func New(workspace string) *Service {
 // just spawns and Docker handles whatever memory pressure exists.
 func (s *Service) WithEvictor(e WarehouseEvictor) *Service {
 	s.evictor = e
+	return s
+}
+
+// WithMetastoreEnsurer wires the shared-metastore ensurer so
+// `pipeline run` and the backfill/record paths attach their containers
+// to the per-workspace Derby Network Server instead of opening the
+// embedded single-writer DB. Without it (unit tests via service.New),
+// the no-op default returns ("", "") and the containers fall back to
+// embedded Derby — keeping test Service instances free of Docker.
+func (s *Service) WithMetastoreEnsurer(fn func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string)) *Service {
+	if fn != nil {
+		s.metastoreEnsure = fn
+	}
 	return s
 }
 

@@ -61,6 +61,16 @@ type runPrep struct {
 	schema        string
 	runID         string
 	channel       *runChannel
+	// metastoreNetwork / metastoreAddr carry the shared local Derby
+	// metastore wiring resolved once per run in prepareRun. When non-empty
+	// the per-node bundle / transform / record-run containers join
+	// metastoreNetwork and connect to metastoreAddr over JDBC instead of
+	// each opening the embedded single-writer Derby DB — the local analog
+	// of cloud's shared Glue. Empty when EnsureMetastore failed; the
+	// containers then fall back to embedded Derby (safe, since no server
+	// is serving).
+	metastoreNetwork string
+	metastoreAddr    string
 	// force / forceNodes carry the operator's --force / --force-node intent
 	// from the CLI into runPipelineBundle, which embeds them in the bundle
 	// event so the runner's per-transform _is_forced() check fires.
@@ -200,16 +210,21 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 		return nil, err
 	}
 
-	// Release the Catalog/dashboard warm-Spark container so the per-run
-	// transform runner has the Docker memory budget to itself. Without
-	// this, on a Docker Desktop with the default 7-8GB memory, the warm
-	// worker (3GB) + transform runner (3GB) + record-run runner (3GB)
-	// race and the kernel OOM-kills one of them mid-Spark-boot. The
-	// next Catalog/dashboard query re-spawns the warm worker on demand.
-	// nil-safe — CLI-only invocations don't have a warm worker.
-	if s.evictor != nil {
-		s.evictor.EvictWarehouse(workspace.LocalWarehouseDir(s.workspace))
-	}
+	// Shared local Derby metastore (the local analog of cloud's shared
+	// Glue Data Catalog). Bring up (or reuse) the per-workspace Derby
+	// Network Server once per run, then thread the network + addr onto
+	// every per-node container below so they connect to it over JDBC
+	// instead of each opening the embedded single-writer DB. Concurrency
+	// between the run's containers and the UI's warm query worker /
+	// notebooks is now INTENDED — the shared metastore is what lets them
+	// coexist, so we no longer evict the warm worker for memory headroom
+	// the way the embedded-Derby-lock era required (slice 5 covers any
+	// follow-on heap tuning). EnsureMetastore is idempotent and fast, so
+	// one ensure per run is enough; the per-node builders just reuse the
+	// stashed (network, addr). Best-effort: the injected ensurer logs and
+	// returns both empty on failure so the containers fall back to
+	// embedded Derby (the no-op default in unit tests returns empty too).
+	metastoreNetwork, metastoreAddr := s.metastoreEnsure(context.Background(), s.workspace, s.workspaceName())
 
 	workdir, err := os.MkdirTemp("", "clavesa-run-")
 	if err != nil {
@@ -253,6 +268,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 		abs: abs, graph: g, order: order, workdir: workdir,
 		image: image, catalog: catalog, systemCatalog: systemCatalog,
 		schema: schema, runID: runID, channel: channel,
+		metastoreNetwork: metastoreNetwork, metastoreAddr: metastoreAddr,
 	}, nil
 }
 
@@ -284,7 +300,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 		if r := recover(); r != nil {
 			if !terminalFired {
 				channel.finish(fmt.Errorf("pipeline runner panicked: %v", r))
-				recordLocalRun(ctx, image, abs, channel, nil)
+				recordLocalRun(ctx, image, abs, channel, nil, s.metastoreEnsure)
 			}
 			panic(r) // re-raise so the caller / Go runtime sees it
 		}
@@ -295,7 +311,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			// channel.state.Status stays "RUNNING" until finish() is
 			// called.
 			channel.finish(nil)
-			recordLocalRun(ctx, image, abs, channel, nil)
+			recordLocalRun(ctx, image, abs, channel, nil, s.metastoreEnsure)
 		}
 	}()
 
@@ -425,7 +441,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	// in real time. Returns the per-transform terminal statuses for
 	// the destination-pass loop below.
 	if len(bundle) > 0 {
-		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, channel, prep.force, prep.forceNodes)
+		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, channel, prep.force, prep.forceNodes, prep.metastoreNetwork, prep.metastoreAddr)
 		// Even on bundle error, walk whatever per-node results we got
 		// before the failure so result.Nodes carries the partial picture
 		// (the UI uses this for the per-node breakdown).
@@ -470,7 +486,7 @@ done:
 	// → runs-writer Lambda that does the same write through Athena). Best-effort:
 	// a failure here logs to stderr but doesn't change the run's outcome — the
 	// data the user cares about already landed via runTransform.
-	recordLocalRun(ctx, image, abs, channel, cascadeSkipped)
+	recordLocalRun(ctx, image, abs, channel, cascadeSkipped, s.metastoreEnsure)
 	terminalFired = true
 	if finalErr != nil {
 		return result, finalErr
@@ -989,6 +1005,17 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 
 	args := []string{"run", "--rm", "-i"}
 	args = append(args, "-e", "CLAVESA_RUN=1")
+	// Shared local Derby metastore. runTransform is reached by the
+	// single-node backfill path (the bundle path resolves the metastore
+	// once in prepareRun and threads it in); resolve it here too so a
+	// backfill container connects to the Derby Network Server as a client
+	// rather than opening the embedded single-writer DB. EnsureMetastore
+	// is idempotent + fast. Best-effort: the injected ensurer returns
+	// empty on failure (and in unit tests), so we fall back to embedded
+	// Derby (safe, since no server is serving).
+	if network, addr := s.metastoreEnsure(ctx, s.workspace, s.workspaceName()); addr != "" {
+		args = appendMetastoreArgs(args, network, addr)
+	}
 	args = append(args, "-e", "CLAVESA_LOGIC_S3_PATH="+logicPath)
 	args = append(args, "-e", "CLAVESA_LANGUAGE="+language)
 	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
@@ -1222,7 +1249,7 @@ type bundleTransformConfig struct {
 // failed (docker exit non-zero, unparseable response, transform
 // failure). On a transform failure the bundle stops; statuses for
 // downstream transforms are not returned (they never ran).
-func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, channel *runChannel, force bool, forceNodes []string) ([]NodeRunStatus, error) {
+func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, channel *runChannel, force bool, forceNodes []string, metastoreNetwork, metastoreAddr string) ([]NodeRunStatus, error) {
 	pipelineName := filepath.Base(pipelineDir)
 	warehouse := workspace.LocalWarehouseDir(s.workspace)
 	if err := os.MkdirAll(warehouse, 0o755); err != nil {
@@ -1275,6 +1302,13 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
 	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
 	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
+	// Shared local Derby metastore (resolved once in prepareRun). Joins the
+	// per-workspace network + sets CLAVESA_METASTORE_ADDR so this run's
+	// Spark connects to the Derby Network Server as a client rather than
+	// opening the embedded single-writer DB — lets the UI warm worker keep
+	// serving queries while this run writes to the same warehouse. No-op
+	// when EnsureMetastore failed (falls back to embedded Derby).
+	args = appendMetastoreArgs(args, metastoreNetwork, metastoreAddr)
 	if digest := dockerImageDigest(image); digest != "" {
 		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
 	}
@@ -1503,7 +1537,7 @@ func msgInt64(msg map[string]any, key string) *int64 {
 // logs to stderr and returns nil. The run already finished and its data is
 // already on disk; failing here would punish the user for an observability
 // concern they didn't ask for.
-func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *runChannel, cascadeSkipped []string) {
+func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *runChannel, cascadeSkipped []string, ensureMetastore func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string)) {
 	pipelineName := filepath.Base(pipelineDir)
 	// Resolve ADR-016 (catalog, schema) the same way RunPipeline does so
 	// the runs row lands in the same Glue DB as the node_runs row this
@@ -1572,6 +1606,20 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *run
 	args := []string{"run", "--rm", "-i"}
 	args = append(args, "-e", "CLAVESA_RECORD_RUN=1")
 	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	// Shared local Derby metastore — the runs-row write hits the same
+	// hive→Derby warehouse the transforms just wrote, and runs while the
+	// UI warm worker may still be serving, so it must speak to the Derby
+	// Network Server as a client rather than open the embedded DB.
+	// workspaceRoot is `filepath.Dir(pipelineDir)` (matches LocalWarehouseDir
+	// above). Best-effort: fall back to embedded Derby on Ensure failure.
+	recordWorkspaceRoot := filepath.Dir(pipelineDir)
+	recordWorkspaceName := ""
+	if m, _ := workspace.Load(recordWorkspaceRoot); m != nil {
+		recordWorkspaceName = m.Name
+	}
+	if network, addr := ensureMetastore(ctx, recordWorkspaceRoot, recordWorkspaceName); addr != "" {
+		args = appendMetastoreArgs(args, network, addr)
+	}
 	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
 	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
 	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
@@ -2017,6 +2065,14 @@ func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[stri
 	args := []string{"run", "--rm", "-i"}
 	args = append(args, "-e", "CLAVESA_RUN=1")
 	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
+	// Shared local Derby metastore. The operation handler (backfill
+	// promote / discard) reads + rewrites Delta tables in the same
+	// hive→Derby warehouse and can run while the UI warm worker is live,
+	// so it connects to the Derby Network Server as a client when one is
+	// up. Best-effort: fall back to embedded Derby on Ensure failure.
+	if network, addr := s.metastoreEnsure(ctx, s.workspace, s.workspaceName()); addr != "" {
+		args = appendMetastoreArgs(args, network, addr)
+	}
 	// Override the baked-in version — see runTransform for the rationale.
 	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
 	args = append(args, "-v", warehouse+":"+warehouse)
@@ -2043,6 +2099,32 @@ func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[stri
 		return nil, fmt.Errorf("docker run operation: %w\nstdout: %s\nstderr: %s", runErr, stdout.String(), stderr.String())
 	}
 	return nil, fmt.Errorf("runner operation %v: no parseable output\nstdout: %s\nstderr: %s", op["_operation"], stdout.String(), stderr.String())
+}
+
+// workspaceName resolves the workspace manifest name EnsureMetastore needs
+// to pick the runner image the metastore container reuses. Empty when the
+// manifest isn't readable (legacy / uninitialized) — EnsureMetastore then
+// falls back to the empty-name image.
+func (s *Service) workspaceName() string {
+	if m, _ := workspace.Load(s.workspace); m != nil {
+		return m.Name
+	}
+	return ""
+}
+
+// appendMetastoreArgs appends the `--network` + CLAVESA_METASTORE_ADDR run
+// args that point a local Spark client container at the shared Derby
+// metastore. No-op when network/addr are empty (EnsureMetastore failed or
+// hasn't run), in which case the container falls back to embedded Derby.
+// Centralizes the wiring so every local-Spark launch site in this package
+// stays consistent.
+func appendMetastoreArgs(args []string, network, addr string) []string {
+	if network == "" || addr == "" {
+		return args
+	}
+	args = append(args, "--network", network)
+	args = append(args, "-e", "CLAVESA_METASTORE_ADDR="+addr)
+	return args
 }
 
 // newRunID returns a 32-char hex run identifier matching the runner's
