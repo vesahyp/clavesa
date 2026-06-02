@@ -328,6 +328,247 @@ module "silver" {
 	}
 }
 
+// cdfDescriptor extracts the single delta_table_cdf input descriptor from
+// an emitted orchestration.tf body — everything from `kind =
+// "delta_table_cdf"` up to its closing brace. Lets a test assert on the
+// INPUT descriptor's merge_keys without colliding with the OUTPUT
+// descriptor's merge_keys, which buildNodeOutputsExpr also emits.
+func cdfDescriptor(t *testing.T, body string) string {
+	t.Helper()
+	i := strings.Index(body, `kind = "delta_table_cdf"`)
+	if i < 0 {
+		t.Fatalf("no delta_table_cdf descriptor in:\n%s", body)
+	}
+	j := strings.IndexByte(body[i:], '}')
+	if j < 0 {
+		t.Fatalf("unterminated delta_table_cdf descriptor in:\n%s", body)
+	}
+	return body[i : i+j]
+}
+
+// TestSyncOrchestrationEmitsIncrementalCrossPipelineInput covers v2.6.0:
+// incremental_inputs now works for a CROSS-PIPELINE input too (an upstream
+// table owned by another pipeline, referenced as "<schema>.<table>"). The
+// emitter writes a delta_table_cdf descriptor pointing at the resolved table
+// id directly (no module.X.outputs — the producer is in another pipeline) so
+// the runner CDF-reads it and the keyed merge upserts. This is the path the
+// medallion uses when bronze/silver/gold are separate pipelines.
+//
+// The descriptor's merge_keys are the PRODUCER's grain, resolved from the
+// upstream pipeline's output_definitions — not the consumer's own output
+// merge_keys. Here the producer (rawpipe.events) merges on "event_id" while
+// the consumer merges on "row_id"; the CDF descriptor must carry "event_id".
+func TestSyncOrchestrationEmitsIncrementalCrossPipelineInput(t *testing.T) {
+	t.Parallel()
+	ws := xpipeWorkspace(t)
+	writePipelineMain(t, ws, "rawpipe", `module "events" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "events"
+  sql    = "SELECT 1 AS event_id"
+  output_definitions = { default = { mode = "merge", merge_keys = ["event_id"] } }
+}
+`)
+	writePipelineMain(t, ws, "consumer", `module "silver" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "silver"
+  sql    = "SELECT * FROM up"
+  incremental_inputs = ["up"]
+  inputs = {
+    up = "rawpipe.events"
+  }
+  output_definitions = { default = { mode = "merge", merge_keys = ["row_id"] } }
+}
+`)
+	svc := New(ws)
+	if err := svc.SyncOrchestration("consumer", ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	s := mustRead(t, filepath.Join(ws, "consumer", "orchestration.tf"))
+
+	for _, want := range []string{
+		`kind = "delta_table_cdf"`,
+		`alias = "silver__up"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("orchestration.tf missing %q\n%s", want, s)
+		}
+	}
+	desc := cdfDescriptor(t, s)
+	if !strings.Contains(desc, `merge_keys = ["event_id"]`) {
+		t.Errorf("CDF descriptor should key on the producer grain event_id, got:\n%s", desc)
+	}
+	if strings.Contains(desc, "row_id") {
+		t.Errorf("CDF descriptor must NOT carry the consumer's output key row_id:\n%s", desc)
+	}
+	// The cross-pipeline CDF table is a resolved string id, NOT a
+	// module.X.outputs reference (the producer is in another pipeline).
+	if strings.Contains(s, `table = "${module.`) {
+		t.Errorf("cross-pipeline CDF should reference a resolved table id, not module.X.outputs:\n%s", s)
+	}
+}
+
+// TestSyncOrchestrationCrossPipelineCDFKeysOnProducerGrain is the regression
+// lock for the dim CDF crash: a gold dimension reading silver's enriched
+// table incrementally renames the upstream column
+// (`SELECT cs_User_Agent AS user_agent`) and merges its OWN output on
+// `user_agent`. The CDF input descriptor must key the range-dedup on the
+// PRODUCER's grain `x_edge_request_id` — a column that exists on the
+// enriched feed — not on `user_agent`, which doesn't exist upstream and
+// makes the runner's partitionBy throw "column not found".
+func TestSyncOrchestrationCrossPipelineCDFKeysOnProducerGrain(t *testing.T) {
+	t.Parallel()
+	ws := xpipeWorkspace(t)
+	writePipelineMain(t, ws, "silver", `module "enriched" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "enriched"
+  sql    = "SELECT x_edge_request_id, cs_User_Agent FROM bronze"
+  output_definitions = { default = { mode = "merge", merge_keys = ["x_edge_request_id"] } }
+}
+`)
+	writePipelineMain(t, ws, "gold", `module "dim_device" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "dim_device"
+  sql    = "SELECT DISTINCT cs_User_Agent AS user_agent FROM enriched"
+  incremental_inputs = ["enriched"]
+  inputs = {
+    enriched = "silver.enriched"
+  }
+  output_definitions = { default = { mode = "merge", merge_keys = ["user_agent"] } }
+}
+`)
+	svc := New(ws)
+	if err := svc.SyncOrchestration("gold", ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	s := mustRead(t, filepath.Join(ws, "gold", "orchestration.tf"))
+
+	desc := cdfDescriptor(t, s)
+	if !strings.Contains(desc, `merge_keys = ["x_edge_request_id"]`) {
+		t.Errorf("CDF descriptor must key on producer grain x_edge_request_id, got:\n%s", desc)
+	}
+	if strings.Contains(desc, "user_agent") {
+		t.Errorf("CDF descriptor must NOT key on the consumer output column user_agent (it doesn't exist upstream):\n%s", desc)
+	}
+}
+
+// TestSyncOrchestrationSkipsDisabledNode covers `enabled = false`: a disabled
+// transform is omitted from the emitted run (its module stays in main.tf, but
+// it isn't in the bundle's transforms list), while enabled nodes still emit.
+func TestSyncOrchestrationSkipsDisabledNode(t *testing.T) {
+	t.Parallel()
+	ws, dir := pipelineForAttachTest(t)
+	abs := filepath.Join(ws, dir)
+	pipeline := `terraform {
+  required_providers { aws = { source = "hashicorp/aws" } }
+}
+variable "pipeline_name" { type = string default = "demo" }
+
+module "keep" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "keep"
+  sql    = "SELECT 1"
+}
+
+module "skip" {
+  source  = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name    = "skip"
+  sql     = "SELECT 2"
+  enabled = false
+}
+`
+	if err := os.WriteFile(filepath.Join(abs, "main.tf"), []byte(pipeline), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(ws).SyncOrchestration(dir, ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(abs, "orchestration.tf"))
+	// Collapse whitespace so the `node = "..."` marker matches regardless of
+	// the emitter's column alignment.
+	flat := strings.Join(strings.Fields(string(got)), " ")
+	if !strings.Contains(flat, `node = "keep"`) {
+		t.Errorf("enabled node 'keep' missing from orchestration:\n%s", got)
+	}
+	if strings.Contains(flat, `node = "skip"`) {
+		t.Errorf("disabled node 'skip' should be omitted from orchestration:\n%s", got)
+	}
+}
+
+// TestSyncOrchestrationSkipsDisabledMiddleNode locks the cascade behaviour
+// for a disabled node in the MIDDLE of a chain: t1 (enabled) → t2 (disabled)
+// → t3 (enabled, reads t2). The emitter must (a) omit t2 from the transforms
+// list, (b) keep t3 with its inputs still pointing at module.t2.outputs (the
+// module block stays, so downstream reads t2's last-materialized table), and
+// (c) drop t2 from t3's `parents` — a disabled upstream never runs, so it
+// can't be in the runner's skipped-set and would otherwise block cascade-skip.
+func TestSyncOrchestrationSkipsDisabledMiddleNode(t *testing.T) {
+	t.Parallel()
+	ws, dir := pipelineForAttachTest(t)
+	abs := filepath.Join(ws, dir)
+	pipeline := `terraform {
+  required_providers { aws = { source = "hashicorp/aws" } }
+}
+variable "pipeline_name" { type = string default = "demo" }
+
+module "t1" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "t1"
+  sql    = "SELECT 1"
+}
+
+module "t2" {
+  source  = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name    = "t2"
+  sql     = "SELECT * FROM t1"
+  enabled = false
+  inputs  = { t1 = module.t1.outputs["default"] }
+}
+
+module "t3" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "t3"
+  sql    = "SELECT * FROM t2"
+  inputs = { t2 = module.t2.outputs["default"] }
+}
+`
+	if err := os.WriteFile(filepath.Join(abs, "main.tf"), []byte(pipeline), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(ws).SyncOrchestration(dir, ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(abs, "orchestration.tf"))
+	s := string(got)
+	// Collapse whitespace so column-aligned markers match regardless of the
+	// emitter's spacing.
+	flat := strings.Join(strings.Fields(s), " ")
+
+	// (a) t2 is skipped; t1 and t3 are present.
+	if strings.Contains(flat, `node = "t2"`) {
+		t.Errorf("disabled middle node 't2' should be omitted from transforms:\n%s", s)
+	}
+	for _, want := range []string{`node = "t1"`, `node = "t3"`} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("enabled node marker %q missing:\n%s", want, s)
+		}
+	}
+
+	// (b) t3's inputs still reference module.t2.outputs — the module block
+	// stays so downstream reads the disabled node's materialized table.
+	if !strings.Contains(s, `module.t2.outputs`) {
+		t.Errorf("t3 should still read module.t2.outputs (disabled node's table):\n%s", s)
+	}
+
+	// (c) t3's parents must NOT list t2. t2 is t3's only upstream and it's
+	// disabled, so t3 renders an empty parents list.
+	if strings.Contains(flat, `parents = ["t2"]`) {
+		t.Errorf("t3 parents must exclude disabled upstream t2:\n%s", s)
+	}
+	if !strings.Contains(flat, `parents = []`) {
+		t.Errorf("t3 should render empty parents (only upstream t2 is disabled):\n%s", s)
+	}
+}
+
 // TestSyncOrchestrationEmitsS3ReadExternalForRegisteredS3 covers the
 // v2.2.1 regression fix: a transform attached to a registered kind=s3
 // source must populate ExternalBuckets so the per-pipeline Lambda's IAM

@@ -277,10 +277,13 @@ function SnapshotsCell({ table }: { table: CatalogTable }) {
   if (snaps.length === 0) {
     return <span className="text-xs text-muted-foreground">—</span>;
   }
-  const label = data?.truncated ? `${snaps.length}+` : String(snaps.length);
+  // `total` is the real commit count (backend reports it independent of the
+  // limit-truncated snapshots slice), so we show the actual number instead of
+  // the old "<limit>+".
+  const count = data?.total && data.total > 0 ? data.total : snaps.length;
   return (
     <Badge variant="outline" className="font-mono text-[10px]">
-      {label}
+      {count}
     </Badge>
   );
 }

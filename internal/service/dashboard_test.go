@@ -636,3 +636,47 @@ func TestMigrateSkipsWhenRegistryPopulated(t *testing.T) {
 		t.Errorf("populated registry should not re-seed from legacy, got %+v", list)
 	}
 }
+
+// recordingParser records every SQL it is asked to parse and rejects any
+// that still carries an unexpanded `{{` control placeholder — mimicking
+// the real Spark parser, which errors on `{{`.
+type recordingParser struct{ seen []string }
+
+func (p *recordingParser) Parse(_ context.Context, sql string) error {
+	p.seen = append(p.seen, sql)
+	if strings.Contains(sql, "{{") {
+		return &observability.ParseError{Message: "unexpanded placeholder: " + sql}
+	}
+	return nil
+}
+
+// TestSaveDashboardExpandsPlaceholdersBeforeParseCheck guards the save-time
+// parse-check against control placeholders. Dataset SQL carries
+// `{{period.start}}`-style placeholders that are not valid SQL; the save
+// validator must expand them (from the controls' defaults, as RenderDashboard
+// does) before parsing, or every dashboard with a control fails to save with
+// a spurious PARSE_SYNTAX_ERROR on `{{`.
+func TestSaveDashboardExpandsPlaceholdersBeforeParseCheck(t *testing.T) {
+	p := &recordingParser{}
+	s := dashService(t, &fakeProvider{}).WithSQLParser(p)
+	d := Dashboard{
+		Slug:     "ph",
+		Title:    "Placeholders",
+		Controls: []DashboardControl{{Name: "tr", Type: "time_range", Default: "last_7d"}},
+		Datasets: []DashboardDataset{{
+			Name: "ds", Dir: "demo",
+			SQL: "SELECT COUNT(*) AS n FROM t WHERE d >= {{tr.start}} AND d < {{tr.end}}",
+		}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("save with placeholder SQL should succeed (placeholders expanded before parse-check): %v", err)
+	}
+	if len(p.seen) == 0 {
+		t.Fatal("parser was never invoked")
+	}
+	for _, sql := range p.seen {
+		if strings.Contains(sql, "{{") {
+			t.Errorf("parser received unexpanded placeholder SQL: %q", sql)
+		}
+	}
+}

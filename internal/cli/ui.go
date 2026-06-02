@@ -752,7 +752,7 @@ Examples:
 				}
 			}
 			workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithRestart(restartFn)
-			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc}).WithCloudRunner(cloudPipelineRunnerBridge{svc: svc})
+			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc}).WithCloudRunner(cloudPipelineRunnerBridge{svc: svc}).WithAthenaOutputBucket(athenaOutputBucket)
 			dataHandler := dataquery.NewHandler(s3Client, athenaClient, athenaOutputBucket).(*dataquery.Handler).WithResolver(resolver)
 			// nil-safe: catalog handler renders an empty list in local-only mode.
 			var catalogClient api.GlueClient

@@ -8,7 +8,7 @@
  * the breadcrumb chrome since the Sheet owns its own header.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ReactFlowProvider } from "@xyflow/react";
 
@@ -62,8 +62,7 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
   // Local vs cloud — controls how StepLogs addresses CloudWatch / runner
   // log files in the drawer it opens.
   const pipelines = usePipelines();
-  const isLocal =
-    pipelines.data?.find((p) => p.dir === dir)?.compute === "local";
+  const isLocal = pipelines.data?.find((p) => p.dir === dir)?.compute === "local";
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedSyntheticId, setInspectedSyntheticId] = useState<string | null>(null);
@@ -88,12 +87,26 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
   const isRunning = liveStatus === "RUNNING";
   const settled = !states.isLoading && !isRunning;
 
-  const runs = useRuns(pipelineName, { dir, limit: 200, enabled: settled });
+  // node_runs / runs are read via Athena (cloud) or the warm Spark worker
+  // (local) and gated until the run is settled: locally that avoids racing
+  // the runner's transform container for memory mid-run; on both surfaces
+  // the live DAG colours come from the `states` channel (S3 `_progress`
+  // terminal markers for cloud, state.json for local — both authoritative
+  // per node), so node_runs is needed only at settle for durations / the
+  // triage strip / the per-node breakdown.
+  const runs = useRuns(pipelineName, {
+    dir,
+    limit: 200,
+    enabled: settled,
+  });
   const runRow: Run | undefined = useMemo(
     () => runs.data?.rows.find((r) => r.run_id === runId),
     [runs.data, runId],
   );
 
+  // arn ties node_runs to this execution. During a live cloud run runRow
+  // isn't loaded yet (runs is gated to settled), but runId IS the SFN
+  // execution ARN for cloud, so the join key still resolves.
   const arn = runRow?.sf_execution_arn || runId;
   const nodeRuns = useNodeRuns(pipelineName, {
     dir,
@@ -135,19 +148,44 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
     );
   }, [nodeRuns.data, graph]);
 
+  // The DAG's node colours merge two laggy, independent channels: the live
+  // progress states (S3 `_progress` for cloud, state.json for local — both
+  // report only RUNNING nodes and drop a node a few seconds after it stops
+  // emitting) and node_runs (the authoritative ok/failed record, but written
+  // then read back through Athena on a poll, so it lands seconds later). A
+  // node that finishes therefore briefly belongs to NEITHER channel — gone
+  // from the live states, not yet in node_runs — and a stateless merge would
+  // flash it back to uncolored before snapping green. Carry colours forward
+  // in a sticky map so a node never loses its colour: "running" only fills a
+  // node with no colour yet, and the terminal ok/failed result (whichever
+  // channel reports it first) wins and is never downgraded. Reset when the
+  // inspected run changes so colours don't bleed across runs.
+  const stickyStatusRef = useRef<{
+    runId: string;
+    m: Map<string, NodeRunColor>;
+  }>({ runId: "", m: new Map() });
   const nodeStatuses = useMemo(() => {
-    const m = new Map<string, NodeRunColor>();
+    if (stickyStatusRef.current.runId !== runId) {
+      stickyStatusRef.current = { runId, m: new Map() };
+    }
+    const sticky = stickyStatusRef.current.m;
+    const promote = (node: string, color: NodeRunColor) => {
+      const cur = sticky.get(node);
+      if (color === "running" && (cur === "succeeded" || cur === "failed"))
+        return;
+      sticky.set(node, color);
+    };
     for (const [node, st] of Object.entries(states.data?.states ?? {})) {
       const v = liveNodeColor(st.status);
-      if (v) m.set(node, v);
+      if (v) promote(node, v);
     }
     for (const r of perNode.values()) {
-      if (r.status === "ok") m.set(r.node, "succeeded");
-      else if (r.status === "failed") m.set(r.node, "failed");
-      else m.set(r.node, "running");
+      if (r.status === "ok") promote(r.node, "succeeded");
+      else if (r.status === "failed") promote(r.node, "failed");
+      else promote(r.node, "running");
     }
-    return m;
-  }, [states.data, perNode]);
+    return new Map(sticky);
+  }, [states.data, perNode, runId]);
 
   // In-flight Spark progress per node, fed to the DAG's task-progress bar.
   // Only RUNNING nodes with a non-zero task total carry an entry; finished

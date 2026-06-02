@@ -577,7 +577,22 @@ function IncrementalUpstreamSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (incomingTransformAliases.length === 0) {
+  // Cross-pipeline inputs (external_inputs) aren't graph edges, so they don't
+  // show up in incomingTransformAliases — but they're equally valid CDF
+  // targets (the runner reads a cross-pipeline Delta table's change feed by
+  // name as of v2.6.0). List them alongside the same-pipeline transform edges
+  // so the toggle covers both (CLI/UI parity, ADR-015).
+  const externalAliases = (
+    config.external_inputs && typeof config.external_inputs === "object"
+      ? Object.keys(config.external_inputs as Record<string, unknown>)
+      : []
+  ).sort();
+  const rows: { alias: string; cross: boolean }[] = [
+    ...incomingTransformAliases.map((alias) => ({ alias, cross: false })),
+    ...externalAliases.map((alias) => ({ alias, cross: true })),
+  ];
+
+  if (rows.length === 0) {
     return null;
   }
 
@@ -614,7 +629,7 @@ function IncrementalUpstreamSection({
         Incremental upstream reads
       </div>
       <ul className="mb-2 space-y-1">
-        {incomingTransformAliases.map((alias) => (
+        {rows.map(({ alias, cross }) => (
           <li
             key={alias}
             className="flex items-center justify-between rounded-md border border-border px-2 py-1 font-mono text-xs"
@@ -627,6 +642,11 @@ function IncrementalUpstreamSection({
                 onChange={() => void toggle(alias)}
               />
               <code>{alias}</code>
+              {cross && (
+                <span className="rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                  cross-pipeline
+                </span>
+              )}
             </label>
             <span className="text-[11px] text-muted-foreground">
               {current.has(alias) ? "CDF range" : "full read"}
@@ -1031,6 +1051,7 @@ export function ConfigPanel({
   );
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [togglingEnabled, setTogglingEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [destTab, setDestTab] = useState<"config" | "live">("config");
   // Transform-only: which tab — Code (editor + immediate I/O) or Settings
@@ -1292,6 +1313,23 @@ export function ConfigPanel({
 
 
   const isTransformNode = selectedNode!.type === "transform";
+  // A node is enabled unless its config explicitly says enabled = false.
+  const nodeEnabled =
+    (selectedNode!.data as Record<string, unknown> | undefined)?.enabled !==
+    false;
+
+  async function handleToggleEnabled() {
+    setTogglingEnabled(true);
+    setError(null);
+    try {
+      await updateNode(dir, selectedNode!.id, { enabled: !nodeEnabled });
+      onGraphUpdate();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTogglingEnabled(false);
+    }
+  }
 
   const showPreview =
     selectedNode!.type === "s3_source" ||
@@ -1450,6 +1488,31 @@ export function ConfigPanel({
             className="justify-start"
           >
             Preview
+          </Button>
+        )}
+        {isTransformNode && (
+          <Button
+            onClick={handleToggleEnabled}
+            disabled={togglingEnabled}
+            variant="outline"
+            size="sm"
+            className="justify-start"
+            title={
+              nodeEnabled
+                ? "Skip this node in runs without deleting it; its existing output table stays for downstream"
+                : "Run this node again"
+            }
+          >
+            {togglingEnabled ? (
+              <>
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {nodeEnabled ? "Disabling…" : "Enabling…"}
+              </>
+            ) : nodeEnabled ? (
+              "Disable node"
+            ) : (
+              "Enable node"
+            )}
           </Button>
         )}
         <Button

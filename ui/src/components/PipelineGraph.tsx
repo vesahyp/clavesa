@@ -460,7 +460,7 @@ export function PipelineGraph({
     return () => document.removeEventListener("keydown", onKey, true);
   }, [selectedEdgeId, handleDeleteEdge]);
 
-  const { nodes: rfNodes, edges: rfEdges } = useMemo(() => {
+  const { nodes: baseNodes, edges: rfEdges } = useMemo(() => {
     // ADR-017 registered sources aren't graph nodes — they live in each
     // transform's config.source_inputs. With showSources on, derive one
     // synthetic source node per referenced source plus an edge into each
@@ -608,6 +608,11 @@ export function PipelineGraph({
           nodeType: node.type,
           language: node.config?.language as string | undefined,
           compute: node.config?.compute as string | undefined,
+          // A node is enabled unless its config explicitly says
+          // enabled = false (mirrors ConfigPanel's nodeEnabled derivation).
+          // Synthetic source / external renderings have an empty config, so
+          // they're never marked disabled.
+          enabled: node.config?.enabled !== false,
           outputMode: extractDefaultOutputMode(node.config),
           sourceKind,
           sourceFormat,
@@ -616,8 +621,12 @@ export function PipelineGraph({
           output: nodeOutputs?.get(node.id),
           loading: loadingChain.has(node.id),
           previewed: previewedChain.has(node.id),
-          runStatus: nodeStatuses?.get(node.id),
-          progress: nodeProgress?.get(node.id),
+          // runStatus / progress are NOT set here on purpose — they tick
+          // every 2-3s during a live run, and folding them into this memo
+          // would re-run the dagre layout and rebuild every edge object on
+          // each tick (edge-label flicker + main-thread jank). They are
+          // applied in a cheap second pass below that leaves layout +
+          // edges untouched.
           quickAdd,
         },
       };
@@ -670,7 +679,26 @@ export function PipelineGraph({
     });
 
     return { nodes: rfNodes, edges: rfEdges };
-  }, [graph, nodeSchemas, nodeOutputs, loadingNodeId, previewedNodeId, nodeStatuses, nodeProgress, showSources, enableQuickAdd, handleQuickCreate, handleQuickConnect, handleSourceCreate, handleSourceConnect, selectedEdgeId, sourceSpecsByName]);
+  }, [graph, nodeSchemas, nodeOutputs, loadingNodeId, previewedNodeId, showSources, enableQuickAdd, handleQuickCreate, handleQuickConnect, handleSourceCreate, handleSourceConnect, selectedEdgeId, sourceSpecsByName]);
+
+  // Apply live run status / progress as a cheap second pass. This re-runs on
+  // every status tick (every 2-3s during a run) but only spreads each node's
+  // data — no dagre layout, no edge rebuild — so the DAG colours update live
+  // without flickering the edge labels or janking the main thread. The edges
+  // memo above never depends on status, so `rfEdges` stays referentially
+  // stable across ticks and React Flow leaves the edges alone.
+  const rfNodes = useMemo(
+    () =>
+      baseNodes.map((n) => ({
+        ...n,
+        data: {
+          ...n.data,
+          runStatus: nodeStatuses?.get(n.id),
+          progress: nodeProgress?.get(n.id),
+        },
+      })),
+    [baseNodes, nodeStatuses, nodeProgress],
+  );
 
   return (
     <div className="h-full w-full" data-testid="pipeline-graph" tabIndex={0}>

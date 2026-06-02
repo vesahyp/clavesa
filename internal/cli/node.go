@@ -45,6 +45,8 @@ Examples:
 		newNodeConnectCmd(),
 		newNodeDisconnectCmd(),
 		newNodePreviewCmd(),
+		newNodeDisableCmd(),
+		newNodeEnableCmd(),
 	)
 
 	return cmd
@@ -569,6 +571,47 @@ func newNodeRemoveCmd() *cobra.Command {
 				return fmt.Errorf("remove node: %w", err)
 			}
 			fmt.Printf("Removed node: %s\n", nodeID)
+			return nil
+		},
+	}
+}
+
+// newNodeDisableCmd / newNodeEnableCmd toggle a node's `enabled` attribute.
+// A disabled node is omitted from runs (the orchestration emitter skips it)
+// but keeps its module + last output table, so downstream reads the existing
+// table — a pause, not a delete.
+func newNodeDisableCmd() *cobra.Command {
+	return nodeEnabledToggleCmd("disable", false)
+}
+
+func newNodeEnableCmd() *cobra.Command {
+	return nodeEnabledToggleCmd("enable", true)
+}
+
+func nodeEnabledToggleCmd(verb string, enabled bool) *cobra.Command {
+	short := "Disable a node — skip it in runs without deleting it"
+	if enabled {
+		short = "Re-enable a previously disabled node"
+	}
+	return &cobra.Command{
+		Use:   verb + " [pipeline-dir] <node-id>",
+		Short: short,
+		Long:  short + ".\n\nTakes effect on the next local run, and on cloud after `pipeline orchestration sync` / deploy.\n\n" + pipelineDirHelp,
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, rest, _, err := resolvePipelineDir(cmd, args, 1)
+			if err != nil {
+				return err
+			}
+			nodeID := rest[0]
+			svc, _, err := newService(cmd)
+			if err != nil {
+				return err
+			}
+			if _, err := svc.UpdateNode(dir, nodeID, map[string]interface{}{"enabled": enabled}); err != nil {
+				return fmt.Errorf("%s node: %w", verb, err)
+			}
+			fmt.Printf("%sd node: %s\n", verb, nodeID)
 			return nil
 		},
 	}

@@ -21,6 +21,8 @@ package tfgen
 import (
 	"fmt"
 	"strings"
+
+	"github.com/vesahyp/clavesa/internal/version"
 )
 
 // Pipeline carries everything tfgen needs to emit orchestration.tf.
@@ -215,6 +217,15 @@ func emitGlueCatalogDB(b *strings.Builder, p Pipeline) {
 	// encoders must stay byte-identical so the runner writes to the DB
 	// terraform created. Schema isn't a literal (it's var.schema), so the
 	// encoded name is itself an HCL string with an embedded replace().
+	// The deploying principal (whoever runs `terraform apply`) is the
+	// workspace owner and the principal the local `clavesa ui` queries
+	// Athena as. On Lake-Formation-enabled accounts it needs an explicit
+	// read grant on clavesa's DBs or every UI/CLI query is denied. We grant
+	// it below, on this pipeline's DB and (in the runs-writer section) the
+	// system catalog. This is the "owner" read role; finer roles
+	// (analyst/bi/...) layer on later.
+	fmt.Fprintf(b, "data \"aws_caller_identity\" \"clavesa_owner\" {}\n\n")
+
 	fmt.Fprintf(b, "# Glue catalog database — per-pipeline output namespace (ADR-016).\n")
 	fmt.Fprintf(b, "# location_uri is required for Spark's Glue Hive Client to resolve\n")
 	fmt.Fprintf(b, "# the DB's warehouse path on saveAsTable. Without it Hive trips\n")
@@ -256,6 +267,27 @@ func emitGlueCatalogDB(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"pipeline_runner_tables\" {\n")
 	fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
 	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"INSERT\", \"DELETE\", \"ALTER\", \"DROP\", \"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  table {\n")
+	fmt.Fprintf(b, "    database_name = aws_glue_catalog_database.pipeline.name\n")
+	fmt.Fprintf(b, "    wildcard      = true\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	// Owner read grant — the deploying principal (workspace owner / UI query
+	// principal) gets read on this pipeline's tables so the Catalog, table
+	// pages, and dashboards work in cloud. Named principals can wildcard
+	// (unlike IAM_ALLOWED_PRINCIPALS).
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"owner_db\" {\n")
+	fmt.Fprintf(b, "  principal   = data.aws_caller_identity.clavesa_owner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  database {\n")
+	fmt.Fprintf(b, "    name = aws_glue_catalog_database.pipeline.name\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"owner_tables\" {\n")
+	fmt.Fprintf(b, "  principal   = data.aws_caller_identity.clavesa_owner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"DESCRIBE\"]\n")
 	fmt.Fprintf(b, "  table {\n")
 	fmt.Fprintf(b, "    database_name = aws_glue_catalog_database.pipeline.name\n")
 	fmt.Fprintf(b, "    wildcard      = true\n")
@@ -378,13 +410,12 @@ func emitIAMRole(b *strings.Builder, p Pipeline) {
 // ---------------------------------------------------------------------------
 
 // moduleVersionLiteral is baked into the pipeline Lambda env as
-// CLAVESA_MODULE_VERSION. The orchestration emitter doesn't have access
-// to internal/service/version.go (cyclic import), and pushing it through
-// Pipeline as a field has no other consumer today — hardcoded for
-// v2.2.2; bump alongside ModuleVersion in version.go. (v2.2.1 missed
-// this bump; threading the value through Pipeline would prevent the
-// next miss — filed in TODO.md.)
-const moduleVersionLiteral = "v2.2.2"
+// CLAVESA_MODULE_VERSION (provenance, stamped onto node_runs). Sourced
+// from the leaf internal/version package — importable here with no cycle
+// (it has no internal imports), which is what the previous "hardcoded,
+// remember to bump" literal kept drifting against (it sat at v2.2.2 while
+// version.go moved to v2.5.0). Single source of truth now.
+var moduleVersionLiteral = version.Module
 
 func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	safeCatalog := safeCatalogLiteral(p.Catalog)
@@ -956,6 +987,11 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "    Statement = [\n")
 	fmt.Fprintf(b, "      { Sid = \"GlueCatalog\", Effect = \"Allow\", Action = [\"glue:GetDatabase\", \"glue:CreateDatabase\", \"glue:GetTable\", \"glue:GetTables\", \"glue:CreateTable\", \"glue:UpdateTable\", \"glue:GetPartition\", \"glue:GetPartitions\"], Resource = [\n")
 	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:catalog\",\n")
+	// The runner image's Spark/Hive session probes the `default` database
+	// during init, before any user SQL runs — same as the pipeline runner
+	// role (GlueCatalogRead above). Without GetDatabase on it the session
+	// never initialises and the runs row is never written.
+	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/default\",\n")
 	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:database/%s__pipelines\",\n", sysCatalogSafe)
 	fmt.Fprintf(b, "          \"arn:aws:glue:*:*:table/%s__pipelines/*\",\n", sysCatalogSafe)
 	fmt.Fprintf(b, "      ]},\n")
@@ -1006,6 +1042,27 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"pipeline_runner_system_tables\" {\n")
 	fmt.Fprintf(b, "  principal   = aws_iam_role.pipeline_runner.arn\n")
 	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"INSERT\", \"ALTER\", \"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  table {\n")
+	fmt.Fprintf(b, "    database_name = \"%s__pipelines\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "    wildcard      = true\n")
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	// Owner read grant on the system catalog — the deploying principal (UI
+	// query principal) reads the observability tables (runs, node_runs, ...)
+	// so the dashboard and run history work in cloud. Without it the UI is
+	// LF-denied even though the cron writes the rows fine.
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"owner_system_db\" {\n")
+	fmt.Fprintf(b, "  principal   = data.aws_caller_identity.clavesa_owner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"DESCRIBE\"]\n")
+	fmt.Fprintf(b, "  database {\n")
+	fmt.Fprintf(b, "    name = \"%s__pipelines\"\n", sysCatalogSafe)
+	fmt.Fprintf(b, "  }\n")
+	fmt.Fprintf(b, "}\n\n")
+
+	fmt.Fprintf(b, "resource \"aws_lakeformation_permissions\" \"owner_system_tables\" {\n")
+	fmt.Fprintf(b, "  principal   = data.aws_caller_identity.clavesa_owner.arn\n")
+	fmt.Fprintf(b, "  permissions = [\"SELECT\", \"DESCRIBE\"]\n")
 	fmt.Fprintf(b, "  table {\n")
 	fmt.Fprintf(b, "    database_name = \"%s__pipelines\"\n", sysCatalogSafe)
 	fmt.Fprintf(b, "    wildcard      = true\n")

@@ -95,6 +95,8 @@ const SnapshotsResult = z.object({
   snapshots: z.array(SnapshotInfo),
   latest_record_count: z.number().nullish(),
   truncated: z.boolean(),
+  // Full commit count, independent of the (limit-truncated) snapshots slice.
+  total: z.number().optional().default(0),
 });
 export type SnapshotsResult = z.infer<typeof SnapshotsResult>;
 

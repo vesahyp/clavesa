@@ -393,6 +393,12 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 		if node == nil || node.Type != "transform" {
 			continue
 		}
+		// Disabled node: skip execution but keep its output-path registration
+		// (first pass) so downstream consumers resolve to its existing table.
+		// Mirrors the orchestration emitter's nodeEnabled filter (ADR-014).
+		if !nodeEnabled(*node) {
+			continue
+		}
 		tableID := outputPath[nodeID]
 		inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
 		if ierr != nil {
@@ -423,6 +429,17 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			finalErr = err
 			goto done
 		}
+		// Exclude disabled upstreams from the cascade-skip parent list — a
+		// disabled node never runs, so it's never in pipeline_handler's
+		// skipped_set, and leaving it in would block legitimate cascade-skip
+		// (mirror of the orchestration emitter's Parents filter).
+		var enabledParents []string
+		for _, p := range parents[nodeID] {
+			if up := nodeByID[p]; up != nil && up.Type == "transform" && !nodeEnabled(*up) {
+				continue
+			}
+			enabledParents = append(enabledParents, p)
+		}
 		bundle = append(bundle, bundleTransformConfig{
 			NodeID:    nodeID,
 			Node:      node,
@@ -430,7 +447,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			Outputs:   buildLocalOutputs(node, tableID),
 			LogicPath: logicPath,
 			Language:  language,
-			Parents:   parents[nodeID],
+			Parents:   enabledParents,
 			TableID:   tableID,
 		})
 	}

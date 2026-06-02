@@ -347,6 +347,47 @@ func TestNodeRemove(t *testing.T) {
 	}
 }
 
+// TestNodeDisableEnable locks the `node disable` / `node enable` CLI
+// subcommands: disable writes `enabled = false` onto the module block,
+// enable flips it back to `enabled = true`. The seeded transform module is
+// the target. Mirrors the Run([]string{...}) harness the other node tests use.
+func TestNodeDisableEnable(t *testing.T) {
+	t.Parallel()
+	ws := setupWorkspace(t)
+	svc := service.New(ws)
+	if _, err := svc.AddNode("my-pipeline", "transform", "t1"); err != nil {
+		t.Fatalf("add transform: %v", err)
+	}
+	mainTF := filepath.Join(ws, "my-pipeline", "main.tf")
+
+	// disable
+	if err := Run([]string{"node", "disable", "my-pipeline", "t1", "--workspace", ws}); err != nil {
+		t.Fatalf("node disable: %v", err)
+	}
+	// Collapse whitespace before matching: the HCL writer column-aligns
+	// attributes (`enabled        = false`), and the alignment width is
+	// non-deterministic across runs, so an exact single-space substring
+	// flakes. strings.Fields normalizes it.
+	flat := func() string {
+		b, _ := os.ReadFile(mainTF)
+		return strings.Join(strings.Fields(string(b)), " ")
+	}
+	if f := flat(); !strings.Contains(f, "enabled = false") {
+		t.Errorf("main.tf should contain `enabled = false` after disable:\n%s", f)
+	}
+
+	// enable
+	if err := Run([]string{"node", "enable", "my-pipeline", "t1", "--workspace", ws}); err != nil {
+		t.Fatalf("node enable: %v", err)
+	}
+	if f := flat(); !strings.Contains(f, "enabled = true") {
+		t.Errorf("main.tf should contain `enabled = true` after re-enable:\n%s", f)
+	}
+	if f := flat(); strings.Contains(f, "enabled = false") {
+		t.Errorf("`enabled = false` should be gone after re-enable:\n%s", f)
+	}
+}
+
 func TestNodeConnectDisconnect(t *testing.T) {
 	t.Parallel()
 	ws := t.TempDir()

@@ -178,6 +178,10 @@ type SnapshotsResult struct {
 	Snapshots         []SnapshotInfo `json:"snapshots"`
 	LatestRecordCount *int64         `json:"latest_record_count,omitempty"`
 	Truncated         bool           `json:"truncated"`
+	// Total is the full commit count for the table, independent of the
+	// returned (possibly limit-truncated) Snapshots slice — so the catalog
+	// can show the real number of commits instead of "<limit>+".
+	Total int `json:"total"`
 }
 
 // ColumnStatsQuery selects per-column statistics for one Iceberg table from

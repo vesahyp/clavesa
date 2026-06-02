@@ -363,17 +363,18 @@ export function NodesGrid({
         </div>
       )}
       <div className="relative">
-        {/* The sticky node-name column carries a distinct background
-            (bg-muted/30) — that contrast is the affordance that signals
-            "this side is fixed; everything right of it scrolls." The
-            "N older / N newer" pills above handle the overflow count;
-            no gradient fades needed. */}
+        {/* The sticky node-name column carries an OPAQUE background (bg-card,
+            matching the card it sits on) plus a right border — the border is
+            the "this side is fixed; everything right of it scrolls" affordance.
+            Opaque is load-bearing: a translucent fill (the old bg-muted/30) let
+            the run cells scroll visibly through the column. The "N older /
+            N newer" pills above handle the overflow count. */}
         <div ref={scrollRef} className="overflow-x-auto">
           <table className="border-separate border-spacing-0">
           <thead>
             {/* Day-group band */}
             <tr>
-              <th className="sticky left-0 z-20 bg-muted/30 pb-1 text-left">
+              <th className="sticky left-0 z-20 bg-card border-r border-border pb-1 text-left">
                 <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Node · output table
                 </span>
@@ -395,7 +396,7 @@ export function NodesGrid({
             </tr>
             {/* Per-run header — runtime bar + time */}
             <tr>
-              <th className="sticky left-0 z-20 bg-muted/30" />
+              <th className="sticky left-0 z-20 bg-card border-r border-border" />
               {cols.map((r) => (
                 <th
                   key={r.run_id}
@@ -455,8 +456,8 @@ export function NodesGrid({
                 <tr key={node} className="group">
                   <td
                     className={cn(
-                      "sticky left-0 z-20 bg-muted/30 group-hover:bg-muted/50",
-                      isSelectedNode && "bg-muted/60",
+                      "sticky left-0 z-20 bg-card border-r border-border group-hover:bg-muted",
+                      isSelectedNode && "bg-muted",
                     )}
                   >
                     <div className="flex items-center gap-3 py-1.5 pr-6">

@@ -94,7 +94,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	}
 	transformIDs := make([]string, 0, len(topoOrder))
 	for _, id := range topoOrder {
-		if nodeByID[id].Type == "transform" {
+		if nodeByID[id].Type == "transform" && nodeEnabled(nodeByID[id]) {
 			transformIDs = append(transformIDs, id)
 		}
 	}
@@ -164,6 +164,13 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	// machine to listen to.
 	upstreamProducers := s.upstreamProducerPipelines(g, pipelineName, resolvePipelineSchema(abs, pipelineName))
 
+	// Producer-grain lookup for cross-pipeline CDF reads (GH: dim CDF
+	// crash). Keyed schema → table → the producing node's output
+	// merge_keys, so buildNodeInputsExpr stamps the upstream's grain on
+	// each delta_table_cdf descriptor rather than the consumer's own
+	// output keys (which name the consumer's columns, not the upstream's).
+	producerMergeKeys := s.crossPipelineProducerMergeKeys(pipelineName)
+
 	// Lake Formation read grants on upstream schemas (GH #4). Distinct
 	// sanitized schemas this pipeline reads cross-pipeline, own schema
 	// excluded — runs after edge reclassification so only genuine
@@ -215,17 +222,23 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 			bucketExpr, id, ext,
 		)
 
-		inputsExpr, err := s.buildNodeInputsExpr(id, catalog, nodeByID, edgesByToNode)
+		inputsExpr, err := s.buildNodeInputsExpr(id, catalog, nodeByID, edgesByToNode, producerMergeKeys)
 		if err != nil {
 			return err
 		}
 		outputsExpr := buildNodeOutputsExpr(id, nodeByID, edgesByFromNode)
 
 		// Parents = intra-pipeline upstream transform node ids (cascade-
-		// skip input for pipeline_handler).
+		// skip input for pipeline_handler). Disabled upstreams are excluded:
+		// they never run, so they're never in the runner's skipped_set, and
+		// leaving them in would block legitimate cascade-skip (the "all
+		// parents skipped" test can never pass with a parent that can't
+		// skip). Downstream still reads the disabled node's materialized
+		// table via its inputs descriptor — the module block stays in .tf.
 		var parents []string
 		for _, e := range edgesByToNode[id] {
-			if nodeByID[e.FromNode].Type == "transform" {
+			from := nodeByID[e.FromNode]
+			if from.Type == "transform" && nodeEnabled(from) {
 				parents = append(parents, e.FromNode)
 			}
 		}
@@ -293,8 +306,9 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 // is unchanged because the runner reads the same shapes; only the
 // surrounding container moved from `nodes = { id = { inputs = … } }` to
 // `Payload = { inputs = … }`.
-func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]graph.Node, edgesByToNode map[string][]graph.Edge) (string, error) {
+func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]graph.Node, edgesByToNode map[string][]graph.Edge, producerMergeKeys map[string]map[string][]string) (string, error) {
 	entries := make([]string, 0)
+	incrementalAliases := incrementalInputAliases(nodeByID[id])
 
 	// Cross-pipeline / external table refs (ADR-016 slice 2).
 	if extInputs, ok := nodeByID[id].Config["external_inputs"].(map[string]interface{}); ok {
@@ -304,6 +318,30 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 			tableID, err := identutil.EncodeExternalTableRef(catalog, ref)
 			if err != nil {
 				return "", fmt.Errorf("transform %q input %q: %w", id, alias, err)
+			}
+			if incrementalAliases[alias] {
+				// Cross-pipeline incremental read: the upstream Delta table
+				// lives in another pipeline, so there's no module.X.outputs to
+				// reference — point the CDF descriptor straight at the resolved
+				// table id. The runner reads the upstream's Change Data Feed
+				// over (watermark, current] and dedups the range to the latest
+				// row per key by `_commit_version DESC`. That dedup MUST key on
+				// the PRODUCER's grain — the columns that physically exist on
+				// the upstream Delta table — not this consumer's output
+				// merge_keys. The consumer renames freely (`SELECT cs_User_Agent
+				// AS user_agent`), so its output keys need not exist upstream;
+				// keying the range dedup on them throws "column not found" and
+				// kills the transform. See crossPipelineProducerMergeKeys.
+				// Watermark is per (consumer, alias), same as same-pipeline CDF.
+				watermarkAlias := id + "__" + alias
+				mergeKeysAttr := ""
+				if mk := producerGrainForRef(producerMergeKeys, ref); len(mk) > 0 {
+					mergeKeysAttr = fmt.Sprintf(", merge_keys = [%s]", quoteList(mk))
+				}
+				entries = append(entries, fmt.Sprintf(
+					`%s = { kind = "delta_table_cdf", table = %q, alias = %q%s }`,
+					alias, tableID, watermarkAlias, mergeKeysAttr))
+				continue
 			}
 			entries = append(entries, fmt.Sprintf("%s = %q", alias, tableID))
 		}
@@ -374,7 +412,6 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 	sort.Slice(incoming, func(i, j int) bool {
 		return inputAlias(incoming[i]) < inputAlias(incoming[j])
 	})
-	incrementalAliases := incrementalInputAliases(nodeByID[id])
 	for _, e := range incoming {
 		alias := inputAlias(e)
 		fromOutput := "default"
@@ -622,6 +659,20 @@ func isCloudCompute(n graph.Node) bool {
 // <alias>` to add to that list. Returns an empty set when the
 // attribute is absent so the default behaviour stays "full read every
 // run".
+// nodeEnabled reports whether a transform participates in pipeline runs. A
+// node with `enabled = false` in its HCL is omitted from the emitted
+// transforms list — it isn't executed, but its module block and its
+// last-materialized output table remain, so downstream consumers read the
+// existing (no-longer-refreshed) table rather than failing. Default (attribute
+// absent) is enabled. Used to pause a node — e.g. a derivation being moved to
+// a view — without deleting it.
+func nodeEnabled(n graph.Node) bool {
+	if v, ok := n.Config["enabled"].(bool); ok {
+		return v
+	}
+	return true
+}
+
 func incrementalInputAliases(n graph.Node) map[string]bool {
 	raw, ok := n.Config["incremental_inputs"]
 	if !ok {
@@ -819,6 +870,88 @@ func (s *Service) upstreamProducerPipelines(g graph.PipelineGraph, thisName, thi
 	}
 	sort.Strings(out)
 	return out
+}
+
+// crossPipelineProducerMergeKeys scans sibling pipelines and returns a
+// schema → table → producer-output-merge_keys map. The CDF input
+// descriptor for a cross-pipeline incremental read keys its range-dedup
+// on the PRODUCING node's grain (the columns that physically exist on the
+// upstream Delta table), never on the consumer's own output merge_keys.
+//
+// The distinction is load-bearing: a dim doing
+// `SELECT cs_User_Agent AS user_agent ... merge_keys = ["user_agent"]`
+// outputs a `user_agent` column, but the upstream `enriched` change feed
+// only has `cs_User_Agent` / `x_edge_request_id`. Keying the runner's
+// `partitionBy(...)` range-dedup on `user_agent` throws "column not found"
+// and kills the transform. The producer's grain (`x_edge_request_id`) is
+// the only correct key — it's the column on the feed and the grain the
+// upstream upserts on. The consumer's own SQL (DISTINCT / its own MERGE)
+// does the output-side collapse; the input dedup must not pre-empt it.
+//
+// Best-effort, mirroring upstreamProducerPipelines: a scan failure or a
+// ref that resolves to no in-workspace producer (external Glue table,
+// typo) yields no keys, so the descriptor is emitted without merge_keys
+// and the runner reads the CDF range raw. We can't dedup on a key we
+// can't prove exists upstream.
+//
+// Table-name resolution accepts both the bare `<node>` (ADR-019
+// single-default-output) and legacy `<node>__<key>` forms, matching
+// upstreamProducerPipelines.
+func (s *Service) crossPipelineProducerMergeKeys(thisName string) map[string]map[string][]string {
+	siblings, err := s.workspacePipelineScan()
+	if err != nil || len(siblings) == 0 {
+		return nil
+	}
+	out := map[string]map[string][]string{}
+	for _, p := range siblings {
+		if p.name == thisName {
+			continue
+		}
+		tbl, ok := out[p.schema]
+		if !ok {
+			tbl = map[string][]string{}
+			out[p.schema] = tbl
+		}
+		for _, n := range p.graph.Nodes {
+			if n.Type != "transform" {
+				continue
+			}
+			bare := identutil.Sanitize(n.ID)
+			outs, _ := n.Config["output_definitions"].(map[string]interface{})
+			if len(outs) == 0 {
+				mk := outputMergeKeys(n, "default")
+				tbl[bare] = mk
+				tbl[bare+"__default"] = mk
+				continue
+			}
+			if len(outs) == 1 {
+				if _, defaultOnly := outs["default"]; defaultOnly {
+					mk := outputMergeKeys(n, "default")
+					tbl[bare] = mk
+					tbl[bare+"__default"] = mk
+					continue
+				}
+			}
+			for k := range outs {
+				tbl[bare+"__"+k] = outputMergeKeys(n, k)
+			}
+		}
+	}
+	return out
+}
+
+// producerGrainForRef looks up the producing node's output merge_keys for
+// a cross-pipeline `<schema>.<table>` reference. Empty when the ref is
+// malformed or the producer isn't in the workspace scan.
+func producerGrainForRef(m map[string]map[string][]string, ref string) []string {
+	dot := strings.Index(ref, ".")
+	if dot < 0 {
+		return nil
+	}
+	if tbl, ok := m[ref[:dot]]; ok {
+		return tbl[ref[dot+1:]]
+	}
+	return nil
 }
 
 // upstreamReadSchemas returns the deduplicated, sorted set of sanitized

@@ -254,36 +254,119 @@ func (s *Service) SaveDashboard(ctx context.Context, d Dashboard) (Dashboard, er
 // Transport failures (warm worker dead, missing image) are logged but
 // don't block the save — render-time will surface real parse errors.
 func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
-	if s.sqlParser == nil {
+	// Trino/Athena portability gate (ADR-022). A dashboard is a SERVING
+	// surface: on a cloud workspace its SQL runs on Athena (Trino), not Spark,
+	// so Spark-only SQL (`to_date(x)`, `APPROX_COUNT_DISTINCT`, a bare
+	// timestamp-vs-string compare, …) parses fine on the Spark parser below but
+	// 500s at render. Dry-run each statement via Athena `EXPLAIN` — it
+	// validates dialect, functions and types without scanning data — and
+	// reject the save with the engine's own message. Cloud-only: a local
+	// workspace has no Athena to validate against (its serving SQL runs on
+	// Spark), so the gate is skipped there — the known portability gap is
+	// local-authored SQL that only breaks once deployed to cloud (ADR-022).
+	var trinoProv observability.Provider
+	if s.dashResolver != nil && !s.dashResolver.IsLocal() {
+		if p, perr := s.dashboardProvider(); perr == nil {
+			trinoProv = p
+		}
+	}
+	// Neither check is available (no SparkSQL parser wired AND no cloud serving
+	// engine) — nothing to validate. Common in CLI/unit paths with no docker.
+	if s.sqlParser == nil && trinoProv == nil {
 		return nil
 	}
+
+	// Expand control-placeholder defaults before parsing. Dataset / control
+	// SQL carries `{{name}}` placeholders (e.g. `{{period.start}}`) that are
+	// not valid SQL until substituted — the parser chokes on `{{`. Resolve
+	// the dashboard's declared control defaults exactly as RenderDashboard
+	// does, so we parse-check the SQL the engine will actually run rather
+	// than the raw template.
+	effective := map[string]string{}
+	resolveControlDefaults(d.Controls, effective, time.Now())
+
 	var failures []string
-	checkOne := func(label, sql string) {
-		if err := s.ValidateSQL(ctx, sql); err != nil {
+	checkOne := func(label, sql, dir string) {
+		expanded, expErr := expandPlaceholders(sql, effective)
+		if expErr != nil {
+			// An unresolved placeholder is a control-wiring issue, not a SQL
+			// syntax error the user can fix in the editor — render-time
+			// surfaces it. Skip the parse-check rather than block the save.
+			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped for %s (unresolved placeholder: %v)\n", label, expErr)
+			return
+		}
+		if err := s.ValidateSQL(ctx, expanded); err != nil {
 			var pe *ParseError
 			if errors.As(err, &pe) {
 				failures = append(failures, label+": "+pe.Message)
 				return
 			}
 			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped for %s: %v\n", label, err)
+			return
+		}
+		// SparkSQL parsed clean; now gate on Trino dialect for cloud serving.
+		if trinoProv == nil {
+			return
+		}
+		if _, qErr := trinoProv.Query(ctx, observability.QueryQuery{
+			SQL:         "EXPLAIN " + expanded,
+			PipelineDir: dir,
+			MaxRows:     1,
+		}); qErr != nil {
+			if hint, isDialect := servingDialectError(qErr); isDialect {
+				failures = append(failures, label+": "+hint)
+				return
+			}
+			// A non-dialect EXPLAIN failure (table not deployed yet, a
+			// transient Athena error) must not block authoring — log and move
+			// on so the save still succeeds.
+			fmt.Fprintf(os.Stderr, "warn: Trino EXPLAIN check skipped for %s: %v\n", label, qErr)
 		}
 	}
 	for _, ds := range d.Datasets {
 		if strings.TrimSpace(ds.SQL) == "" {
 			continue
 		}
-		checkOne(fmt.Sprintf("dataset %q", ds.Name), ds.SQL)
+		checkOne(fmt.Sprintf("dataset %q", ds.Name), ds.SQL, ds.Dir)
 	}
 	for _, c := range d.Controls {
 		if c.Type != "select" || strings.TrimSpace(c.SQL) == "" {
 			continue
 		}
-		checkOne(fmt.Sprintf("control %q", c.Name), c.SQL)
+		checkOne(fmt.Sprintf("control %q", c.Name), c.SQL, c.Dir)
 	}
 	if len(failures) == 0 {
 		return nil
 	}
-	return &ParseError{Message: "SQL parse failed:\n  " + strings.Join(failures, "\n  ")}
+	return &ParseError{Message: "Dashboard SQL validation failed:\n  " + strings.Join(failures, "\n  ")}
+}
+
+// servingDialectError reports whether an Athena/Trino EXPLAIN failure is a
+// SQL-dialect/portability problem the author must fix (a Spark-only function,
+// a type mismatch from an implicit Spark cast, a syntax error) versus an
+// environmental one (table not deployed, transient backend error) that should
+// not block a save. Returns a trimmed, user-facing hint for the former.
+func servingDialectError(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	msg := err.Error()
+	// Trino error codes that mean "this SQL won't run on Athena as written".
+	for _, code := range []string{
+		"FUNCTION_NOT_FOUND",
+		"TYPE_MISMATCH",
+		"SYNTAX_ERROR",
+		"INVALID_FUNCTION_ARGUMENT",
+		"NOT_SUPPORTED",
+		"AMBIGUOUS_FUNCTION_CALL",
+	} {
+		if idx := strings.Index(msg, code); idx >= 0 {
+			// Surface from the code onward — that's the actionable part
+			// ("FUNCTION_NOT_FOUND: line 1:153: Unexpected parameters …").
+			return msg[idx:], true
+		}
+	}
+	return "", false
 }
 
 // ApplyDashboardFile parses a dashboard JSON document (legacy or

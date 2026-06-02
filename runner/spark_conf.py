@@ -40,6 +40,47 @@ import os
 EVENTLOG_DIR = "/tmp/clavesa-eventlog"
 
 
+def _runtime_vcpus() -> float:
+    """Best-effort vCPU count for the current runtime.
+
+    Lambda allocates CPU proportional to memory — one full vCPU per 1769 MB
+    (so 3008 MB ≈ 1.7 vCPU, 10240 MB ≈ 5.8 vCPU) — and exposes the memory in
+    AWS_LAMBDA_FUNCTION_MEMORY_SIZE. That env is the reliable signal on Lambda
+    (os.cpu_count() reports the underlying host, not the allocated slice). Off
+    Lambda (local dev, a future Fargate task) fall back to the CPU count.
+    """
+    mem = os.environ.get("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
+    if mem:
+        try:
+            return max(1.0, int(mem) / 1769.0)
+        except ValueError:
+            pass
+    return float(os.cpu_count() or 1)
+
+
+def shuffle_partitions() -> int:
+    """Right-size spark.sql.shuffle.partitions to the runtime.
+
+    Spark's default of 200 is sized for a cluster. On the small-data tiers
+    clavesa targets (Lambda especially) it just spawns ~200 near-empty tasks
+    per shuffle, so a 14-node pipeline spends its budget on task scheduling
+    rather than work — the dominant cost behind the gold pipeline's ~35s/node
+    and the 900s Lambda timeout when stats are on. Scale to ~4 partitions per
+    vCPU, clamped so a 1-vCPU Lambda keeps a little parallelism and a large
+    future Fargate task doesn't overshoot:
+
+        memory_mb   ~vCPU   partitions
+          1769        1          4
+          3008        1.7        8
+          3540        2          8
+          5308        3         12
+          7076        4         16
+          8846        5         20
+         10240        5.8       24
+    """
+    return max(4, min(64, round(_runtime_vcpus()) * 4))
+
+
 def clavesa_spark_conf(
     warehouse: str | None = None,
     *,
@@ -115,6 +156,13 @@ def clavesa_spark_conf(
         # the pipeline's S3 bucket prefix, set by orchestration via
         # CLAVESA_WAREHOUSE.
         "spark.sql.warehouse.dir": warehouse,
+        # Right-size shuffle parallelism to the runtime (see shuffle_partitions
+        # docstring). The 200 default is a cluster value; on Lambda it's pure
+        # task-scheduling overhead. AQE coalescing stays on so a stage whose
+        # output is smaller than this still collapses to fewer tasks.
+        "spark.sql.shuffle.partitions": str(shuffle_partitions()),
+        "spark.sql.adaptive.enabled": "true",
+        "spark.sql.adaptive.coalescePartitions.enabled": "true",
     }
 
     if not is_s3:

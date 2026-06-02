@@ -1324,6 +1324,101 @@ def _ensure_database(spark, db_part: str) -> None:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_part}")
 
 
+def _sync_glue_table_schema(table_id: str, schema) -> None:
+    """Write the real Delta schema into a Glue table's ``StorageDescriptor.Columns``.
+
+    Spark's ``saveAsTable`` registers the Glue table with a generic
+    datasource stub (one ``col array<string>`` column) because the real
+    schema lives in the Delta ``_delta_log/``, not in Glue. The stub
+    schema is what Athena's table browser, autocomplete,
+    ``information_schema.columns``, external/BI consumers, and Lake
+    Formation all read. AWS docs say a columns-populated Delta
+    registration relies on ``spark.sql.sources.provider=delta`` (which
+    Spark already sets) and should NOT carry ``table_type`` — so this
+    helper writes the genuine columns and strips any stale ``table_type``
+    parameter a prior run left behind.
+
+    No-op unless the warehouse is an ``s3://`` path (cloud / Glue mode);
+    local Hadoop-catalog runs never touch Glue. ``table_id`` is the
+    two-segment ``<glue_db>.<table>`` Spark identifier; ``<glue_db>`` is
+    the Glue DatabaseName and the last segment the Glue table Name.
+    ``schema`` is the written PySpark ``StructType``;
+    ``dataType.simpleString()`` yields Hive/Glue-compatible type strings
+    (``decimal(p,s)``, ``timestamp``, ``date``, nested ``array<…>`` /
+    ``map<…>`` / ``struct<…>``).
+
+    Best-effort: idempotent (skips the update when Glue's columns already
+    equal the computed ones), preserves the existing TableInput
+    (StorageDescriptor location + serde + format, PartitionKeys,
+    parameters, …), and never raises — a sync failure logs to stderr and
+    the next write retries it. Region comes from the default boto3 session
+    (Lambda provides it).
+    """
+    warehouse = os.environ.get("CLAVESA_WAREHOUSE", "")
+    if not warehouse.startswith("s3://"):
+        return
+    try:
+        import boto3  # noqa: PLC0415
+
+        database = table_id.rsplit(".", 1)[0]
+        name = table_id.rsplit(".", 1)[1]
+        columns = [
+            {"Name": f.name, "Type": f.dataType.simpleString()}
+            for f in schema.fields
+        ]
+
+        glue = boto3.client("glue")
+        table = glue.get_table(DatabaseName=database, Name=name)["Table"]
+
+        existing_sd = dict(table.get("StorageDescriptor") or {})
+        existing_cols = existing_sd.get("Columns") or []
+        # Compare by ordered (Name, Type) pairs — ignore Comment/Parameters
+        # keys Glue may attach to each column.
+        existing_pairs = [(c.get("Name"), c.get("Type")) for c in existing_cols]
+        computed_pairs = [(c["Name"], c["Type"]) for c in columns]
+        if existing_pairs == computed_pairs:
+            return  # Glue already carries the real schema — nothing to do
+
+        new_sd = dict(existing_sd)
+        new_sd["Columns"] = columns
+
+        # Drop table_type: the columns-populated Delta registration uses
+        # spark.sql.sources.provider=delta (set by Spark), and AWS docs say
+        # NOT to set table_type when Glue carries real columns.
+        params = {
+            k: v
+            for k, v in (table.get("Parameters") or {}).items()
+            if k != "table_type"
+        }
+
+        # Carry forward every settable field of the existing table so the
+        # update only rewrites columns + parameters, never clobbering the
+        # rest of the registration.
+        table_input: dict[str, Any] = {
+            "Name": name,
+            "StorageDescriptor": new_sd,
+            "Parameters": params,
+        }
+        for field in (
+            "Description",
+            "Owner",
+            "Retention",
+            "PartitionKeys",
+            "ViewOriginalText",
+            "ViewExpandedText",
+            "TableType",
+            "TargetTable",
+        ):
+            if field in table:
+                table_input[field] = table[field]
+        glue.update_table(DatabaseName=database, TableInput=table_input)
+    except Exception as exc:  # noqa: BLE001 — best-effort, never crash
+        print(
+            f"[clavesa] glue schema sync failed for {table_id!r}: {exc!r}",
+            file=sys.stderr,
+        )
+
+
 def _v2_layout_path(base: str, db_part: str) -> str:
     """ADR-019 Slice 4 on-disk layout for a Hive-style ``<catalog>__<schema>``
     DB: ``<base>/<catalog>/<schema>`` (no ``.db`` suffix) for local
@@ -1482,6 +1577,7 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
                 spark.table(staging).write.format("delta").mode("append").option(
                     "mergeSchema", "true"
                 ).saveAsTable(target)
+                _sync_glue_table_schema(target, spark.table(target).schema)
             else:
                 raise RuntimeError(
                     "backfill_promote append: append-mode targets need force_dedup or allow_duplicates"
@@ -1614,6 +1710,19 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
         if df is None:
             # Empty partitioned input — skip the entire run.
             return {"status": "skipped", "reason": f"input {alias!r} has no new partitions"}
+        # Bundle-level input cache: a plain table/path input that ≥2 nodes of
+        # this pipeline run read (e.g. silver.enriched, read by every gold dim)
+        # is persisted on first use and handed to every later node, so the
+        # shared upstream is scanned from S3 once per run instead of once per
+        # node. pipeline_handler seeds _BUNDLE_SHARED_INPUTS and unpersists when
+        # the run ends. Inactive (set empty) for single-node handler() calls.
+        if isinstance(src, str) and src in _BUNDLE_SHARED_INPUTS:
+            cached = _BUNDLE_INPUT_CACHE.get(src)
+            if cached is not None:
+                df = cached
+            else:
+                df = df.cache()
+                _BUNDLE_INPUT_CACHE[src] = df
         df.createOrReplaceTempView(alias)
         input_dfs[alias] = df
         if advance is not None:
@@ -1688,6 +1797,13 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                 df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
             else:
                 df.write.format("delta").mode("overwrite").saveAsTable(table_id)
+            # Write the real schema into Glue's StorageDescriptor.Columns so
+            # Athena's browser / information_schema / Lake Formation see the
+            # genuine columns instead of Spark's generic `col array<string>`
+            # stub. Use the committed table schema (post schema-evolution on
+            # the merge path). No-op outside cloud / Glue mode; re-runs are
+            # idempotent and re-sync after Spark overwrite resets Glue.
+            _sync_glue_table_schema(table_id, spark.table(table_id).schema)
         written[key] = spec["target"]
 
         # Per-output opt-in column statistics (v0.24+). Computed off the
@@ -1952,6 +2068,7 @@ def _record_node_run(row: dict[str, Any]) -> None:
             # of letting the metastore default it under the invoking pipeline.
             writer = writer.option("path", location)
     writer.saveAsTable(table_id)
+    _sync_glue_table_schema(table_id, df.schema)
 
 
 def _runs_table_id() -> str:
@@ -2012,6 +2129,7 @@ def _record_run(row: dict[str, Any]) -> None:
 
     df = spark.createDataFrame([row], schema=_runs_schema())
     df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
+    _sync_glue_table_schema(table_id, df.schema)
 
 
 def _tables_table_id() -> str:
@@ -2157,6 +2275,7 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
         if location:
             writer = writer.option("path", location)
     writer.saveAsTable(tables_id)
+    _sync_glue_table_schema(tables_id, df.schema)
 
     # Net rows this commit contributed.
     #
@@ -2438,6 +2557,7 @@ def _record_column_stats(rows):
         if location:
             writer = writer.option("path", location)
     writer.saveAsTable(table_id)
+    _sync_glue_table_schema(table_id, df.schema)
 
 
 def run_record_run() -> None:
@@ -2758,12 +2878,19 @@ def handler(event, context):
 
         def _emit_progress_s3(payload, _bucket=prog_bucket, _key=prog_key):
             # Best-effort: a PUT failure must never affect the transform.
+            # "status": "running" tags this as a live in-flight tick so the
+            # backend can tell it apart from the terminal marker written in
+            # the finally block below.
             try:
                 _s3_client().put_object(
                     Bucket=_bucket,
                     Key=_key,
                     Body=json.dumps(
-                        {**payload, "updated_ms": int(time.time() * 1000)}
+                        {
+                            **payload,
+                            "status": "running",
+                            "updated_ms": int(time.time() * 1000),
+                        }
                     ).encode("utf-8"),
                 )
             except Exception:  # noqa: BLE001 — sink is enrichment-only
@@ -2824,6 +2951,43 @@ def handler(event, context):
         if cloud_poller is not None:
             cloud_poller.stop()
         ended_ms = int(time.time() * 1000)
+        # Terminal marker: overwrite the last running tick with a final
+        # snapshot so the progress file is AUTHORITATIVE for completed nodes.
+        # The backend no longer has to infer "done" from a stale-but-running
+        # file — a terminal "status" (succeeded/failed/skipped) is written
+        # explicitly. No stage/task counters here on purpose; the progress
+        # bar only shows for in-flight nodes. "metrics" is reserved for future
+        # executor/shuffle telemetry (e.g. Spark task metrics) and ships empty
+        # for now. Best-effort: a PUT failure must never affect or mask the
+        # transform outcome.
+        if progress_target is not None:
+            prog_bucket, prog_key = progress_target
+            terminal = (
+                "failed"
+                if status == "failed"
+                else "skipped"
+                if status == "skipped"
+                else "succeeded"
+            )
+            try:
+                _s3_client().put_object(
+                    Bucket=prog_bucket,
+                    Key=prog_key,
+                    Body=json.dumps(
+                        {
+                            "status": terminal,
+                            "started_ms": started_ms,
+                            "ended_ms": ended_ms,
+                            "error": (error_msg or "")[:500]
+                            if status == "failed"
+                            else "",
+                            "updated_ms": ended_ms,
+                            "metrics": {},
+                        }
+                    ).encode("utf-8"),
+                )
+            except Exception:  # noqa: BLE001 — sink is enrichment-only
+                pass
         try:
             # Resource + Spark task-metric capture. Both are best-effort and
             # already inside this try, so a failure here logs and is
@@ -2905,6 +3069,33 @@ def _topo_sort_transforms(transforms):
     return [by_node[n] for n in ordered]
 
 
+# Bundle-level shared-input cache. pipeline_handler runs every transform in one
+# Spark session, so an input read by multiple nodes (the medallion pattern: one
+# silver table feeding many gold dims) need only be scanned from S3 once for the
+# whole run. _BUNDLE_SHARED_INPUTS holds the descriptors worth caching (seeded
+# per run); _BUNDLE_INPUT_CACHE holds the persisted DataFrames (populated lazily
+# by _run_transform on first use, released when the run ends). Empty outside a
+# bundle run, so single-transform handler()/preview paths are unaffected.
+_BUNDLE_SHARED_INPUTS: set[str] = set()
+_BUNDLE_INPUT_CACHE: dict[str, Any] = {}
+
+
+def _bundle_shared_inputs(transforms) -> set[str]:
+    """Plain string input descriptors referenced by ≥2 transforms in the
+    bundle — the ones worth persisting once and reusing. dict descriptors
+    (partitioned_path incremental reads, with per-node windows + watermark
+    side effects) are never cached.
+    """
+    counts: dict[str, int] = {}
+    for t in transforms:
+        if not isinstance(t, dict):
+            continue
+        for src in (t.get("inputs") or {}).values():
+            if isinstance(src, str) and src:
+                counts[src] = counts.get(src, 0) + 1
+    return {src for src, n in counts.items() if n >= 2}
+
+
 def pipeline_handler(event, context):
     """Pipeline-bundle entry point: run every transform in a pipeline
     sequentially in one Spark session, reusing the module-level ``_SPARK``
@@ -2950,6 +3141,11 @@ def pipeline_handler(event, context):
     # mis-ordered payload (GH #6) would otherwise run a consumer before its
     # parent's table exists. Re-sort by declared parents before executing.
     transforms = _topo_sort_transforms(transforms)
+    # Seed the shared-input cache for this run: inputs ≥2 nodes read get
+    # scanned once and reused. Released in the finally below.
+    _BUNDLE_SHARED_INPUTS.clear()
+    _BUNDLE_SHARED_INPUTS.update(_bundle_shared_inputs(transforms))
+    _BUNDLE_INPUT_CACHE.clear()
     parents_by_node = {
         t.get("node"): list(t.get("parents") or [])
         for t in transforms
@@ -3079,6 +3275,15 @@ def pipeline_handler(event, context):
                 "status": "ok",
                 "output_rows": output_rows,
             })
+
+    # Every node has run — release the shared inputs cached for this bundle.
+    for cached in _BUNDLE_INPUT_CACHE.values():
+        try:
+            cached.unpersist()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+    _BUNDLE_INPUT_CACHE.clear()
+    _BUNDLE_SHARED_INPUTS.clear()
 
     result = {
         "status": overall_status,

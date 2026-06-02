@@ -80,6 +80,37 @@ variable "inputs" {
   default = {}
 }
 
+variable "enabled" {
+  description = <<-EOT
+    Whether this transform runs. `false` pauses the node: the orchestration
+    emitter omits it from pipeline runs, so it stops refreshing — but its
+    module and last-materialized output table remain, and downstream consumers
+    read that existing table. Used to disable a node (e.g. one being replaced
+    by a view) without deleting it. The module body doesn't consume this; the
+    emitter reads it from the parsed HCL. Default true.
+  EOT
+  type    = bool
+  default = true
+}
+
+variable "incremental_inputs" {
+  description = <<-EOT
+    Input aliases (from `inputs`) that should be read incrementally — the
+    runner reads only the upstream Delta table's Change Data Feed since this
+    consumer's last run (a per-(consumer, alias) version watermark) instead of
+    a full scan, and the keyed `merge` output upserts the new rows. The
+    medallion default: one silver table feeding many gold consumers, each
+    processing only what changed.
+
+    This module does not consume the value — the orchestration emitter reads it
+    from the parsed HCL to build the `delta_table_cdf` input descriptor. It is
+    declared here only so `terraform validate` accepts the argument; restoring
+    it (dropped after v0.19.0) is what makes incremental reads authorable again.
+  EOT
+  type    = list(string)
+  default = []
+}
+
 # Registered-source attachments (ADR-017 v0.22.0). Separate variable from
 # var.inputs because the runner event payload comes from the orchestration
 # module (which resolves the registry name → descriptor at SFN execution

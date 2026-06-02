@@ -149,7 +149,11 @@ func isAthenaMissingTableErr(err error) bool {
 const (
 	athenaMaxPollAttempts = 60
 	athenaPollInterval    = 500 * time.Millisecond
-	logsLimit             = 500
+	// athenaResultReuseMinutes bounds how stale a reused query result may be.
+	// Short enough that a just-finished run's rollup shows up promptly on the
+	// next poll, long enough to collapse the repeated per-page cold-starts.
+	athenaResultReuseMinutes = 5
+	logsLimit                = 500
 )
 
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -544,6 +548,47 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		return nil, fmt.Errorf("read delta log: %w", err)
 	}
 
+	// Full commit count before any limit truncation — the catalog shows
+	// this as the real number of commits instead of "<limit>+".
+	totalCommits := len(commits)
+
+	// Compute LatestRecordCount by walking commits oldest-first — the
+	// MERGE-mode commits that dominate cloud pipelines carry added/deleted
+	// per commit but no per-commit TotalRecords, so reading only the latest
+	// commit's TotalRecords (the old behaviour) left the catalog row count
+	// blank. Mirrors LocalProvider.Snapshots so local and cloud agree
+	// (ADR-014). Replaces resets the running total; MERGE nets out updates
+	// (they don't change row count); APPEND/DELETE net added-deleted.
+	var latestCount *int64
+	if len(commits) > 0 {
+		var total int64
+		for i := len(commits) - 1; i >= 0; i-- {
+			ci := commits[i]
+			added := int64(0)
+			if ci.AddedRecords != nil {
+				added = *ci.AddedRecords
+			}
+			updated := int64(0)
+			if ci.UpdatedRecords != nil {
+				updated = *ci.UpdatedRecords
+			}
+			deleted := int64(0)
+			if ci.DeletedRecords != nil {
+				deleted = *ci.DeletedRecords
+			}
+			netDelta := added - updated - deleted
+			if ci.Replaces {
+				total = netDelta
+			} else {
+				total += netDelta
+			}
+		}
+		if total < 0 {
+			total = 0
+		}
+		latestCount = &total
+	}
+
 	limit := q.Limit
 	if limit <= 0 {
 		limit = len(commits)
@@ -577,10 +622,12 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		}
 		out = append(out, info)
 	}
-	res := &SnapshotsResult{Snapshots: out, Truncated: truncated}
+	res := &SnapshotsResult{Snapshots: out, Truncated: truncated, Total: totalCommits}
 	if len(out) > 0 && out[0].TotalRecords != nil {
 		v := *out[0].TotalRecords
 		res.LatestRecordCount = &v
+	} else if latestCount != nil {
+		res.LatestRecordCount = latestCount
 	}
 	return res, nil
 }
@@ -971,18 +1018,17 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	}
 	// Since v2.2.0 the cloud machine is a single bundled RunPipeline Task
 	// running the whole DAG in one Lambda, so SFN history only carries that
-	// one synthetic state name, never per-node. Per-node progress comes
-	// instead from the `_progress/<execARN>/<node>.json` objects the runner
-	// writes per poll tick. While the execution is RUNNING, LIST those and
-	// surface a RUNNING StateStatus per fresh node so the UI's progress bars
-	// (ADR-014 parity with local) light up. Once the execution reaches a
-	// terminal status there is nothing in flight, so we return an empty map.
-	var states map[string]StateStatus
-	if string(desc.Status) == string(sfntypes.ExecutionStatusRunning) {
-		states = c.liveProgressStates(ctx, q.ExecutionRef, c.nowFn())
-	} else {
-		states = map[string]StateStatus{}
-	}
+	// one synthetic state name, never per-node. Per-node status comes instead
+	// from the `_progress/<execARN>/<node>.json` objects the runner writes:
+	// a "running" snapshot rewritten each poll tick while a node is in flight,
+	// then a single terminal marker ("succeeded"/"failed"/"skipped") once it
+	// finishes. We always LIST those files and let each one's own `status`
+	// field drive the per-node StateStatus — authoritative for both live and
+	// completed nodes (ADR-014 parity with local). The overall Status below
+	// still comes from SFN DescribeExecution; only per-node state comes from
+	// the progress files, so a terminal execution still surfaces every node's
+	// final status rather than an empty map.
+	states := c.liveProgressStates(ctx, q.ExecutionRef, c.nowFn())
 	return &ExecutionStatesResult{
 		Status:    string(desc.Status),
 		States:    states,
@@ -997,12 +1043,17 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 // millisecond the runner stamped the snapshot, used to filter out stale
 // objects left behind by a previous node or a crashed run.
 type progressSnapshot struct {
-	StagesTotal     *int64 `json:"stages_total"`
-	StagesCompleted *int64 `json:"stages_completed"`
-	TasksTotal      *int64 `json:"tasks_total"`
-	TasksCompleted  *int64 `json:"tasks_completed"`
-	TasksFailed     *int64 `json:"tasks_failed"`
-	UpdatedMs       int64  `json:"updated_ms"`
+	StagesTotal     *int64          `json:"stages_total"`
+	StagesCompleted *int64          `json:"stages_completed"`
+	TasksTotal      *int64          `json:"tasks_total"`
+	TasksCompleted  *int64          `json:"tasks_completed"`
+	TasksFailed     *int64          `json:"tasks_failed"`
+	UpdatedMs       int64           `json:"updated_ms"`
+	Status          string          `json:"status"`
+	StartedMs       *int64          `json:"started_ms"`
+	EndedMs         *int64          `json:"ended_ms"`
+	Error           string          `json:"error"`
+	Metrics         json.RawMessage `json:"metrics"`
 }
 
 // freshnessWindowMs bounds how recent a `_progress/<node>.json` snapshot
@@ -1013,10 +1064,20 @@ type progressSnapshot struct {
 const freshnessWindowMs = 12000
 
 // liveProgressStates LISTs the per-node `_progress/<execARN>/<node>.json`
-// objects the runner writes each poll tick and returns a RUNNING StateStatus
-// per node whose snapshot is fresh (updated within freshnessWindowMs of now).
-// This is the per-node progress source for the bundled single-Task cloud
-// machine (v2.2.0+), where SFN history no longer carries per-node states.
+// objects the runner writes and returns a StateStatus per node whose status
+// is taken from the file's own `status` field. The runner rewrites a
+// "running" snapshot each poll tick (~1.5s) while a node is in flight, then
+// writes a single terminal marker ("succeeded"/"failed"/"skipped") once the
+// node finishes. This is the per-node progress source for the bundled
+// single-Task cloud machine (v2.2.0+), where SFN history no longer carries
+// per-node states.
+//
+// The freshness check applies ONLY to still-"running" files: a stale running
+// file is a crashed node (or an old runner whose node already finished but
+// never wrote a terminal marker) and is dropped. Terminal markers are
+// authoritative and always included — they never go stale. An empty status
+// (old runner that never wrote the field) is treated as "running" to preserve
+// the prior LIST-fresh-and-mark-RUNNING behavior.
 //
 // Best-effort throughout: a missing S3 client or bucket, a LIST error, or any
 // per-object GET/parse failure yields whatever was accumulated so far (an
@@ -1053,12 +1114,34 @@ func (c *CloudProvider) liveProgressStates(ctx context.Context, execARN string, 
 			if snap == nil {
 				continue
 			}
-			if nowMs-snap.UpdatedMs >= freshnessWindowMs {
-				// Stale object from a node that already finished — skip it.
-				continue
+			// An empty status means an old runner that never wrote the field;
+			// treat it as "running" to preserve the prior behavior.
+			rawStatus := snap.Status
+			if rawStatus == "" {
+				rawStatus = "running"
+			}
+			if rawStatus == "running" {
+				if nowMs-snap.UpdatedMs >= freshnessWindowMs {
+					// Stale "running" object — a crashed node, or an old
+					// runner whose node already finished. Skip it.
+					continue
+				}
+			}
+			var status string
+			switch rawStatus {
+			case "running":
+				status = "RUNNING"
+			case "succeeded":
+				status = "SUCCEEDED"
+			case "failed":
+				status = "FAILED"
+			case "skipped":
+				status = "SKIPPED"
+			default:
+				status = "RUNNING"
 			}
 			states[node] = StateStatus{
-				Status:          "RUNNING",
+				Status:          status,
 				StagesTotal:     snap.StagesTotal,
 				StagesCompleted: snap.StagesCompleted,
 				TasksTotal:      snap.TasksTotal,
@@ -1307,6 +1390,20 @@ func runAthenaQuery(ctx context.Context, ac AthenaClient, outputBucket, sql stri
 		QueryString: aws.String(sql),
 		ResultConfiguration: &athenatypes.ResultConfiguration{
 			OutputLocation: aws.String("s3://" + outputBucket + "/athena-results/"),
+		},
+		// Reuse a cached result for an identical query within the window
+		// instead of re-scanning. The observability tables (runs, node_runs,
+		// snapshots) are append-mostly and the UI polls the same queries
+		// repeatedly across the catalog, pipelines, and dashboard pages — so
+		// a short reuse window collapses the per-query Athena cold-start
+		// (seconds each) to a near-instant cache hit on repeat loads. A run
+		// completing invalidates naturally once the window lapses; the live
+		// status channel (S3 _progress) carries in-flight state regardless.
+		ResultReuseConfiguration: &athenatypes.ResultReuseConfiguration{
+			ResultReuseByAgeConfiguration: &athenatypes.ResultReuseByAgeConfiguration{
+				Enabled:         true,
+				MaxAgeInMinutes: aws.Int32(athenaResultReuseMinutes),
+			},
 		},
 	})
 	if err != nil {

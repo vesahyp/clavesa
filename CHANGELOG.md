@@ -12,6 +12,40 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.6.0] — 2026-06-02
+
+### Fixed
+
+- Restored table-to-table **incremental (CDF) reads** — the reason for the Iceberg→Delta move (ADR-018) — which had silently broken. The transform module dropped the `incremental_inputs` variable after v0.19.0, so declaring it failed `terraform validate` ("Unsupported argument"), and `pipeline upgrade` *stripped* it — even though the orchestration emitter still read it to build the `delta_table_cdf` descriptor. Net effect: an incremental input fell back to a full scan every run, and a keyed `merge` output behind it that should have deduped instead piled up duplicates. The module re-declares `incremental_inputs` (a passthrough the emitter reads), and `pipeline upgrade` no longer strips it. Authoring shape: `incremental_inputs = ["<alias>"]` + a `merge` output keyed on the upstream's grain. The node config panel's "Incremental upstream reads" toggle now also lists cross-pipeline inputs (it was scoped to same-pipeline transform edges only), so the full-table-vs-CDF choice is settable from the UI for a separate-pipeline medallion, not just the CLI/`.tf`.
+- `CLAVESA_MODULE_VERSION` stamped into the pipeline Lambda (provenance on `node_runs`) now tracks the real version — it had drifted, hardcoded at `v2.2.2` since v2.2.2 while the binary moved to v2.5.0. Sourced from the leaf `internal/version` package (no import cycle), so it can't drift again.
+
+### Changed
+
+- The bundled pipeline runner caches an input that multiple nodes read (the medallion shape — one silver table feeding many gold dims) for the duration of a run, so the shared upstream is scanned from S3 once instead of once per node. On the web-traffic gold pipeline this cut per-node overhead enough that `stats = true` now completes in ~526s where it previously hit the 900s Lambda ceiling (GH #14).
+- The runner right-sizes `spark.sql.shuffle.partitions` to the runtime instead of using Spark's cluster-oriented default of 200 — ~4 partitions per vCPU (Lambda: 3008 MB → 8, scaling with memory; off-Lambda falls back to CPU count), with AQE coalescing left on. Removes needless task-scheduling overhead on the small-data Lambda tier. (Note: this is a sound default but was *not* the cause of the gold-pipeline 900s timeout — that's per-node file-scan of the small-file upstream plus column-stats passes; see #14.)
+
+### Added
+
+- Nodes can be paused with `enabled = false`: a disabled transform is skipped in runs but keeps its module and last output table, so downstream still reads that table — a pause, not a delete. Settable from the CLI (`clavesa node disable` / `enable <pipeline> <node>`) or the node config panel; paused nodes render dimmed with a "Disabled" badge on the canvas and run DAG.
+- Dashboard saves are gated on serving-engine portability (ADR-022). On a cloud workspace each dataset/control query is dry-run via Athena `EXPLAIN` at save, so Spark-only serving SQL (single-arg `to_date`, `APPROX_COUNT_DISTINCT`, a bare timestamp-vs-string comparison, …) is rejected at save with the engine's own message instead of returning 500 at render. Local workspaces (no Athena) are unaffected.
+
+### Fixed
+
+- The "Recent executions" list on a pipeline's Runs tab is ordered newest-first again. Step Functions' `ListExecutions` ordering isn't reliable when several executions start in the same minute (a scheduled run plus cross-pipeline triggers), so the list rendered out of order; the handler now sorts by start time explicitly.
+- Catalog now shows real row counts for cloud Delta tables (the "rows" column was blank). The count is derived by walking the Delta commit history — the same computation local already did — instead of reading only the latest commit's record total, which MERGE-mode commits don't carry.
+- Catalog's "commits" column shows the true commit count instead of a capped "20+".
+- The pipeline runs grid's sticky node column is now opaque — run cells no longer scroll visibly through the "Node · output table" panel.
+- The run-detail sheet no longer blurs the page behind it; the backdrop-blur over the live dashboard was the cause of the high CPU and sluggishness while the sheet was open.
+- Cloud observability queries (catalog, run history, dashboards) reuse Athena results within a short window, cutting the per-query cold-start on repeated page loads.
+- The run-detail DAG now colours live during a cloud (Step Functions) run. The pipeline-status handler's cloud provider was built without an S3 client or the workspace bucket, so it could not read the per-node `_progress/<execARN>/<node>.json` objects the runner publishes each poll tick — in-flight node states came back empty and the DAG stayed grey until the run finished. It is now wired with both, matching the other UI handlers; the runner-side publishing was already working.
+- Cloud run status is now live and in sync across the run-detail DAG and the dashboard runs grid: each node turns green the moment it finishes, instead of completed nodes lagging behind a slow Athena read or showing as frozen/pending mid-run. The runner now writes a terminal `succeeded`/`failed` marker into each node's `_progress` file, and the status channel reads node status straight from those files for both running and finished executions — one fast authoritative source per node.
+- The run-detail DAG no longer flickers its edge labels or janks the canvas during a live run — per-node status updates no longer trigger a full graph relayout.
+
+- Cloud run history now appears on the dashboard and `/pipelines` (previously "Never run" even though the scheduled runs succeeded). Two causes: (1) the runs-writer Lambda's role was missing `glue:GetDatabase` on the `default` database, so its Spark session failed to initialise and the per-execution `runs` table was never created; (2) on Lake-Formation-enabled accounts the workspace owner — the principal the local `clavesa ui` queries Athena as — had no read grant on clavesa's catalogs, so Athena denied every dashboard query. The orchestration now grants the deploying principal `SELECT`/`DESCRIBE` on each pipeline's database and the system observability catalog.
+
+- Cloud Delta tables now show their real schema in the Glue Data Catalog instead of a single `col array<string>` stub — so the Athena table browser, autocomplete, `information_schema.columns`, external/BI consumers, and Lake Formation (which requires the catalog schema to match the transaction log) all see the genuine columns. Spark's `saveAsTable` registers the stub because the real schema lives in the Delta log; the runner now syncs the actual columns into each Glue table's `StorageDescriptor` after every write, covering transform outputs and the system observability tables (`runs`, `node_runs`, `tables`, `column_stats`). `SELECT` already worked via Spark's `spark.sql.sources.provider=delta` marker; this fixes everything that reads Glue's column metadata.
+- Saving a dashboard that uses a control (e.g. a time-range filter) no longer fails with a spurious `PARSE_SYNTAX_ERROR`. The save-time SQL parse-check now expands `{{...}}` control placeholders from the controls' defaults before parsing — the same expansion the render path does — instead of feeding the raw template to the parser, which choked on `{{`.
+
 ## [v2.5.0] — 2026-05-31
 
 ### Added

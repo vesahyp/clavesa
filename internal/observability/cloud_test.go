@@ -533,8 +533,16 @@ func TestIsAthenaMissingTableErr(t *testing.T) {
 // counters and updated_ms timestamp. Helper for the live-progress tests.
 func progressJSON(updatedMs int64) []byte {
 	return []byte(fmt.Sprintf(
-		`{"stages_total":3,"stages_completed":1,"tasks_total":40,"tasks_completed":18,"tasks_failed":2,"updated_ms":%d}`,
+		`{"status":"running","stages_total":3,"stages_completed":1,"tasks_total":40,"tasks_completed":18,"tasks_failed":2,"updated_ms":%d}`,
 		updatedMs))
+}
+
+// terminalProgressJSON is the final marker the runner writes when a node
+// finishes — it carries an explicit terminal status and no counters.
+func terminalProgressJSON(status string, updatedMs int64) []byte {
+	return []byte(fmt.Sprintf(
+		`{"status":%q,"started_ms":1,"ended_ms":%d,"updated_ms":%d,"metrics":{}}`,
+		status, updatedMs, updatedMs))
 }
 
 // TestLiveProgressStates asserts that LISTing the per-node `_progress`
@@ -613,10 +621,10 @@ func (s *stubSFN) GetExecutionHistory(_ context.Context, _ *sfn.GetExecutionHist
 	return &sfn.GetExecutionHistoryOutput{}, nil
 }
 
-// TestExecutionStatesRunningVsTerminal proves the RUNNING-vs-terminal
-// branch: a RUNNING execution surfaces fresh per-node `_progress` objects,
-// while a terminal one returns an empty state map even when a fresh object
-// still sits in the bucket.
+// TestExecutionStatesRunningVsTerminal proves per-node status is read from
+// the `_progress` files' own status field: a RUNNING execution surfaces a
+// fresh running node, and a terminal execution surfaces each node's terminal
+// marker from S3 — authoritative even when the marker is stale.
 func TestExecutionStatesRunningVsTerminal(t *testing.T) {
 	const arn = "arn:aws:states:eu-west-1:111122223333:execution:clavesa-demo:run-1"
 	const bucket = "demo-bucket"
@@ -648,9 +656,19 @@ func TestExecutionStatesRunningVsTerminal(t *testing.T) {
 		}
 	})
 
-	t.Run("terminal returns empty states", func(t *testing.T) {
+	t.Run("terminal surfaces per-node terminal markers from S3", func(t *testing.T) {
+		// A finished node writes a terminal marker. Even a STALE marker
+		// (older than the freshness window) must surface — terminal markers
+		// are authoritative and never expire, unlike still-"running" files.
+		staleMs := now.UnixMilli() - 60000
+		s3term := &stubS3Snap{
+			objects: map[string][]byte{
+				bucket + "/_progress/" + arn + "/a.json": terminalProgressJSON("succeeded", staleMs),
+				bucket + "/_progress/" + arn + "/b.json": terminalProgressJSON("failed", staleMs),
+			},
+		}
 		sfnStub := &stubSFN{status: sfntypes.ExecutionStatusSucceeded, arn: arn, start: now}
-		c := NewCloudProvider(nil, bucket, sfnStub, nil).WithS3(s3stub)
+		c := NewCloudProvider(nil, bucket, sfnStub, nil).WithS3(s3term)
 		c.clock = func() time.Time { return now }
 
 		res, err := c.ExecutionStates(context.Background(), ExecutionStatesQuery{ExecutionRef: arn})
@@ -660,11 +678,11 @@ func TestExecutionStatesRunningVsTerminal(t *testing.T) {
 		if res.Status != "SUCCEEDED" {
 			t.Errorf("Status = %q, want SUCCEEDED", res.Status)
 		}
-		if res.States == nil {
-			t.Fatal("States is nil, want empty non-nil map")
+		if got := res.States["a"].Status; got != "SUCCEEDED" {
+			t.Errorf("node a Status = %q, want SUCCEEDED (terminal marker, authoritative even when stale)", got)
 		}
-		if len(res.States) != 0 {
-			t.Errorf("terminal States = %v, want empty", res.States)
+		if got := res.States["b"].Status; got != "FAILED" {
+			t.Errorf("node b Status = %q, want FAILED", got)
 		}
 	})
 }

@@ -48,6 +48,14 @@ export type PipelineNodeData = {
    */
   outputMode?: string;
   /**
+   * Whether the node participates in runs. `false` means the author has
+   * paused it (config `enabled = false`) — the node is skipped in runs but
+   * kept in the graph. Rendered dimmed with a "Disabled" pill; still
+   * selectable so the user can re-enable it. Defaults to enabled (true /
+   * undefined). Always true for synthetic source / external renderings.
+   */
+  enabled?: boolean;
+  /**
    * Source-only metadata surfaced on the synthetic source card so users
    * see what kind of source it is (http / s3), its data format
    * (parquet / csv / json), and a short location label without having to
@@ -404,6 +412,7 @@ export function PipelineNode({ data, selected }: NodeProps) {
     language,
     compute,
     outputMode,
+    enabled,
     sourceKind,
     sourceFormat,
     sourceLocation,
@@ -433,6 +442,10 @@ export function PipelineNode({ data, selected }: NodeProps) {
   // output_definitions override — same fallback the runner uses.
   const writeMode = nodeType === "transform" ? outputMode || "replace" : "";
   const hasColumns = columns && columns.length > 0;
+  // A node is disabled only when config explicitly says so. Dim the card and
+  // show a "Disabled" pill so a paused node is distinguishable on the canvas;
+  // the card stays clickable so the user can re-enable it from the config drawer.
+  const isDisabled = enabled === false;
 
   // Border color precedence: preview-loading > runStatus (live SFN) >
   // previewed (completed preview chain) > selected > idle. The live SFN
@@ -458,6 +471,9 @@ export function PipelineNode({ data, selected }: NodeProps) {
       className={cn(
         "relative min-w-44 rounded-lg border-2 bg-card text-foreground transition-all",
         borderClass,
+        // Dim a paused node, but keep it interactive (no pointer-events-none)
+        // so the user can click in and re-enable it.
+        isDisabled && "opacity-50",
       )}
     >
       {nodeType !== "source" && (
@@ -482,6 +498,14 @@ export function PipelineNode({ data, selected }: NodeProps) {
           >
             {nodeType}
           </span>
+          {isDisabled && (
+            <span
+              title="This node is paused — skipped in runs until re-enabled"
+              className="ml-auto flex-shrink-0 rounded-sm bg-muted px-1.5 py-px text-[9px] font-semibold uppercase tracking-wider text-muted-foreground"
+            >
+              Disabled
+            </span>
+          )}
         </div>
         <div className="overflow-hidden truncate font-mono text-sm font-semibold">
           {label}

@@ -900,6 +900,10 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		latestCount = &total
 	}
 
+	// Full commit count before truncation — surfaced as Total so the
+	// catalog shows the real commit count, not "<limit>+".
+	totalCommits := len(commits)
+
 	limit := q.Limit
 	if limit <= 0 {
 		limit = len(commits)
@@ -928,7 +932,7 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		}
 		out = append(out, info)
 	}
-	result := &SnapshotsResult{Snapshots: out, Truncated: truncated}
+	result := &SnapshotsResult{Snapshots: out, Truncated: truncated, Total: totalCommits}
 	if len(out) > 0 && out[0].TotalRecords != nil {
 		v := *out[0].TotalRecords
 		result.LatestRecordCount = &v

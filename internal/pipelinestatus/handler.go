@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
@@ -77,6 +79,13 @@ type Handler struct {
 	awsRegion string
 	awsErr    error
 
+	// athenaOutputBucket is the workspace bucket that also holds the
+	// `_progress/<execARN>/<node>.json` objects the runner publishes per
+	// poll tick. liveProgressStates LISTs it to colour the run DAG live;
+	// without it (and the S3 client wired in ensureAWS) the cloud provider
+	// short-circuits and in-flight node states never surface.
+	athenaOutputBucket string
+
 	// resolver, when set, lets states/logs dispatch per-pipeline based on
 	// `compute` attr (ADR-014). When nil, the handler falls through to the
 	// cloud-only ARN path — preserves the pre-resolver call shape for tests.
@@ -110,6 +119,14 @@ func NewHandler(root string) *Handler {
 // path is used. Returns h for chained construction.
 func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 	h.resolver = r
+	return h
+}
+
+// WithAthenaOutputBucket wires the workspace bucket so the cloud provider
+// can read the runner's `_progress/` objects and colour the run DAG live.
+// Returns h for chained construction.
+func (h *Handler) WithAthenaOutputBucket(b string) *Handler {
+	h.athenaOutputBucket = b
 	return h
 }
 
@@ -156,7 +173,12 @@ func (h *Handler) ensureAWS(ctx context.Context) {
 		h.sfnClient = sfn.NewFromConfig(cfg)
 		h.cwlClient = cloudwatchlogs.NewFromConfig(cfg)
 		h.awsRegion = cfg.Region
-		h.cloud = observability.NewCloudProvider(nil, "", h.sfnClient, h.cwlClient)
+		// Pass the workspace bucket + an S3 client so liveProgressStates can
+		// LIST the runner's `_progress/<execARN>/<node>.json` objects and
+		// colour the run DAG live. Without both, the provider short-circuits
+		// and in-flight node states stay empty (the DAG never colours).
+		h.cloud = observability.NewCloudProvider(nil, h.athenaOutputBucket, h.sfnClient, h.cwlClient).
+			WithS3(s3.NewFromConfig(cfg))
 	})
 }
 
@@ -350,6 +372,15 @@ func (h *Handler) listExecutions(ctx context.Context, arnStr string) ([]executio
 		}
 		result = append(result, ei)
 	}
+	// SFN ListExecutions is documented as most-recent-first, but in practice
+	// the ordering isn't reliable across near-simultaneous starts (e.g. a
+	// scheduled run plus two cross-pipeline triggers landing in the same
+	// minute), so the "Recent executions" list rendered out of order. Sort
+	// explicitly by start time, newest first — StartedAt is ISO-8601 UTC, so
+	// a reverse string compare is chronological.
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i].StartedAt > result[j].StartedAt
+	})
 	return result, nil
 }
 

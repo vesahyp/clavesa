@@ -103,15 +103,6 @@ func (s *Service) PipelineModuleVersion(dir string) (*ModuleVersionInfo, error) 
 // CRLF line ending.
 var localComputeRE = regexp.MustCompile(`(?m)^[ \t]*compute[ \t]*=[ \t]*"local"[ \t]*\r?\n`)
 
-// incrementalInputsRE matches a standalone `incremental_inputs = [...]`
-// attribute line inside a transform module block. The transform module
-// dropped this variable; the orchestration emitter still reads it from
-// the parsed graph for the incremental-read descriptor, but `terraform
-// validate` rejects passing it as a module argument. `pipeline upgrade`
-// strips the line so deploys stop failing — does NOT touch the
-// incremental behaviour itself (the emitter falls back to full reads).
-var incrementalInputsRE = regexp.MustCompile(`(?m)^[ \t]*incremental_inputs[ \t]*=[ \t]*\[[^\]\n]*\][ \t]*\r?\n`)
-
 // runnerImageRE matches a standalone `runner_image = <expr>` attribute
 // line inside a transform module block. v2.2.0 collapsed the
 // per-transform Lambda; v2.2.1 dropped `var.runner_image` from the
@@ -173,19 +164,14 @@ func (s *Service) UpgradePipeline(dir, targetRef string) (currentRef, finalRef s
 		migrated += n
 	}
 
-	// One-shot migration: strip `incremental_inputs = [...]`. The
-	// transform module dropped the variable (last seen at v0.19.0); a
-	// pipeline carrying it now fails `terraform validate` with
-	// "Unsupported argument: incremental_inputs". The orchestration
-	// emitter no longer reads it either — the snapshot-bounded read
-	// descriptor moved to a different authoring shape (TODO line item).
-	for _, f := range tfFiles {
-		n, merr := stripIncrementalInputs(f)
-		if merr != nil {
-			return currentRef, finalRef, updated, migrated, merr
-		}
-		migrated += n
-	}
+	// `incremental_inputs = [...]` is NO LONGER stripped on upgrade — the
+	// transform module re-declares the variable as of v2.6.0 (it had been
+	// dropped after v0.19.0, which silently broke table-to-table CDF
+	// incremental reads: the emitter still read the attribute, but
+	// `terraform validate` rejected it as an unsupported module argument, so
+	// `pipeline upgrade` deleted the author's incremental config). With the
+	// variable restored, the attribute validates and the orchestration
+	// emitter builds the `delta_table_cdf` descriptor from it (ADR-018).
 
 	// One-shot migration: strip `runner_image = ...`. v2.2.0 collapsed
 	// the per-transform Lambda; v2.2.1 dropped the variable. Existing
@@ -348,13 +334,6 @@ func latestGitTag(repoURL string) (string, error) {
 // is left untouched.
 func stripLocalCompute(path string) (int, error) {
 	return stripLines(path, localComputeRE)
-}
-
-// stripIncrementalInputs removes every `incremental_inputs = [...]`
-// line from a single tf file. The transform module no longer declares
-// this variable; carrying it makes deploys fail at validate-time.
-func stripIncrementalInputs(path string) (int, error) {
-	return stripLines(path, incrementalInputsRE)
 }
 
 // stripRunnerImage removes every `runner_image = ...` line from a
