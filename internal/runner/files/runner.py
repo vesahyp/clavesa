@@ -1174,8 +1174,38 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
     raise RuntimeError(f"input {alias!r}: unknown kind {kind!r}")
 
 
+_MERGE_PRIMITIVES = {
+    "additive": "target.`{c}` + source.`{c}`",
+    "min": "least(target.`{c}`, source.`{c}`)",
+    "max": "greatest(target.`{c}`, source.`{c}`)",
+    "sketch": "hll_union(target.`{c}`, source.`{c}`)",
+}
+
+
+def _merge_set_clause(source_cols: list[str], merge_keys: list[str], merge_update: dict[str, str]) -> str:
+    """Build the `WHEN MATCHED THEN UPDATE SET ...` assignments for an
+    aggregate-aware merge. Each source column (except merge keys) is set:
+    columns named in merge_update use their primitive expr (additive / min /
+    max / sketch) or a raw SparkSQL expression; all others replace from
+    source. Uses the `target` / `source` MERGE aliases."""
+    keys = set(merge_keys)
+    parts = []
+    for c in source_cols:
+        if c in keys:
+            continue
+        spec = merge_update.get(c)
+        if spec in _MERGE_PRIMITIVES:
+            expr = _MERGE_PRIMITIVES[spec].format(c=c)
+        elif spec:
+            expr = spec  # raw SparkSQL expression, references target./source.
+        else:
+            expr = f"source.`{c}`"
+        parts.append(f"target.`{c}` = {expr}")
+    return ", ".join(parts)
+
+
 def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dict[str, Any]:
-    """Returns {kind: "path"|"delta_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...]}.
+    """Returns {kind: "path"|"delta_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...], merge_update: {...}, cluster_by: [...]}.
 
     String forms map to the existing semantics:
       "" or "<id>" → delta_table, mode=replace
@@ -1190,9 +1220,9 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
     """
     if isinstance(dest, str):
         if dest and _looks_like_path(dest):
-            return {"kind": "path", "target": dest, "mode": "replace", "merge_keys": []}
+            return {"kind": "path", "target": dest, "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
         target = dest if dest else _table_id_for(key, all_outputs)
-        return {"kind": "delta_table", "target": target, "mode": "replace", "merge_keys": []}
+        return {"kind": "delta_table", "target": target, "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
 
     if not isinstance(dest, dict):
         raise TypeError(f"output {key!r}: unsupported descriptor type {type(dest).__name__}")
@@ -1210,12 +1240,16 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
     if kind == "delta_table" and not target:
         target = _table_id_for(key, all_outputs)
     stats = bool(dest.get("stats"))
+    cluster_by = list(dest.get("cluster_by") or [])
+    merge_update = dict(dest.get("merge_update") or {})
     return {
         "kind": kind,
         "target": target,
         "mode": mode,
         "merge_keys": merge_keys,
+        "merge_update": merge_update,
         "stats": stats,
+        "cluster_by": cluster_by,
     }
 
 
@@ -1587,6 +1621,9 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
                        columns before the merge — Iceberg schema evolution.
                        Drops staging on success.
       backfill_discard: DROP TABLE staging.
+      optimize:      OPTIMIZE table [ZORDER BY (cols)]; compact + cluster.
+      cluster_alter: ALTER TABLE table CLUSTER BY (cols) then OPTIMIZE.
+      vacuum:        VACUUM table [RETAIN n HOURS]; purge stale files.
 
     All operations run via SparkSQL — same engine that wrote the staging
     table in the first place, same MERGE semantics the runner already
@@ -1669,7 +1706,75 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
             "columns_added": columns_added,
         }
 
+    if op == "optimize":
+        table = event["table"]
+        zorder = list(event.get("zorder") or [])
+        sql = f"OPTIMIZE {table}"
+        if zorder:
+            cols = ", ".join(f"`{c}`" for c in zorder)
+            sql += f" ZORDER BY ({cols})"
+        spark.sql(sql)
+        _refresh_table_snapshot(event.get("record"), table)
+        return {"status": "ok", "operation": op, "table": table, "zorder": zorder}
+
+    if op == "cluster_alter":
+        table = event["table"]
+        cluster_by = list(event.get("cluster_by") or [])
+        if not cluster_by:
+            raise RuntimeError("cluster_alter requires non-empty cluster_by")
+        cols = ", ".join(f"`{c}`" for c in cluster_by)
+        # ALTER sets the clustering spec on an existing (possibly unclustered)
+        # table; OPTIMIZE then physically re-clusters the current data. This
+        # is the migration path for tables created before liquid clustering.
+        spark.sql(f"ALTER TABLE {table} CLUSTER BY ({cols})")
+        spark.sql(f"OPTIMIZE {table}")
+        _refresh_table_snapshot(event.get("record"), table)
+        return {"status": "ok", "operation": op, "table": table, "cluster_by": cluster_by}
+
+    if op == "vacuum":
+        table = event["table"]
+        retain = event.get("retain_hours")
+        sql = f"VACUUM {table}"
+        if retain is not None:
+            sql += f" RETAIN {int(retain)} HOURS"
+        spark.sql(sql)
+        _refresh_table_snapshot(event.get("record"), table)
+        return {"status": "ok", "operation": op, "table": table, "retain_hours": retain}
+
     raise RuntimeError(f"unknown _operation: {op!r}")
+
+
+def _refresh_table_snapshot(event_record, table_id):
+    """After an out-of-band table rewrite (OPTIMIZE / CLUSTER BY / VACUUM),
+    re-record the latest commit into the system `tables` table so the
+    catalog's snapshot_id does not go stale. Best-effort; a failure logs
+    and is swallowed (the data rewrite already succeeded)."""
+    if not event_record:
+        return
+    # _record_table_state / _tables_table_id derive identifiers from these
+    # env vars; set them from the event so recording works under both the
+    # local runOperation dispatch (which does not set them) and cloud Lambda.
+    for env_key, rec_key in (
+        ("CLAVESA_CATALOG", "catalog"),
+        ("CLAVESA_SYSTEM_CATALOG", "system_catalog"),
+        ("CLAVESA_SCHEMA", "schema"),
+        ("CLAVESA_PIPELINE", "pipeline"),
+        ("CLAVESA_NODE", "node"),
+    ):
+        v = event_record.get(rec_key)
+        if v:
+            os.environ[env_key] = str(v)
+    try:
+        _record_table_state(
+            event_record.get("run_id", ""),
+            event_record.get("output_key", "default"),
+            table_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[clavesa] optimize: tables-snapshot refresh failed for {table_id!r}: {exc!r}",
+            file=sys.stderr,
+        )
 
 
 def _apply_snapshot_props(props):
@@ -1826,18 +1931,21 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             # Redirect this output to its staging table; always replace so
             # backfill retries rewrite the staging cleanly.
             spec = {**spec, "kind": "delta_table", "target": backfill_targets[key],
-                    "mode": "replace", "merge_keys": []}
+                    "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
         if spec["kind"] == "path":
             df.write.mode("overwrite").parquet(spec["target"])
         else:
             table_id = spec["target"]
             db_part = table_id.rsplit(".", 1)[0]
             _ensure_database(spark, db_part)
+            # Liquid-clustering columns: an explicit cluster_by wins; else a
+            # merge output clusters by its merge_keys (set at create, see #18).
+            cluster_cols = spec["cluster_by"] or (spec["merge_keys"] if spec["mode"] == "merge" else [])
             if spec["mode"] == "merge":
                 # First run: no target yet, MERGE has nothing to match
                 # against. Create the table and skip MERGE for this run.
                 if not spark.catalog.tableExists(table_id):
-                    _create_delta_table(df, table_id, spec["merge_keys"])
+                    _create_delta_table(df, table_id, cluster_cols)
                 else:
                     try:
                         existing = set(spark.table(table_id).schema.fieldNames())
@@ -1849,27 +1957,44 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                     staging = f"__merge_src_{key}"
                     df.createOrReplaceTempView(staging)
                     on_clause = " AND ".join(
-                        f"t.{col} = s.{col}" for col in spec["merge_keys"]
+                        f"target.`{col}` = source.`{col}`" for col in spec["merge_keys"]
                     )
+                    if spec["merge_update"]:
+                        set_clause = _merge_set_clause(
+                            df.schema.fieldNames(), spec["merge_keys"], spec["merge_update"]
+                        )
+                        when_matched = f"WHEN MATCHED THEN UPDATE SET {set_clause}"
+                    else:
+                        when_matched = "WHEN MATCHED THEN UPDATE SET *"
                     spark.sql(
-                        f"MERGE WITH SCHEMA EVOLUTION INTO {table_id} t USING {staging} s "
+                        f"MERGE WITH SCHEMA EVOLUTION INTO {table_id} target USING {staging} source "
                         f"ON {on_clause} "
-                        f"WHEN MATCHED THEN UPDATE SET * "
+                        f"{when_matched} "
                         f"WHEN NOT MATCHED THEN INSERT *"
                     )
             elif spec["mode"] == "append":
-                # Delta's mode("append").saveAsTable auto-creates if the
-                # table doesn't exist yet; no need to branch on tableExists.
-                try:
-                    existing = set(spark.table(table_id).schema.fieldNames())
-                    new_cols = [c for c in df.schema.fieldNames() if c not in existing]
-                    if new_cols:
-                        print(f"[clavesa] output {key!r}: schema evolved, +{','.join(new_cols)}", file=sys.stderr, flush=True)
-                except Exception:  # table may not exist yet on first append; skip silently
-                    pass
-                df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
+                if cluster_cols and not spark.catalog.tableExists(table_id):
+                    # First write of a clustered append table: create it with
+                    # CLUSTER BY so the layout is set; later appends preserve it.
+                    _create_delta_table(df, table_id, cluster_cols)
+                else:
+                    # Delta's mode("append").saveAsTable auto-creates if the
+                    # table doesn't exist yet; no need to branch on tableExists.
+                    try:
+                        existing = set(spark.table(table_id).schema.fieldNames())
+                        new_cols = [c for c in df.schema.fieldNames() if c not in existing]
+                        if new_cols:
+                            print(f"[clavesa] output {key!r}: schema evolved, +{','.join(new_cols)}", file=sys.stderr, flush=True)
+                    except Exception:  # table may not exist yet on first append; skip silently
+                        pass
+                    df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
             else:
-                df.write.format("delta").mode("overwrite").saveAsTable(table_id)
+                if cluster_cols and not spark.catalog.tableExists(table_id):
+                    # First create of a clustered replace table: CTAS with
+                    # CLUSTER BY. Later overwrites preserve the clustering.
+                    _create_delta_table(df, table_id, cluster_cols)
+                else:
+                    df.write.format("delta").mode("overwrite").saveAsTable(table_id)
             # Write the real schema into Glue's StorageDescriptor.Columns so
             # Athena's browser / information_schema / Lake Formation see the
             # genuine columns instead of Spark's generic `col array<string>`

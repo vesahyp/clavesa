@@ -1390,6 +1390,47 @@ export async function discardBackfill(
   throw new Error(`POST /backfills/${runID}/discard → ${res.status}: ${text}`);
 }
 
+// Optimize — Delta table maintenance (compact / re-cluster / vacuum)
+const OptimizeTableResult = z.object({
+  table: z.string(),
+  node: z.string(),
+  output_key: z.string(),
+  operation: z.string(),
+  vacuumed: z.boolean().default(false),
+  status: z.string(),
+  error: z.string().optional().default(""),
+});
+export type OptimizeTableResult = z.infer<typeof OptimizeTableResult>;
+
+const OptimizeResponse = z.object({
+  results: z.array(OptimizeTableResult).default([]),
+});
+
+/**
+ * POST /api/pipelines/optimize — run Delta maintenance over a pipeline's
+ * output tables. With no `node` it sweeps every transform output; `recluster`
+ * migrates pre-clustering tables to liquid clustering before compacting;
+ * `vacuum` additionally prunes tombstoned files. The per-table results come
+ * back even when individual tables failed (status === "failed").
+ */
+export async function optimizePipeline(body: {
+  dir: string;
+  node?: string;
+  recluster?: boolean;
+  vacuum?: boolean;
+}): Promise<OptimizeTableResult[]> {
+  const res = await fetch(`${BASE_URL}/pipelines/optimize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`POST /pipelines/optimize → ${res.status}: ${text}`);
+  }
+  return OptimizeResponse.parse(await res.json()).results;
+}
+
 /** GET /api/dashboards — workspace's dashboard list. */
 export function useDashboards() {
   return useQuery({

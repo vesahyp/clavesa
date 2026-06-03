@@ -485,3 +485,172 @@ func TestRunner_PromoteAppendAllowDupes_SchemaEvolution(t *testing.T) {
 		t.Fatalf("rows: want 2 (original + appended), got %d (%v)", len(r.TargetRows), r.TargetRows)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CDF-path tests: aggregate-aware merge (#19) and OPTIMIZE non-re-emission
+// (#15). Both exercise the real readChangeFeed incremental path against a
+// managed Delta source, not a full re-read.
+// ---------------------------------------------------------------------------
+
+// runRawDriver runs a self-contained driver script (which sets up its own
+// Delta state under the /work warehouse) and returns the parsed RESULT_LINE
+// as a generic map — the result shapes here differ per test.
+func runRawDriver(t *testing.T, script string) map[string]any {
+	t.Helper()
+	work := t.TempDir()
+	scriptPath := filepath.Join(work, "driver.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := dockerRun(t, dockerOpts{
+		mountSrc:   work,
+		mountDst:   "/work",
+		entrypoint: "python",
+		cmd:        []string{"/work/driver.py"},
+	})
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "RESULT_LINE:") {
+			var r map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "RESULT_LINE:")), &r); err != nil {
+				t.Fatalf("parse RESULT_LINE: %v\nline: %s", err, line)
+			}
+			return r
+		}
+	}
+	t.Fatalf("RESULT_LINE not found in output:\n%s", out)
+	return nil
+}
+
+// TestRunner_IncrementalMergeAdditive proves the #19 fix end-to-end on the
+// real CDF path: an `additive` merge_update output reading an upstream via
+// `delta_table_cdf` accumulates a lifetime counter across batches instead of
+// the prior `UPDATE SET *` clobber. Key A is seen twice in batch 1 and once
+// in batch 2; its merged count must be 3 (2+1), not 1 (replaced) or 5
+// (full re-read summed in).
+func TestRunner_IncrementalMergeAdditive(t *testing.T) {
+	script := `
+import json, os, sys
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_WAREHOUSE"] = "/work/wh"
+os.environ["CLAVESA_WATERMARKS"] = "/work/wm"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_CATALOG"] = "itest_cat"
+os.environ["CLAVESA_SCHEMA"] = "itest"
+os.environ["CLAVESA_PIPELINE"] = "itest"
+os.environ["CLAVESA_NODE"] = "itest"
+os.makedirs("/work/wm", exist_ok=True)
+
+from runner import _spark, handler
+
+spark = _spark()
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
+
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT k, COUNT(*) AS cnt FROM src GROUP BY k")
+
+event = {
+    "inputs": {"src": {"kind": "delta_table_cdf", "table": "itest.src"}},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.dim",
+        "mode": "merge", "merge_keys": ["k"], "merge_update": {"cnt": "additive"}}},
+}
+
+# Batch 1: A x2, B x1 -> first incremental run reads the full snapshot, creates dim.
+spark.createDataFrame([{"k": "A"}, {"k": "A"}, {"k": "B"}]).write.format("delta").mode("append").saveAsTable("itest.src")
+r1 = handler(event, None)
+
+# Batch 2: A x1, C x1 (one commit) -> CDF read of only the new rows, additive merge.
+spark.createDataFrame([{"k": "A"}, {"k": "C"}]).write.format("delta").mode("append").saveAsTable("itest.src")
+r2 = handler(event, None)
+
+rows = {row["k"]: int(row["cnt"]) for row in spark.table("itest.dim").collect()}
+print("RESULT_LINE:" + json.dumps({"r1": r1.get("status"), "r2": r2.get("status"), "rows": rows}))
+`
+	r := runRawDriver(t, script)
+	if r["r1"] != "ok" || r["r2"] != "ok" {
+		t.Fatalf("handler status: r1=%v r2=%v (want ok/ok)", r["r1"], r["r2"])
+	}
+	rows, _ := r["rows"].(map[string]any)
+	want := map[string]float64{"A": 3, "B": 1, "C": 1}
+	for k, w := range want {
+		if got, _ := rows[k].(float64); got != w {
+			t.Errorf("cnt[%s]: want %v, got %v (full rows: %v)", k, w, rows[k], rows)
+		}
+	}
+	if len(rows) != len(want) {
+		t.Errorf("row count: want %d keys, got %v", len(want), rows)
+	}
+}
+
+// TestRunner_OptimizeCDFNoReemit proves the #15 CDF-safety claim: an OPTIMIZE
+// commit is dataChange=false, so a downstream readChangeFeed range spanning it
+// returns no change rows — the consumer neither errors nor re-emits already-
+// consumed data. The consumer's lifetime counts must be unchanged after the
+// source is OPTIMIZEd and the consumer re-runs.
+func TestRunner_OptimizeCDFNoReemit(t *testing.T) {
+	script := `
+import json, os, sys
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_WAREHOUSE"] = "/work/wh"
+os.environ["CLAVESA_WATERMARKS"] = "/work/wm"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_CATALOG"] = "itest_cat"
+os.environ["CLAVESA_SCHEMA"] = "itest"
+os.environ["CLAVESA_PIPELINE"] = "itest"
+os.environ["CLAVESA_NODE"] = "itest"
+os.makedirs("/work/wm", exist_ok=True)
+
+from runner import _spark, handler, _run_operation
+
+spark = _spark()
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
+
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT k, COUNT(*) AS cnt FROM src2 GROUP BY k")
+
+event = {
+    "inputs": {"src2": {"kind": "delta_table_cdf", "table": "itest.src2"}},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.dim2",
+        "mode": "merge", "merge_keys": ["k"], "merge_update": {"cnt": "additive"}}},
+}
+
+# Two append commits, then a first consumer run reads the full snapshot.
+spark.createDataFrame([{"k": "A"}]).write.format("delta").mode("append").saveAsTable("itest.src2")
+spark.createDataFrame([{"k": "B"}]).write.format("delta").mode("append").saveAsTable("itest.src2")
+r1 = handler(event, None)
+before = {row["k"]: int(row["cnt"]) for row in spark.table("itest.dim2").collect()}
+
+# OPTIMIZE the source: a dataChange=false commit that bumps the version.
+opt = _run_operation({"_operation": "optimize", "table": "itest.src2"})
+
+# Re-run the consumer: its CDF range now spans only the OPTIMIZE commit.
+r2 = handler(event, None)
+after = {row["k"]: int(row["cnt"]) for row in spark.table("itest.dim2").collect()}
+
+print("RESULT_LINE:" + json.dumps({"r1": r1.get("status"), "opt": opt.get("status"),
+    "r2": r2.get("status"), "before": before, "after": after}))
+`
+	r := runRawDriver(t, script)
+	if r["r1"] != "ok" {
+		t.Fatalf("first consumer run: want ok, got %v", r["r1"])
+	}
+	if r["opt"] != "ok" {
+		t.Fatalf("optimize op: want ok, got %v", r["opt"])
+	}
+	if r["r2"] != "ok" && r["r2"] != "skipped" {
+		t.Fatalf("consumer run after OPTIMIZE: want ok/skipped (no error), got %v", r["r2"])
+	}
+	before, _ := r["before"].(map[string]any)
+	after, _ := r["after"].(map[string]any)
+	if fmt.Sprint(before) != fmt.Sprint(after) {
+		t.Errorf("counts changed across OPTIMIZE (re-emit!): before=%v after=%v", before, after)
+	}
+	// Sanity: the counts are the lifetime values, not zeroed.
+	if got, _ := after["A"].(float64); got != 1 {
+		t.Errorf("after[A]: want 1, got %v (full: %v)", got, after)
+	}
+	if got, _ := after["B"].(float64); got != 1 {
+		t.Errorf("after[B]: want 1, got %v (full: %v)", got, after)
+	}
+}

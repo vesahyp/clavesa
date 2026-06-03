@@ -2003,7 +2003,23 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 				}
 			}
 		}
-		if mode == "" && len(mergeKeys) == 0 && !stats {
+		var clusterKeys []string
+		if ck, ok := def["cluster_by"].([]interface{}); ok {
+			for _, v := range ck {
+				if s, ok := v.(string); ok {
+					clusterKeys = append(clusterKeys, s)
+				}
+			}
+		}
+		mergeUpdate := map[string]string{}
+		if mu, ok := def["merge_update"].(map[string]interface{}); ok {
+			for col, v := range mu {
+				if s, ok := v.(string); ok {
+					mergeUpdate[col] = s
+				}
+			}
+		}
+		if mode == "" && len(mergeKeys) == 0 && len(clusterKeys) == 0 && len(mergeUpdate) == 0 && !stats {
 			// Replace + no merge keys + stats off: leave bare string.
 			// "default" carries the caller's explicit target;
 			// everything else gets "" → runner auto-table.
@@ -2041,6 +2057,12 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 		}
 		if stats {
 			desc["stats"] = true
+		}
+		if len(clusterKeys) > 0 {
+			desc["cluster_by"] = clusterKeys
+		}
+		if len(mergeUpdate) > 0 {
+			desc["merge_update"] = mergeUpdate
 		}
 		out[key] = desc
 	}

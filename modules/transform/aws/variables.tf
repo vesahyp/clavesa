@@ -204,6 +204,13 @@ variable "output_definitions" {
     merge_keys lists the columns that uniquely identify a row; required when
     mode is "merge", and usable on "append" outputs so a later backfill can
     promote via MERGE instead of refusing.
+    cluster_by lists columns to liquid-cluster the output Delta table on,
+    for prune-friendly reads; merge outputs already cluster by merge_keys.
+    merge_update gives per-column merge expressions for mode=merge outputs so
+      CDF-incremental aggregates accumulate instead of being overwritten: a
+      column maps to a keyword (additive, min, max, sketch) or a raw SparkSQL
+      expression over the target/source aliases. Columns not listed keep
+      replace semantics.
     stats = true opts this output into per-column profile computation
       (null %, approx distinct, min/max, percentiles, top-10) at write
       time. Rows land in the workspace system column_stats table and
@@ -220,9 +227,11 @@ variable "output_definitions" {
       }))
       include_rescued_data = optional(bool, false)
     }))
-    mode       = optional(string, "replace")
-    merge_keys = optional(list(string), [])
-    stats      = optional(bool, false)
+    mode         = optional(string, "replace")
+    merge_keys   = optional(list(string), [])
+    cluster_by   = optional(list(string), [])
+    merge_update = optional(map(string), {})
+    stats        = optional(bool, false)
   }))
 
   validation {

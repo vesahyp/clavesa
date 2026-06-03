@@ -480,16 +480,16 @@ def test_resolve_output_string_forms():
     os.environ["CLAVESA_SCHEMA"] = "p"
 
     s = runner._resolve_output("default", "")
-    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "replace", "merge_keys": []}
+    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
 
     s = runner._resolve_output("default", "s3://bucket/dest/")
-    assert s == {"kind": "path", "target": "s3://bucket/dest/", "mode": "replace", "merge_keys": []}
+    assert s == {"kind": "path", "target": "s3://bucket/dest/", "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
 
     # Bare-string table id is passed through as-is — the runner no longer
     # interprets a "clavesa." prefix (ADR-018: Delta tables resolve via
     # spark_catalog, two-segment `<db>.<table>`).
     s = runner._resolve_output("default", "demo_ws__p.n__default")
-    assert s == {"kind": "delta_table", "target": "demo_ws__p.n__default", "mode": "replace", "merge_keys": []}
+    assert s == {"kind": "delta_table", "target": "demo_ws__p.n__default", "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
 
 
 def test_resolve_output_dict_append():
@@ -500,12 +500,55 @@ def test_resolve_output_dict_append():
     os.environ["CLAVESA_SCHEMA"] = "p"
 
     s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "", "mode": "append"})
-    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False}
+    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False, "merge_update": {}, "cluster_by": []}
 
     # stats opt-in flows through to the resolved spec — the call site
     # only reads spec["stats"], so propagation is the whole test.
     s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "", "stats": True})
     assert s["stats"] is True
+
+
+def test_resolve_output_cluster_by_and_merge_update():
+    """cluster_by (liquid clustering) and merge_update (aggregate-aware
+    merge) parse off the dict descriptor into the resolved spec."""
+    runner = _load_runner()
+    os.environ["CLAVESA_PIPELINE"] = "p"
+    os.environ["CLAVESA_NODE"] = "n"
+    os.environ["CLAVESA_CATALOG"] = "clavesa_demo_ws"
+    os.environ["CLAVESA_SCHEMA"] = "p"
+
+    s = runner._resolve_output("default", {
+        "kind": "delta_table", "table_id": "db.t", "mode": "merge",
+        "merge_keys": ["k"], "merge_update": {"cnt": "additive"},
+        "cluster_by": ["event_date"],
+    })
+    assert s["merge_keys"] == ["k"]
+    assert s["merge_update"] == {"cnt": "additive"}
+    assert s["cluster_by"] == ["event_date"]
+
+    # Unset → empty containers, not missing keys (the write path reads them).
+    s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "db.t"})
+    assert s["merge_update"] == {}
+    assert s["cluster_by"] == []
+
+
+def test_merge_set_clause_primitives_and_raw():
+    """_merge_set_clause maps keywords to exprs, passes raw through, replaces
+    unlisted columns, and skips merge keys."""
+    runner = _load_runner()
+    clause = runner._merge_set_clause(
+        ["k", "cnt", "first_seen", "last_seen", "sketch", "note", "other"],
+        ["k"],
+        {"cnt": "additive", "first_seen": "min", "last_seen": "max",
+         "sketch": "sketch", "note": "concat(target.note, source.note)"},
+    )
+    assert "target.`k`" not in clause  # merge key never updated
+    assert "target.`cnt` = target.`cnt` + source.`cnt`" in clause
+    assert "target.`first_seen` = least(target.`first_seen`, source.`first_seen`)" in clause
+    assert "target.`last_seen` = greatest(target.`last_seen`, source.`last_seen`)" in clause
+    assert "target.`sketch` = hll_union(target.`sketch`, source.`sketch`)" in clause
+    assert "target.`note` = concat(target.note, source.note)" in clause
+    assert "target.`other` = source.`other`" in clause  # unlisted → replace
 
 
 def test_resolve_output_rejects_unknown_mode():

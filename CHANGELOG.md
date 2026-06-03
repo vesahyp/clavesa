@@ -12,6 +12,14 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.7.0] — 2026-06-03
+
+### Added
+
+- `cluster_by` on `output_definitions`: liquid-cluster a non-merge (replace/append) output Delta table on declared columns for prune-friendly reads (e.g. `cluster_by = ["event_date"]` on a fact queried by date). Set via the CLI (`node edit --output-cluster-by`) or the node config panel's "Cluster by" field; it does not change the write mode. Merge outputs already cluster by their merge keys. Capped at Delta's 4-column limit.
+- `clavesa pipeline optimize [dir]` and an "Optimize tables" button on the pipeline dashboard: compact a pipeline's Delta output tables. `--recluster` migrates pre-clustering tables to liquid clustering (`ALTER TABLE CLUSTER BY` + `OPTIMIZE`); `--vacuum` prunes tombstoned files. Per-node or whole-pipeline, `--json`, local and cloud.
+- `merge_update` on `output_definitions`: per-column merge expressions for `mode = "merge"` outputs, so incrementally-read aggregates accumulate instead of being overwritten. Each column maps to a keyword (`additive`, `min`, `max`, `sketch`) or a raw SparkSQL expression over `target.`/`source.`; unlisted columns keep replace semantics. Fixes lifetime counters, daily `SUM` rollups, and `first_seen`/`last_seen` that merge-replace silently clobbered. Set via `node edit --output-merge-update` or the node config panel's "Merge update" field.
+
 ## [v2.6.1] — 2026-06-03
 
 ### Fixed

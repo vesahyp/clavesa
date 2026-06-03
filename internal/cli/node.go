@@ -208,6 +208,8 @@ func newNodeEditCmd() *cobra.Command {
 	sets := make(setFlags)
 	var outputMode string
 	var outputMergeKeys []string
+	var outputClusterBy []string
+	var outputMergeUpdate map[string]string
 	var outputStats bool
 	var addOutputs []string
 	var removeOutputs []string
@@ -228,13 +230,21 @@ output keys for multi-output Python transforms that return more than
 one DataFrame. New outputs are seeded with replace mode; tune them
 with --set output_definitions={...} or by hand-editing the .tf for
 now. Pass --output-merge-keys with no value to clear the existing
-keys; pass --output-mode "" likewise.
+keys; pass --output-mode "" likewise. --output-cluster-by liquid-clusters
+a replace/append output on the given columns without changing its mode
+(merge outputs already cluster by their merge_keys); pass it with no value
+to clear. --output-merge-update sets per-column merge expressions (col=spec
+pairs) so CDF-incremental aggregates accumulate on a mode=merge output
+instead of being overwritten; does not change mode. Pass with no value to
+clear.
 
 Examples:
   clavesa node edit my-pipeline source1 --set bucket=my-data
   clavesa node edit my-pipeline transform1 --set sql="SELECT * FROM source1"
   clavesa node edit my-pipeline transform1 --set python=file(transforms/enrich.py)
   clavesa node edit my-pipeline dim_customers --output-merge-keys customer_id
+  clavesa node edit my-pipeline daily_revenue --output-cluster-by region,day
+  clavesa node edit my-pipeline daily_counts --output-merge-update event_count=additive,last_seen=max
   clavesa node edit my-pipeline orders --output-mode append
   clavesa node edit my-pipeline enrich --add-output outliers
   clavesa node edit my-pipeline source1    # show settable keys
@@ -253,10 +263,12 @@ Examples:
 			}
 			modeChanged := cmd.Flags().Changed("output-mode")
 			keysChanged := cmd.Flags().Changed("output-merge-keys")
+			clusterChanged := cmd.Flags().Changed("output-cluster-by")
+			mergeUpdateChanged := cmd.Flags().Changed("output-merge-update")
 			statsChanged := cmd.Flags().Changed("output-stats")
 			outputsChanged := len(addOutputs) > 0 || len(removeOutputs) > 0
 			incrementalsChanged := len(addIncrementalInputs) > 0 || len(removeIncrementalInputs) > 0
-			if len(sets) == 0 && !modeChanged && !keysChanged && !statsChanged && !outputsChanged && !incrementalsChanged {
+			if len(sets) == 0 && !modeChanged && !keysChanged && !clusterChanged && !mergeUpdateChanged && !statsChanged && !outputsChanged && !incrementalsChanged {
 				g, err := svc.GetPipeline(dir)
 				if err != nil {
 					return fmt.Errorf("get pipeline: %w", err)
@@ -291,6 +303,25 @@ Examples:
 							}
 							parts = append(parts, "merge_keys="+joinComma(ks))
 						}
+						if ck, ok := def["cluster_by"].([]interface{}); ok && len(ck) > 0 {
+							ks := make([]string, len(ck))
+							for i, v := range ck {
+								ks[i] = fmt.Sprint(v)
+							}
+							parts = append(parts, "cluster_by="+joinComma(ks))
+						}
+						if mu, ok := def["merge_update"].(map[string]interface{}); ok && len(mu) > 0 {
+							cols := make([]string, 0, len(mu))
+							for col := range mu {
+								cols = append(cols, col)
+							}
+							sort.Strings(cols)
+							ps := make([]string, len(cols))
+							for i, col := range cols {
+								ps[i] = col + "=" + fmt.Sprint(mu[col])
+							}
+							parts = append(parts, "merge_update="+joinComma(ps))
+						}
 						if stats, _ := def["stats"].(bool); stats {
 							parts = append(parts, "stats=true")
 						}
@@ -300,7 +331,7 @@ Examples:
 				return nil
 			}
 			attrs := map[string]interface{}(sets)
-			if modeChanged || keysChanged || statsChanged || outputsChanged {
+			if modeChanged || keysChanged || clusterChanged || mergeUpdateChanged || statsChanged || outputsChanged {
 				g, err := svc.GetPipeline(dir)
 				if err != nil {
 					return fmt.Errorf("get pipeline: %w", err)
@@ -310,7 +341,7 @@ Examples:
 					return fmt.Errorf("node %q not found in %s", nodeID, displayDir(ws, dir))
 				}
 				existing, _ := n.Config["output_definitions"].(map[string]interface{})
-				updated := updateOutputDefault(existing, modeChanged, outputMode, keysChanged, outputMergeKeys)
+				updated := updateOutputDefault(existing, modeChanged, outputMode, keysChanged, outputMergeKeys, clusterChanged, outputClusterBy, mergeUpdateChanged, outputMergeUpdate)
 				for _, key := range removeOutputs {
 					if key == "default" {
 						return fmt.Errorf("cannot remove the 'default' output (every transform has one)")
@@ -399,6 +430,8 @@ Examples:
 	cmd.Flags().Var(sets, "set", "set key=value (repeatable)")
 	cmd.Flags().StringVar(&outputMode, "output-mode", "", `default-output mode: "replace" (default; full overwrite), "append", or "merge"`)
 	cmd.Flags().StringSliceVar(&outputMergeKeys, "output-merge-keys", nil, `comma-separated columns forming the natural key; sets mode=merge implicitly`)
+	cmd.Flags().StringSliceVar(&outputClusterBy, "output-cluster-by", nil, `comma-separated columns to liquid-cluster the output Delta table on (replace/append outputs); does not change mode. Pass with no value to clear`)
+	cmd.Flags().StringToStringVar(&outputMergeUpdate, "output-merge-update", nil, `col=spec pairs giving per-column merge expressions for mode=merge outputs (e.g. event_count=additive,last_seen=max). Spec is a keyword (additive, min, max, sketch) or a raw SparkSQL expression. Does not change mode. Pass with no value to clear`)
 	cmd.Flags().BoolVar(&outputStats, "output-stats", false, `opt this transform's outputs into per-column stats (null %, distinct, top-K, percentiles); pass --output-stats=false to turn off`)
 	cmd.Flags().StringSliceVar(&addOutputs, "add-output", nil, "declare an additional output key on a multi-output transform (repeatable). Seeded with mode=replace; tune via direct .tf edit")
 	cmd.Flags().StringSliceVar(&removeOutputs, "remove-output", nil, "remove a non-default output key from output_definitions (repeatable)")
@@ -430,9 +463,12 @@ func validateOutputKey(key string) error {
 }
 
 // updateOutputDefault returns a new output_definitions map with the "default"
-// entry's mode + merge_keys updated. Other outputs (rare; multi-output transforms)
-// are preserved as-is. Passing an empty mode/keys clears the field.
-func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode string, keysChanged bool, keys []string) map[string]interface{} {
+// entry's mode + merge_keys + cluster_by + merge_update updated. Other outputs
+// (rare; multi-output transforms) are preserved as-is. Passing an empty
+// mode/keys/cluster/merge_update clears the field. Unlike merge_keys, setting
+// cluster_by or merge_update does not flip mode; cluster_by records the
+// liquid-clustering columns, merge_update records per-column merge expressions.
+func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode string, keysChanged bool, keys []string, clusterChanged bool, clusterKeys []string, mergeUpdateChanged bool, mergeUpdate map[string]string) map[string]interface{} {
 	out := map[string]interface{}{}
 	for k, v := range existing {
 		out[k] = v
@@ -477,6 +513,28 @@ func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode
 					def["mode"] = "merge"
 				}
 			}
+		}
+	}
+	if clusterChanged {
+		if len(clusterKeys) == 0 {
+			delete(def, "cluster_by")
+		} else {
+			items := make([]interface{}, len(clusterKeys))
+			for i, k := range clusterKeys {
+				items[i] = k
+			}
+			def["cluster_by"] = items
+		}
+	}
+	if mergeUpdateChanged {
+		if len(mergeUpdate) == 0 {
+			delete(def, "merge_update")
+		} else {
+			items := map[string]interface{}{}
+			for col, spec := range mergeUpdate {
+				items[col] = spec
+			}
+			def["merge_update"] = items
 		}
 	}
 	out["default"] = def

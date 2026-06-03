@@ -533,6 +533,39 @@ func (b lineageBridge) Lineage(dir string) (*lineagetype.Response, error) {
 	return b.svc.Lineage(dir)
 }
 
+// optimizeBridge adapts service.Service onto api.Optimizer. The service and
+// API request/result types mirror each other field-for-field; this bridge is
+// the seam that keeps internal/api free of an internal/service import.
+type optimizeBridge struct {
+	svc *tuiservice.Service
+}
+
+func (b optimizeBridge) OptimizeTable(ctx context.Context, req api.OptimizeRequest) ([]api.OptimizeTableResult, error) {
+	src, err := b.svc.OptimizeTable(ctx, tuiservice.OptimizeRequest{
+		Dir:         req.Dir,
+		Node:        req.Node,
+		Recluster:   req.Recluster,
+		Vacuum:      req.Vacuum,
+		RetainHours: req.RetainHours,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.OptimizeTableResult, len(src))
+	for i, r := range src {
+		out[i] = api.OptimizeTableResult{
+			Table:     r.Table,
+			Node:      r.Node,
+			OutputKey: r.OutputKey,
+			Operation: r.Operation,
+			Vacuumed:  r.Vacuumed,
+			Status:    r.Status,
+			Error:     r.Error,
+		}
+	}
+	return out, nil
+}
+
 func newUICmd() *cobra.Command {
 	var noBrowser bool
 
@@ -777,6 +810,7 @@ Examples:
 			credentialsHandler := api.NewCredentialsHandler(credentialRegistryBridge{svc: svc})
 			notebooksHandler := api.NewNotebooksHandler(notebookRegistryBridge{svc: svc})
 			backfillHandler := api.NewBackfillHandler(backfillBridge{svc: svc})
+			optimizeHandler := api.NewOptimizeHandler(optimizeBridge{svc: svc})
 			runtimeHandler := api.NewRuntimeHandler(warmQuery, awsIdentity)
 
 			hclParserFunc := func(dir string) (*graph.PipelineGraph, error) {
@@ -806,6 +840,7 @@ Examples:
 			credentialsHandler.RegisterRoutes(apiMux)
 			notebooksHandler.RegisterRoutes(apiMux)
 			backfillHandler.RegisterRoutes(apiMux)
+			optimizeHandler.RegisterRoutes(apiMux)
 			runtimeHandler.RegisterRoutes(apiMux)
 			apiMux.Handle("/data/", dataHandler)
 			apiMux.Handle("/preview/", previewHandler)

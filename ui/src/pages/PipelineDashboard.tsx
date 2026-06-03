@@ -64,8 +64,10 @@ import {
   usePipelines,
   useRuns,
   useTablesState,
+  optimizePipeline,
   type BackfillRun,
   type ExecutionInfo,
+  type OptimizeTableResult,
   type Run,
   type TableInfo,
 } from "@/lib/queries";
@@ -345,6 +347,39 @@ export function PipelineDashboard() {
     [graph],
   );
   const [bfDialogOpen, setBfDialogOpen] = useState(false);
+
+  // Optimize (Delta maintenance) — local + cloud (ADR-014). Compacts every
+  // transform output table; recluster migrates pre-clustering tables to
+  // liquid clustering, vacuum prunes tombstoned files. Per-table results
+  // (some may fail while others succeed) land in optimizeResults.
+  const [optRecluster, setOptRecluster] = useState(false);
+  const [optVacuum, setOptVacuum] = useState(false);
+  const [optimizeResults, setOptimizeResults] = useState<
+    OptimizeTableResult[] | null
+  >(null);
+  const optimizeMut = useMutation({
+    mutationFn: () =>
+      optimizePipeline({ dir, recluster: optRecluster, vacuum: optVacuum }),
+    onSuccess: (results) => {
+      setOptimizeResults(results);
+      const failed = results.filter((r) => r.status !== "ok").length;
+      if (results.length === 0) {
+        toast.info("No transform output tables to optimize.");
+      } else if (failed > 0) {
+        toast.error(
+          `Optimized ${results.length - failed}/${results.length} tables (${failed} failed).`,
+        );
+      } else {
+        toast.success(`Optimized ${results.length} tables.`);
+      }
+      void qc.invalidateQueries({ queryKey: ["catalog"] });
+      void qc.invalidateQueries({ queryKey: ["tables-state"] });
+    },
+    onError: (err: unknown) => {
+      setOptimizeResults(null);
+      toast.error(err instanceof Error ? err.message : "Optimize failed.");
+    },
+  });
 
   // Per-output-table commit summary from <pipeline>.tables, keyed by the
   // short `<node>__<output_key>` name so the Nodes grid can show each
@@ -818,6 +853,112 @@ export function PipelineDashboard() {
                       <BackfillRow key={b.run_id} bf={b} dir={dir} />
                     ))}
                   </ul>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Optimize (Delta maintenance) — local + cloud (ADR-014). */}
+            <Card>
+              <CardHeader className="flex-row items-center justify-between pb-3">
+                <CardTitle className="flex items-center gap-2">
+                  <Zap className="h-4 w-4 text-muted-foreground" />
+                  Optimize
+                </CardTitle>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => optimizeMut.mutate()}
+                  disabled={
+                    transformNodeIds.length === 0 || optimizeMut.isPending
+                  }
+                >
+                  {optimizeMut.isPending && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  {optimizeMut.isPending ? "Optimizing…" : "Optimize tables"}
+                </Button>
+              </CardHeader>
+              <CardContent className="space-y-4 p-6 pt-0">
+                <p className="text-sm text-muted-foreground">
+                  Compact every transform output table. Re-cluster migrates
+                  pre-clustering tables to liquid clustering; vacuum prunes
+                  tombstoned files past the retention window.
+                </p>
+                <div className="flex items-center gap-6">
+                  <Label className="flex items-center gap-2 text-sm font-normal">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-primary"
+                      checked={optRecluster}
+                      onChange={(e) => setOptRecluster(e.target.checked)}
+                      disabled={optimizeMut.isPending}
+                    />
+                    Re-cluster
+                  </Label>
+                  <Label className="flex items-center gap-2 text-sm font-normal">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-primary"
+                      checked={optVacuum}
+                      onChange={(e) => setOptVacuum(e.target.checked)}
+                      disabled={optimizeMut.isPending}
+                    />
+                    Vacuum
+                  </Label>
+                </div>
+                {transformNodeIds.length === 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    Add a transform node to enable maintenance.
+                  </p>
+                )}
+                {optimizeResults && optimizeResults.length > 0 && (
+                  <div className="overflow-hidden rounded-md border border-border">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50 text-xs text-muted-foreground">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-medium">
+                            Node
+                          </th>
+                          <th className="px-3 py-2 text-left font-medium">
+                            Table
+                          </th>
+                          <th className="px-3 py-2 text-left font-medium">
+                            Operation
+                          </th>
+                          <th className="px-3 py-2 text-left font-medium">
+                            Status
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {optimizeResults.map((r) => (
+                          <tr key={r.table}>
+                            <td className="px-3 py-2">{r.node}</td>
+                            <td className="px-3 py-2 font-mono text-xs">
+                              {r.table}
+                            </td>
+                            <td className="px-3 py-2">
+                              {r.operation}
+                              {r.vacuumed ? " + vacuum" : ""}
+                            </td>
+                            <td className="px-3 py-2">
+                              {r.status === "ok" ? (
+                                <Badge variant="outline">ok</Badge>
+                              ) : (
+                                <Badge
+                                  variant="outline"
+                                  className="border-destructive/40 text-destructive"
+                                  title={r.error}
+                                >
+                                  failed
+                                </Badge>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 )}
               </CardContent>
             </Card>

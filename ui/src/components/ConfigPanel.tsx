@@ -31,6 +31,7 @@ import {
 } from "./TransformInputsSection";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import {
   Table,
@@ -257,6 +258,8 @@ function S3DestinationForm({
 interface OutputDefault {
   mode?: string;
   merge_keys?: string[];
+  cluster_by?: string[];
+  merge_update?: Record<string, string>;
 }
 
 function readDefaultOutput(config: Record<string, unknown>): OutputDefault {
@@ -267,7 +270,24 @@ function readDefaultOutput(config: Record<string, unknown>): OutputDefault {
   const mk = Array.isArray(def.merge_keys)
     ? (def.merge_keys.filter((k) => typeof k === "string") as string[])
     : undefined;
-  return { mode, merge_keys: mk };
+  const cb = Array.isArray(def.cluster_by)
+    ? (def.cluster_by.filter((k) => typeof k === "string") as string[])
+    : undefined;
+  let mu: Record<string, string> | undefined;
+  if (
+    def.merge_update &&
+    typeof def.merge_update === "object" &&
+    !Array.isArray(def.merge_update)
+  ) {
+    const out: Record<string, string> = {};
+    for (const [col, spec] of Object.entries(
+      def.merge_update as Record<string, unknown>
+    )) {
+      if (typeof spec === "string") out[col] = spec;
+    }
+    if (Object.keys(out).length > 0) mu = out;
+  }
+  return { mode, merge_keys: mk, cluster_by: cb, merge_update: mu };
 }
 
 // readTransformStats reports whether every declared output key has
@@ -303,6 +323,14 @@ function TransformOutputSection({
   const [keysText, setKeysText] = useState<string>(
     (parsed.merge_keys ?? []).join(", ")
   );
+  const [clusterByText, setClusterByText] = useState<string>(
+    (parsed.cluster_by ?? []).join(", ")
+  );
+  const [mergeUpdateText, setMergeUpdateText] = useState<string>(
+    Object.entries(parsed.merge_update ?? {})
+      .map(([col, spec]) => `${col} = ${spec}`)
+      .join("\n")
+  );
   const [stats, setStats] = useState<boolean>(initialStats);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -315,6 +343,12 @@ function TransformOutputSection({
     setPrevNode(nodeId);
     setMode(parsed.mode ?? "");
     setKeysText((parsed.merge_keys ?? []).join(", "));
+    setClusterByText((parsed.cluster_by ?? []).join(", "));
+    setMergeUpdateText(
+      Object.entries(parsed.merge_update ?? {})
+        .map(([col, spec]) => `${col} = ${spec}`)
+        .join("\n")
+    );
     setStats(initialStats);
     setError(null);
     setSavedAt(null);
@@ -347,6 +381,29 @@ function TransformOutputSection({
         delete nextDefault.merge_keys;
       } else {
         nextDefault.merge_keys = keys;
+      }
+      const clusterBy = clusterByText
+        .split(/[\s,]+/)
+        .map((k) => k.trim())
+        .filter((k) => k.length > 0);
+      if (clusterBy.length === 0) {
+        delete nextDefault.cluster_by;
+      } else {
+        nextDefault.cluster_by = clusterBy;
+      }
+      const mergeUpdate: Record<string, string> = {};
+      for (const line of mergeUpdateText.split("\n")) {
+        const eq = line.indexOf("=");
+        if (eq === -1) continue;
+        const col = line.slice(0, eq).trim();
+        const spec = line.slice(eq + 1).trim();
+        if (col.length === 0 || spec.length === 0) continue;
+        mergeUpdate[col] = spec;
+      }
+      if (Object.keys(mergeUpdate).length === 0) {
+        delete nextDefault.merge_update;
+      } else {
+        nextDefault.merge_update = mergeUpdate;
       }
       defs.default = nextDefault;
       // stats lives on the data model per-key, but the editor exposes one
@@ -413,6 +470,35 @@ function TransformOutputSection({
       <p className="mb-2 text-[11px] text-muted-foreground">
         Comma-separated. Setting merge keys implies <code>mode = merge</code>{" "}
         when mode is left at the default.
+      </p>
+      <Field label="Cluster by" htmlFor="cfg-output-cluster-by">
+        <Input
+          id="cfg-output-cluster-by"
+          value={clusterByText}
+          placeholder="event_date, customer_id"
+          onChange={(e) => setClusterByText(e.target.value)}
+          className="font-mono text-xs"
+        />
+      </Field>
+      <p className="mb-2 text-[11px] text-muted-foreground">
+        Columns to liquid-cluster the output table on (prune-friendly reads).
+        Optional; merge outputs already cluster by their merge keys.
+      </p>
+      <Field label="Merge update (aggregate-aware)" htmlFor="cfg-output-merge-update">
+        <Textarea
+          id="cfg-output-merge-update"
+          value={mergeUpdateText}
+          rows={3}
+          placeholder={"total = additive\nlast_seen = max\nfingerprints = sketch"}
+          onChange={(e) => setMergeUpdateText(e.target.value)}
+          className="font-mono text-xs"
+        />
+      </Field>
+      <p className="mb-2 text-[11px] text-muted-foreground">
+        One <code>column = spec</code> per line for mode=merge outputs. Spec is a
+        keyword (additive, min, max, sketch) or a raw SparkSQL expression over
+        target./source. Accumulates instead of overwriting; unlisted columns
+        replace as usual.
       </p>
       <label className="mb-3 flex items-start gap-2 text-xs text-foreground">
         <input

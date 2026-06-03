@@ -473,6 +473,8 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 	if len(outputKeys) == 1 && outputKeys[0] == "default" &&
 		outputMode(nodeByID[id], "default") == "replace" &&
 		len(outputMergeKeys(nodeByID[id], "default")) == 0 &&
+		len(outputClusterBy(nodeByID[id], "default")) == 0 &&
+		len(outputMergeUpdate(nodeByID[id], "default")) == 0 &&
 		!outputStats(nodeByID[id], "default") {
 		return fmt.Sprintf(`{ default = %s }`, defaultDest)
 	}
@@ -484,8 +486,10 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		}
 		mode := outputMode(nodeByID[id], key)
 		mergeKeys := outputMergeKeys(nodeByID[id], key)
+		clusterBy := outputClusterBy(nodeByID[id], key)
+		mergeUpdate := outputMergeUpdate(nodeByID[id], key)
 		stats := outputStats(nodeByID[id], key)
-		if mode == "replace" && len(mergeKeys) == 0 && !stats {
+		if mode == "replace" && len(mergeKeys) == 0 && len(clusterBy) == 0 && len(mergeUpdate) == 0 && !stats {
 			entries = append(entries, fmt.Sprintf("%s = %s", key, dest))
 			continue
 		}
@@ -493,9 +497,17 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		if stats {
 			statsAttr = ", stats = true"
 		}
+		clusterAttr := ""
+		if len(clusterBy) > 0 {
+			clusterAttr = fmt.Sprintf(", cluster_by = [%s]", quoteList(clusterBy))
+		}
+		mergeUpdateAttr := ""
+		if len(mergeUpdate) > 0 {
+			mergeUpdateAttr = fmt.Sprintf(", merge_update = { %s }", joinMergeUpdate(mergeUpdate))
+		}
 		entries = append(entries, fmt.Sprintf(
-			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s }`,
-			key, dest, mode, quoteList(mergeKeys), statsAttr))
+			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s%s%s }`,
+			key, dest, mode, quoteList(mergeKeys), clusterAttr, statsAttr, mergeUpdateAttr))
 	}
 	return "{ " + strings.Join(entries, ", ") + " }"
 }
@@ -771,6 +783,75 @@ func outputMergeKeys(n graph.Node, key string) []string {
 		}
 	}
 	return keys
+}
+
+// outputClusterBy returns the cluster_by list configured for an output, in
+// declared order. Empty when unset.
+func outputClusterBy(n graph.Node, key string) []string {
+	defs, ok := n.Config["output_definitions"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	def, ok := defs[key].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	raw, ok := def["cluster_by"].([]interface{})
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			keys = append(keys, s)
+		}
+	}
+	return keys
+}
+
+// outputMergeUpdate returns the per-column merge expressions configured for
+// an output (column name -> spec). Non-string values are skipped. Returns
+// nil when unset or empty.
+func outputMergeUpdate(n graph.Node, key string) map[string]string {
+	defs, ok := n.Config["output_definitions"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	def, ok := defs[key].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	raw, ok := def["merge_update"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for col, v := range raw {
+		if s, ok := v.(string); ok {
+			out[col] = s
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// joinMergeUpdate formats a merge_update map as the body of an HCL map
+// literal: sorted `"col" = "spec"` pairs joined by ", ". Both key and
+// value are quoted so column names that aren't valid HCL identifiers stay
+// safe.
+func joinMergeUpdate(mu map[string]string) string {
+	cols := make([]string, 0, len(mu))
+	for col := range mu {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	pairs := make([]string, 0, len(cols))
+	for _, col := range cols {
+		pairs = append(pairs, fmt.Sprintf("%q = %q", col, mu[col]))
+	}
+	return strings.Join(pairs, ", ")
 }
 
 // upstreamProducerPipelines returns the deduplicated, sorted list of
