@@ -12,6 +12,17 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.6.1] — 2026-06-03
+
+### Fixed
+
+- Cloud per-node run history and column profiles populate again. The runner's `node_runs` / `tables` / `column_stats` observability tables were registered in Glue at an empty placeholder location with no Delta provider, so Athena and the catalog couldn't read them — the data was intact at the warehouse path, just orphaned from the Glue pointer. The runner now repairs each table's Glue location + Delta provider on write; deployed workspaces self-heal on the next run after `workspace upgrade` + deploy. Local was unaffected (no Glue).
+
+### Changed
+
+- `mode = "merge"` output tables are now created with Delta **liquid clustering** on their merge keys (the first 4 if the key is wider — Delta's clustering-column limit), so MERGE upserts and keyed reads prune to the relevant files instead of scanning the whole table. Automatic, no config. Existing tables pick it up when next created (or after a reset); a full recluster of already-written data awaits a compaction command.
+- Optimized writes (`delta.optimizeWrite`) are on by default for the runner, coalescing small output files at write time so file counts stay bounded without a manual `OPTIMIZE`.
+
 ## [v2.6.0] — 2026-06-02
 
 ### Fixed

@@ -152,6 +152,12 @@ def clavesa_spark_conf(
         # write site — including the four system tables and any user
         # transform output.
         "spark.databricks.delta.properties.defaults.enableChangeDataFeed": "true",
+        # Coalesce small output files at write time (and cluster-on-write for
+        # liquid-clustered tables) so file counts stay bounded without anyone
+        # running OPTIMIZE. autoCompact is intentionally left off (write
+        # amplification on heavily-MERGEd targets); explicit compaction is a
+        # separate command.
+        "spark.databricks.delta.optimizeWrite.enabled": "true",
         # Where managed tables land. Local mode: filesystem path. Cloud:
         # the pipeline's S3 bucket prefix, set by orchestration via
         # CLAVESA_WAREHOUSE.

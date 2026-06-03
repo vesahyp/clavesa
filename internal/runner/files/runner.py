@@ -1324,7 +1324,43 @@ def _ensure_database(spark, db_part: str) -> None:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_part}")
 
 
-def _sync_glue_table_schema(table_id: str, schema) -> None:
+# Delta liquid clustering accepts at most 4 clustering columns. A merge key
+# wider than that (e.g. a 5-column utm_* composite) is capped to its first 4,
+# which still co-locates the MERGE target well.
+_MAX_CLUSTER_COLS = 4
+
+
+def _create_delta_table(df, table_id: str, cluster_by: list[str]) -> None:
+    """Create a managed Delta table. When ``cluster_by`` is non-empty the
+    table is created with Delta liquid clustering on those columns via
+    ``CREATE TABLE ... CLUSTER BY (...) AS SELECT`` (the OSS-Delta path;
+    DataFrameWriterV2.clusterBy translates to an unsupported partition
+    transform). Clustering is set at creation and preserved by later
+    overwrite/append/MERGE writes. Empty ``cluster_by`` falls back to a
+    plain overwrite create."""
+    keys = cluster_by[:_MAX_CLUSTER_COLS]
+    if keys:
+        if len(cluster_by) > _MAX_CLUSTER_COLS:
+            print(
+                f"[clavesa] {table_id}: {len(cluster_by)} merge keys exceed Delta's "
+                f"{_MAX_CLUSTER_COLS}-column clustering limit; clustering by the first "
+                f"{_MAX_CLUSTER_COLS}: {keys}",
+                file=sys.stderr,
+                flush=True,
+            )
+        spark = df.sparkSession
+        view = "__create_src_" + table_id.replace(".", "_").replace("-", "_")
+        df.createOrReplaceTempView(view)
+        cols = ", ".join(f"`{c}`" for c in keys)
+        spark.sql(
+            f"CREATE TABLE {table_id} USING delta CLUSTER BY ({cols}) "
+            f"AS SELECT * FROM {view}"
+        )
+    else:
+        df.write.format("delta").mode("overwrite").saveAsTable(table_id)
+
+
+def _sync_glue_table_schema(table_id: str, schema, location: str | None = None) -> None:
     """Write the real Delta schema into a Glue table's ``StorageDescriptor.Columns``.
 
     Spark's ``saveAsTable`` registers the Glue table with a generic
@@ -1353,6 +1389,20 @@ def _sync_glue_table_schema(table_id: str, schema) -> None:
     parameters, …), and never raises — a sync failure logs to stderr and
     the next write retries it. Region comes from the default boto3 session
     (Lambda provides it).
+
+    ``location`` (cloud system-table callers only): when not None, the
+    sync also REPAIRS the registration's ``StorageDescriptor.Location`` to
+    this path and stamps ``spark.sql.sources.provider=delta`` /
+    ``spark.sql.partitionProvider=catalog``. This fixes the orphaned
+    system-table registration: ``.option("path", …)`` through the Glue
+    catalog leaves the SD.Location at an empty ``…-__PLACEHOLDER__`` stub
+    and a null provider, so Athena / the catalog UI (which read SD.Location)
+    can't find the Delta log even though Spark/Delta reads resolve via Delta
+    metadata. With ``location`` set the early-return short-circuit ALSO
+    requires Location and provider to already match, so a later run still
+    repairs them even when the columns already line up.
+    ``location=None`` (the user-output-table callers) preserves the
+    existing Location/provider untouched.
     """
     warehouse = os.environ.get("CLAVESA_WAREHOUSE", "")
     if not warehouse.startswith("s3://"):
@@ -1376,11 +1426,28 @@ def _sync_glue_table_schema(table_id: str, schema) -> None:
         # keys Glue may attach to each column.
         existing_pairs = [(c.get("Name"), c.get("Type")) for c in existing_cols]
         computed_pairs = [(c["Name"], c["Type"]) for c in columns]
-        if existing_pairs == computed_pairs:
-            return  # Glue already carries the real schema — nothing to do
+        columns_match = existing_pairs == computed_pairs
+        if location is None:
+            if columns_match:
+                return  # Glue already carries the real schema — nothing to do
+        else:
+            # System-table repair path: only short-circuit when columns AND
+            # Location AND the delta provider are all already in place —
+            # otherwise a later run must still fix an orphaned registration.
+            existing_provider = (table.get("Parameters") or {}).get(
+                "spark.sql.sources.provider"
+            )
+            if (
+                columns_match
+                and existing_sd.get("Location") == location
+                and existing_provider == "delta"
+            ):
+                return
 
         new_sd = dict(existing_sd)
         new_sd["Columns"] = columns
+        if location is not None:
+            new_sd["Location"] = location
 
         # Drop table_type: the columns-populated Delta registration uses
         # spark.sql.sources.provider=delta (set by Spark), and AWS docs say
@@ -1390,6 +1457,12 @@ def _sync_glue_table_schema(table_id: str, schema) -> None:
             for k, v in (table.get("Parameters") or {}).items()
             if k != "table_type"
         }
+        if location is not None:
+            # The orphaned system-table registration carries a null provider
+            # and Hive-default SerDe; stamp the Delta provider so Athena /
+            # the catalog UI resolve the Delta log at the repaired Location.
+            params["spark.sql.sources.provider"] = "delta"
+            params.setdefault("spark.sql.partitionProvider", "catalog")
 
         # Carry forward every settable field of the existing table so the
         # update only rewrites columns + parameters, never clobbering the
@@ -1764,7 +1837,7 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                 # First run: no target yet, MERGE has nothing to match
                 # against. Create the table and skip MERGE for this run.
                 if not spark.catalog.tableExists(table_id):
-                    df.write.format("delta").mode("overwrite").saveAsTable(table_id)
+                    _create_delta_table(df, table_id, spec["merge_keys"])
                 else:
                     try:
                         existing = set(spark.table(table_id).schema.fieldNames())
@@ -2059,16 +2132,16 @@ def _record_node_run(row: dict[str, Any]) -> None:
     _ensure_database(spark, db_part)
 
     df = spark.createDataFrame([row], schema=_node_runs_schema())
+    location = _system_table_location("node_runs")
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
     if not spark.catalog.tableExists(table_id):
-        location = _system_table_location("node_runs")
         if location:
             # Delta's external-location pin: .option("path", …) at first write
             # registers the table at the workspace-shared system prefix instead
             # of letting the metastore default it under the invoking pipeline.
             writer = writer.option("path", location)
     writer.saveAsTable(table_id)
-    _sync_glue_table_schema(table_id, df.schema)
+    _sync_glue_table_schema(table_id, df.schema, location=location)
 
 
 def _runs_table_id() -> str:
@@ -2269,13 +2342,13 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
     _ensure_database(spark, db_part)
 
     df = spark.createDataFrame([row], schema=_tables_schema())
+    location = _system_table_location("tables")
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
     if not spark.catalog.tableExists(tables_id):
-        location = _system_table_location("tables")
         if location:
             writer = writer.option("path", location)
     writer.saveAsTable(tables_id)
-    _sync_glue_table_schema(tables_id, df.schema)
+    _sync_glue_table_schema(tables_id, df.schema, location=location)
 
     # Net rows this commit contributed.
     #
@@ -2551,13 +2624,13 @@ def _record_column_stats(rows):
     _ensure_database(spark, db_part)
 
     df = spark.createDataFrame(rows, schema=_column_stats_schema())
+    location = _system_table_location("column_stats")
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
     if not spark.catalog.tableExists(table_id):
-        location = _system_table_location("column_stats")
         if location:
             writer = writer.option("path", location)
     writer.saveAsTable(table_id)
-    _sync_glue_table_schema(table_id, df.schema)
+    _sync_glue_table_schema(table_id, df.schema, location=location)
 
 
 def run_record_run() -> None:
