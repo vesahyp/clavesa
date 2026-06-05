@@ -1405,18 +1405,12 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("docker start: %w", err)
-	}
-
-	// Per-run log file under the pipeline's first transform — channel
-	// events stream to the per-node log via logPathFor, but the bundle
-	// has no single owning node for "everything else stdout"; route
-	// non-event stdout into a pipeline-level log so Spark output is
-	// recoverable for debugging.
+	// Per-run log file under the pipeline's run dir — channel events stream
+	// to the per-node log via logPathFor, but the bundle has no single
+	// owning node for "everything else stdout"; route non-event stdout AND
+	// all stderr into a pipeline-level log so Spark output (and the real
+	// stack trace when the session dies) is recoverable for debugging.
+	// Created before cmd.Stderr so stderr can be teed into it.
 	var bundleLog *os.File
 	bundleLogPath := filepath.Join(pipelineDir, ".clavesa", "runs", runID, "_bundle.log")
 	if err := os.MkdirAll(filepath.Dir(bundleLogPath), 0o755); err == nil {
@@ -1424,6 +1418,19 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 			bundleLog = f
 			defer bundleLog.Close()
 		}
+	}
+
+	// Keep a bounded in-memory copy for the inline error tail; tee the full
+	// stream to the bundle log so the Spark stack trace isn't swallowed.
+	var stderrBuf bytes.Buffer
+	if bundleLog != nil {
+		cmd.Stderr = io.MultiWriter(&stderrBuf, bundleLog)
+	} else {
+		cmd.Stderr = &stderrBuf
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("docker start: %w", err)
 	}
 
 	statuses := make([]NodeRunStatus, 0, len(bundle))
@@ -1511,20 +1518,31 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	}
 
 	if waitErr != nil {
-		stderrTail := stderrBuf.String()
-		if len(stderrTail) > 2048 {
-			stderrTail = "…" + stderrTail[len(stderrTail)-2048:]
-		}
-		return statuses, fmt.Errorf("pipeline runner: %w\nstderr: %s", waitErr, stderrTail)
+		return statuses, fmt.Errorf("pipeline runner: %w\nstderr: %s", waitErr, boundedStderrTail(stderrBuf.String()))
 	}
 	if finalResp == nil {
-		return statuses, fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s", stderrBuf.String())
+		return statuses, fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s", boundedStderrTail(stderrBuf.String()))
 	}
 	if status, _ := finalResp["status"].(string); status == "failed" {
 		failed, _ := finalResp["failed_node"].(string)
-		return statuses, fmt.Errorf("pipeline failed at node %q", failed)
+		// Docker exited 0 (the runner returned a clean dict), but a node
+		// failed. Append the stderr tail so the real Spark stack trace
+		// reaches the caller/dashboard rather than blaming a node by name
+		// alone.
+		return statuses, fmt.Errorf("pipeline failed at node %q\nstderr: %s", failed, boundedStderrTail(stderrBuf.String()))
 	}
 	return statuses, nil
+}
+
+// boundedStderrTail trims captured stderr to the last 2 KiB so the real
+// Spark stack trace surfaces in the returned error without dumping an
+// unbounded buffer into the error string.
+func boundedStderrTail(s string) string {
+	const max = 2048
+	if len(s) > max {
+		return "…" + s[len(s)-max:]
+	}
+	return s
 }
 
 // msgInt64 reads an integer field out of a decoded runner event. JSON

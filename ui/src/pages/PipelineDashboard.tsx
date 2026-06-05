@@ -60,6 +60,7 @@ import {
   useExecutionStates,
   useLineage,
   useNodeRuns,
+  usePipelineCost,
   usePipelineStatus,
   usePipelines,
   useRuns,
@@ -117,6 +118,26 @@ function incomingTransformEdgeMap(
     out[alias] = e.from_node;
   }
   return out;
+}
+
+// formatUsd renders a dollar figure for the Cost card. Sub-cent values
+// keep more precision so a tiny $/billion still reads as a number rather
+// than collapsing to "$0.00".
+function formatUsd(n: number): string {
+  if (n === 0) return "$0.00";
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  if (n < 1) return `$${n.toFixed(3)}`;
+  if (n < 100) return `$${n.toFixed(2)}`;
+  return `$${Math.round(n).toLocaleString()}`;
+}
+
+// formatRate renders a records/sec throughput figure with a compact
+// magnitude suffix (K/M) so high-throughput rows stay legible.
+function formatRate(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  if (n >= 10) return `${Math.round(n)}`;
+  return n.toFixed(1);
 }
 
 export function PipelineDashboard() {
@@ -305,6 +326,11 @@ export function PipelineDashboard() {
     limit: 50,
     dir: queryDir,
   });
+
+  // North-star "cost per billion records" rollup for the Cost card on the
+  // Runs tab. Non-fatal for the dashboard (a fresh pipeline returns an
+  // empty rollup); gated on the same dir the other run hooks use.
+  const cost = usePipelineCost(queryDir);
 
   // Synthetic in-flight run for the Runs grid. Local runs only get a
   // runs-table row at end-of-run (recordLocalRun), so during the actual
@@ -765,6 +791,111 @@ export function PipelineDashboard() {
                     pipelineName={pipelineName}
                     onRunSelect={openRunDetail}
                   />
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Cost — north-star "cost per billion records processed".
+                Throughput (rec/s) stays useful pre-deploy when compute is
+                free, so the local case still leads with it. Local + cloud
+                (ADR-014). */}
+            <Card>
+              <CardHeader className="flex-row items-center justify-between pb-3">
+                <CardTitle>Cost</CardTitle>
+                {cost.isFetching && !cost.isLoading && (
+                  <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    refreshing
+                  </span>
+                )}
+              </CardHeader>
+              <CardContent className="space-y-4 p-6 pt-0">
+                {cost.isLoading && (
+                  <div className="space-y-2">
+                    <Skeleton className="h-7 w-1/2" />
+                    <Skeleton className="h-4 w-2/3" />
+                  </div>
+                )}
+                {Boolean(cost.error) && !cost.isLoading && (
+                  <div className="text-xs text-muted-foreground">
+                    Couldn't compute cost for this pipeline yet. Run it at
+                    least once so there are billed runs to aggregate.
+                  </div>
+                )}
+                {cost.data && (
+                  <>
+                    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                      {cost.data.totalCostUsd === 0 ? (
+                        <span className="text-2xl font-semibold tabular-nums">
+                          $0.00 compute (local)
+                        </span>
+                      ) : (
+                        <>
+                          <span className="text-2xl font-semibold tabular-nums">
+                            {formatUsd(cost.data.costPerBillion)}
+                          </span>
+                          <span className="text-sm text-muted-foreground">
+                            per billion records
+                          </span>
+                        </>
+                      )}
+                      <span className="text-sm text-muted-foreground tabular-nums">
+                        {cost.data.totalCostUsd === 0 ? "" : "· "}
+                        {formatRate(cost.data.recordsPerSec)} rec/s
+                      </span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {cost.data.priceBasis}
+                    </p>
+                    {cost.data.perNode.length > 0 && (
+                      <div className="overflow-hidden rounded-md border border-border">
+                        <table className="w-full text-sm">
+                          <thead className="bg-muted/50 text-xs text-muted-foreground">
+                            <tr>
+                              <th className="px-3 py-2 text-left font-medium">
+                                Node
+                              </th>
+                              <th className="px-3 py-2 text-left font-medium">
+                                Target
+                              </th>
+                              <th className="px-3 py-2 text-right font-medium">
+                                Records
+                              </th>
+                              <th className="px-3 py-2 text-right font-medium">
+                                $/billion
+                              </th>
+                              <th className="px-3 py-2 text-right font-medium">
+                                rec/s
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-border">
+                            {cost.data.perNode.map((n) => (
+                              <tr key={n.node}>
+                                <td className="px-3 py-2">{n.node}</td>
+                                <td className="px-3 py-2">
+                                  <Badge variant="outline">
+                                    {n.computeTarget}
+                                  </Badge>
+                                </td>
+                                <td className="px-3 py-2 text-right tabular-nums">
+                                  {n.records.toLocaleString()}
+                                </td>
+                                <td className="px-3 py-2 text-right tabular-nums">
+                                  {n.costUsd === 0
+                                    ? "$0.00"
+                                    : formatUsd(n.costPerBillion)}
+                                </td>
+                                <td className="px-3 py-2 text-right tabular-nums">
+                                  {formatRate(n.recordsPerSec)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </>
                 )}
               </CardContent>
             </Card>

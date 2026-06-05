@@ -569,6 +569,59 @@ export function useNodeRuns(
 }
 
 // ---------------------------------------------------------------------------
+// pipeline-cost — north-star "cost per billion records" rollup
+// ---------------------------------------------------------------------------
+
+const NodeCostSchema = z.object({
+  node: z.string(),
+  computeTarget: z.string(),
+  runs: z.number(),
+  records: z.number(),
+  billedSeconds: z.number(),
+  costUsd: z.number(),
+  recordsPerSec: z.number(),
+  costPerBillion: z.number(),
+});
+export type NodeCost = z.infer<typeof NodeCostSchema>;
+
+const PipelineCostSchema = z.object({
+  pipeline: z.string(),
+  totalRecords: z.number(),
+  totalCostUsd: z.number(),
+  costPerBillion: z.number(),
+  recordsPerSec: z.number(),
+  perNode: z.array(NodeCostSchema),
+  priceBasis: z.string(),
+});
+export type PipelineCost = z.infer<typeof PipelineCostSchema>;
+
+/**
+ * GET /api/data/pipeline-cost?dir=… — the north-star "cost per billion
+ * records processed" rollup, aggregated from the pipeline's recent runner
+ * invocations. Local pipelines report $0 compute (the throughput half of
+ * the metric stays meaningful pre-deploy). Errors are non-fatal for the
+ * dashboard — a fresh pipeline with no runs returns an empty rollup.
+ */
+export function usePipelineCost(dir: string) {
+  return useQuery({
+    queryKey: ["pipeline-cost", dir],
+    enabled: Boolean(dir),
+    retry: false,
+    staleTime: 30_000,
+    queryFn: async () => {
+      const params = new URLSearchParams({ dir });
+      const url = `${BASE_URL}/data/pipeline-cost?${params.toString()}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new Error(`GET pipeline-cost → ${res.status}: ${text}`);
+      }
+      return PipelineCostSchema.parse(await res.json());
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // rightsize — recommend-only per-node memory recommendation
 // ---------------------------------------------------------------------------
 

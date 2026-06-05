@@ -57,6 +57,42 @@ fi
 echo "Using Java executable: $JAVA_EXECUTABLE" >&2
 $JAVA_EXECUTABLE -version >&2 2>&1
 
+# JVM heap sizing (issue #24). In local[*] the driver and executor share this
+# one JVM, so the old hard-coded -Xmx1g boxed the whole engine into 1 GB even
+# on a multi-GB Lambda/container — a shuffle-heavy transform then exhausted the
+# heap and GC-thrashed until the heartbeat thread stalled and the executor
+# self-exited (looked like "plenty of free memory" because that was *container*
+# memory, not the capped JVM heap). Size the heap to ~75% of the container,
+# leaving room for JVM metaspace + off-heap shuffle buffers and the
+# Python/pyspark side. Precedence:
+#   CLAVESA_JVM_HEAP_MB (explicit override)
+#   > 75% of AWS_LAMBDA_FUNCTION_MEMORY_SIZE (Lambda exposes its size in MB)
+#   > 75% of the cgroup memory limit (a memory-capped local container)
+#   > 1024 (unconstrained local fallback — unchanged from the old default).
+heap_mb="${CLAVESA_JVM_HEAP_MB:-}"
+if [ -z "$heap_mb" ] && [ -n "$AWS_LAMBDA_FUNCTION_MEMORY_SIZE" ]; then
+  heap_mb=$(( AWS_LAMBDA_FUNCTION_MEMORY_SIZE * 3 / 4 ))
+fi
+if [ -z "$heap_mb" ]; then
+  # cgroup v2 (memory.max) then v1 (memory.limit_in_bytes); skip "max" /
+  # unlimited sentinels and the host total that leaks through when uncapped.
+  for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    [ -r "$f" ] || continue
+    lim=$(cat "$f")
+    case "$lim" in
+      ''|max|*[!0-9]*) continue ;;
+    esac
+    if [ "$lim" -gt 268435456 ] && [ "$lim" -lt 1099511627776 ]; then
+      heap_mb=$(( lim / 1024 / 1024 * 3 / 4 ))
+      break
+    fi
+  done
+fi
+heap_mb="${heap_mb:-1024}"
+# Floor so a tiny limit can't produce an unusable heap.
+[ "$heap_mb" -lt 512 ] && heap_mb=512
+echo "[clavesa] spark-class JVM heap = ${heap_mb}m (lambda_mem=${AWS_LAMBDA_FUNCTION_MEMORY_SIZE:-none}MB, override=${CLAVESA_JVM_HEAP_MB:-none})" >&2
+
 # Use Python 3.12 paths for PySpark. The --add-opens set mirrors Spark 4's
 # JavaModuleOptions.java at the v4.0.2 tag — Java 17 module-system access
 # the JVM denies by default but Spark's off-heap / unsafe paths need.
@@ -76,4 +112,4 @@ exec "$JAVA_EXECUTABLE" \
   --add-opens=java.base/sun.security.action=ALL-UNNAMED \
   --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
   --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
-  -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx1g "$@"
+  -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx${heap_mb}m "$@"

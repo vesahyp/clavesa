@@ -49,6 +49,15 @@ type dockerOpts struct {
 
 func dockerRun(t *testing.T, opts dockerOpts) string {
 	t.Helper()
+	out, _ := dockerRunCapture(t, opts)
+	return out
+}
+
+// dockerRunCapture is dockerRun but also returns the container's stderr, which
+// some tests assert on (e.g. counting the "[clavesa] spark master = ..." line
+// the runner prints once per Spark session build).
+func dockerRunCapture(t *testing.T, opts dockerOpts) (stdout, stderr string) {
+	t.Helper()
 	args := []string{"run", "--rm"}
 	if opts.stdin != "" {
 		args = append(args, "-i")
@@ -69,13 +78,13 @@ func dockerRun(t *testing.T, opts dockerOpts) string {
 	if opts.stdin != "" {
 		cmd.Stdin = strings.NewReader(opts.stdin)
 	}
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("docker run failed: %v\nstdout: %s\nstderr: %s", err, out, stderr.String())
+		t.Fatalf("docker run failed: %v\nstdout: %s\nstderr: %s", err, out, errBuf.String())
 	}
-	return string(out)
+	return string(out), errBuf.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +492,198 @@ func TestRunner_PromoteAppendAllowDupes_SchemaEvolution(t *testing.T) {
 	}
 	if len(r.TargetRows) != 2 {
 		t.Fatalf("rows: want 2 (original + appended), got %d (%v)", len(r.TargetRows), r.TargetRows)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bundle session self-heal (#23): pipeline_handler reuses the module-level
+// _SPARK singleton across nodes. If that cached session dies mid-bundle (GC
+// pause trips the heartbeat, driver JVM gone, py4j gateway closed), the next
+// node's _spark() must transparently rebuild it instead of erroring. The
+// CLAVESA_TEST_KILL_SESSION_AFTER_NODE hook kills the session after a named
+// node succeeds WITHOUT clearing the global, leaving a dead handle cached so
+// the following node exercises the self-heal path.
+// ---------------------------------------------------------------------------
+
+// pipelineBundleEvent builds the on-disk logic files + the CLAVESA_RUN=1
+// `_pipeline_run` stdin payload for a 2-node hermetic bundle. Each node is a
+// self-contained SQL transform (no external inputs, no parent edges) writing a
+// Delta table under the /work warehouse, so the test needs no fixtures and the
+// two nodes are independent — a clean stage for the kill/rebuild assertion.
+func pipelineBundleEvent(t *testing.T, work string) string {
+	t.Helper()
+	// logic_path points at host paths mounted into the container at /work.
+	if err := os.WriteFile(filepath.Join(work, "logic_a.txt"), []byte("SELECT 1 AS x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "logic_b.txt"), []byte("SELECT 2 AS y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	event := map[string]any{
+		"_pipeline_run":     true,
+		"run_id":            "itest-heal",
+		"_sf_execution_arn": "itest-heal",
+		"_trigger":          "manual",
+		"transforms": []map[string]any{
+			{
+				"node":       "a",
+				"language":   "sql",
+				"logic_path": "/work/logic_a.txt",
+				"inputs":     map[string]any{},
+				"outputs": map[string]any{
+					"default": map[string]any{"kind": "delta_table", "table_id": "itest.a"},
+				},
+				"parents": []string{},
+			},
+			{
+				"node":       "b",
+				"language":   "sql",
+				"logic_path": "/work/logic_b.txt",
+				"inputs":     map[string]any{},
+				"outputs": map[string]any{
+					"default": map[string]any{"kind": "delta_table", "table_id": "itest.b"},
+				},
+				"parents": []string{},
+			},
+		},
+	}
+	b, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// bundleEnv mirrors the env the CLAVESA_RUN=1 local path sets for a bundle run,
+// using the /work mount as the Delta warehouse so the run is hermetic.
+func bundleEnv(extra map[string]string) map[string]string {
+	env := map[string]string{
+		"CLAVESA_RUN":        "1",
+		"CLAVESA_WAREHOUSE":  "/work/wh",
+		"CLAVESA_WATERMARKS": "/work/wm",
+		"CLAVESA_CATALOG":    "itest_cat",
+		"CLAVESA_SCHEMA":     "itest",
+		"CLAVESA_PIPELINE":   "itest",
+	}
+	for k, v := range extra {
+		env[k] = v
+	}
+	return env
+}
+
+// bundleResult is the aggregated pipeline_handler result — the LAST stdout line
+// (the only line with no top-level "_event" key).
+type bundleResult struct {
+	Status     string `json:"status"`
+	FailedNode string `json:"failed_node"`
+	Transforms []struct {
+		Node   string `json:"node"`
+		Status string `json:"status"`
+	} `json:"transforms"`
+}
+
+// parseBundle scans the runner stdout for the per-node _event lines and the
+// final aggregate result line. Returns the succeeded node set and the result.
+func parseBundle(t *testing.T, stdout string) (succeeded map[string]bool, res bundleResult) {
+	t.Helper()
+	succeeded = map[string]bool{}
+	var resultLine string
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var probe map[string]any
+		if json.Unmarshal([]byte(line), &probe) != nil {
+			continue
+		}
+		if ev, ok := probe["_event"]; ok {
+			if ev == "succeeded" {
+				if node, _ := probe["node"].(string); node != "" {
+					succeeded[node] = true
+				}
+			}
+			continue
+		}
+		// No _event key + has a "status" key => the aggregate result line.
+		if _, ok := probe["status"]; ok {
+			resultLine = line
+		}
+	}
+	if resultLine == "" {
+		t.Fatalf("aggregate result line not found in bundle stdout:\n%s", stdout)
+	}
+	if err := json.Unmarshal([]byte(resultLine), &res); err != nil {
+		t.Fatalf("parse aggregate result: %v\nline: %s", err, resultLine)
+	}
+	return succeeded, res
+}
+
+// TestPipelineBundle_HealsDeadSession kills the shared Spark session after node
+// `a` succeeds (without clearing the global), then asserts node `b` still
+// succeeds — proving _spark() detected the dead cached handle and rebuilt it
+// transparently mid-bundle. The "[clavesa] spark master = ..." stderr line is
+// printed once per session build, so seeing it TWICE is direct proof of the
+// rebuild.
+func TestPipelineBundle_HealsDeadSession(t *testing.T) {
+	work := t.TempDir()
+	stdin := pipelineBundleEvent(t, work)
+
+	stdout, stderr := dockerRunCapture(t, dockerOpts{
+		env: bundleEnv(map[string]string{
+			"CLAVESA_TEST_KILL_SESSION_AFTER_NODE": "a",
+		}),
+		mountSrc:   work,
+		mountDst:   "/work",
+		entrypoint: "python",
+		cmd:        []string{"/var/task/runner.py"},
+		stdin:      stdin,
+	})
+
+	succeeded, res := parseBundle(t, stdout)
+	if !succeeded["a"] {
+		t.Errorf("node a should have emitted succeeded; stdout:\n%s", stdout)
+	}
+	if !succeeded["b"] {
+		t.Errorf("node b should have emitted succeeded after the session was killed (self-heal failed); stdout:\n%s", stdout)
+	}
+	if res.Status != "ok" {
+		t.Errorf("bundle status: want ok, got %q (failed_node=%q)", res.Status, res.FailedNode)
+	}
+
+	// Two session builds = two master log lines = the rebuild happened.
+	builds := strings.Count(stderr, "[clavesa] spark master = ")
+	if builds != 2 {
+		t.Errorf("expected 2 Spark session builds (initial + post-kill rebuild), got %d; stderr:\n%s", builds, stderr)
+	}
+}
+
+// TestPipelineBundle_SingleSessionNoKill is the control: without the kill hook
+// both nodes run on one session, so exactly one "[clavesa] spark master = ..."
+// line appears. Proves the double-build in the heal test is caused by the kill,
+// not by the bundle building a session per node.
+func TestPipelineBundle_SingleSessionNoKill(t *testing.T) {
+	work := t.TempDir()
+	stdin := pipelineBundleEvent(t, work)
+
+	stdout, stderr := dockerRunCapture(t, dockerOpts{
+		env:        bundleEnv(nil),
+		mountSrc:   work,
+		mountDst:   "/work",
+		entrypoint: "python",
+		cmd:        []string{"/var/task/runner.py"},
+		stdin:      stdin,
+	})
+
+	succeeded, res := parseBundle(t, stdout)
+	if !succeeded["a"] || !succeeded["b"] {
+		t.Errorf("both nodes should succeed in the control run; stdout:\n%s", stdout)
+	}
+	if res.Status != "ok" {
+		t.Errorf("bundle status: want ok, got %q", res.Status)
+	}
+	if builds := strings.Count(stderr, "[clavesa] spark master = "); builds != 1 {
+		t.Errorf("control: expected exactly 1 Spark session build, got %d; stderr:\n%s", builds, stderr)
 	}
 }
 

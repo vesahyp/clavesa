@@ -12,6 +12,18 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.7.1] — 2026-06-05
+
+### Added
+
+- `clavesa pipeline cost [dir]` and a "Cost" card on the pipeline dashboard surfacing clavesa's north-star metric: **cost per billion records processed**. Prices each node's recent runner invocations from a static per-target table (Lambda, Fargate, EMR Serverless; local = $0) and reports the blended cost-per-billion alongside sustained throughput (records/sec). Local pipelines show $0 compute and still report throughput, so the efficiency half holds before deploy. `--json`, `--last N`, local and cloud (ADR-014/015).
+
+### Fixed
+
+- Runner now self-heals a dead Spark session instead of wedging the pipeline. A crashed/heartbeat-killed session was cached and reused on warm Lambda invocations with no liveness check, so every later run (and the scheduled cron) failed with `ConnectionRefusedError` until the container recycled. `_spark()` now probes the cached session and rebuilds it when dead, so the next invocation recovers cleanly. Failed-node telemetry survives a dead session too.
+- Runner JVM heap is now sized to the container instead of a hard-coded 1 GB. The launcher capped the driver/executor JVM at `-Xmx1g` regardless of the Lambda's memory, so a shuffle-heavy transform exhausted the heap and GC-thrashed until the session died — even with gigabytes of *container* memory free (it was the JVM heap ceiling, not the container, that ran out). The heap is now ~75% of `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` (or the cgroup limit locally), overridable via `CLAVESA_JVM_HEAP_MB`. Heartbeat/network timeouts were also widened as a secondary cushion, and the resolved Spark master + heap size are logged for diagnosis.
+- Local pipeline runs surface the runner container's real stderr. Bundle-run stderr is teed to `_bundle.log` and appended to the failure error even when the container exits 0, so the actual Spark stack trace is visible and failures stop being attributed to the wrong node.
+
 ## [v2.7.0] — 2026-06-03
 
 ### Added

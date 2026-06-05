@@ -10,6 +10,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/pricing"
 )
 
 const (
@@ -101,6 +102,13 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 			return
 		}
 		handleRightsize(w, r, p, h.systemGlueDBFor(r))
+	})
+	mux.HandleFunc("GET /data/pipeline-cost", func(w http.ResponseWriter, r *http.Request) {
+		p, ok := h.providerFor(w, r)
+		if !ok {
+			return
+		}
+		handlePipelineCost(w, r, p, h.systemGlueDBFor(r), h.pipelineNameFor(r))
 	})
 	mux.HandleFunc("GET /data/tables-state", func(w http.ResponseWriter, r *http.Request) {
 		p, ok := h.providerFor(w, r)
@@ -206,6 +214,21 @@ func (h *Handler) systemGlueDBFor(r *http.Request) string {
 		return ""
 	}
 	return h.resolver.SystemGlueDB()
+}
+
+// pipelineNameFor resolves the `pipeline = '...'` row-filter name for the
+// pipeline at `?dir=…`. Used by /data/pipeline-cost, which is keyed by dir
+// (not pipeline) per its route contract; the name still feeds the node_runs
+// scan's pipeline-column filter. Empty when no resolver / no dir is set.
+func (h *Handler) pipelineNameFor(r *http.Request) string {
+	if h.resolver == nil {
+		return ""
+	}
+	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
+	if dir == "" {
+		return ""
+	}
+	return h.resolver.PipelineName(dir)
 }
 
 // handleSource serves GET /data/source?bucket=<b>&prefix=<p>&format=<f>&limit=<n>.
@@ -613,6 +636,49 @@ func handleRightsize(w http.ResponseWriter, r *http.Request, p observability.Pro
 	httputil.WriteJSON(w, http.StatusOK, map[string]any{
 		"rows": observability.Rightsize(res.Rows),
 	})
+}
+
+// handlePipelineCost serves GET /data/pipeline-cost?dir=<pipelineDir>[&last=N].
+//
+// Returns the cost-per-billion-records rollup for the pipeline at `dir`,
+// computed from its recent runner invocations (PriceBasis = AWS us-east-1
+// on-demand approximation; local=$0). Same shape from both providers
+// (ADR-014); IncludeMetrics forces the metrics-bearing scan so input_records /
+// memory_mb are populated. `pipeline` (the node_runs row filter) is derived
+// from `dir` by the caller — this route is dir-keyed by contract.
+func handlePipelineCost(w http.ResponseWriter, r *http.Request, p observability.Provider, database, pipeline string) {
+	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
+	if dir == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+		return
+	}
+	if pipeline == "" || !observability.IsValidPipelineName(pipeline) {
+		httputil.WriteError(w, http.StatusBadRequest, "could not resolve a valid pipeline name from dir")
+		return
+	}
+
+	last := nodeRunsDefaultLimit
+	if s := r.URL.Query().Get("last"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 || n > nodeRunsMaxLimit {
+			httputil.WriteError(w, http.StatusBadRequest, "last must be a positive integer ≤ 500")
+			return
+		}
+		last = n
+	}
+
+	res, err := p.NodeRuns(r.Context(), observability.NodeRunsQuery{
+		PipelineName:   pipeline,
+		Database:       database,
+		PipelineDir:    dir,
+		Limit:          last,
+		IncludeMetrics: true,
+	})
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, pricing.AggregateCost(pipeline, res.Rows))
 }
 
 // handleTables serves GET /data/tables-state?pipeline=<name>[&dir=<dir>][&limit=N].

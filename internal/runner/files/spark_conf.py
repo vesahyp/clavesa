@@ -326,6 +326,26 @@ def clavesa_spark_conf(
         conf["spark.eventLog.logBlockUpdates.enabled"] = "false"
         conf["spark.eventLog.compress"] = "false"
 
+    # #24 GC-pause tolerance. In a single-process local[*] bundle run the
+    # driver and executor share one JVM, so a long stop-the-world GC during a
+    # shuffle-heavy stage stalls the executor heartbeat. Under Spark's defaults
+    # (heartbeat 10s, network timeout 120s) a stall longer than the timeout
+    # makes the driver mark the executor lost and tear the SparkContext down —
+    # which is exactly the dead-session symptom #23 then has to heal. Widening
+    # the timeout and heartbeat window absorbs the common pause instead of
+    # killing the run. These are mitigations, not a cure: the #23 self-heal is
+    # the backstop if the session dies anyway. All env-overridable; keep
+    # heartbeatInterval < network.timeout (Spark validates this at init).
+    conf["spark.network.timeout"] = os.environ.get(
+        "CLAVESA_SPARK_NETWORK_TIMEOUT", "300s"
+    )
+    conf["spark.executor.heartbeatInterval"] = os.environ.get(
+        "CLAVESA_SPARK_HEARTBEAT_INTERVAL", "20s"
+    )
+    conf["spark.executor.heartbeat.maxFailures"] = os.environ.get(
+        "CLAVESA_SPARK_HEARTBEAT_MAX_FAILURES", "120"
+    )
+
     return conf
 
 

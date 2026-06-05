@@ -188,12 +188,26 @@ def _spark():
     Iceberg catalog + S3A wiring.
     """
     global _SPARK
+    # #23 self-heal: if a cached session is dead (driver JVM gone, py4j gateway
+    # closed, SparkContext stopped) — e.g. after a GC pause tripped the
+    # heartbeat in a long shuffle-heavy bundle run — drop it so the build block
+    # below rebuilds a fresh one. SKIP this when acting as the Spark Connect
+    # host (CLAVESA_QUERY_SERVER / CLAVESA_CONNECT_SERVER): _SPARK there is the
+    # plugin-hosting driver assigned in _run_connect_host, and resetting it
+    # would tear down the live Connect server out from under its clients.
+    _connect_host = (
+        os.environ.get("CLAVESA_QUERY_SERVER") == "1"
+        or os.environ.get("CLAVESA_CONNECT_SERVER") == "1"
+    )
+    if _SPARK is not None and not _connect_host and _is_spark_session_dead(_SPARK):
+        _reset_spark_session()
     if _SPARK is None:
         from pyspark.sql import SparkSession  # noqa: PLC0415
         from spark_conf import clavesa_spark_conf, spark_master  # noqa: PLC0415
 
+        master = spark_master()
         builder = (
-            SparkSession.builder.appName("clavesa-runner").master(spark_master())
+            SparkSession.builder.appName("clavesa-runner").master(master)
         )
         for k, v in clavesa_spark_conf().items():
             builder = builder.config(k, v)
@@ -203,7 +217,54 @@ def _spark():
         # which otherwise throws FileNotFoundException on a missing log dir.
         _SPARK = builder.getOrCreate()
         _SPARK.sparkContext.setLogLevel("ERROR")
+        # #24: surface the resolved master so a misrouted run (e.g. an
+        # unintended local[1] or a stale CLAVESA_SPARK_MASTER) is visible in
+        # the runner stderr/log stream instead of being silently inferred.
+        print(f"[clavesa] spark master = {master}", file=sys.stderr, flush=True)
     return _SPARK
+
+
+def _is_spark_session_dead(session) -> bool:
+    """Cheapest reliable liveness probe for a cached py4j SparkSession (#23).
+
+    One py4j round-trip to the JVM-side SparkContext.isStopped() — NO Spark job
+    (no parallelize/count), because this runs once per node in a bundle. A dead
+    driver / closed gateway raises a py4j network error or an OSError on that
+    round-trip; we treat any failure, and isStopped()==True, as dead so the
+    caller rebuilds. py4j has no session-id tombstoning problem (unlike
+    Connect), so a plain rebuild is enough."""
+    class _NoPy4J(Exception):
+        """Placeholder so the except tuple stays valid when py4j is absent
+        (stubbed in unit tests) — it can never actually be raised here."""
+
+    try:
+        from py4j.java_gateway import Py4JNetworkError  # noqa: PLC0415
+        from py4j.protocol import Py4JError  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — py4j missing (stubbed in unit tests)
+        Py4JNetworkError = _NoPy4J  # type: ignore[assignment]
+        Py4JError = _NoPy4J  # type: ignore[assignment]
+    try:
+        return bool(session.sparkContext._jsc.sc().isStopped())
+    except (Py4JNetworkError, Py4JError, ConnectionRefusedError, OSError):
+        return True
+    except Exception:  # noqa: BLE001 — any unexpected failure ⇒ treat as dead
+        return True
+
+
+def _reset_spark_session() -> None:
+    """Drop the cached py4j session so the next _spark() rebuilds it (#23).
+
+    Best-effort stop of the stale handle first (it may already be dead), then
+    clear the module global. No session-id rotation: py4j has no tombstoning
+    problem, so a fresh getOrCreate() is a clean rebuild."""
+    global _SPARK
+    old = _SPARK
+    _SPARK = None
+    if old is not None:
+        try:
+            old.stop()
+        except Exception:  # noqa: BLE001 — stale handle; nothing useful to do
+            pass
 
 
 def _load_script(source: str) -> types.ModuleType:
@@ -3473,6 +3534,18 @@ def pipeline_handler(event, context):
                 "status": "ok",
                 "output_rows": output_rows,
             })
+
+        # Test-only hook (#23): when CLAVESA_TEST_KILL_SESSION_AFTER_NODE names
+        # the node just finished, deterministically kill the cached py4j session
+        # WITHOUT clearing the global, so the dead handle stays cached and the
+        # next node's _spark() must self-heal it. Named like
+        # CLAVESA_CONNECT_SESSION_TIMEOUT to mark it obviously test-only.
+        if os.environ.get("CLAVESA_TEST_KILL_SESSION_AFTER_NODE") == node:
+            try:
+                if _SPARK is not None:
+                    _SPARK.stop()
+            except Exception:  # noqa: BLE001 — best-effort kill for the test
+                pass
 
     # Every node has run — release the shared inputs cached for this bundle.
     for cached in _BUNDLE_INPUT_CACHE.values():
