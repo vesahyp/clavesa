@@ -1188,7 +1188,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		_ = logFile.Close()
 	}
 	if runErr != nil {
-		return "", nil, fmt.Errorf("docker run: %w\nstderr: %s", runErr, stderr.String())
+		return "", nil, s.withDerbyHint(fmt.Errorf("docker run: %w\nstderr: %s", runErr, stderr.String()), stderr.String())
 	}
 
 	// Runner writes a single JSON object to stdout. Parse to surface errors.
@@ -1518,10 +1518,10 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	}
 
 	if waitErr != nil {
-		return statuses, fmt.Errorf("pipeline runner: %w\nstderr: %s", waitErr, boundedStderrTail(stderrBuf.String()))
+		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner: %w\nstderr: %s", waitErr, boundedStderrTail(stderrBuf.String())), stderrBuf.String())
 	}
 	if finalResp == nil {
-		return statuses, fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s", boundedStderrTail(stderrBuf.String()))
+		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s", boundedStderrTail(stderrBuf.String())), stderrBuf.String())
 	}
 	if status, _ := finalResp["status"].(string); status == "failed" {
 		failed, _ := finalResp["failed_node"].(string)
@@ -1532,6 +1532,36 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		return statuses, fmt.Errorf("pipeline failed at node %q\nstderr: %s", failed, boundedStderrTail(stderrBuf.String()))
 	}
 	return statuses, nil
+}
+
+// derbyLockHint detects the embedded-Derby "already booted" failure in
+// captured stderr and returns an actionable one-line remedy, or "" when the
+// signature is absent. The usual cause is a warm metastore container left
+// holding the workspace's Derby lock — e.g. a `clavesa ui` killed with
+// SIGKILL (which skips the graceful StopMetastore on exit), or a `ui` still
+// running while a local pipeline run starts (#21). Without this the user
+// only sees the raw multi-frame XSDB6 stack trace.
+func (s *Service) derbyLockHint(stderr string) string {
+	if !strings.Contains(stderr, "XSDB6") && !strings.Contains(stderr, "Another instance of Derby may have already booted") {
+		return ""
+	}
+	container := observability.MetastoreContainerName(s.workspace)
+	return fmt.Sprintf(
+		"another process holds the local Derby metastore lock — stop `clavesa ui` for this workspace, or run `docker stop %s`, then re-run",
+		container,
+	)
+}
+
+// withDerbyHint prepends the Derby-lock remedy (if the stderr matches) to a
+// run error so the actionable message leads and the raw trace follows.
+func (s *Service) withDerbyHint(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	if hint := s.derbyLockHint(stderr); hint != "" {
+		return fmt.Errorf("%s\n\n%w", hint, err)
+	}
+	return err
 }
 
 // boundedStderrTail trims captured stderr to the last 2 KiB so the real

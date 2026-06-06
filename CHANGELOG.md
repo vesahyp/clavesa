@@ -12,6 +12,13 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.7.2] — 2026-06-06
+
+### Fixed
+
+- `.tf` files emitted by `node add` / `node edit` / `node disable`/`enable` are now byte-stable: block attributes write in a fixed canonical order, so re-emitting an unchanged block is a no-op diff instead of reshuffling attribute alignment run-to-run.
+- `clavesa ui` now tears down its shared local Derby metastore container on exit, so a subsequent `clavesa pipeline run --env local` no longer fails with "Another instance of Derby may have already booted the database". If a held lock is still hit (e.g. after a SIGKILL, or a `ui` left running), the local run now leads with an actionable remedy: stop `clavesa ui`, or `docker stop` the named container, instead of a raw stack trace.
+
 ## [v2.7.1] — 2026-06-05
 
 ### Added

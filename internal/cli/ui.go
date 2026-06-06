@@ -863,10 +863,19 @@ Examples:
 			}
 
 			// Graceful shutdown: SIGINT/SIGTERM triggers http.Server.Shutdown
-			// AND a docker stop on every warm Spark container we spawned.
-			// Without this, Ctrl-C would leak ~1GB-resident containers per
-			// pipeline; SweepWarmWorkers cleans that up on the next start
-			// but the kill-and-restart cycle still wastes time and RAM.
+			// AND a docker stop on every warm Spark container we spawned —
+			// the warm query workers AND the shared Derby metastore. Without
+			// the metastore teardown, the container keeps holding the
+			// workspace's embedded Derby lock after `clavesa ui` exits, and
+			// the next `clavesa pipeline run --env local` dies with
+			// "Another instance of Derby may have already booted the
+			// database" (#21). SweepWarmWorkers / SweepMetastores clean both
+			// up on the next UI start, but a local run in between would still
+			// be blocked, so we release on exit rather than on next start.
+			shutdown := func() {
+				warmQuery.Close()
+				observability.StopMetastore(workspace)
+			}
 			srv := &http.Server{Addr: addr, Handler: mux}
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -875,7 +884,7 @@ Examples:
 
 			select {
 			case err := <-serveErr:
-				warmQuery.Close()
+				shutdown()
 				if err != nil && !errors.Is(err, http.ErrServerClosed) {
 					return err
 				}
@@ -884,7 +893,7 @@ Examples:
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				_ = srv.Shutdown(shutdownCtx)
-				warmQuery.Close()
+				shutdown()
 				return nil
 			}
 		},

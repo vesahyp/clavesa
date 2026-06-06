@@ -295,11 +295,19 @@ def transform(spark, inputs):
 // Operation-mode tests (the path UI's promote / discard buttons exercise)
 // ---------------------------------------------------------------------------
 
-// promoteDriverScript creates a Hadoop-catalog Iceberg canonical + staging
-// table with the given column schemas, invokes runner._run_operation with
+// promoteDriverScript creates a Delta canonical + staging table with the
+// given column schemas, invokes runner._run_operation with
 // _operation=backfill_promote, and prints {"result": ..., "target_schema":
 // [...], "target_rows": [...]} so the test asserts both the operation
 // response and the resulting table state.
+//
+// Namespace shape mirrors production (canonicalTargetFor in
+// internal/service/backfill.go): a single-part database namespace holding
+// `<table>` and its `<table>__backfill__<run_id>` staging sibling, addressed
+// two-segment as `<db>.<table>`. The Iceberg-era three-level `clavesa.itest.*`
+// form (V2 `writeTo(...).createOrReplace()`) was removed at the v2.0.0
+// Delta migration (ADR-018) — `spark_catalog` requires a single-part
+// namespace (see runner/spark_conf.py).
 func promoteDriverScript(canonicalCols, stagingCols, canonicalRows, stagingRows, mode, mergeKeys, forceDedup string, allowDupes bool) string {
 	return fmt.Sprintf(`
 import json, os, sys, shutil
@@ -314,17 +322,17 @@ sys.path.insert(0, "/var/task")
 from runner import _spark, _run_operation
 
 spark = _spark()
-spark.sql("CREATE NAMESPACE IF NOT EXISTS clavesa.itest")
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
 
-# Canonical table — created via writeTo so it's a real Iceberg table.
-spark.createDataFrame(%s, %q).writeTo("clavesa.itest.canon").createOrReplace()
+# Canonical table — written as Delta via saveAsTable (the runner's table shape).
+spark.createDataFrame(%s, %q).write.format("delta").mode("overwrite").saveAsTable("itest.canon")
 # Staging table — column set may differ from canonical.
-spark.createDataFrame(%s, %q).writeTo("clavesa.itest.canon__backfill__rid").createOrReplace()
+spark.createDataFrame(%s, %q).write.format("delta").mode("overwrite").saveAsTable("itest.canon__backfill__rid")
 
 event = {
     "_operation": "backfill_promote",
-    "staging": "clavesa.itest.canon__backfill__rid",
-    "target": "clavesa.itest.canon",
+    "staging": "itest.canon__backfill__rid",
+    "target": "itest.canon",
     "mode": %q,
     "merge_keys": %s,
     "force_dedup": %q,
@@ -332,12 +340,12 @@ event = {
 }
 result = _run_operation(event)
 
-target_schema = [(f.name, f.dataType.simpleString()) for f in spark.table("clavesa.itest.canon").schema]
+target_schema = [(f.name, f.dataType.simpleString()) for f in spark.table("itest.canon").schema]
 target_rows = sorted(
-    (r.asDict() for r in spark.table("clavesa.itest.canon").collect()),
+    (r.asDict() for r in spark.table("itest.canon").collect()),
     key=lambda r: tuple((k, v) for k, v in sorted(r.items()) if v is not None),
 )
-staging_exists = spark.catalog.tableExists("clavesa.itest.canon__backfill__rid")
+staging_exists = spark.catalog.tableExists("itest.canon__backfill__rid")
 print("RESULT_LINE:" + json.dumps({
     "result": result,
     "target_schema": target_schema,

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -306,11 +307,54 @@ func findBlocks(body *hclwrite.Body, blockType, blockName string) []*hclwrite.Bl
 	return result
 }
 
+// attributeLeadOrder is the canonical lead order for the common module
+// identity attributes. hclwrite column-aligns `=` within a block and the
+// width depends on the order attributes are added, so a stable order is
+// what makes re-emitting an unchanged block a no-op diff. Identity attrs
+// come first in this fixed order; everything else follows alphabetically
+// (see sortedAttributeNames). Grounded in service.AddNode's attr map.
+var attributeLeadOrder = []string{
+	"source",
+	"name",
+	"pipeline_name",
+	"bucket",
+	"catalog",
+	"schema",
+	"system_catalog",
+}
+
+// sortedAttributeNames returns the attribute names in a deterministic order:
+// the canonical lead attributes first (attributeLeadOrder), then the rest
+// alphabetically. Iterating the attributes map directly is non-deterministic
+// (Go randomizes map iteration), which previously produced noisy `.tf`
+// diffs and flaky exact-HCL assertions.
+func sortedAttributeNames(attributes map[string]AttributeValue) []string {
+	lead := make([]string, 0, len(attributeLeadOrder))
+	leadSet := make(map[string]bool, len(attributeLeadOrder))
+	for _, name := range attributeLeadOrder {
+		if _, ok := attributes[name]; ok {
+			lead = append(lead, name)
+			leadSet[name] = true
+		}
+	}
+	rest := make([]string, 0, len(attributes))
+	for name := range attributes {
+		if !leadSet[name] {
+			rest = append(rest, name)
+		}
+	}
+	sort.Strings(rest)
+	return append(lead, rest...)
+}
+
 // setAttributes applies the attributes map to the block body.
 // nil values remove the attribute; all others set/overwrite it.
+// Attributes are encoded in a deterministic order (see sortedAttributeNames)
+// so the emitted HCL — including hclwrite's `=` column alignment — is stable
+// across runs.
 func setAttributes(body *hclwrite.Body, attributes map[string]AttributeValue) error {
-	for name, value := range attributes {
-		if err := encodeAttributeValue(body, name, value); err != nil {
+	for _, name := range sortedAttributeNames(attributes) {
+		if err := encodeAttributeValue(body, name, attributes[name]); err != nil {
 			return newError(ErrParseError, "cannot encode attribute %q: %v", name, err)
 		}
 	}

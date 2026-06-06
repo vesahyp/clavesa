@@ -41,9 +41,9 @@ func TestUpdateNodeRoundTripsEnabledBool(t *testing.T) {
 	if _, err := svc.UpdateNode(dir, "t1", map[string]interface{}{"enabled": false}); err != nil {
 		t.Fatalf("UpdateNode enabled=false: %v", err)
 	}
-	// Collapse whitespace: the HCL writer column-aligns attributes and the
-	// alignment width is non-deterministic across runs, so an exact
-	// single-space substring flakes.
+	// Collapse whitespace: hclwrite column-aligns the `=` within a block, so
+	// a single-space substring won't match the padded form. The alignment is
+	// deterministic now (#17); this only normalizes the padding.
 	flat := func() string {
 		b, _ := os.ReadFile(filepath.Join(abs, "main.tf"))
 		return strings.Join(strings.Fields(string(b)), " ")

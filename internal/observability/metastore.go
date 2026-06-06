@@ -336,10 +336,17 @@ func SweepMetastores(workspaceRoot string) {
 	_ = exec.Command("docker", "rm", "-f", name).Run()
 }
 
+// MetastoreContainerName returns the deterministic name of the per-workspace
+// metastore container, so callers can name it in user-facing remedies (e.g.
+// "docker stop <name>" when a held Derby lock blocks a local run, #21).
+func MetastoreContainerName(workspaceRoot string) string {
+	return metastoreContainerName(workspaceRoot)
+}
+
 // StopMetastore removes the per-workspace metastore container, for
-// explicit teardown (e.g. `clavesa ui` shutdown in a later slice).
-// Best-effort: a missing container or unreachable daemon is a no-op. The
-// network is left in place for the same reason SweepMetastores keeps it.
+// explicit teardown (e.g. `clavesa ui` shutdown). Best-effort: a missing
+// container or unreachable daemon is a no-op. The network is left in place
+// for the same reason SweepMetastores keeps it.
 func StopMetastore(workspaceRoot string) {
 	if strings.TrimSpace(workspaceRoot) == "" {
 		return

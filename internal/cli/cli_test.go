@@ -364,10 +364,10 @@ func TestNodeDisableEnable(t *testing.T) {
 	if err := Run([]string{"node", "disable", "my-pipeline", "t1", "--workspace", ws}); err != nil {
 		t.Fatalf("node disable: %v", err)
 	}
-	// Collapse whitespace before matching: the HCL writer column-aligns
-	// attributes (`enabled        = false`), and the alignment width is
-	// non-deterministic across runs, so an exact single-space substring
-	// flakes. strings.Fields normalizes it.
+	// Collapse whitespace before matching: hclwrite column-aligns the `=`
+	// within a block (`enabled        = false`), so a single-space substring
+	// won't match the padded form. The alignment is deterministic now (#17),
+	// so this only normalizes the padding, not run-to-run flakiness.
 	flat := func() string {
 		b, _ := os.ReadFile(mainTF)
 		return strings.Join(strings.Fields(string(b)), " ")

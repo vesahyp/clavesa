@@ -165,6 +165,46 @@ func TestAddBlock_BasicAdd(t *testing.T) {
 	}
 }
 
+// TestAddBlock_DeterministicOutput locks #17: emitting the same block from
+// the same attribute map must produce byte-identical HCL every time. Go
+// randomizes map iteration order per range call, so before setAttributes
+// sorted its keys, hclwrite's `=` column alignment varied run-to-run,
+// producing noisy `.tf` diffs and flaky exact-HCL assertions. The attribute
+// set here is wide enough (varying name lengths) that any order-dependence
+// in the alignment would surface across these iterations.
+func TestAddBlock_DeterministicOutput(t *testing.T) {
+	attrs := map[string]interface{}{
+		"source":             "clavesa/transform/aws",
+		"name":               "t1",
+		"pipeline_name":      "p",
+		"bucket":             "b",
+		"catalog":            "clavesa_ws",
+		"schema":             "demo",
+		"system_catalog":     "clavesa_ws_system",
+		"enabled":            false,
+		"output_definitions": "x",
+	}
+	fo := fileops.New()
+
+	var first string
+	for i := 0; i < 25; i++ {
+		dir := tmpDir(t)
+		path := filepath.Join(dir, "main.tf")
+		writeFile(t, path, "")
+		result, err := fo.AddBlock(path, "module", "t1", attrs)
+		if err != nil {
+			t.Fatalf("AddBlock iteration %d: %v", i, err)
+		}
+		if i == 0 {
+			first = result.Content
+			continue
+		}
+		if result.Content != first {
+			t.Fatalf("non-deterministic HCL output on iteration %d:\nfirst:\n%s\ngot:\n%s", i, first, result.Content)
+		}
+	}
+}
+
 func TestAddBlock_AppendToExistingFile(t *testing.T) {
 	dir := tmpDir(t)
 	path := filepath.Join(dir, "main.tf")
