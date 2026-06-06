@@ -748,6 +748,125 @@ def _write_watermark(uri: str, cursor: tuple[str, ...]) -> None:
         f.write(body)
 
 
+def _max_files_per_run() -> int:
+    """Per-run batch cap for notification-drain ingest. Bounds how many SQS
+    object-created messages one run consumes so a backlog drains over several
+    runs instead of one unbounded read."""
+    raw = os.environ.get("CLAVESA_MAX_FILES_PER_RUN", "")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 1000
+    return val if val > 0 else 1000
+
+
+def _drain_source_queue(queue_url: str, max_keys: int, region: str | None = None) -> tuple[list[str], list[str]]:
+    """Drain an SQS queue fed by S3 ``Object Created`` events (Auto-Loader-style
+    file-notification ingest). Returns ``(keys, handles)`` where ``keys`` is the
+    list of ``s3://<bucket>/<key>`` URIs to read this run and ``handles`` is the
+    matching list of SQS receipt handles to delete *after* outputs commit.
+
+    Each message body is the EventBridge ``Object Created`` event JSON; the
+    bucket + object key live under ``detail.bucket.name`` / ``detail.object.key``
+    (the key arrives percent-encoded, so URL-decode it). Keys are deduped within
+    the batch.
+
+    Posture on un-parseable bodies: a body that isn't a recognisable
+    ObjectCreated event is logged to stderr and skipped, and its handle is NOT
+    collected — so it stays on the queue and the DLQ redrive policy handles the
+    poison message rather than this run silently swallowing it. Only handles for
+    messages we successfully turned into a key are returned for deletion.
+
+    Long-polls (``WaitTimeSeconds``) so a near-empty queue doesn't spin; stops at
+    the first empty receive OR once ``max_keys`` keys are collected.
+    """
+    import boto3  # noqa: PLC0415
+    import urllib.parse  # noqa: PLC0415
+
+    sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
+
+    keys: list[str] = []
+    handles: list[str] = []
+    seen: set[str] = set()
+    skipped = 0
+    while len(keys) < max_keys:
+        resp = sqs.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=5,
+        )
+        messages = resp.get("Messages") or []
+        if not messages:
+            break
+        for msg in messages:
+            receipt = msg.get("ReceiptHandle")
+            try:
+                body = json.loads(msg.get("Body") or "")
+                detail = body["detail"]
+                bucket = detail["bucket"]["name"]
+                raw_key = detail["object"]["key"]
+                key = urllib.parse.unquote_plus(str(raw_key))
+                if not bucket or not key:
+                    raise ValueError("empty bucket or key")
+            except Exception as exc:  # noqa: BLE001
+                skipped += 1
+                print(
+                    f"[clavesa] drain {queue_url!r}: skipping un-parseable message "
+                    f"(left on queue for DLQ redrive): {exc!r}",
+                    file=sys.stderr,
+                )
+                continue
+            uri = f"s3://{bucket}/{key}"
+            # Always collect the handle for a parsed message so a duplicate
+            # event (same object enqueued twice) still gets deleted; only the
+            # first occurrence contributes a key to read.
+            if receipt:
+                handles.append(receipt)
+            if uri not in seen:
+                seen.add(uri)
+                keys.append(uri)
+        if len(messages) < 10:
+            # Partial batch ⇒ queue is (near) drained; one more empty poll
+            # would just burn the long-poll wait. Stop here.
+            break
+    if skipped:
+        print(
+            f"[clavesa] drain {queue_url!r}: skipped {skipped} un-parseable message(s)",
+            file=sys.stderr,
+        )
+    return keys, handles
+
+
+def _delete_sqs_messages(queue_url: str, handles: list[str], region: str | None = None) -> None:
+    """Best-effort batch delete of consumed SQS messages after outputs commit.
+    Chunks into ≤10-entry ``DeleteMessageBatch`` calls. A delete failure logs to
+    stderr but never raises — the message redelivers and downstream dedup absorbs
+    the duplicate, same at-least-once posture as watermark advance."""
+    if not handles:
+        return
+    import boto3  # noqa: PLC0415
+
+    sqs = boto3.client("sqs", region_name=region) if region else boto3.client("sqs")
+    for start in range(0, len(handles), 10):
+        chunk = handles[start:start + 10]
+        entries = [{"Id": str(i), "ReceiptHandle": h} for i, h in enumerate(chunk)]
+        try:
+            resp = sqs.delete_message_batch(QueueUrl=queue_url, Entries=entries)
+            failed = resp.get("Failed") or []
+            if failed:
+                print(
+                    f"[clavesa] drain {queue_url!r}: {len(failed)} message(s) failed to delete "
+                    f"(will redeliver): {failed!r}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[clavesa] drain {queue_url!r}: delete_message_batch failed "
+                f"(messages will redeliver): {exc!r}",
+                file=sys.stderr,
+            )
+
+
 def _resolve_initial_cursor(start_from: str, partitions: list[tuple[tuple[str, ...], str]]) -> tuple[str, ...] | None:
     """Translate a start_from declaration into an effective watermark when none
     is stored yet.
@@ -934,6 +1053,26 @@ def _read_path_format(spark, path: str, fmt: str):
     raise RuntimeError(f"unsupported source format {fmt!r} for path {path!r}")
 
 
+def _read_keys_format(spark, keys: list[str], fmt: str, base_path: str):
+    """Read an explicit list of object URIs by source format, deriving Hive
+    partition columns from ``base_path`` so a flat or partitioned layout yields
+    the same schema a full-prefix read would. Mirrors _read_path_format's format
+    dispatch but over a concrete key set (the notification-drain path) instead of
+    a single prefix. basePath is what tells Spark to recover partition columns
+    (year=/month=/…) from each key's tail relative to the source prefix; without
+    it, multi-path reads drop the partition columns and the output schema
+    diverges from a listing-mode read (same INCOMPATIBLE_DATA_FOR_TABLE trap the
+    partitioned_path branch guards against)."""
+    reader = spark.read.option("basePath", base_path)
+    if fmt in ("parquet", ""):
+        return reader.parquet(*keys)
+    if fmt == "csv":
+        return reader.option("header", "true").option("inferSchema", "true").csv(*keys)
+    if fmt == "json" or fmt == "ndjson":
+        return reader.json(*keys)
+    raise RuntimeError(f"unsupported source format {fmt!r} for drain keys under {base_path!r}")
+
+
 def _is_forced(event: Any, node_id: str) -> bool:
     """Decide whether this node's incremental-skip checks are bypassed for
     this run.
@@ -970,6 +1109,43 @@ def _is_forced(event: Any, node_id: str) -> bool:
                 return True
             return node_id in force_nodes
     return False
+
+
+def _drain_if_configured(spark, alias: str, src: dict[str, Any], bucket: str, prefix: str):
+    """Notification-drain ingest (Auto-Loader style), shared by the partitioned
+    and flat s3 read paths. When the descriptor carries a non-empty `queue_url`,
+    the source's SQS queue (fed by S3 Object Created events) is the cursor: drain
+    it for new object keys, read exactly those objects, and delete the messages
+    after the Delta write commits (post-commit ack hook in _run_transform). No
+    partition-tree listing, no watermark — the queue replaces both, and it works
+    the same for flat and partitioned layouts (a flat source otherwise re-reads
+    its whole prefix every run, so it benefits most). Semantics are at-least-once:
+    a crash before delete redelivers the message and downstream dedup absorbs it.
+
+    Returns None when no `queue_url` is set — the caller falls back to listing.
+    Otherwise returns the (df, advance) pair for _resolve_input to return:
+    (None, None) when the queue is empty (skips the run), else (df, ack-record).
+    """
+    queue_url = str(src.get("queue_url") or "")
+    if not queue_url:
+        return None
+    if not prefix.endswith("/"):
+        prefix += "/"
+    region = src.get("region") or None
+    keys, handles = _drain_source_queue(queue_url, _max_files_per_run(), region=region)
+    if not keys:
+        print(f"[clavesa] input {alias!r}: drain queue empty; skipping run", file=sys.stderr)
+        return None, None
+    print(
+        f"[clavesa] input {alias!r}: draining {len(keys)} new object(s) from queue",
+        file=sys.stderr,
+    )
+    # basePath = the source prefix so Hive partition columns derive identically
+    # to a full-prefix read, even when drained keys sit at varying depths.
+    fmt = str(src.get("format") or "parquet").lower()
+    base_path = f"s3://{bucket}/{prefix}"
+    df = _read_keys_format(spark, keys, fmt, base_path)
+    return df, {"ack": {"queue_url": queue_url, "handles": handles, "region": region}}
 
 
 def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None = None, forced: bool = False) -> tuple[Any, dict[str, Any] | None]:
@@ -1022,6 +1198,14 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         # via assume-role land in a later slice.
         bucket = src["bucket"]
         prefix = str(src.get("prefix") or "")
+
+        # A flat s3 source re-reads its whole prefix every run; notification-drain
+        # (when the descriptor carries a queue_url) turns that into "read only the
+        # new objects", the single biggest re-read this eliminates.
+        drained = _drain_if_configured(spark, alias, src, bucket, prefix)
+        if drained is not None:
+            return drained
+
         path = f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}/"
         fmt = str(src.get("format") or "parquet").lower()
         return _read_path_format(spark, path, fmt), None
@@ -1178,6 +1362,11 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         bucket, prefix = _split_s3(path)
         if not prefix.endswith("/"):
             prefix += "/"
+
+        drained = _drain_if_configured(spark, alias, src, bucket, prefix)
+        if drained is not None:
+            return drained
+
         all_partitions = _list_partition_tree(bucket, prefix, partition_names)
 
         if backfill is not None:
@@ -2085,18 +2274,30 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                     file=sys.stderr,
                 )
 
-    # Advance watermarks. Best-effort atomicity: outputs committed first, so a
-    # failure here causes the next run to reprocess the same partitions
-    # (at-least-once on the input side). Mode="replace" outputs absorb the
-    # duplicate; "append" outputs would dupe rows. Document, don't solve.
+    # Advance watermarks + ack drained queue messages. Best-effort atomicity:
+    # outputs committed first, so a failure here causes the next run to
+    # reprocess the same partitions / re-read the same objects (at-least-once on
+    # the input side). Mode="replace" outputs absorb the duplicate; "append"
+    # outputs would dupe rows. Document, don't solve.
+    #
+    # An advance record carries EITHER a watermark (uri + new_cursor) OR an ack
+    # (notification-drain queue + receipt handles), never both. Watermark writes
+    # run first, then queue deletes — both best-effort, neither masks the
+    # transform outcome.
     for adv in pending_watermarks:
-        _write_watermark(adv["uri"], adv["new_cursor"])
+        if "uri" in adv:
+            _write_watermark(adv["uri"], adv["new_cursor"])
+    for adv in pending_watermarks:
+        ack = adv.get("ack")
+        if ack:
+            _delete_sqs_messages(ack["queue_url"], ack.get("handles") or [], region=ack.get("region"))
 
     response: dict[str, Any] = {"status": "ok", "outputs": written}
     if saw_partitioned:
         response["watermarks_advanced"] = [
             {"uri": adv["uri"], "cursor": list(adv["new_cursor"])}
             for adv in pending_watermarks
+            if "uri" in adv
         ]
     return response
 

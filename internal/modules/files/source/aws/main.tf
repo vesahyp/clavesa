@@ -32,6 +32,31 @@ locals {
 resource "aws_sqs_queue" "trigger" {
   name                      = "clavesa-${var.pipeline_name}-${var.name}-trigger"
   message_retention_seconds = 86400 # 1 day
+
+  # The runner Lambda drains this queue with ReceiveMessage and only deletes a
+  # message after the Delta write commits. Keep received-but-undeleted messages
+  # invisible for the whole run (SFN task TimeoutSeconds is 900); a shorter
+  # window would resurface them mid-run and a concurrent/next fire would re-read
+  # the same objects.
+  visibility_timeout_seconds = var.trigger_visibility_timeout_seconds
+
+  # Messages that repeatedly fail to process (poison / unreadable object) drop
+  # to the DLQ instead of cycling forever.
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.trigger_dlq.arn
+    maxReceiveCount     = var.trigger_max_receive_count
+  })
+
+  tags = local.tags
+}
+
+# Dead-letter queue for the trigger queue. Failures land here for inspection;
+# a long retention keeps them around. It only receives messages via the
+# trigger queue's redrive policy (not EventBridge), so it needs no queue policy
+# of its own.
+resource "aws_sqs_queue" "trigger_dlq" {
+  name                      = "clavesa-${var.pipeline_name}-${var.name}-trigger-dlq"
+  message_retention_seconds = 1209600 # 14 days
   tags                      = local.tags
 }
 

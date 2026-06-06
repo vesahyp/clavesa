@@ -2,7 +2,11 @@
 Clavesa pipeline poller — invoked on a schedule by EventBridge.
 
 Checks all source SQS queues. If any queue has messages, starts the
-Step Functions state machine once and purges all queues.
+Step Functions state machine once. The poller does NOT consume the
+queues: it reads ApproximateNumberOfMessages and leaves every message
+in place for the runner Lambda to drain (ReceiveMessage + DeleteMessage
+after the Delta write commits). Consuming here would steal the keys the
+runner needs to know which objects to ingest.
 """
 import boto3
 import json
@@ -22,18 +26,17 @@ def handler(event, context):
     queue_arns = json.loads(os.environ["QUEUE_ARNS"])
     state_machine_arn = os.environ["STATE_MACHINE_ARN"]
 
-    # receive_message (not get_queue_attributes): ApproximateNumberOfMessages
-    # is eventually consistent and can read 0 right after a message lands.
-    # VisibilityTimeout=0 + no delete; purge_queue below handles cleanup.
+    # Non-consuming depth check: ApproximateNumberOfMessages is eventually
+    # consistent (can briefly read 0 right after a message lands), but it
+    # leaves messages in the queue for the runner to drain. ReceiveMessage
+    # would hide them from the runner during the visibility window.
     has_messages = False
     for arn in queue_arns:
-        resp = sqs.receive_message(
+        resp = sqs.get_queue_attributes(
             QueueUrl=arn_to_url(arn),
-            MaxNumberOfMessages=1,
-            VisibilityTimeout=0,
-            WaitTimeSeconds=0,
+            AttributeNames=["ApproximateNumberOfMessages"],
         )
-        if resp.get("Messages"):
+        if int(resp["Attributes"].get("ApproximateNumberOfMessages", "0")) > 0:
             has_messages = True
             break
 
@@ -47,11 +50,5 @@ def handler(event, context):
         stateMachineArn=state_machine_arn,
         input=json.dumps({"_trigger": "event"}),
     )
-
-    for arn in queue_arns:
-        try:
-            sqs.purge_queue(QueueUrl=arn_to_url(arn))
-        except sqs.exceptions.PurgeQueueInProgress:
-            pass  # already being purged, fine
 
     return {"triggered": True}

@@ -12,6 +12,16 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.7.3] — 2026-06-06
+
+### Changed
+
+- S3 sources now ingest by draining their notification queue (the SQS queue fed by S3 `Object Created` events) instead of listing the bucket prefix every run, the same file-notification approach as Databricks Auto Loader. Each run reads only the new objects and deletes the messages after the write commits, so source `ListBucket` cost stops growing with accumulated history. Applies to partitioned and flat s3 sources alike; flat sources, which previously re-read the whole prefix every run, benefit most. Default and automatic, with no configuration. Local runs fall back to listing (no queue) and produce identical results. Ingest is at-least-once on retry, so pair `append` outputs with a downstream dedup or use `merge`.
+
+### Fixed
+
+- The source trigger queue's visibility timeout is now sized to the run (default 900s) and backed by a dead-letter queue, so an in-flight run's messages can't be re-read mid-run and a repeatedly-failing object drops to the DLQ instead of cycling forever.
+
 ## [v2.7.2] — 2026-06-06
 
 ### Fixed

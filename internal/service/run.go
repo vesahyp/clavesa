@@ -670,6 +670,13 @@ func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath,
 						}
 						break
 					}
+					// Listing read. Deliberately no `queue_url`: SQS
+					// notification-drain is a cloud-only cost optimization
+					// the orchestration emitter stamps onto the cloud
+					// descriptor. Local has no SQS, so the runner falls
+					// back to the listing/partition-walk read here. Row
+					// shape is identical to the cloud descriptor minus that
+					// one optional field (ADR-014 parity holds).
 					descriptor := map[string]any{
 						"kind":   "s3",
 						"bucket": spec.Bucket,

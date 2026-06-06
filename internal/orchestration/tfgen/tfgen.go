@@ -541,6 +541,19 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "      ]},\n")
 
 	fmt.Fprintf(b, "      { Sid = \"Logs\", Effect = \"Allow\", Action = [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"], Resource = [\"arn:aws:logs:*:*:*\"] },\n")
+
+	// Notification-drain ingest: the runner consumes each s3 source's
+	// trigger queue (ReceiveMessage on the keys an upload signalled,
+	// DeleteMessage after the Delta write commits). The queue ARNs are the
+	// same set the poller's `_poller_queue_arns` local builds, but the
+	// runner needs them even when the poller is disabled (no batch window),
+	// so the list is emitted inline from p.TriggerQueueExprs. Only when
+	// non-empty.
+	if len(p.TriggerQueueExprs) > 0 {
+		queueListExpr := "[" + strings.Join(p.TriggerQueueExprs, ", ") + "]"
+		fmt.Fprintf(b, "      { Sid = \"SQSDrain\", Effect = \"Allow\", Action = [\"sqs:ReceiveMessage\", \"sqs:DeleteMessage\", \"sqs:GetQueueAttributes\"], Resource = %s },\n", queueListExpr)
+	}
+
 	fmt.Fprintf(b, "    ]\n")
 	fmt.Fprintf(b, "  })\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -772,7 +785,7 @@ func emitPoller(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
 	fmt.Fprintf(b, "    Statement = [\n")
-	fmt.Fprintf(b, "      { Sid = \"SQSPoll\",  Effect = \"Allow\", Action = [\"sqs:ReceiveMessage\", \"sqs:PurgeQueue\"], Resource = local._poller_queue_arns },\n")
+	fmt.Fprintf(b, "      { Sid = \"SQSPoll\",  Effect = \"Allow\", Action = [\"sqs:GetQueueAttributes\"], Resource = local._poller_queue_arns },\n")
 	fmt.Fprintf(b, "      { Sid = \"SFNStart\", Effect = \"Allow\", Action = [\"states:StartExecution\"], Resource = [aws_sfn_state_machine.pipeline.arn] },\n")
 	fmt.Fprintf(b, "      { Sid = \"Logs\",     Effect = \"Allow\", Action = [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"], Resource = [\"arn:aws:logs:*:*:*\"] },\n")
 	fmt.Fprintf(b, "    ]\n")

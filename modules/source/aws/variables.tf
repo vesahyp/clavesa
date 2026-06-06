@@ -82,6 +82,28 @@ variable "start_from" {
   EOT
 }
 
+variable "trigger_visibility_timeout_seconds" {
+  type        = number
+  default     = 900
+  description = <<-EOT
+    Visibility timeout for the trigger queue, in seconds. The runner Lambda
+    receives a message, reads the new objects, and only deletes the message
+    after the Delta write commits, so this must be at least as long as a full
+    run (the SFN task TimeoutSeconds is 900). A shorter window resurfaces
+    messages mid-run and risks duplicate reads.
+  EOT
+}
+
+variable "trigger_max_receive_count" {
+  type        = number
+  default     = 5
+  description = <<-EOT
+    Number of times a trigger message may be received before it is moved to the
+    dead-letter queue. Bounds retries on a poison or unreadable object so a
+    failing message stops cycling instead of blocking the queue forever.
+  EOT
+}
+
 variable "manage_bucket_notifications" {
   type        = bool
   default     = false

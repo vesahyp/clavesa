@@ -37,8 +37,15 @@ def _load_runner():
     the fake S3 bucket before running.
     """
     fake_s3 = _FakeS3Backend()
+    fake_sqs = _FakeSQSBackend()
     boto3_mod = types.ModuleType("boto3")
-    boto3_mod.client = lambda *_a, **_k: fake_s3.client()  # type: ignore[attr-defined]
+
+    def _client(service, *_a, **_k):
+        if service == "sqs":
+            return fake_sqs.client()
+        return fake_s3.client()
+
+    boto3_mod.client = _client  # type: ignore[attr-defined]
 
     botocore_mod = types.ModuleType("botocore")
     botocore_exceptions = types.ModuleType("botocore.exceptions")
@@ -68,6 +75,7 @@ def _load_runner():
     assert spec.loader is not None
     spec.loader.exec_module(mod)
     mod._FAKE_S3 = fake_s3  # expose so tests can populate it
+    mod._FAKE_SQS = fake_sqs  # notification-drain ingest (#25)
     return mod
 
 
@@ -141,6 +149,84 @@ class _StreamingBody:
         self._body = body
     def read(self):
         return self._body
+
+
+class _FakeSQSBackend:
+    """In-memory SQS stand-in for notification-drain ingest (#25). Holds a
+    list of messages; receive_message pops up to MaxNumberOfMessages, and
+    delete_message_batch records the receipt handles deleted (so a test can
+    assert delete-after-commit fired on the right handles)."""
+
+    def __init__(self):
+        self.messages: list[dict] = []
+        self.deleted: list[str] = []
+        self.fail_delete = False
+
+    def reset(self):
+        self.messages = []
+        self.deleted = []
+        self.fail_delete = False
+
+    def add_object_event(self, bucket: str, key: str, handle: str):
+        """Enqueue an EventBridge `Object Created` event for one S3 object."""
+        body = json.dumps({"detail": {"bucket": {"name": bucket}, "object": {"key": key}}})
+        self.messages.append({"Body": body, "ReceiptHandle": handle})
+
+    def add_raw(self, body: str, handle: str):
+        """Enqueue a raw (possibly un-parseable) message body."""
+        self.messages.append({"Body": body, "ReceiptHandle": handle})
+
+    def client(self):
+        backend = self
+
+        class _Client:
+            def receive_message(self, **kwargs):
+                n = kwargs.get("MaxNumberOfMessages", 10)
+                batch = backend.messages[:n]
+                backend.messages = backend.messages[n:]
+                return {"Messages": batch} if batch else {}
+
+            def delete_message_batch(self, **kwargs):
+                if backend.fail_delete:
+                    raise RuntimeError("simulated delete failure")
+                backend.deleted.extend(e["ReceiptHandle"] for e in kwargs["Entries"])
+                return {}
+
+        return _Client()
+
+
+class _FakeSpark:
+    """Minimal Spark stand-in: records the keys handed to a reader so a drain
+    test can assert exactly which objects were read. `read.option(...).parquet(
+    *keys)` returns a sentinel DataFrame and stashes the keys on `.read_keys`."""
+
+    def __init__(self):
+        self.read_keys: list[str] | None = None
+        self.base_path: str | None = None
+
+    @property
+    def read(self):
+        spark = self
+
+        class _Reader:
+            def option(self, name, value):
+                if name == "basePath":
+                    spark.base_path = value
+                return self
+
+            def parquet(self, *keys):
+                spark.read_keys = list(keys)
+                return "DF"
+
+            def csv(self, *keys):
+                spark.read_keys = list(keys)
+                return "DF"
+
+            def json(self, *keys):
+                spark.read_keys = list(keys)
+                return "DF"
+
+        return _Reader()
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +673,170 @@ def test_resolve_output_merge_keys_default_mode():
     s = runner._resolve_output("default", {"merge_keys": ["event_id"]})
     assert s["mode"] == "merge"
     assert s["merge_keys"] == ["event_id"]
+
+
+# ---------------------------------------------------------------------------
+# Notification-drain ingest (#25): SQS-queue-as-cursor read path. The queue
+# (fed by S3 Object Created events) replaces the partition-tree listing — drain
+# new keys, read exactly those, delete the messages after the write commits.
+# ---------------------------------------------------------------------------
+
+_DRAIN_SRC = {
+    "kind": "partitioned_path",
+    "path": "s3://logs/cf/",
+    "partitions": ["day", "hour"],
+    "start_from": "all",
+    "queue_url": "https://sqs.local/q",
+}
+
+
+def test_drain_reads_new_keys_and_returns_ack():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.add_object_event("logs", "cf/day=2026-04-26/hour=00/a.parquet", "h1")
+    sqs.add_object_event("logs", "cf/day=2026-04-26/hour=01/b.parquet", "h2")
+    spark = _FakeSpark()
+    df, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    assert df == "DF"
+    assert spark.read_keys == [
+        "s3://logs/cf/day=2026-04-26/hour=00/a.parquet",
+        "s3://logs/cf/day=2026-04-26/hour=01/b.parquet",
+    ]
+    # basePath = the source prefix so Hive partition columns recover identically
+    # to a listing-mode read.
+    assert spark.base_path == "s3://logs/cf/"
+    assert advance == {
+        "ack": {"queue_url": "https://sqs.local/q", "handles": ["h1", "h2"], "region": None}
+    }
+
+
+def test_drain_url_decodes_object_keys():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    # S3 event keys arrive percent-encoded: '+' is a space, %3D is '='.
+    sqs.add_object_event("logs", "cf/day%3D2026-04-26/part+1.parquet", "h1")
+    spark = _FakeSpark()
+    runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    assert spark.read_keys == ["s3://logs/cf/day=2026-04-26/part 1.parquet"]
+
+
+def test_drain_empty_queue_skips_run():
+    runner = _load_runner()
+    runner._FAKE_SQS.reset()
+    spark = _FakeSpark()
+    df, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    assert df is None and advance is None
+    assert spark.read_keys is None  # nothing read on an empty drain
+
+
+def test_drain_dedups_object_but_acks_all_handles():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    # Same object enqueued twice (at-least-once delivery): read once, ack both.
+    sqs.add_object_event("logs", "cf/day=2026-04-26/hour=00/a.parquet", "h1")
+    sqs.add_object_event("logs", "cf/day=2026-04-26/hour=00/a.parquet", "h2")
+    spark = _FakeSpark()
+    _, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    assert spark.read_keys == ["s3://logs/cf/day=2026-04-26/hour=00/a.parquet"]
+    assert advance["ack"]["handles"] == ["h1", "h2"]
+
+
+def test_drain_leaves_unparseable_message_on_queue():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.add_object_event("logs", "cf/day=2026-04-26/hour=00/a.parquet", "h1")
+    sqs.add_raw("not json at all", "bad1")
+    sqs.add_raw(json.dumps({"detail": {"no": "object"}}), "bad2")
+    spark = _FakeSpark()
+    _, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    assert spark.read_keys == ["s3://logs/cf/day=2026-04-26/hour=00/a.parquet"]
+    # Only the parseable message is acked; poison ones stay for DLQ redrive.
+    assert advance["ack"]["handles"] == ["h1"]
+
+
+def test_drain_caps_batch_and_leaves_remainder():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    for i in range(25):
+        sqs.add_object_event("logs", f"cf/day=2026-04-26/hour=00/p{i}.parquet", f"h{i}")
+    os.environ["CLAVESA_MAX_FILES_PER_RUN"] = "5"
+    try:
+        spark = _FakeSpark()
+        df, _ = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    finally:
+        del os.environ["CLAVESA_MAX_FILES_PER_RUN"]
+    # The cap bounds the receive loop so a backlog drains over several runs;
+    # the remainder stays queued for the next hourly fire.
+    assert df == "DF"
+    assert 0 < len(spark.read_keys) < 25
+    assert len(sqs.messages) > 0
+
+
+def test_drain_flat_s3_source_also_drains():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.add_object_event("raw-bkt", "events/x.parquet", "h1")
+    spark = _FakeSpark()
+    flat = {
+        "kind": "s3",
+        "bucket": "raw-bkt",
+        "prefix": "events/",
+        "format": "parquet",
+        "queue_url": "https://sqs.local/q",
+    }
+    _, advance = runner._resolve_input(spark, "raw", flat)
+    assert spark.read_keys == ["s3://raw-bkt/events/x.parquet"]
+    assert spark.base_path == "s3://raw-bkt/events/"
+    assert advance["ack"]["handles"] == ["h1"]
+
+
+def test_drain_if_configured_returns_none_without_queue_url():
+    # Listing-mode fallback (local run / no queue): the gate returns None so the
+    # caller takes the existing read path; the queue is never touched.
+    runner = _load_runner()
+    runner._FAKE_SQS.reset()
+    spark = _FakeSpark()
+    assert runner._drain_if_configured(spark, "raw", {"format": "parquet"}, "b", "p/") is None
+
+
+def test_delete_messages_chunks_and_records():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    handles = [f"h{i}" for i in range(23)]
+    runner._delete_sqs_messages("https://sqs.local/q", handles)  # 3 chunks: 10+10+3
+    assert sqs.deleted == handles
+
+
+def test_delete_failure_does_not_raise():
+    runner = _load_runner()
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.fail_delete = True
+    # Best-effort: a delete failure must not raise (message redelivers, dedup absorbs).
+    runner._delete_sqs_messages("https://sqs.local/q", ["h1"])
+    assert sqs.deleted == []
+
+
+def test_max_files_per_run_defaults_on_garbage_or_nonpositive():
+    runner = _load_runner()
+    for bad in ("", "abc", "0", "-3"):
+        os.environ["CLAVESA_MAX_FILES_PER_RUN"] = bad
+        try:
+            assert runner._max_files_per_run() == 1000
+        finally:
+            del os.environ["CLAVESA_MAX_FILES_PER_RUN"]
+    os.environ["CLAVESA_MAX_FILES_PER_RUN"] = "50"
+    try:
+        assert runner._max_files_per_run() == 50
+    finally:
+        del os.environ["CLAVESA_MAX_FILES_PER_RUN"]
 
 
 # ---------------------------------------------------------------------------

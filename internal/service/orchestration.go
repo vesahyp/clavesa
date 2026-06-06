@@ -390,18 +390,24 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 				entries = append(entries, fmt.Sprintf(`%s = { kind = "http", url = %q, format = %q%s }`,
 					alias, spec.URL, spec.Format, credBlock))
 			case "s3":
+				// Notification-drain ingest: the runner drains this source's
+				// SQS queue (S3 ObjectCreated events) for new keys when the
+				// descriptor carries a non-empty queue_url. The value is an
+				// unquoted TF reference to the source module's output, same
+				// module-instance name emitS3SourceModule uses.
+				queueURLRef := fmt.Sprintf("module.%s.trigger_queue_url", srcModuleName(name))
 				if len(spec.Partitions) > 0 {
 					startFrom := spec.StartFrom
 					if startFrom == "" {
 						startFrom = "all"
 					}
 					quoted := quoteList(spec.Partitions)
-					entries = append(entries, fmt.Sprintf(`%s = { kind = "partitioned_path", path = "s3://%s/%s", partitions = [%s], start_from = %q }`,
-						alias, spec.Bucket, spec.Prefix, quoted, startFrom))
+					entries = append(entries, fmt.Sprintf(`%s = { kind = "partitioned_path", path = "s3://%s/%s", partitions = [%s], start_from = %q, queue_url = %s }`,
+						alias, spec.Bucket, spec.Prefix, quoted, startFrom, queueURLRef))
 					break
 				}
-				entries = append(entries, fmt.Sprintf(`%s = { kind = "s3", bucket = %q, prefix = %q, format = %q%s }`,
-					alias, spec.Bucket, spec.Prefix, spec.Format, credBlock))
+				entries = append(entries, fmt.Sprintf(`%s = { kind = "s3", bucket = %q, prefix = %q, format = %q, queue_url = %s%s }`,
+					alias, spec.Bucket, spec.Prefix, spec.Format, queueURLRef, credBlock))
 			default:
 				return "", fmt.Errorf("source %q kind %q not supported", name, spec.Kind)
 			}

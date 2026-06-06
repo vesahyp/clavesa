@@ -123,7 +123,9 @@ func TestSyncOrchestrationEmitsS3SourceDescriptor(t *testing.T) {
 	}
 	body, _ := os.ReadFile(filepath.Join(ws, dir, "orchestration.tf"))
 	got := string(body)
-	want := `raw = { kind = "s3", bucket = "my-bucket", prefix = "events/2024/data.parquet/", format = "parquet" }`
+	// queue_url is an unquoted TF reference to the source module's output —
+	// the runner drains it for new keys (notification-drain ingest, #25).
+	want := `raw = { kind = "s3", bucket = "my-bucket", prefix = "events/2024/data.parquet/", format = "parquet", queue_url = module.src_logs.trigger_queue_url }`
 	if !strings.Contains(got, want) {
 		t.Errorf("orchestration.tf missing s3 descriptor.\nwant substring: %s\ngot:\n%s", want, got)
 	}
@@ -167,6 +169,12 @@ func TestSyncOrchestrationMaterialisesS3SourceModule(t *testing.T) {
 		// v1.1.5+: trigger queue ARNs flow into the poller's local._poller_queue_arns
 		// list rather than a module variable (orchestration is now inline TF).
 		`_poller_queue_arns = [module.src_events.trigger_queue_arn]`,
+		// #25 notification-drain: the partitioned descriptor carries queue_url,
+		// the runner role gains SQS drain perms, and the poller no longer consumes.
+		`queue_url = module.src_events.trigger_queue_url`,
+		`Sid = "SQSDrain"`,
+		`"sqs:ReceiveMessage", "sqs:DeleteMessage"`,
+		`Sid = "SQSPoll",  Effect = "Allow", Action = ["sqs:GetQueueAttributes"]`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("orchestration.tf missing %q\ngot:\n%s", want, got)

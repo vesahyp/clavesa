@@ -66,6 +66,8 @@ in the pipeline bucket. `start_from = "all"` (default) backfills history;
 | `json_path`     | `string`       | No       | `null`  | Top-level key to unwrap when JSON payload is nested under one root key. |
 | `partitions`    | `list(string)` | No       | `[]`    | Hive-style partition columns for incremental reads. |
 | `start_from`    | `string`       | No       | `"all"` | First-run cursor for partitioned sources: `"all"`, `"now"`, or a literal cursor string. |
+| `trigger_visibility_timeout_seconds` | `number` | No | `900` | Visibility timeout for the trigger queue. Must cover a full run so received-but-undeleted messages stay invisible until the Delta write commits. |
+| `trigger_max_receive_count` | `number` | No | `5` | Receives before a trigger message moves to the DLQ. Bounds retries on a poison/unreadable object. |
 | `manage_bucket_notifications` | `bool` | No | `false` | Have terraform own `aws_s3_bucket_notification` on the source bucket. Authoritative; replaces other notification config. Set on one pipeline only when a source attaches to multiple. |
 
 ## Outputs
@@ -74,15 +76,17 @@ in the pipeline bucket. `start_from = "all"` (default) backfills history;
 |---------------------|-------------|
 | `outputs`           | Map keyed by `"default"`. Each value carries `table_path`, `catalog_db`, `catalog_table`, `schema`, `partitions`, `start_from`. |
 | `trigger_queue_arn` | SQS queue ARN. Pass to the orchestration module's `trigger_queue_arns`. |
+| `trigger_queue_url` | SQS queue URL. The runner Lambda uses it to `ReceiveMessage` / `DeleteMessage` when draining new-data events. |
 
 ## Resources created
 
 | Resource                      | Purpose |
 |-------------------------------|---------|
-| `aws_sqs_queue.trigger`       | Queue that the orchestration poller checks for new-data events. |
+| `aws_sqs_queue.trigger`       | Queue that the orchestration poller checks for new-data events; drained by the runner Lambda. |
+| `aws_sqs_queue.trigger_dlq`   | Dead-letter queue (14-day retention) for trigger messages that exceed `trigger_max_receive_count`. |
 | `aws_cloudwatch_event_rule`   | EventBridge rule on S3:ObjectCreated, scoped to `bucket`/`prefix`. |
 | `aws_cloudwatch_event_target` | Routes matched events to the SQS queue. |
-| `aws_sqs_queue_policy`        | Lets EventBridge publish to the queue. |
+| `aws_sqs_queue_policy`        | Lets EventBridge publish to the trigger queue. The DLQ needs none — it only receives via redrive. |
 
 All resources are tagged `clavesa:pipeline`, `clavesa:node`,
 `clavesa:type = "source"`.
