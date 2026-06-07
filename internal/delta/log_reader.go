@@ -27,6 +27,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	parquetgo "github.com/parquet-go/parquet-go"
 )
 
 // ErrNotDelta is returned by ReadCurrent when the supplied filesystem has
@@ -99,6 +101,46 @@ const maxCommitsScanned = 200
 // is skipped.
 var commitFileRe = regexp.MustCompile(`^([0-9]{20})\.json$`)
 
+// checkpointSingleRe matches a single-part Delta checkpoint:
+// `<20-digit-version>.checkpoint.parquet`. The checkpoint snapshots the
+// table state (every live `add`, the active `metaData`, the `protocol`)
+// at that version so a reader doesn't have to replay the commits before
+// it. Delta writes one every checkpointInterval commits (10 by default).
+var checkpointSingleRe = regexp.MustCompile(`^([0-9]{20})\.checkpoint\.parquet$`)
+
+// checkpointMultiRe matches one part of a multi-part Delta checkpoint:
+// `<20-digit-version>.checkpoint.<10-digit-part>.<10-digit-numParts>.parquet`.
+// Large tables split the checkpoint across N parts; all N share the same
+// version prefix and carry the same numParts. The active `metaData` lives
+// in exactly one part (whichever row group it landed in), so the reader
+// scans parts until it finds it. Capture groups: version, part, numParts.
+var checkpointMultiRe = regexp.MustCompile(`^([0-9]{20})\.checkpoint\.([0-9]{10})\.([0-9]{10})\.parquet$`)
+
+// ReadSchema loads ONLY the latest schema from a `_delta_log` filesystem,
+// the single thing the catalog page needs. `logFS` must be rooted at the
+// `_delta_log` directory (NOT the table root); ReadDir(".") on it lists
+// the commit and checkpoint files. Returns ErrNotDelta when the directory
+// holds no commit files AND no checkpoint — the same "silently skip
+// non-Delta directories" contract ReadCurrent honors.
+//
+// It is checkpoint-aware: on an append-only table that only ever wrote
+// `metaData` at version 0 (e.g. `node_runs`), the schema resolver reads
+// the schema out of the latest checkpoint parquet and walks at most the
+// handful of JSON commits written after that checkpoint, rather than
+// replaying every commit back to version 0. On a 2551-commit table this
+// turns ~2551 sequential S3 GetObject calls into a handful. Use this in
+// preference to ReadCurrent wherever the commit history is not needed.
+func ReadSchema(logFS fs.FS) (*Schema, error) {
+	idx, err := listLog(logFS)
+	if err != nil {
+		return nil, err
+	}
+	if len(idx.versions) == 0 && !idx.hasCheckpoint() {
+		return nil, ErrNotDelta
+	}
+	return resolveSchema(logFS, idx)
+}
+
 // ReadCurrent loads the latest schema + recent commit history from a
 // `_delta_log` filesystem. `logFS` must be rooted at the `_delta_log`
 // directory (NOT the table root); ReadDir(".") on it lists the commit
@@ -106,57 +148,34 @@ var commitFileRe = regexp.MustCompile(`^([0-9]{20})\.json$`)
 // matches the catalog walker's "silently skip non-Delta directories"
 // contract.
 //
+// The schema half is resolved checkpoint-aware (see resolveSchema), so a
+// long-lived table no longer pays a full backward walk just to render the
+// snapshot timeline. The commit-history half is unchanged: it returns the
+// last maxCommitsScanned commits, newest first.
+//
 // A malformed commit file surfaces as an error rather than a silent
 // skip — silent skips would hide schema-evolution bugs that a future
 // refactor introduces.
 func ReadCurrent(logFS fs.FS) (*Schema, []Commit, error) {
-	entries, err := fs.ReadDir(logFS, ".")
+	idx, err := listLog(logFS)
 	if err != nil {
-		// Missing-directory and similar "no table here" failures all
-		// degrade to ErrNotDelta so callers can swallow them with one
-		// errors.Is check. Genuine I/O failures (permission denied on
-		// a present directory, network errors on S3) come back wrapped.
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil, ErrNotDelta
-		}
-		return nil, nil, fmt.Errorf("read _delta_log: %w", err)
+		return nil, nil, err
 	}
-
-	versions := make([]int64, 0, len(entries))
-	versionToFile := make(map[int64]string, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		m := commitFileRe.FindStringSubmatch(e.Name())
-		if m == nil {
-			continue
-		}
-		n, err := strconv.ParseInt(m[1], 10, 64)
-		if err != nil {
-			continue // unreachable per the regex, but defensive
-		}
-		versions = append(versions, n)
-		versionToFile[n] = e.Name()
-	}
-	if len(versions) == 0 {
+	// History needs commit files; a `_delta_log` carrying only a
+	// checkpoint with no surviving JSON commits can't produce a timeline.
+	// In practice Delta never deletes the checkpoint's own commit, so
+	// versions is non-empty whenever a real table exists; the guard keeps
+	// the ErrNotDelta contract identical to the pre-checkpoint reader.
+	if len(idx.versions) == 0 {
 		return nil, nil, ErrNotDelta
 	}
-	sort.Slice(versions, func(i, j int) bool { return versions[i] < versions[j] })
 
-	// Walk forward to find the last metaData action — schema evolution
-	// rewrites it on subsequent commits, so we can't short-circuit on
-	// the first one. Bound the read to the most recent
-	// maxCommitsScanned files (history beyond that is fine, but we
-	// still need to find a metaData; in practice the initial commit
-	// always carries one, and we read commits backwards from the tip
-	// looking for one if needed).
-	schema, err := findLatestSchema(logFS, versions, versionToFile)
+	schema, err := resolveSchema(logFS, idx)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	commits, err := readRecentCommits(logFS, versions, versionToFile)
+	commits, err := readRecentCommits(logFS, idx.versions, idx.versionToFile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -164,28 +183,262 @@ func ReadCurrent(logFS fs.FS) (*Schema, []Commit, error) {
 	return schema, commits, nil
 }
 
+// logIndex is the one-pass inventory of a `_delta_log/` listing: the JSON
+// commit versions (sorted ascending) with their file names, plus the
+// checkpoint version → its part file name(s). Both ReadSchema and
+// ReadCurrent build this once from a single ReadDir so the checkpoint and
+// commit views agree.
+type logIndex struct {
+	versions      []int64
+	versionToFile map[int64]string
+	// checkpointParts maps a checkpoint version to its part file names,
+	// already sorted by part number (single-part checkpoints have one).
+	checkpointParts map[int64][]string
+}
+
+// hasCheckpoint reports whether the listing carried at least one
+// checkpoint. Used by the ErrNotDelta guard so a `_delta_log` that holds
+// only a checkpoint (no surviving JSON commit) still reads as a table.
+func (ix *logIndex) hasCheckpoint() bool { return len(ix.checkpointParts) > 0 }
+
+// latestCheckpoint returns the highest checkpoint version and its part
+// files (sorted by part number), ok=false when no checkpoint exists.
+func (ix *logIndex) latestCheckpoint() (version int64, parts []string, ok bool) {
+	for v, p := range ix.checkpointParts {
+		if !ok || v > version {
+			version, parts, ok = v, p, true
+		}
+	}
+	return version, parts, ok
+}
+
+// listLog performs the single fs.ReadDir(".") and classifies every entry
+// into commit JSON files and checkpoint parquet parts. Missing-directory
+// failures degrade to ErrNotDelta so callers can swallow them with one
+// errors.Is check; genuine I/O failures (permission denied, S3 network
+// errors) come back wrapped.
+func listLog(logFS fs.FS) (*logIndex, error) {
+	entries, err := fs.ReadDir(logFS, ".")
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, ErrNotDelta
+		}
+		return nil, fmt.Errorf("read _delta_log: %w", err)
+	}
+
+	ix := &logIndex{
+		versionToFile:   make(map[int64]string, len(entries)),
+		checkpointParts: make(map[int64][]string),
+	}
+	// partOrder records each checkpoint part's 1-based part number so we
+	// can return parts sorted: a multi-part checkpoint's metaData lives in
+	// one part and scanning them in order is deterministic.
+	partOrder := make(map[string]int64)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if m := commitFileRe.FindStringSubmatch(name); m != nil {
+			n, err := strconv.ParseInt(m[1], 10, 64)
+			if err != nil {
+				continue // unreachable per the regex, but defensive
+			}
+			ix.versions = append(ix.versions, n)
+			ix.versionToFile[n] = name
+			continue
+		}
+		if m := checkpointMultiRe.FindStringSubmatch(name); m != nil {
+			v, err := strconv.ParseInt(m[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			part, _ := strconv.ParseInt(m[2], 10, 64)
+			ix.checkpointParts[v] = append(ix.checkpointParts[v], name)
+			partOrder[name] = part
+			continue
+		}
+		if m := checkpointSingleRe.FindStringSubmatch(name); m != nil {
+			v, err := strconv.ParseInt(m[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			ix.checkpointParts[v] = append(ix.checkpointParts[v], name)
+			partOrder[name] = 1
+			continue
+		}
+	}
+	sort.Slice(ix.versions, func(i, j int) bool { return ix.versions[i] < ix.versions[j] })
+	for v := range ix.checkpointParts {
+		parts := ix.checkpointParts[v]
+		sort.Slice(parts, func(i, j int) bool { return partOrder[parts[i]] < partOrder[parts[j]] })
+	}
+	return ix, nil
+}
+
+// resolveSchema returns the table's current schema checkpoint-aware.
+//
+// When a checkpoint exists at version CV, the active schema is whatever
+// the latest metaData carries. A metaData fired after CV (schema
+// evolution post-checkpoint) wins, so we first walk the JSON commits with
+// version > CV newest→oldest looking for one. Absent that, the schema is
+// the one snapshotted in the checkpoint parquet itself, which we read
+// without touching any commit before CV.
+//
+// When no checkpoint exists the table is small or new, the full backward
+// walk over every commit is cheap, and we fall back to it.
+func resolveSchema(logFS fs.FS, ix *logIndex) (*Schema, error) {
+	cv, parts, ok := ix.latestCheckpoint()
+	if !ok {
+		return findLatestSchema(logFS, ix.versions, ix.versionToFile)
+	}
+	// Schema-evolution-after-checkpoint: scan only the post-checkpoint
+	// JSON commits, newest first. These are at most checkpointInterval-1
+	// files in the common case (Delta checkpoints every ~10 commits).
+	for i := len(ix.versions) - 1; i >= 0; i-- {
+		v := ix.versions[i]
+		if v <= cv {
+			break // versions is ascending; everything below is pre-checkpoint
+		}
+		actions, err := readCommitActions(logFS, ix.versionToFile[v])
+		if err != nil {
+			return nil, err
+		}
+		if sch, ok, err := schemaFromActions(actions, v); err != nil {
+			return nil, err
+		} else if ok {
+			return sch, nil
+		}
+	}
+	// No post-checkpoint metaData: the checkpoint's snapshot is current.
+	return schemaFromCheckpoint(logFS, parts)
+}
+
+// schemaFromActions returns the schema carried on the first metaData
+// action in a commit, ok=false when the commit has none. Shared by the
+// post-checkpoint scan and the full backward walk so both decode the
+// metaData identically.
+func schemaFromActions(actions []rawAction, version int64) (*Schema, bool, error) {
+	for _, a := range actions {
+		if a.MetaData == nil {
+			continue
+		}
+		sch, err := parseSchemaString(a.MetaData.SchemaString)
+		if err != nil {
+			return nil, false, fmt.Errorf("parse schema_string at version %d: %w", version, err)
+		}
+		return sch, true, nil
+	}
+	return nil, false, nil
+}
+
 // findLatestSchema walks versions from newest to oldest and returns the
 // schema carried on the most recent commit that includes a `metaData`
 // action. Delta's initial commit always has one; subsequent metaData
-// actions only fire on schema-evolution writes.
+// actions only fire on schema-evolution writes. This is the no-checkpoint
+// fallback; the checkpoint-aware path in resolveSchema avoids walking
+// past the latest checkpoint version.
 func findLatestSchema(logFS fs.FS, versions []int64, files map[int64]string) (*Schema, error) {
 	for i := len(versions) - 1; i >= 0; i-- {
 		actions, err := readCommitActions(logFS, files[versions[i]])
 		if err != nil {
 			return nil, err
 		}
-		for _, a := range actions {
-			if a.MetaData == nil {
-				continue
-			}
-			sch, err := parseSchemaString(a.MetaData.SchemaString)
-			if err != nil {
-				return nil, fmt.Errorf("parse schema_string at version %d: %w", versions[i], err)
-			}
+		if sch, ok, err := schemaFromActions(actions, versions[i]); err != nil {
+			return nil, err
+		} else if ok {
 			return sch, nil
 		}
 	}
 	return nil, fmt.Errorf("no metaData action found in transaction log")
+}
+
+// checkpointRow is a minimal projection over a Delta checkpoint parquet.
+// A checkpoint carries one top-level group column per action kind
+// (`add`, `remove`, `metaData`, `protocol`, `txn`); each row populates
+// exactly one. We reference only `metaData.schemaString`, so parquet-go's
+// generic reader projects to that single leaf column and never decodes
+// the large `add` column (the bulk of a checkpoint, one row per live data
+// file). MetaData is a pointer so a row whose metaData group is entirely
+// null deserializes to nil rather than a zero struct.
+type checkpointRow struct {
+	MetaData *struct {
+		SchemaString string `parquet:"schemaString"`
+	} `parquet:"metaData"`
+}
+
+// schemaFromCheckpoint reads the active table schema out of a checkpoint
+// parquet. Exactly one row in a checkpoint has a non-null metaData (the
+// current table metadata); the rest are add/remove/protocol/txn rows. We
+// scan parts in order and return the first metaData.schemaString we find,
+// projecting to only that leaf column so the read stays cheap regardless
+// of how many data-file `add` rows the checkpoint holds. An error is
+// returned when no part carries a metaData.
+func schemaFromCheckpoint(logFS fs.FS, partFiles []string) (*Schema, error) {
+	for _, name := range partFiles {
+		data, err := fs.ReadFile(logFS, name)
+		if err != nil {
+			return nil, fmt.Errorf("read checkpoint part %s: %w", name, err)
+		}
+		pf, err := parquetgo.OpenFile(newBytesReaderAt(data), int64(len(data)))
+		if err != nil {
+			return nil, fmt.Errorf("open checkpoint part %s: %w", name, err)
+		}
+		reader := parquetgo.NewGenericReader[checkpointRow](pf)
+		buf := make([]checkpointRow, 64)
+		var found *Schema
+		for found == nil {
+			n, readErr := reader.Read(buf)
+			for i := 0; i < n; i++ {
+				md := buf[i].MetaData
+				if md == nil || md.SchemaString == "" {
+					continue
+				}
+				sch, err := parseSchemaString(md.SchemaString)
+				if err != nil {
+					reader.Close()
+					return nil, fmt.Errorf("parse schema_string in checkpoint %s: %w", name, err)
+				}
+				found = sch
+				break
+			}
+			if readErr == io.EOF || n == 0 {
+				break
+			}
+			if readErr != nil {
+				reader.Close()
+				return nil, fmt.Errorf("read checkpoint part %s: %w", name, readErr)
+			}
+		}
+		reader.Close()
+		if found != nil {
+			return found, nil
+		}
+	}
+	return nil, fmt.Errorf("no metaData action found in checkpoint")
+}
+
+// bytesReaderAt wraps a []byte so it satisfies io.ReaderAt, which
+// parquet-go's OpenFile requires. Mirrors the helper in
+// internal/dataquery/source.go; kept package-local to avoid coupling the
+// delta reader to the dataquery package.
+type bytesReaderAt struct {
+	data []byte
+}
+
+func newBytesReaderAt(data []byte) *bytesReaderAt {
+	return &bytesReaderAt{data: data}
+}
+
+func (b *bytesReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 // readRecentCommits returns Commit records for the last maxCommitsScanned

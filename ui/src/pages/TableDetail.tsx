@@ -27,6 +27,11 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   useCatalogTables,
   useColumnStats,
   useDashboards,
@@ -566,31 +571,73 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
           {top.length > 0 ? "Top values" : "Range"}
         </span>
         {top.length > 0 ? (
-          <ol className="space-y-0.5">
-            {top.slice(0, 5).map((b, i) => {
-              const pct = topTotal > 0 ? (b.count / topTotal) * 100 : 0;
-              const label = b.value === "" ? "∅" : b.value;
-              return (
-                <li
-                  key={i}
-                  className="grid grid-cols-[1fr,2.5rem] items-center gap-2"
-                >
-                  <div className="relative h-3.5 overflow-hidden rounded-sm bg-muted">
-                    <div
-                      className="absolute inset-y-0 left-0 bg-sky-500/30"
-                      style={{ width: `${pct}%` }}
-                    />
-                    <span className="absolute inset-y-0 left-1.5 right-1 flex items-center truncate font-mono text-[10px] text-foreground">
-                      {label}
-                    </span>
-                  </div>
-                  <span className="text-right font-mono text-[10px] text-muted-foreground">
-                    {formatCount(b.count)}
-                  </span>
-                </li>
-              );
-            })}
-          </ol>
+          (() => {
+            const shown = top.slice(0, 5);
+            const shownSum = shown.reduce((acc, b) => acc + (b.count ?? 0), 0);
+            return (
+              <ol className="space-y-0.5">
+                {shown.map((b, i) => {
+                  const pct =
+                    total != null && total > 0
+                      ? (b.count / total) * 100
+                      : topTotal > 0
+                        ? (b.count / topTotal) * 100
+                        : 0;
+                  const label = b.value == null || b.value === "" ? "∅" : b.value;
+                  return (
+                    <Tooltip key={i}>
+                      <TooltipTrigger asChild>
+                        <li className="grid grid-cols-[minmax(0,4.5rem)_1fr_auto] items-center gap-2">
+                          <span
+                            className="truncate font-mono text-[10px] text-foreground"
+                            title={label}
+                          >
+                            {label}
+                          </span>
+                          <div className="relative h-3.5 overflow-hidden rounded-sm bg-muted">
+                            <div
+                              className="absolute inset-y-0 left-0 bg-sky-500/50"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                          <span className="text-right font-mono text-[10px] text-foreground">
+                            {`${pct.toFixed(1)}%`}
+                          </span>
+                        </li>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {`${formatCount(b.count)} / ${formatCount(total ?? topTotal)} rows`}
+                      </TooltipContent>
+                    </Tooltip>
+                  );
+                })}
+                {total != null && total > 0 && total > shownSum
+                  ? (() => {
+                      const otherPct = ((total - shownSum) / total) * 100;
+                      return (
+                        <li
+                          className="grid grid-cols-[minmax(0,4.5rem)_1fr_auto] items-center gap-2"
+                          title={`${formatCount(total - shownSum)} / ${formatCount(total)} rows`}
+                        >
+                          <span className="truncate font-mono text-[10px] text-muted-foreground">
+                            other
+                          </span>
+                          <div className="relative h-3.5 overflow-hidden rounded-sm bg-muted">
+                            <div
+                              className="absolute inset-y-0 left-0 bg-muted-foreground/30"
+                              style={{ width: `${otherPct}%` }}
+                            />
+                          </div>
+                          <span className="text-right font-mono text-[10px] text-muted-foreground">
+                            {`${otherPct.toFixed(1)}%`}
+                          </span>
+                        </li>
+                      );
+                    })()
+                  : null}
+              </ol>
+            );
+          })()
         ) : distinct != null && distinct > 1000 ? (
           <Badge
             variant="outline"

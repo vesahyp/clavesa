@@ -1,15 +1,18 @@
 package delta_test
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
 
+	parquetgo "github.com/parquet-go/parquet-go"
 	"github.com/vesahyp/clavesa/internal/delta"
 )
 
@@ -350,6 +353,199 @@ func TestReadCurrentSurfacesGenuineIOError(t *testing.T) {
 	if !errors.Is(err, want) {
 		t.Errorf("err = %v, want chain containing %v", err, want)
 	}
+}
+
+// checkpointRow mirrors the projection delta.schemaFromCheckpoint reads.
+// We write real checkpoint parquet bytes in-test with this shape so the
+// parser exercises the same metaData.schemaString leaf the production
+// reader projects to. MetaData is a pointer so add-only rows serialize
+// with a null metaData group.
+type checkpointRow struct {
+	MetaData *struct {
+		SchemaString string `parquet:"schemaString"`
+	} `parquet:"metaData"`
+}
+
+// writeCheckpointParquet returns the bytes of a single checkpoint parquet
+// part. Each schemaString in schemas yields one row with a non-nil
+// metaData carrying it; addRows nil-metaData rows are appended to simulate
+// the `add` action rows that dominate a real checkpoint. Passing schemas
+// with more than one entry is only used by the multi-part split helper.
+func writeCheckpointParquet(t *testing.T, schemas []string, addRows int) []byte {
+	t.Helper()
+	rows := make([]checkpointRow, 0, len(schemas)+addRows)
+	for i := 0; i < addRows; i++ {
+		rows = append(rows, checkpointRow{}) // nil MetaData → an add-style row
+	}
+	for _, s := range schemas {
+		r := checkpointRow{MetaData: &struct {
+			SchemaString string `parquet:"schemaString"`
+		}{SchemaString: s}}
+		rows = append(rows, r)
+	}
+	var buf bytes.Buffer
+	pw := parquetgo.NewGenericWriter[checkpointRow](&buf)
+	if _, err := pw.Write(rows); err != nil {
+		t.Fatalf("write checkpoint parquet: %v", err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close checkpoint parquet: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// appendCommit is a commitInfo-only commit body (no metaData) — the shape
+// an append-mode write to node_runs produces after table creation.
+func appendCommit(ts int64) string {
+	return `{"commitInfo":{"timestamp":` + intStr(ts) + `,"operation":"WRITE","operationMetrics":{"numOutputRows":"1"}}}` + "\n" +
+		`{"add":{"path":"p.parquet","partitionValues":{},"size":1,"modificationTime":` + intStr(ts) + `,"dataChange":true}}` + "\n"
+}
+
+// metaDataCommit is a metaData+commitInfo commit body carrying schema.
+func metaDataCommit(schema string, ts int64, op string) string {
+	return `{"metaData":{"id":"x","format":{"provider":"parquet"},"schemaString":` + marshalString(schema) + `,"partitionColumns":[],"configuration":{}}}` + "\n" +
+		`{"commitInfo":{"timestamp":` + intStr(ts) + `,"operation":"` + op + `"}}` + "\n"
+}
+
+func intStr(n int64) string { return strconv.FormatInt(n, 10) }
+
+// TestReadSchemaCheckpointNoVersionZero proves the checkpoint short-cut:
+// the `_delta_log` carries only commits 11–15 (append commits, NO
+// metaData) plus a checkpoint at version 10 holding the schema. There is
+// no version 0 to walk to — the reader MUST read the schema out of the
+// checkpoint or it finds nothing. This is the node_runs case.
+func TestReadSchemaCheckpointNoVersionZero(t *testing.T) {
+	cpBytes := writeCheckpointParquet(t, []string{trivialSchemaString}, 8)
+	mfs := fstest.MapFS{
+		"00000000000000000010.checkpoint.parquet": &fstest.MapFile{Data: cpBytes},
+	}
+	for v := int64(11); v <= 15; v++ {
+		name := padVersion(v) + ".json"
+		mfs[name] = &fstest.MapFile{Data: []byte(appendCommit(v * 1000))}
+	}
+
+	schema, err := delta.ReadSchema(mfs)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if len(schema.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2 (from checkpoint)", len(schema.Columns))
+	}
+	if schema.Columns[0].Name != "id" || schema.Columns[1].Name != "amount" {
+		t.Errorf("cols = %+v, want id/amount from checkpoint schema", schema.Columns)
+	}
+}
+
+// TestReadSchemaEvolutionAfterCheckpoint: a metaData fired on commit 13
+// (post-checkpoint schema evolution) must win over the schema snapshotted
+// in the version-10 checkpoint.
+func TestReadSchemaEvolutionAfterCheckpoint(t *testing.T) {
+	schemaA := `{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}`
+	schemaB := `{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"added","type":"string","nullable":true,"metadata":{}}]}`
+	cpBytes := writeCheckpointParquet(t, []string{schemaA}, 4)
+	mfs := fstest.MapFS{
+		"00000000000000000010.checkpoint.parquet": &fstest.MapFile{Data: cpBytes},
+		"00000000000000000011.json":               &fstest.MapFile{Data: []byte(appendCommit(11000))},
+		"00000000000000000012.json":               &fstest.MapFile{Data: []byte(appendCommit(12000))},
+		"00000000000000000013.json":               &fstest.MapFile{Data: []byte(metaDataCommit(schemaB, 13000, "ADD COLUMN"))},
+		"00000000000000000014.json":               &fstest.MapFile{Data: []byte(appendCommit(14000))},
+	}
+
+	schema, err := delta.ReadSchema(mfs)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if len(schema.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2 (post-checkpoint evolution)", len(schema.Columns))
+	}
+	if schema.Columns[1].Name != "added" {
+		t.Errorf("col[1] = %+v, want {added string} from commit 13", schema.Columns[1])
+	}
+}
+
+// TestReadSchemaMultiPartCheckpoint: the metaData lives in one part and
+// another part has only add rows. The reader must scan parts until it
+// finds the metaData.
+func TestReadSchemaMultiPartCheckpoint(t *testing.T) {
+	// Part 1 of 2: only add rows, no metaData. Part 2 of 2: the metaData.
+	part1 := writeCheckpointParquet(t, nil, 6)
+	part2 := writeCheckpointParquet(t, []string{trivialSchemaString}, 6)
+	mfs := fstest.MapFS{
+		"00000000000000000020.checkpoint.0000000001.0000000002.parquet": &fstest.MapFile{Data: part1},
+		"00000000000000000020.checkpoint.0000000002.0000000002.parquet": &fstest.MapFile{Data: part2},
+		"00000000000000000021.json":                                     &fstest.MapFile{Data: []byte(appendCommit(21000))},
+	}
+
+	schema, err := delta.ReadSchema(mfs)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if len(schema.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2 (from multi-part checkpoint)", len(schema.Columns))
+	}
+}
+
+// TestReadSchemaNoCheckpoint: a small table, commits 0–3, metaData only at
+// 0, no checkpoint. ReadSchema must still find the schema via the backward
+// walk fallback.
+func TestReadSchemaNoCheckpoint(t *testing.T) {
+	mfs := fstest.MapFS{
+		"00000000000000000000.json": &fstest.MapFile{Data: []byte(metaDataCommit(trivialSchemaString, 1000, "CREATE TABLE"))},
+		"00000000000000000001.json": &fstest.MapFile{Data: []byte(appendCommit(2000))},
+		"00000000000000000002.json": &fstest.MapFile{Data: []byte(appendCommit(3000))},
+		"00000000000000000003.json": &fstest.MapFile{Data: []byte(appendCommit(4000))},
+	}
+
+	schema, err := delta.ReadSchema(mfs)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	if len(schema.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2 (backward walk)", len(schema.Columns))
+	}
+}
+
+// TestReadSchemaEmptyReturnsErrNotDelta: no commits and no checkpoint is a
+// non-Delta directory.
+func TestReadSchemaEmptyReturnsErrNotDelta(t *testing.T) {
+	_, err := delta.ReadSchema(fstest.MapFS{})
+	if !errors.Is(err, delta.ErrNotDelta) {
+		t.Fatalf("err = %v, want ErrNotDelta", err)
+	}
+}
+
+// TestReadCurrentCheckpointAware: ReadCurrent on a table with a checkpoint
+// returns BOTH the checkpoint-resolved schema and the recent commit
+// history. The schema comes from the checkpoint (no version 0 present);
+// the history covers the post-checkpoint JSON commits.
+func TestReadCurrentCheckpointAware(t *testing.T) {
+	cpBytes := writeCheckpointParquet(t, []string{trivialSchemaString}, 8)
+	mfs := fstest.MapFS{
+		"00000000000000000010.checkpoint.parquet": &fstest.MapFile{Data: cpBytes},
+		"00000000000000000011.json":               &fstest.MapFile{Data: []byte(appendCommit(11000))},
+		"00000000000000000012.json":               &fstest.MapFile{Data: []byte(appendCommit(12000))},
+	}
+
+	schema, commits, err := delta.ReadCurrent(mfs)
+	if err != nil {
+		t.Fatalf("ReadCurrent: %v", err)
+	}
+	if len(schema.Columns) != 2 {
+		t.Fatalf("columns = %d, want 2 (from checkpoint)", len(schema.Columns))
+	}
+	if len(commits) != 2 {
+		t.Fatalf("commits = %d, want 2 (11,12)", len(commits))
+	}
+	if commits[0].Version != 12 || commits[1].Version != 11 {
+		t.Errorf("commit versions = [%d,%d], want [12,11]", commits[0].Version, commits[1].Version)
+	}
+}
+
+// padVersion renders an int64 as Delta's 20-digit zero-padded version
+// prefix.
+func padVersion(v int64) string {
+	s := strconv.FormatInt(v, 10)
+	return strings.Repeat("0", 20-len(s)) + s
 }
 
 // marshalString returns a JSON-encoded string literal (with the

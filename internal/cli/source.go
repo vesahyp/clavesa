@@ -74,12 +74,14 @@ For s3, you can also pass kind/bucket/prefix explicitly:
 --attach <pipeline-dir> --to <transform> [--as <alias>] to attach the
 new source to a pipeline in one step.
 
-Incremental reads: when the bucket is partitioned Hive-style
-(year=2024/month=01/day=03/…), declare the partition keys with
---partitions year,month,day. Each run advances a stored watermark and
-reads only new partitions. --start-from seeds the watermark on first
-run: "all" (default; read history), "now" (skip history, start at the
-newest partition), or a literal "/"-joined cursor like "2024-01-01".`,
+Incremental ingest: a deployed s3 source reads only the newly-arrived
+files each run by draining the bucket's notification queue (the SQS queue
+fed by S3 Object Created events); no per-run bucket listing. Declare
+Hive-style partition keys with --partitions year,month,day so the output
+table recovers its partition columns. --start-from controls the first run
+before the queue takes over: "all" (default; read pre-existing files),
+"now" (skip them), or a literal "/"-joined cursor like "2024-01-01".
+Local runs fall back to listing (no queue), with identical results.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -158,8 +160,8 @@ newest partition), or a literal "/"-joined cursor like "2024-01-01".`,
 	cmd.Flags().StringVar(&attachTo, "to", "", "transform node id (when --attach is set)")
 	cmd.Flags().StringVar(&attachAs, "as", "", "input alias (default: source name) when --attach is set")
 	cmd.Flags().StringVar(&creds, "credentials", "", "name of a registered credential (slice 2: header auth)")
-	cmd.Flags().StringSliceVar(&partitions, "partitions", nil, "kind=s3: comma-separated Hive partition keys (e.g. year,month,day) for incremental reads")
-	cmd.Flags().StringVar(&startFrom, "start-from", "", `kind=s3 with --partitions: watermark seed ("all" | "now" | "<cursor>")`)
+	cmd.Flags().StringSliceVar(&partitions, "partitions", nil, "kind=s3: comma-separated Hive partition keys (e.g. year,month,day) for partition-column recovery")
+	cmd.Flags().StringVar(&startFrom, "start-from", "", `kind=s3 with --partitions: first-run seed before queue-drain takes over ("all" | "now" | "<cursor>")`)
 	cmd.Flags().BoolVar(&manageNotifications, "manage-notifications", false, "kind=s3: have terraform manage the bucket's EventBridge notification config (authoritative — replaces existing notification config). Default off; only enable when clavesa owns the source bucket")
 	return cmd
 }

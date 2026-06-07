@@ -57,7 +57,7 @@ For larger buckets or append-only sources, see [Incremental reads](#incremental-
 
 ## Incremental reads
 
-If files in the bucket have Hive-style partition keys in the path — `year=2024/month=01/`, `region=us-east-1/`, etc. — you can switch to an incremental shape where each run reads only new partitions.
+If files in the bucket have Hive-style partition keys in the path — `year=2024/month=01/`, `region=us-east-1/`, etc. — you can switch to an incremental shape where each run reads only the newly-arrived files.
 
 Register the source with `--partitions` (and optionally `--start-from`):
 
@@ -82,7 +82,7 @@ bin/clavesa source attach sales orders --to orders_raw --as orders
 
 The UI equivalent: register the source from `/sources` → expand **Advanced** → set Format to `parquet`, fill Partitions with `year,month,day`, Start from with `all`. Attach it to the transform; set the **Output** mode to `append` on the editor's right panel.
 
-Now each run advances a watermark — only partitions newer than the last run get read. Pair this with the cron trigger pattern, or move on to the event-driven pattern in [s3-trigger](s3-trigger.md).
+Now a deployed run reads only the new files, drained from the bucket's notification queue (the same mechanism the [event-driven recipe](s3-trigger.md) uses); the partition keys give the output table its partition columns. Local runs fall back to listing new partitions by watermark. Pair this with the cron trigger pattern, or move on to the fully event-driven pattern in [s3-trigger](s3-trigger.md).
 
 **Note:** partitioned reads require `format=parquet` today. The runner's incremental path hardcodes `spark.read.parquet`; CSV/JSON partitioned reads land when the runner grows a format-dispatched branch.
 

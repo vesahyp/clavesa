@@ -483,7 +483,12 @@ func (h *CatalogHandler) readDeltaColumns(ctx context.Context, location string) 
 	}
 	logPrefix := strings.TrimSuffix(key, "/") + "/_delta_log/"
 	fsys := s3fs.New(ctx, h.s3, bucket, logPrefix)
-	schema, _, err := delta.ReadCurrent(fsys)
+	// ReadSchema, not ReadCurrent: the catalog only needs the column list,
+	// and the schema-only path is checkpoint-aware so an append-only table
+	// (e.g. node_runs) no longer replays its whole commit history per page
+	// load. The discarded commit history is exactly the other expensive
+	// half this avoids.
+	schema, err := delta.ReadSchema(fsys)
 	if err != nil {
 		return nil, err
 	}

@@ -12,6 +12,16 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.7.4] — 2026-06-07
+
+### Changed
+
+- The Column profile's top-value breakdown now reads like Kibana's field popover: each value sits in its own aligned column (value · bar · percentage), the percentage is of all rows (not just the shown top-K), and a muted "other" row makes the long tail visible when the top values don't cover everything. Exact counts show on hover.
+
+### Fixed
+
+- The Catalog page no longer stalls for tens of seconds on workspaces with long-lived append tables. Reading a Delta table's schema now uses the table's checkpoint instead of replaying every commit back to version 0, so an append-only table like `node_runs` with thousands of commits reads its schema in a handful of S3 requests rather than one per commit. On a real cloud workspace this dropped the catalog load from ~47s to ~4s.
+
 ## [v2.7.3] — 2026-06-06
 
 ### Changed
