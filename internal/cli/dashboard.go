@@ -22,17 +22,19 @@ import (
 )
 
 // newDashboardsCmd implements `clavesa dashboards` — the CLI half of
-// the dashboards surface (ADR-015 parity with the UI). Dashboards live in
-// the `dashboards` system Iceberg table; these commands read and write it
-// through the same service layer the HTTP handler uses.
+// the dashboards surface (ADR-015 parity with the UI). Dashboards are
+// file-backed JSON specs under <workspace>/.clavesa/dashboards/<slug>.json
+// (ADR-021); these commands read and write them through the same service
+// layer the HTTP handler uses.
 func newDashboardsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "dashboards",
 		Short: "List, inspect, render, and author workspace dashboards",
 		Long: `Manage workspace dashboards — saved SQL widgets over the catalog.
 
-Dashboards are stored in the workspace's ` + "`dashboards`" + ` system
-Iceberg table, shared across everyone with workspace access.
+Dashboards are stored as JSON specs under the workspace's
+` + "`.clavesa/dashboards/`" + ` directory (one file per dashboard), shared with
+everyone who has the workspace checked out.
 
 Examples:
   clavesa dashboards list

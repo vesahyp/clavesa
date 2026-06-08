@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -31,8 +32,8 @@ Reads SQL from the first positional arg, or from STDIN when none given.
 
 Examples:
   clavesa query "SHOW DATABASES"
-  clavesa query "SELECT * FROM clavesa_demo__demo.trips__default LIMIT 5"
-  echo "SELECT count(*) FROM clavesa_demo__demo.trips__default" | clavesa query --json`,
+  clavesa query "SELECT * FROM clavesa_demo__demo.trips LIMIT 5"
+  echo "SELECT count(*) FROM clavesa_demo__demo.trips" | clavesa query --json`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sql := ""
@@ -75,11 +76,7 @@ Examples:
 			for _, row := range res.Rows {
 				cells := make([]string, len(row))
 				for i, c := range row {
-					if c == nil {
-						cells[i] = ""
-					} else {
-						cells[i] = fmt.Sprintf("%v", c)
-					}
+					cells[i] = formatQueryCell(c)
 				}
 				fmt.Fprintln(tw, strings.Join(cells, "\t"))
 			}
@@ -88,4 +85,23 @@ Examples:
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Emit columns + rows JSON")
 	return cmd
+}
+
+// formatQueryCell renders one result cell for the tab-separated text
+// output. Rows arrive as []interface{} decoded from the runner's JSON, so
+// every SQL number (int, bigint, double) lands here as a float64; a naive
+// fmt("%v") then prints anything ≥ ~1e6 in scientific notation
+// (2319046 → "2.319046e+06"). FormatFloat with 'f'/-1 keeps integers
+// integer-shaped and floats in plain decimal, matching the --json output.
+func formatQueryCell(v interface{}) string {
+	switch n := v.(type) {
+	case nil:
+		return ""
+	case float64:
+		return strconv.FormatFloat(n, 'f', -1, 64)
+	case string:
+		return n
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }

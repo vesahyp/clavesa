@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
-	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -33,11 +32,13 @@ type deployFlow struct {
 	// for `workspace deploy`, equal to a pipeline subdirectory for
 	// `pipeline deploy`.
 	TfDir string
-	// VerifyRunnerImage gates `workspace deploy` only — the workspace's
-	// `null_resource.push_runner` retags + pushes the local image, so a
-	// stale image silently lands in production. Pipeline deploys don't
-	// push images (they pin the Lambda to an ECR digest), so skip there.
-	VerifyRunnerImage bool
+	// BuildRunnerImage gates `workspace deploy` only — the workspace's
+	// `null_resource.push_runner` retags + pushes the local image, so the
+	// local image must exist and be current before terraform runs. We build
+	// it here (docker decides what work is needed) rather than verifying a
+	// possibly-missing one. Pipeline deploys don't push images (they pin the
+	// Lambda to an ECR digest), so skip there.
+	BuildRunnerImage bool
 	// AutoApprove skips the interactive "Apply this plan? [y/N]" prompt.
 	// For scripted / CI use; the prompt is the default safety.
 	AutoApprove bool
@@ -138,20 +139,17 @@ func (d deployFlow) preflight() error {
 		return err
 	}
 
-	if !d.VerifyRunnerImage {
+	if !d.BuildRunnerImage {
 		return nil
 	}
 
-	m, err := workspace.Load(d.WorkspaceRoot)
-	if err != nil {
-		return fmt.Errorf("load manifest for runner-image check: %w", err)
+	// Build the local runner image (docker's layer cache decides what work is
+	// needed) so the `null_resource.push_runner` provisioner has a current
+	// `:<version>` tag to push. Cheap when nothing changed.
+	if _, err := workspace.EnsureLocalRunnerImage(d.WorkspaceRoot); err != nil {
+		return fmt.Errorf("build runner image before deploy: %w", err)
 	}
-	if m == nil {
-		// Stat said the file exists; Load returned nil only when the
-		// file is missing. Treat the same as the stat branch.
-		return fmt.Errorf("clavesa.json could not be read at %s", d.WorkspaceRoot)
-	}
-	return workspace.VerifyRunnerImage(m.Name, service.ModuleVersion)
+	return nil
 }
 
 // verifyAWSCredentials runs sts:GetCallerIdentity against the default

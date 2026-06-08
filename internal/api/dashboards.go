@@ -46,6 +46,11 @@ type DashboardWidget struct {
 	YField       string                `json:"y_field,omitempty"`
 	SeriesFields []string              `json:"series_fields,omitempty"`
 	LineField    string                `json:"line_field,omitempty"`
+	// RegionField + TooltipField are world_map-only (mirrors the service
+	// struct). Missing here meant the API silently dropped region_field
+	// when re-serializing a dashboard, blanking the choropleth.
+	RegionField  string                `json:"region_field,omitempty"`
+	TooltipField string                `json:"tooltip_field,omitempty"`
 	Layout       DashboardWidgetLayout `json:"layout"`
 }
 

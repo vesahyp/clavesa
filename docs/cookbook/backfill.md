@@ -90,5 +90,5 @@ Unpromoted staging tables get swept by the Delta-maintenance slice after `backfi
 ## See also
 
 - [s3-trigger](s3-trigger.md) — the event-driven counterpart; once a pipeline is wired for live triggers, backfill is what loads everything older.
-- [merge-dim-table](merge-dim-table.md) — the SCD-Type-1 shape; merge_keys-on-append makes backfill promote naturally safe.
+- [merge-cdf](merge-cdf.md) — the SCD-Type-1 shape; merge_keys-on-append makes backfill promote naturally safe.
 - [s3-bulk-ingest](s3-bulk-ingest.md) — when there is no incremental pipeline at all and you just want the whole bucket mirrored once.

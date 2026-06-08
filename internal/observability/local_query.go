@@ -122,7 +122,7 @@ func (d *dockerQueryRunner) Run(ctx context.Context, warehouse, sql string) (*Qu
 			Error string `json:"error"`
 		}
 		if err := json.Unmarshal(out, &errEnv); err == nil && errEnv.Error != "" {
-			return nil, fmt.Errorf("query runner: %s", errEnv.Error)
+			return nil, fmt.Errorf("query runner: %s", trimSparkStackTrace(errEnv.Error))
 		}
 
 		var res QueryRunnerResult

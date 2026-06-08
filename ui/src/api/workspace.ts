@@ -109,7 +109,7 @@ export interface WorkspaceUpgradeResult {
   prev_version: string;
   target_version: string;
   workspace_rewritten: number;
-  runner_refreshed: boolean;
+  runner_built: boolean;
   /** Workspace-level warning; omitted (undefined) when empty. */
   warning?: string;
   pipelines: WorkspaceUpgradePipelineResult[];

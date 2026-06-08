@@ -161,5 +161,5 @@ Default `replace` mode is right here — a rollup is fully recomputed from the f
 
 ## See also
 
-- [merge-dim-table](merge-dim-table.md) — the merge-keyed dimension pattern in depth; `stories` here is a merge dimension.
+- [merge-cdf](merge-cdf.md) — the merge-keyed dimension pattern in depth; `stories` here is a merge dimension.
 - [scheduled-rollup](scheduled-rollup.md) — put `newsfeed` on a cron so the snapshot fact fills itself.

@@ -452,9 +452,9 @@ type upgradeWorkspaceResponse struct {
 	PrevVersion        string `json:"prev_version"`
 	TargetVersion      string `json:"target_version"`
 	WorkspaceRewritten int    `json:"workspace_rewritten"`
-	RunnerRefreshed    bool   `json:"runner_refreshed"`
+	RunnerBuilt        bool   `json:"runner_built"`
 	// Warning carries a non-fatal note (e.g. the local runner image
-	// refresh failed); the upgrade itself still succeeded.
+	// build failed); the upgrade itself still succeeded.
 	Warning   string               `json:"warning,omitempty"`
 	Pipelines []pipelineUpgradeRow `json:"pipelines"`
 }
@@ -490,11 +490,13 @@ func (wh *WorkspaceHandler) UpgradeWorkspace(w http.ResponseWriter, r *http.Requ
 			Err:        p.Err,
 		})
 	}
-	// Image refresh mirrors the CLI: best-effort, never fails the request.
-	if _, refreshed, imgErr := workspace.EnsureLocalRunnerImageStatus(wh.root); imgErr != nil {
-		resp.Warning = "refresh local runner image: " + imgErr.Error()
+	// Image build mirrors the CLI: best-effort, never fails the request.
+	// Unconditional build; docker's layer cache makes a no-change rebuild
+	// a fast cache hit.
+	if _, imgErr := workspace.EnsureLocalRunnerImage(wh.root); imgErr != nil {
+		resp.Warning = "build local runner image: " + imgErr.Error()
 	} else {
-		resp.RunnerRefreshed = refreshed
+		resp.RunnerBuilt = true
 	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
 }

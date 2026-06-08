@@ -102,4 +102,4 @@ The pipeline above only processes files that land *after* the EventBridge rule i
 
 - [s3-bulk-ingest](s3-bulk-ingest.md) — one-shot full-bucket read without triggers, lower-overhead pattern for static historical data.
 - [backfill](backfill.md) — load historical files that landed before this pipeline existed, or replay a window after a transform-logic fix.
-- [merge-dim-table](merge-dim-table.md) — the SCD-Type-1 variant of the merge_keys pattern this recipe uses.
+- [merge-cdf](merge-cdf.md) — the SCD-Type-1 variant of the merge_keys pattern this recipe uses.

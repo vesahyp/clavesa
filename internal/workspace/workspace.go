@@ -280,9 +280,9 @@ output "system_catalog" {
 		return fmt.Errorf("extract modules: %w", err)
 	}
 
-	// Build (or retag) the local Docker image for preview so the workspace
-	// has the image its first `pipeline run` will use.
-	if _, _, err := ensureLocalRunnerImageAt(root, moduleVersion); err != nil {
+	// Build the local Docker image so the workspace has the image its first
+	// `pipeline run` will use.
+	if _, err := ensureLocalRunnerImageAt(root, moduleVersion); err != nil {
 		return err
 	}
 
@@ -392,253 +392,53 @@ func Upgrade(root, targetVersion string) (prevVersion string, rewritten int, err
 	return prevVersion, rewritten, nil
 }
 
-// EnsureLocalRunnerImage guarantees the workspace at `root` has a local
-// Docker runner image whose `clavesa.runner_sha` label matches the
-// runner files embedded in this binary (or, if a fresher
-// `clavesa/transform-runner:<version>` / `:latest` exists in the dev
-// tree, the SHA of that), then returns the `:latest` tag callers should
-// pass to `docker run`.
+// EnsureLocalRunnerImage guarantees the workspace at `root` has a current
+// local Docker runner image — built from the runner source embedded in this
+// binary — and returns the `:latest` tag callers pass to `docker run`.
 //
-// On match: returns instantly (one `docker image inspect`, ~5ms). Most
-// invocations land here.
+// It does not try to guess whether a rebuild is needed: it re-extracts the
+// embedded runner source and calls `docker build` every time, tagging both
+// `:latest` and `:<version>`. Docker's layer cache is the staleness check —
+// an unchanged source tree is a full cache hit (seconds; the Dockerfile's
+// expensive Java/pip/JAR layers sit above the version arg), and a CLI upgrade
+// carrying new runner code rebuilds exactly the changed layers. This replaces
+// a hand-rolled SHA-label/image-ID cache that kept growing gaps docker
+// already handles correctly.
 //
-// On mismatch: emits a one-line progress message on stderr, then either
-// retags from a candidate image whose label already matches (cheap,
-// <1s) or falls back to `docker build` from the embedded runner files
-// (1-3 min on a cold Docker cache, typical first-run-after-brew-upgrade
-// case). Subsequent calls are back on the fast path.
-//
-// This is the entry every local docker-spawning code path should use
-// instead of composing `runner.LocalImageName(...)+":latest"` directly,
-// so that a CLI upgrade carrying new runner code doesn't silently keep
-// serving the pre-upgrade runner image (the regression that bit users
-// going from v1.0.x to v1.1.4).
-//
-// The version this binary tags new images with comes from
-// `internal/version.Module`. The `Init` flow uses its own
-// caller-supplied version via the unexported `ensureLocalRunnerImageAt`
+// The version tagged comes from `internal/version.Module`. `Init` injects its
+// own caller-supplied version via the unexported `ensureLocalRunnerImageAt`
 // helper — tests rely on injecting a specific version there.
 func EnsureLocalRunnerImage(root string) (string, error) {
-	tag, _, err := ensureLocalRunnerImageAt(root, version.Module)
-	return tag, err
-}
-
-// EnsureLocalRunnerImageStatus is the variant that also reports whether
-// the call actually performed work (retag or rebuild). `workspace
-// upgrade` uses this so its "runner refreshed" log line only fires when
-// something actually changed — silent reuse of an already-current image
-// doesn't print a refresh claim it can't back up.
-func EnsureLocalRunnerImageStatus(root string) (tag string, refreshed bool, err error) {
 	return ensureLocalRunnerImageAt(root, version.Module)
 }
 
-func ensureLocalRunnerImageAt(root, moduleVersion string) (string, bool, error) {
+func ensureLocalRunnerImageAt(root, moduleVersion string) (string, error) {
 	m, err := Load(root)
 	if err != nil {
-		return "", false, fmt.Errorf("load workspace at %s: %w — run `clavesa workspace init` first", root, err)
+		return "", fmt.Errorf("load workspace at %s: %w — run `clavesa workspace init` first", root, err)
 	}
 	localTag := runner.LocalImageName(m.Name)
 	latest := localTag + ":latest"
 	versioned := localTag + ":" + moduleVersion
 
-	wantSHA, err := runner.EmbeddedSHA()
-	if err != nil {
-		return "", false, fmt.Errorf("compute embedded runner sha: %w", err)
-	}
-
-	// Dev-tree sources, in priority order. `make build-runner` produces
-	// these; brew-installed users typically have none of them.
-	devSources := []string{
-		"clavesa/transform-runner:" + moduleVersion,
-		"clavesa/transform-runner:latest",
-	}
-
-	workspaceID, workspaceExists := imageID(latest)
-	workspaceSHA, workspaceHasLabel := imageRunnerSHA(latest)
-
-	// No-op fast path. Two equivalent signals that workspace `:latest`
-	// is already current: either it carries the binary's embedded
-	// runner SHA label, or it points at the same image content as a
-	// dev-tree `clavesa/transform-runner:*` tag (which we'd otherwise
-	// retag from in the next step). Either signal suffices.
-	if workspaceExists && workspaceHasLabel && workspaceSHA == wantSHA {
-		// Belt-and-braces: also re-check against dev sources. If the
-		// label says we're current but a dev image with newer content
-		// exists, fall through to retag — the label was stamped by an
-		// earlier in-binary build that the dev image has since
-		// superseded. This is the load-bearing case for an iterating
-		// runner developer.
-		stale := false
-		for _, src := range devSources {
-			if srcID, ok := imageID(src); ok && srcID != workspaceID {
-				stale = true
-				break
-			}
-		}
-		if !stale {
-			return latest, false, nil
-		}
-	} else if workspaceExists {
-		// No label, or label mismatch. If the workspace already points
-		// at the same content as a dev source, no retag would
-		// accomplish anything — accept it.
-		for _, src := range devSources {
-			if srcID, ok := imageID(src); ok && srcID == workspaceID {
-				return latest, false, nil
-			}
-		}
-	}
-
-	// Retag from a dev source if one exists and its content differs
-	// from the workspace's `:latest`. This is the "user just ran `make
-	// build-runner`" branch. We stamp the `clavesa.runner_sha` label
-	// during retag so the deploy preflight (VerifyRunnerImage) sees a
-	// labelled workspace image even when `make build-runner` didn't
-	// stamp the dev source itself.
-	for _, src := range devSources {
-		srcID, ok := imageID(src)
-		if !ok {
-			continue
-		}
-		if workspaceExists && srcID == workspaceID {
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "[clavesa] workspace runner image stale; retagging from %s…\n", src)
-		if err := stampedRetag(src, wantSHA, versioned, latest); err != nil {
-			return "", false, fmt.Errorf("retag %s -> %s: %w", src, latest, err)
-		}
-		return latest, true, nil
-	}
-
-	// Workspace's own prior `:<version>` build (from a previous init at
-	// this CLI version) is the last cheap fallback — useful when the
-	// dev tree isn't present (brew-installed user upgrading the
-	// binary).
-	if vSHA, ok := imageRunnerSHA(versioned); ok && vSHA == wantSHA {
-		if workspaceExists {
-			if vID, ok := imageID(versioned); ok && vID == workspaceID {
-				return latest, false, nil
-			}
-		}
-		fmt.Fprintf(os.Stderr, "[clavesa] workspace runner image stale; retagging from %s…\n", versioned)
-		if err := stampedRetag(versioned, wantSHA, versioned, latest); err != nil {
-			return "", false, fmt.Errorf("retag %s -> %s: %w", versioned, latest, err)
-		}
-		return latest, true, nil
-	}
-
-	// Full rebuild — slow. Re-extract embedded runner files first so a
-	// CLI carrying updated runner code writes them to <root>/runner/
-	// before `docker build` reads from there. Init already does this
-	// for the first-init path; the re-extract here covers the
-	// upgrade-after-init case where the on-disk copy is from an older
-	// CLI version.
-	fmt.Fprintln(os.Stderr, "[clavesa] workspace runner image stale; rebuilding from embedded files — first run after a CLI upgrade can take 1–3 min on a cold Docker cache…")
+	// Re-extract the embedded runner source so the build context matches this
+	// binary, then let docker's layer cache decide what work is needed.
+	// Tagging both `:latest` and `:<version>` on every build guarantees the
+	// version tag the deploy preflight and the ECR push provisioner depend on
+	// always exists and is always current.
 	runnerDir := filepath.Join(root, "runner")
 	if err := extractRunnerFiles(runnerDir); err != nil {
-		return "", false, fmt.Errorf("extract runner source: %w", err)
+		return "", fmt.Errorf("extract runner source: %w", err)
 	}
 	cmd := exec.Command("docker", "build",
-		"--label", runner.SHALabel+"="+wantSHA,
 		"--build-arg", "CLAVESA_MODULE_VERSION="+moduleVersion,
 		"-t", versioned, "-t", latest, runnerDir)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return "", false, fmt.Errorf("build runner image: %w", err)
+		return "", fmt.Errorf("build runner image: %w", err)
 	}
-	fmt.Fprintln(os.Stderr, "[clavesa] runner image ready.")
-	return latest, true, nil
-}
-
-// VerifyRunnerImage checks that the local runner image for `workspaceName`
-// at `version` carries the same `clavesa.runner_sha` label as the
-// runner files embedded in this binary. Used as a deploy preflight: the
-// workspace's `null_resource.push_runner` provisioner retags whatever's
-// at the local tag and pushes to ECR, so a stale or missing image
-// silently lands in production unless the caller refuses to invoke
-// terraform.
-func VerifyRunnerImage(workspaceName, version string) error {
-	wantSHA, err := runner.EmbeddedSHA()
-	if err != nil {
-		return fmt.Errorf("compute embedded runner sha: %w", err)
-	}
-	ref := runner.LocalImageName(workspaceName) + ":" + version
-	if !imageMatchesSHA(ref, wantSHA) {
-		return fmt.Errorf("local runner image %s does not match the embedded runner SHA %s — re-run `clavesa workspace init` to rebuild before deploying", ref, wantSHA)
-	}
-	return nil
-}
-
-// stampedRetag re-tags `src` to `dstVersioned` and `dstLatest` while
-// stamping the `clavesa.runner_sha=wantSHA` label so the deploy
-// preflight (VerifyRunnerImage) can recognise the retagged image as
-// current. `make build-runner` intentionally doesn't stamp the label
-// (so dev-cycle content changes are caught by image-ID compare), so we
-// stamp it here at workspace-retag time via a tiny `docker build` with
-// a stdin Dockerfile (`FROM <src>` + `LABEL`) — no layer rebuild, just
-// a metadata stamp.
-func stampedRetag(src, wantSHA, dstVersioned, dstLatest string) error {
-	dockerfile := "FROM " + src + "\nLABEL " + runner.SHALabel + "=" + wantSHA + "\n"
-	cmd := exec.Command("docker", "build",
-		"-t", dstVersioned, "-t", dstLatest, "-")
-	cmd.Stdin = strings.NewReader(dockerfile)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("stamp runner-sha label on %s: %w (%s)", src, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// imageMatchesSHA returns true iff `ref` exists locally AND carries the
-// expected clavesa.runner_sha label. Missing image, missing label, or
-// label mismatch all return false — the caller falls through to either the
-// next retag candidate or a fresh build.
-func imageMatchesSHA(ref, wantSHA string) bool {
-	got, ok := imageRunnerSHA(ref)
-	return ok && got == wantSHA
-}
-
-// imageID returns the content-addressed Docker image ID (`sha256:…`)
-// for `ref`. Returns ("", false) when the image doesn't exist. Used to
-// detect "user just rebuilt the dev runner image" without relying on
-// any label being present — `make build-runner` doesn't stamp the
-// clavesa.runner_sha label, so we compare image IDs directly to spot
-// content changes between the dev image and the workspace's retagged
-// copy.
-func imageID(ref string) (string, bool) {
-	out, err := exec.Command("docker", "image", "inspect",
-		"--format", "{{ .Id }}", ref).Output()
-	if err != nil {
-		return "", false
-	}
-	got := strings.TrimRight(string(out), "\n")
-	if got == "" {
-		return "", false
-	}
-	return got, true
-}
-
-// imageRunnerSHA reads the clavesa.runner_sha label off `ref`. Returns
-// (sha, true) when the image exists and carries the label, ("", false)
-// otherwise. Used for the "is the workspace's `:latest` already at the
-// binary's embedded SHA?" check on the no-op fast path.
-func imageRunnerSHA(ref string) (string, bool) {
-	out, err := exec.Command("docker", "image", "inspect",
-		"--format", "{{ index .Config.Labels \""+runner.SHALabel+"\" }}", ref).Output()
-	if err != nil {
-		return "", false
-	}
-	got := string(out)
-	if len(got) > 0 && got[len(got)-1] == '\n' {
-		got = got[:len(got)-1]
-	}
-	if got == "" {
-		// Image exists but has no clavesa.runner_sha label. Treat as
-		// "unknown SHA" — same effect as missing image: no equality
-		// claim can be made.
-		return "", false
-	}
-	return got, true
+	return latest, nil
 }
 
 // extractRunnerFiles copies the embedded runner source to dest.

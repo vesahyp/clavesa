@@ -374,11 +374,11 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 					displayDir(ws, dir), filepath.Base(dir), filepath.Base(dir))
 			}
 			return deployFlow{
-				WorkspaceRoot:     ws,
-				TfDir:             dir,
-				VerifyRunnerImage: false,
-				AutoApprove:       autoApprove,
-				PlanOnly:          planOnly,
+				WorkspaceRoot:    ws,
+				TfDir:            dir,
+				BuildRunnerImage: false,
+				AutoApprove:      autoApprove,
+				PlanOnly:         planOnly,
 			}.Run()
 		},
 	}

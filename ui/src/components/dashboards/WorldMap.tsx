@@ -2,7 +2,11 @@
  * WorldMap — country choropleth widget renderer.
  *
  * Reads `(region, value)` rows from a dataset; colors each country by
- * the metric using a sequential blues scale. Region codes can be ISO
+ * the metric. Fill is the theme's `--primary` accent (same blue as the
+ * bar/pie charts) at an opacity ramped by value (dim = low, solid =
+ * high); countries with no data take the muted "land" token. Compositing
+ * the accent over the card means it reads correctly in both light and
+ * dark themes and never bottoms out at white. Region codes can be ISO
  * 3166-1 alpha-2 (`US`, `DE`) or alpha-3 (`USA`, `DEU`) — the format
  * is auto-detected from the first non-empty row. Codes the standard
  * doesn't know (`XX`) are silently dropped with a console.debug so a
@@ -15,8 +19,6 @@
  */
 
 import { useMemo } from "react";
-import { scaleSequential } from "d3-scale";
-import { interpolateBlues } from "d3-scale-chromatic";
 import {
   ComposableMap,
   Geographies,
@@ -82,15 +84,31 @@ export function WorldMap({
     return { valuesById, tooltipsById, min, max };
   }, [data, regionField, valueField, tooltipField]);
 
-  // Sequential scale; identical min/max collapse to a single value so the
-  // scale's range stays sane. d3-scale-chromatic interpolators return
-  // colour strings; clamp protects against rounding-edge values.
-  const color = useMemo(() => {
-    if (min === max) {
-      return () => interpolateBlues(0.6);
-    }
-    return scaleSequential(interpolateBlues).domain([min, max]).clamp(true);
+  // Value → fill opacity. A floor of 0.25 keeps the lowest bucket visibly
+  // tinted (not indistinguishable from no-data land); identical min/max
+  // collapse to a single mid opacity. Compositing the accent at <1 alpha
+  // over the card is what gives the dim→solid ramp in either theme.
+  const opacityFor = useMemo(() => {
+    if (min === max) return () => 0.7;
+    const span = max - min;
+    return (v: number) => 0.25 + 0.75 * Math.min(1, Math.max(0, (v - min) / span));
   }, [min, max]);
+
+  // Resolve theme tokens to literal colours: recharts/SVG `fill` won't
+  // resolve a CSS `var()`, so we read the computed `--primary` (accent),
+  // `--muted` (no-data land) and `--border` (country outlines) once, the
+  // same way the bar/pie charts resolve `--primary`.
+  const theme = useMemo(() => {
+    const fallback = { primary: "#2563eb", muted: "#1e293b", border: "#334155" };
+    if (typeof document === "undefined") return fallback;
+    const cs = getComputedStyle(document.documentElement);
+    const get = (name: string, f: string) => cs.getPropertyValue(name).trim() || f;
+    return {
+      primary: get("--primary", fallback.primary),
+      muted: get("--muted", fallback.muted),
+      border: get("--border", fallback.border),
+    };
+  }, []);
 
   return (
     <div className="h-full w-full">
@@ -103,23 +121,23 @@ export function WorldMap({
             geographies.map((geo) => {
               const id = String(geo.id ?? "");
               const v = valuesById.get(id);
-              const fill = v !== undefined ? color(v) : "#e5e7eb";
-              const tooltip =
-                v !== undefined
-                  ? `${geo.properties?.name ?? id}: ${
-                      tooltipsById.get(id) || formatValue(v)
-                    }`
-                  : `${geo.properties?.name ?? id}: no data`;
+              const has = v !== undefined;
+              const tooltip = has
+                ? `${geo.properties?.name ?? id}: ${
+                    tooltipsById.get(id) || formatValue(v)
+                  }`
+                : `${geo.properties?.name ?? id}: no data`;
               return (
                 <Geography
                   key={geo.rsmKey}
                   geography={geo}
-                  fill={fill as string}
-                  stroke="#9ca3af"
+                  fill={has ? theme.primary : theme.muted}
+                  fillOpacity={has ? opacityFor(v) : 1}
+                  stroke={theme.border}
                   strokeWidth={0.3}
                   style={{
                     default: { outline: "none" },
-                    hover: { outline: "none", fill: "#3b82f6" },
+                    hover: { outline: "none", fill: theme.primary, fillOpacity: 1 },
                     pressed: { outline: "none" },
                   }}
                 >

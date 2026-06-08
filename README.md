@@ -90,8 +90,8 @@ make build                         # produces ./bin/clavesa with embedded UI
 WS=/tmp/clavesa-demo
 mkdir -p $WS
 
-# 1. Init the workspace. Builds the runner Docker image with a content-
-#    hash label so future inits skip the rebuild when nothing changed.
+# 1. Init the workspace. Builds the runner Docker image; docker's layer
+#    cache makes the rebuild a fast no-op when nothing changed.
 #    `init` also records this dir as your active workspace, so the UI
 #    (and any later CLI calls) pick it up without --workspace.
 bin/clavesa workspace init demo-ws --workspace $WS

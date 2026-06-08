@@ -46,8 +46,8 @@ type WorkspaceUpgradeResult struct {
 // rest. The method itself returns a nil error in that case; callers
 // inspect each row's Err.
 //
-// Pure-TF / Docker-free: the runner image refresh
-// (workspace.EnsureLocalRunnerImageStatus) is the caller's job (the CLI
+// Pure-TF / Docker-free: the runner image build
+// (workspace.EnsureLocalRunnerImage) is the caller's job (the CLI
 // and the HTTP handler both invoke it), so this stays exercisable in
 // pure-Go tests.
 func (s *Service) UpgradeWorkspace(target string, includePipelines bool) (WorkspaceUpgradeResult, error) {

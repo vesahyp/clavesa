@@ -120,7 +120,7 @@ module "daily_trips" {
 }
 ```
 
-See [merge-dim-table](merge-dim-table.md) for the deeper version of this pattern.
+See [merge-cdf](merge-cdf.md) for the deeper version of this pattern.
 
 ## Troubleshooting
 
@@ -135,4 +135,4 @@ See [merge-dim-table](merge-dim-table.md) for the deeper version of this pattern
 ## See also
 
 - [multi-stage-pipeline](multi-stage-pipeline.md) — for chaining a bronze ingest and the rollup in one pipeline rather than two.
-- [merge-dim-table](merge-dim-table.md) — for the idempotent-upsert variant of this pattern.
+- [merge-cdf](merge-cdf.md) — for the idempotent-upsert variant of this pattern.

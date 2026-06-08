@@ -578,13 +578,33 @@ func (p *persistentDockerQueryRunner) query(ctx context.Context, w *warmWorker, 
 		Error string `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &errEnv); err == nil && errEnv.Error != "" {
-		return nil, fmt.Errorf("query runner: %s", errEnv.Error)
+		return nil, fmt.Errorf("query runner: %s", trimSparkStackTrace(errEnv.Error))
 	}
 	var res QueryRunnerResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return nil, fmt.Errorf("decode query response: %w (body: %s)", err, string(raw))
 	}
 	return &res, nil
+}
+
+// trimSparkStackTrace strips the Java/Scala stack frames from a Spark
+// Connect error string, keeping the human-readable message (and the
+// "== SQL ==" caret block, when present) that precedes them. Spark errors
+// arrive with the useful diagnostic up top followed by dozens of
+// `\tat org.apache.spark…(Foo.scala:123)` frames that are pure noise to a
+// SQL user typing `clavesa query`. We cut at the first frame OR at Spark
+// Connect's literal "JVM stacktrace:" header (analysis errors emit the
+// header then the class + frames), whichever comes first. A string with
+// no frames is returned as-is (minus trailing blank lines).
+func trimSparkStackTrace(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if t == "JVM stacktrace:" || (strings.HasPrefix(t, "at ") && strings.HasSuffix(t, ")")) {
+			return strings.TrimRight(strings.Join(lines[:i], "\n"), "\n ")
+		}
+	}
+	return strings.TrimRight(s, "\n ")
 }
 
 func (p *persistentDockerQueryRunner) evict(warehouse string, w *warmWorker) {

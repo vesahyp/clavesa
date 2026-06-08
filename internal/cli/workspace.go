@@ -57,7 +57,7 @@ func newWorkspaceUpgradeCmd() *cobra.Command {
 		Use:   "upgrade",
 		Short: "Upgrade the workspace shell and every pipeline to the binary's module version",
 		Long: `Upgrade the workspace shell AND every pipeline in it to match the
-running ` + "`clavesa`" + ` binary's ModuleVersion, then refresh the local
+running ` + "`clavesa`" + ` binary's ModuleVersion, then rebuild the local
 runner image. One shot — no need to walk pipelines by hand.
 
 Mechanics:
@@ -70,8 +70,9 @@ Mechanics:
   - Upgrades every pipeline (rewrites module sources, strips deprecated
     module arguments, re-syncs orchestration.tf). Continue-on-error: a
     pipeline that fails is reported and the rest still run.
-  - Refreshes the local Docker runner image (retag or rebuild from the
-    embedded runner sources).
+  - Rebuilds the local Docker runner image from the embedded runner
+    sources, tagging both :latest and :<version>. The build runs every
+    time; docker's layer cache makes a no-change rebuild a fast cache hit.
 
 Pass --shell-only to upgrade just the workspace shell and skip the
 pipeline walk — the pre-one-shot behaviour.
@@ -96,22 +97,16 @@ swapping the binary).`,
 			if err != nil {
 				return fmt.Errorf("workspace upgrade: %w", err)
 			}
-			// Image refresh is a separate step — UpgradeWorkspace is
+			// Image build is a separate step — UpgradeWorkspace is
 			// pure-TF so pure-Go tests can exercise it without Docker.
-			// Surface the image refresh error but don't abort: the TF
-			// rewrites are already on disk and useful on their own.
-			runnerRefreshed := false
-			if _, refreshed, imgErr := workspace.EnsureLocalRunnerImageStatus(root); imgErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: refresh local runner image: %v\n", imgErr)
-			} else {
-				runnerRefreshed = refreshed
-			}
-			// "runner refreshed" only fires when a retag or rebuild
-			// actually occurred — otherwise it's "runner unchanged" so the
-			// user sees the truth and doesn't trust a stale image.
-			runnerNote := "runner unchanged"
-			if runnerRefreshed {
-				runnerNote = "runner refreshed"
+			// Surface the image error but don't abort: the TF rewrites are
+			// already on disk and useful on their own. The build is
+			// unconditional; docker's layer cache makes a no-change rebuild
+			// a fast cache hit.
+			runnerNote := "runner image built"
+			if _, imgErr := workspace.EnsureLocalRunnerImage(root); imgErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: build local runner image: %v\n", imgErr)
+				runnerNote = "runner image build FAILED (see warning above)"
 			}
 			prev := res.PrevVersion
 			switch {
@@ -479,11 +474,11 @@ Use --plan-only to stop after plan without applying.`,
 			}
 			printTargetContext("workspace deploy", root, "")
 			return deployFlow{
-				WorkspaceRoot:     root,
-				TfDir:             root,
-				VerifyRunnerImage: true,
-				AutoApprove:       autoApprove,
-				PlanOnly:          planOnly,
+				WorkspaceRoot:    root,
+				TfDir:            root,
+				BuildRunnerImage: true,
+				AutoApprove:      autoApprove,
+				PlanOnly:         planOnly,
 			}.Run()
 		},
 	}

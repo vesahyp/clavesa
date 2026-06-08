@@ -12,6 +12,19 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.7.5] — 2026-06-08
+
+### Changed
+
+- `world_map` widgets now colour countries with the theme's accent at a value-ramped opacity (dim → solid) and shade no-data countries with the muted "land" token, instead of a light-blue scale that bottomed out near white. Reads correctly on the dark dashboard (and stays right in light mode), and matches the bar/pie palette.
+
+### Fixed
+
+- `workspace upgrade` and `workspace deploy` no longer fail with a missing `:vX.Y.Z` runner image when a version bump ships no runner-code changes. The local runner image is now always rebuilt (docker's layer cache makes a no-change rebuild a fast no-op) and tagged with both `:latest` and the version, replacing a hand-rolled SHA-label staleness check that could leave the version tag uncreated.
+- `world_map` dashboard widgets rendered as an empty (all-uncoloured) map: the API and CLI bridge structs dropped `region_field` (and `tooltip_field`) when serving a dashboard, so the choropleth had no region column to join on. Both fields now round-trip.
+- `clavesa query` text output no longer prints large integers in scientific notation (`2319046` showed as `2.319046e+06`); counts and IDs render as plain integers, matching `--json`.
+- A failed local query (e.g. a typo'd table name) now shows just the Spark error message instead of ~80 lines of Java/Scala stack trace; the command still exits non-zero. Applies to `clavesa query`, notebooks, and dashboards, which share the warm-Spark error path.
+
 ## [v2.7.4] — 2026-06-07
 
 ### Changed

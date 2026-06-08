@@ -214,4 +214,4 @@ Stick with SQL when the transform is a join / filter / aggregate. SQL is shorter
 ## See also
 
 - [multi-stage-pipeline](multi-stage-pipeline.md) — chain a Python silver transform after a SQL bronze ingest.
-- [merge-dim-table](merge-dim-table.md) — Python transforms support all the same output modes, including `mode = "merge"` with merge keys.
+- [merge-cdf](merge-cdf.md) — Python transforms support all the same output modes, including `mode = "merge"` with merge keys.

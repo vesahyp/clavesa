@@ -219,6 +219,7 @@ func toServiceDashboard(d api.Dashboard) tuiservice.Dashboard {
 			ID: x.ID, Type: x.Type, Title: x.Title, Dataset: x.Dataset,
 			ValueField: x.ValueField, XField: x.XField, YField: x.YField,
 			SeriesFields: x.SeriesFields, LineField: x.LineField,
+			RegionField: x.RegionField, TooltipField: x.TooltipField,
 			Layout: tuiservice.DashboardWidgetLayout{X: x.Layout.X, Y: x.Layout.Y, W: x.Layout.W, H: x.Layout.H},
 		}
 	}
@@ -243,6 +244,7 @@ func toAPIDashboard(d tuiservice.Dashboard) api.Dashboard {
 			ID: x.ID, Type: x.Type, Title: x.Title, Dataset: x.Dataset,
 			ValueField: x.ValueField, XField: x.XField, YField: x.YField,
 			SeriesFields: x.SeriesFields, LineField: x.LineField,
+			RegionField: x.RegionField, TooltipField: x.TooltipField,
 			Layout: api.DashboardWidgetLayout{X: x.Layout.X, Y: x.Layout.Y, W: x.Layout.W, H: x.Layout.H},
 		}
 	}
