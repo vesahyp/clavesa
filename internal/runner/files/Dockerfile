@@ -36,6 +36,14 @@ COPY notebook_repl.py ${LAMBDA_TASK_ROOT}/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# User-supplied extra Python deps for transform UDFs (clavesa runner
+# requirements / .clavesa/runner-requirements.txt). Empty by default → no-op.
+# Placed after the heavy Java/pip/JAR layers so editing it rebuilds only this
+# cheap tail and leaves the base cached; above CLAVESA_MODULE_VERSION so a
+# version bump doesn't re-run it.
+COPY extra-requirements.txt .
+RUN pip install --no-cache-dir -r extra-requirements.txt
+
 # Spark Connect server port — bound only when the warm-worker container runs
 # in CLAVESA_CONNECT_SERVER mode (see entrypoint.sh). Lambda invocations
 # ignore EXPOSE; this is documentation + a hint to `docker run -P`.

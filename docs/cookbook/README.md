@@ -25,10 +25,7 @@ How data actually gets in — each standalone, swap in your own source.
 
 - **[scheduled-rollup](scheduled-rollup.md)** — a cron-triggered transform reading an existing Delta table and writing a daily summary. The dbt-on-Airflow nightly-aggregation pattern.
 - **[python-transform](python-transform.md)** — when SQL isn't enough. Swap `language = "sql"` for `language = "python"` and ship a `transform(spark, inputs) -> dict[str, DataFrame]`.
-
-## Upgrading
-
-- **[migrate-to-v2](migrate-to-v2.md)** — moving from v1.x (Iceberg) to v2.x (Delta). No automated tool; the path is recreate-from-source.
+- **[runner-deps](runner-deps.md)** — add third-party Python packages (pyasn, crawlerdetect, …) to the runner image for your UDFs, via `clavesa runner requirements` or the `/runner` UI.
 
 ## Walk every feature (nothing-broke pass)
 

@@ -1098,6 +1098,40 @@ export async function deleteCredential(
   throw new Error(`DELETE /credentials/${name} → ${res.status}: ${text}`);
 }
 
+// ---------------------------------------------------------------------------
+// Runner requirements — extra Python pip deps baked into the runner image
+// ---------------------------------------------------------------------------
+
+const RunnerRequirementsResponse = z.object({
+  content: z.string(),
+  requirements: z.array(z.string()).default([]),
+});
+export type RunnerRequirementsResponse = z.infer<
+  typeof RunnerRequirementsResponse
+>;
+
+/** GET /api/runner/requirements — the workspace's runner requirements.txt. */
+export function useRunnerRequirements() {
+  return useQuery({
+    queryKey: ["runner-requirements"],
+    queryFn: async () => {
+      const raw = await request<unknown>("/runner/requirements");
+      return RunnerRequirementsResponse.parse(raw);
+    },
+  });
+}
+
+/** PUT /api/runner/requirements — save the raw requirements.txt content. */
+export async function setRunnerRequirements(
+  content: string,
+): Promise<RunnerRequirementsResponse> {
+  const raw = await request<unknown>("/runner/requirements", {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+  });
+  return RunnerRequirementsResponse.parse(raw);
+}
+
 const SourcesListResponse = z.object({
   sources: z.array(SourceSpec).default([]),
 });

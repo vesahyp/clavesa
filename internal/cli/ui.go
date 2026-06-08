@@ -811,6 +811,11 @@ Examples:
 			sourcesHandler := api.NewSourcesHandler(sourceRegistryBridge{svc: svc})
 			credentialsHandler := api.NewCredentialsHandler(credentialRegistryBridge{svc: svc})
 			notebooksHandler := api.NewNotebooksHandler(notebookRegistryBridge{svc: svc})
+			// Runner Python deps: the service methods match the api
+			// interface exactly (no types to translate, unlike the
+			// credentials bridge), so the service satisfies
+			// api.RunnerRequirementsService directly.
+			runnerHandler := api.NewRunnerHandler(svc)
 			backfillHandler := api.NewBackfillHandler(backfillBridge{svc: svc})
 			optimizeHandler := api.NewOptimizeHandler(optimizeBridge{svc: svc})
 			runtimeHandler := api.NewRuntimeHandler(warmQuery, awsIdentity)
@@ -841,6 +846,7 @@ Examples:
 			sourcesHandler.RegisterRoutes(apiMux)
 			credentialsHandler.RegisterRoutes(apiMux)
 			notebooksHandler.RegisterRoutes(apiMux)
+			runnerHandler.RegisterRoutes(apiMux)
 			backfillHandler.RegisterRoutes(apiMux)
 			optimizeHandler.RegisterRoutes(apiMux)
 			runtimeHandler.RegisterRoutes(apiMux)

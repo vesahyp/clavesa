@@ -905,16 +905,51 @@ func loadNodeIO(ctx context.Context, client *sfn.Client, pipelineName, nodeID st
 	if err != nil {
 		return nil, nil, err
 	}
-	def := aws.ToString(desc.Definition)
+	return nodeIOFromDefinition(aws.ToString(desc.Definition), nodeID)
+}
+
+// nodeIOFromDefinition extracts a node's resolved {inputs, outputs} from a
+// deployed SFN definition JSON. Pure (no AWS) so it's unit-testable.
+//
+// Two shapes are handled:
+//   - v2.2.0+ (current): a single Task state whose Parameters.Payload carries
+//     a transforms[] array; each element is {node, language, inputs, outputs,
+//     parents}. No SFN state is named after a node, so we match on the
+//     transform element's "node" field. This is the shape every live pipeline
+//     emits today (see orchestration/tfgen.emitStateMachine).
+//   - pre-v2.2.0 (legacy fallback): one Task state per transform, named after
+//     the node, with I/O on its own Parameters.Payload — including nodes nested
+//     inside a Parallel state's Branches.
+func nodeIOFromDefinition(def, nodeID string) (any, any, error) {
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(def), &parsed); err != nil {
 		return nil, nil, fmt.Errorf("parse SFN definition: %w", err)
 	}
 	states, _ := parsed["States"].(map[string]any)
+
+	// New shape: find the bundle state (the one carrying transforms[]) and
+	// match the requested node inside its array. Keyed on "has a transforms
+	// array" rather than the literal name "RunPipeline" so a future rename
+	// doesn't silently rebreak this.
+	for _, s := range states {
+		st, _ := s.(map[string]any)
+		params, _ := st["Parameters"].(map[string]any)
+		payload, _ := params["Payload"].(map[string]any)
+		transforms, _ := payload["transforms"].([]any)
+		if len(transforms) == 0 {
+			continue
+		}
+		for _, e := range transforms {
+			t, _ := e.(map[string]any)
+			if name, _ := t["node"].(string); name == nodeID {
+				return t["inputs"], t["outputs"], nil
+			}
+		}
+	}
+
+	// Legacy fallback: per-node Task states, top-level or inside a Parallel.
 	state, _ := states[nodeID].(map[string]any)
 	if state == nil {
-		// Parallel-branch nodes live inside a Parallel state's Branches.
-		// Walk into any "Parallel" states to find the inner node.
 		for _, s := range states {
 			st, _ := s.(map[string]any)
 			if st["Type"] != "Parallel" {

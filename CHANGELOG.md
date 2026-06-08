@@ -12,6 +12,20 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.8.0] — 2026-06-08
+
+### Added
+
+- Runner Python dependencies for UDFs. Add third-party pip packages (e.g. `pyasn`, `crawlerdetect`) to the transform runner image via `clavesa runner requirements add/remove/list/import/show`, the `/runner` UI page, or by editing `.clavesa/runner-requirements.txt` (standard pip format) directly. They install into the image on the next build and are importable from SQL/PySpark transforms. Replaces the dead-end of editing `runner/requirements.txt` (a regenerated mirror that gets clobbered on every build).
+
+### Removed
+
+- `docs/cookbook/migrate-to-v2.md`. The v1.x→v2.x recreate-from-source recipe had no install base to serve; the Iceberg→Delta tradeoff it summarised lives in ADR-018.
+
+### Fixed
+
+- `clavesa pipeline backfill` (`stage`/`diff`/`promote`/`discard`) on a deployed cloud pipeline failed with `node "<name>" not found in SFN definition` for every node, making the whole backfill flow unusable. Node resolution still looked for one Step Functions state per transform, but since v2.2.0 the state machine is a single `RunPipeline` task carrying all transforms in its payload; resolution now reads the node out of that payload (and still handles the pre-v2.2.0 per-state shape).
+
 ## [v2.7.5] — 2026-06-08
 
 ### Changed

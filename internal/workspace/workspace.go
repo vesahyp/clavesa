@@ -19,6 +19,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/modules"
 	"github.com/vesahyp/clavesa/internal/runner"
+	"github.com/vesahyp/clavesa/internal/runnerreqs"
 	"github.com/vesahyp/clavesa/internal/version"
 )
 
@@ -273,6 +274,20 @@ output "system_catalog" {
 		return fmt.Errorf("extract runner source: %w", err)
 	}
 
+	// Seed a commented runner-requirements template so users discover the
+	// extension point. Only when absent — never clobber an existing file.
+	if _, err := os.Stat(runnerreqs.Path(root)); os.IsNotExist(err) {
+		template := `# Extra Python pip dependencies for your transform UDFs — one per line.
+# Installed into the runner image on the next build (pipeline run / workspace deploy).
+# Example:
+#   pyasn>=1.6
+#   crawlerdetect>=0.3
+`
+		if err := runnerreqs.Write(root, template); err != nil {
+			return fmt.Errorf("seed runner requirements: %w", err)
+		}
+	}
+
 	// Extract embedded Terraform modules to .clavesa/modules/<version>/
 	// so the generated workspace + pipeline .tf files resolve their `source`
 	// references locally — `terraform init` makes no network call.
@@ -429,6 +444,16 @@ func ensureLocalRunnerImageAt(root, moduleVersion string) (string, error) {
 	runnerDir := filepath.Join(root, "runner")
 	if err := extractRunnerFiles(runnerDir); err != nil {
 		return "", fmt.Errorf("extract runner source: %w", err)
+	}
+	// Stage the user's extra Python deps into the build context. The runner
+	// Dockerfile has a `COPY extra-requirements.txt` layer, so the file must
+	// always exist; extractRunnerFiles just wrote the embedded empty default.
+	// Overwrite it with the workspace's runner-requirements.txt content (empty
+	// when absent — best-effort, a read error degrades to the empty default
+	// rather than blocking the build).
+	extraReqs, _ := runnerreqs.Read(root)
+	if err := os.WriteFile(filepath.Join(runnerDir, "extra-requirements.txt"), []byte(extraReqs), 0o644); err != nil {
+		return "", fmt.Errorf("stage runner requirements: %w", err)
 	}
 	cmd := exec.Command("docker", "build",
 		"--build-arg", "CLAVESA_MODULE_VERSION="+moduleVersion,

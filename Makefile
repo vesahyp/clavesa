@@ -7,7 +7,7 @@ dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
 
 sync-runner: ## Copy runner/ → internal/runner/files/ so the embedded copy used by `clavesa workspace init` stays in sync
-	cp runner/Dockerfile runner/runner.py runner/spark_conf.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	cp runner/Dockerfile runner/runner.py runner/spark_conf.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
 
 sync-modules: ## Copy modules/ → internal/modules/files/ (tracked .tf/.py/.md/.hcl files only) so `terraform init` resolves embedded modules locally
 	@rm -rf internal/modules/files

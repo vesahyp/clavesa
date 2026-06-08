@@ -47,6 +47,7 @@ Quick start:
 		newNodeCmd(),
 		newSourceCmd(),
 		newCredentialCmd(),
+		newRunnerCmd(),
 		newDashboardsCmd(),
 		newNotebookCmd(),
 		newQueryCmd(),

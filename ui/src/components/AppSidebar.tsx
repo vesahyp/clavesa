@@ -9,6 +9,7 @@
 import { NavLink, useLocation } from "react-router-dom";
 import {
   BookOpen,
+  Boxes,
   Database,
   FileInput,
   KeyRound,
@@ -51,6 +52,7 @@ const NAV: NavItem[] = [
   { to: "/query", label: "Query", icon: Terminal, match: (p) => p.startsWith("/query") },
   { to: "/sources", label: "Sources", icon: FileInput, match: (p) => p.startsWith("/sources") },
   { to: "/credentials", label: "Credentials", icon: KeyRound, match: (p) => p.startsWith("/credentials") },
+  { to: "/runner", label: "Runner", icon: Boxes, match: (p) => p.startsWith("/runner") },
 ];
 
 export function AppSidebar() {

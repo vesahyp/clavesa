@@ -6,7 +6,7 @@ Same pipeline skeleton as the SQL recipes; the transform's `language` is `"pytho
 
 ## What you'll end up with
 
-- A pipeline with a Python-backed transform that imports any library on the runner image (pyspark, numpy; add to `runner/requirements.txt` and rebuild for more).
+- A pipeline with a Python-backed transform that imports any library on the runner image (pyspark, numpy; for third-party packages see [runner-deps](runner-deps.md) — `clavesa runner requirements add <pkg>`).
 - A Delta output table the same shape any SQL transform produces.
 - A `transforms/<name>.py` file checked into your workspace alongside the `.tf`, so the logic is reviewable and version-controlled.
 

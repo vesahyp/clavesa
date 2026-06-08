@@ -63,7 +63,7 @@ Specifically:
 
 ## Migration
 
-**No automatic Iceberg→Delta data migration tool ships in v2.0.0.** Existing Iceberg workspaces (`ui-test`, `synth-ingest`, `cloudfront-analytics`) stay on the v1.x line until they're ready to recreate under v2.0.0. The migration path is:
+**No automatic Iceberg→Delta data migration tool ships in v2.0.0.** Existing Iceberg workspaces (`ui-test`, `cloudfront-analytics`) stay on the v1.x line until they're ready to recreate under v2.0.0. The migration path is:
 
 1. Stand up a fresh v2.0.0 workspace via `clavesa workspace init`.
 2. Re-author the pipelines (same `.tf`, no syntax change at the user level).

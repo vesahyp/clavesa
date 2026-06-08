@@ -2,9 +2,11 @@ package workspace
 
 import (
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/vesahyp/clavesa/internal/runner"
+	"github.com/vesahyp/clavesa/internal/runnerreqs"
 )
 
 // dockerAvailable reports whether a working Docker daemon is reachable.
@@ -81,5 +83,57 @@ func TestEnsureLocalRunnerImageRestoresVersionTag(t *testing.T) {
 		if !imageTagExists(versioned) {
 			t.Fatalf("%s not restored after ensureLocalRunnerImageAt (call %d)", versioned, i)
 		}
+	}
+}
+
+// TestRunnerRequirementsReachImage proves the runner-extensibility mechanism
+// end to end: a package listed in the workspace's
+// .clavesa/runner-requirements.txt is pip-installed into the built image (and
+// thus importable in transform UDFs), while the empty/comment-only default
+// builds cleanly and installs nothing extra.
+func TestRunnerRequirementsReachImage(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("docker not available; skipping runner-image deps test")
+	}
+
+	const ver = "v0.5.0"
+	dir := t.TempDir()
+	name := "test-runner-deps"
+	localTag := runner.LocalImageName(name)
+	versioned := localTag + ":" + ver
+	latest := localTag + ":latest"
+
+	// Init builds the image with only the seeded comment-only requirements
+	// (no extra packages). A pure-stdlib import that is NOT in the base image
+	// is the negative control.
+	if err := Init(dir, name, "aws", "", ver); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("docker", "rmi", "-f", versioned, latest).Run()
+	})
+
+	importOK := func(pkg string) bool {
+		return exec.Command("docker", "run", "--rm", "--entrypoint", "python",
+			latest, "-c", "import "+pkg).Run() == nil
+	}
+
+	// `cowsay` is a tiny dependency-free pure-Python package not pulled in by
+	// the base image's requirements (pyspark/pandas/boto3 + their closure).
+	// Before opting in, importing it must fail.
+	if importOK("cowsay") {
+		t.Fatalf("base image unexpectedly already has `cowsay`; pick a different probe package")
+	}
+
+	// Opt in via the workspace requirements file, rebuild, and confirm the
+	// package is now importable inside the image.
+	if err := runnerreqs.Write(dir, "cowsay\n"); err != nil {
+		t.Fatalf("write runner requirements: %v", err)
+	}
+	if _, err := ensureLocalRunnerImageAt(dir, ver); err != nil {
+		t.Fatalf("rebuild with extra dep: %v", err)
+	}
+	if !importOK("cowsay") {
+		t.Fatalf("`cowsay` not importable after adding it to %s", filepath.Base(runnerreqs.Path(dir)))
 	}
 }
