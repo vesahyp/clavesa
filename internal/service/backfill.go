@@ -201,7 +201,7 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	// Lambda Task Parameters, plus our `_backfill` override block. Fetch
 	// the resolved inputs/outputs from the live SFN definition — that's
 	// the only place the post-apply terraform references resolve.
-	inputs, outputs, err := loadNodeIO(ctx, sfn.NewFromConfig(cfg), pipelineName, req.Node)
+	inputs, outputs, language, logicPath, err := loadNodeIO(ctx, sfn.NewFromConfig(cfg), pipelineName, req.Node)
 	if err != nil {
 		return nil, fmt.Errorf("resolve node I/O from SFN definition: %w", err)
 	}
@@ -210,9 +210,11 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 		trigger = "backfill-direct"
 	}
 	payload := map[string]any{
-		"inputs":   inputs,
-		"outputs":  outputs,
-		"_trigger": trigger,
+		"inputs":     inputs,
+		"outputs":    outputs,
+		"language":   language,
+		"logic_path": logicPath,
+		"_trigger":   trigger,
 		"_backfill": map[string]any{
 			"node":           req.Node,
 			"run_id":         runID,
@@ -258,16 +260,62 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 		return run, fmt.Errorf("Lambda %q returned error: %s", functionName, *out.FunctionError)
 	}
 
+	// Inspect the runner's response envelope. A successful single-node
+	// handler run returns a richer envelope; a present non-ok "status"
+	// (e.g. "skipped" — no new partitions in the window — or "failed")
+	// is fatal. Absent "status" is treated as ok for safety.
+	if status := runnerResponseStatus(out.Payload); status != "" && status != "ok" {
+		msg := runnerResponseMessage(out.Payload)
+		run.Status = status
+		run.ErrorMsg = msg
+		return run, fmt.Errorf("backfill staging did not run: %s", msg)
+	}
+
 	// Tag the staging table so List() and the Catalog UI can recognize it.
 	// Skip on --direct: the production table doesn't get the staging tags.
 	if !req.Direct {
 		if err := tagStagingTable(ctx, glue.NewFromConfig(cfg), glueDB, lastSegment(targetTable), run); err != nil {
-			// Tag failure is non-fatal — the table exists; user can find
-			// it by name pattern. Log to caller but don't fail the run.
-			run.ErrorMsg = fmt.Sprintf("staging table written but Glue tagging failed: %v", err)
+			// Tag failure means the table isn't registered for List()/the
+			// Catalog UI to surface — and the table may not even exist
+			// (e.g. the runner short-circuited before writing). Report it
+			// as an error rather than claiming the table was written.
+			run.Status = "error"
+			run.ErrorMsg = fmt.Sprintf("staging table not registered in Glue (tagging failed): %v", err)
+			return run, fmt.Errorf("backfill staging failed: %w", err)
 		}
 	}
 	return run, nil
+}
+
+// runnerResponseStatus parses the runner Lambda response body and returns
+// its top-level "status" field. Empty string when the payload is absent,
+// unparseable, or carries no status (treated as ok by callers).
+func runnerResponseStatus(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return ""
+	}
+	status, _ := resp["status"].(string)
+	return status
+}
+
+// runnerResponseMessage extracts a human-readable failure message from the
+// runner response, preferring "reason" then "error_msg", falling back to the
+// raw payload so the user always sees *something* actionable.
+func runnerResponseMessage(payload []byte) string {
+	var resp map[string]any
+	if err := json.Unmarshal(payload, &resp); err == nil {
+		if reason, _ := resp["reason"].(string); reason != "" {
+			return reason
+		}
+		if em, _ := resp["error_msg"].(string); em != "" {
+			return em
+		}
+	}
+	return string(payload)
 }
 
 // BackfillList returns all open (un-promoted/un-discarded) staging tables
@@ -518,6 +566,9 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	if out2.FunctionError != nil && *out2.FunctionError != "" {
 		return nil, fmt.Errorf("Lambda %q returned error: %s", functionName, string(out2.Payload))
 	}
+	if status := runnerResponseStatus(out2.Payload); status != "" && status != "ok" {
+		return nil, fmt.Errorf("backfill promote did not run: %s", runnerResponseMessage(out2.Payload))
+	}
 	var resp map[string]any
 	if len(out2.Payload) > 0 {
 		_ = json.Unmarshal(out2.Payload, &resp)
@@ -676,6 +727,9 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error 
 	}
 	if out.FunctionError != nil && *out.FunctionError != "" {
 		return fmt.Errorf("Lambda %q returned error: %s", functionName, string(out.Payload))
+	}
+	if status := runnerResponseStatus(out.Payload); status != "" && status != "ok" {
+		return fmt.Errorf("backfill discard did not run: %s", runnerResponseMessage(out.Payload))
 	}
 	return nil
 }
@@ -878,14 +932,14 @@ func outputModeAndKeys(g *graph.PipelineGraph, nodeID, key string) (string, []st
 // values (S3 paths, Iceberg table ids) the runner expects — we can't
 // rebuild them from the .tf alone because module-output references resolve
 // at apply time.
-func loadNodeIO(ctx context.Context, client *sfn.Client, pipelineName, nodeID string) (any, any, error) {
+func loadNodeIO(ctx context.Context, client *sfn.Client, pipelineName, nodeID string) (any, any, string, string, error) {
 	smName := "clavesa-" + pipelineName
 	var nextToken *string
 	var arn string
 	for {
 		out, err := client.ListStateMachines(ctx, &sfn.ListStateMachinesInput{MaxResults: 1000, NextToken: nextToken})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, "", "", err
 		}
 		for _, sm := range out.StateMachines {
 			if aws.ToString(sm.Name) == smName {
@@ -899,31 +953,32 @@ func loadNodeIO(ctx context.Context, client *sfn.Client, pipelineName, nodeID st
 		nextToken = out.NextToken
 	}
 	if arn == "" {
-		return nil, nil, fmt.Errorf("state machine %q not found — is the pipeline deployed?", smName)
+		return nil, nil, "", "", fmt.Errorf("state machine %q not found — is the pipeline deployed?", smName)
 	}
 	desc, err := client.DescribeStateMachine(ctx, &sfn.DescribeStateMachineInput{StateMachineArn: aws.String(arn)})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", "", err
 	}
 	return nodeIOFromDefinition(aws.ToString(desc.Definition), nodeID)
 }
 
-// nodeIOFromDefinition extracts a node's resolved {inputs, outputs} from a
-// deployed SFN definition JSON. Pure (no AWS) so it's unit-testable.
+// nodeIOFromDefinition extracts a node's resolved {inputs, outputs, language,
+// logic_path} from a deployed SFN definition JSON. Pure (no AWS) so it's
+// unit-testable.
 //
 // Two shapes are handled:
 //   - v2.2.0+ (current): a single Task state whose Parameters.Payload carries
-//     a transforms[] array; each element is {node, language, inputs, outputs,
-//     parents}. No SFN state is named after a node, so we match on the
-//     transform element's "node" field. This is the shape every live pipeline
-//     emits today (see orchestration/tfgen.emitStateMachine).
+//     a transforms[] array; each element is {node, language, logic_path,
+//     inputs, outputs, parents}. No SFN state is named after a node, so we
+//     match on the transform element's "node" field. This is the shape every
+//     live pipeline emits today (see orchestration/tfgen.emitStateMachine).
 //   - pre-v2.2.0 (legacy fallback): one Task state per transform, named after
 //     the node, with I/O on its own Parameters.Payload — including nodes nested
 //     inside a Parallel state's Branches.
-func nodeIOFromDefinition(def, nodeID string) (any, any, error) {
+func nodeIOFromDefinition(def, nodeID string) (any, any, string, string, error) {
 	var parsed map[string]any
 	if err := json.Unmarshal([]byte(def), &parsed); err != nil {
-		return nil, nil, fmt.Errorf("parse SFN definition: %w", err)
+		return nil, nil, "", "", fmt.Errorf("parse SFN definition: %w", err)
 	}
 	states, _ := parsed["States"].(map[string]any)
 
@@ -942,7 +997,9 @@ func nodeIOFromDefinition(def, nodeID string) (any, any, error) {
 		for _, e := range transforms {
 			t, _ := e.(map[string]any)
 			if name, _ := t["node"].(string); name == nodeID {
-				return t["inputs"], t["outputs"], nil
+				language, _ := t["language"].(string)
+				logicPath, _ := t["logic_path"].(string)
+				return t["inputs"], t["outputs"], language, logicPath, nil
 			}
 		}
 	}
@@ -970,14 +1027,16 @@ func nodeIOFromDefinition(def, nodeID string) (any, any, error) {
 		}
 	}
 	if state == nil {
-		return nil, nil, fmt.Errorf("node %q not found in SFN definition", nodeID)
+		return nil, nil, "", "", fmt.Errorf("node %q not found in SFN definition", nodeID)
 	}
 	params, _ := state["Parameters"].(map[string]any)
 	payload, _ := params["Payload"].(map[string]any)
 	if payload == nil {
-		return nil, nil, fmt.Errorf("node %q has no Parameters.Payload in SFN definition", nodeID)
+		return nil, nil, "", "", fmt.Errorf("node %q has no Parameters.Payload in SFN definition", nodeID)
 	}
-	return payload["inputs"], payload["outputs"], nil
+	language, _ := payload["language"].(string)
+	logicPath, _ := payload["logic_path"].(string)
+	return payload["inputs"], payload["outputs"], language, logicPath, nil
 }
 
 // tagStagingTable writes the clavesa:backfill-* parameters onto the

@@ -72,11 +72,17 @@ func newBackfillStageCmd() *cobra.Command {
 				Direct: direct,
 			}
 			run, err := svc.BackfillStage(cmd.Context(), req)
+			// Emit the JSON envelope even on failure so machine consumers
+			// get the run metadata (status, error_msg) alongside the
+			// non-zero exit. printJSON runs at most once per invocation.
+			if jsonOut && run != nil {
+				_ = printJSON(os.Stdout, run)
+			}
 			if err != nil {
 				return err
 			}
 			if jsonOut {
-				return printJSON(os.Stdout, run)
+				return nil
 			}
 			fmt.Printf("Backfill staged.\n")
 			fmt.Printf("  run_id:         %s\n", run.RunID)

@@ -36,6 +36,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/pipelinestatus"
 	"github.com/vesahyp/clavesa/internal/preview"
 	tuiservice "github.com/vesahyp/clavesa/internal/service"
+	"github.com/vesahyp/clavesa/internal/servingsql"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -684,6 +685,12 @@ Examples:
 			// `ui` startup.)
 			observability.SweepMetastores(workspace)
 			warmQuery := observability.NewPersistentQueryRunner(workspace)
+			// Slice 4: SparkSQL-to-Trino/Athena transpile sidecar (lazily
+			// spawned, non-Spark sqlglot server) behind an on-disk cache.
+			// Dashboard save runs the transpile-portability gate through
+			// this; render re-derives from the same cache.
+			transpileSidecar := observability.NewTranspileSidecar(workspace)
+			transpiler := servingsql.NewCachedTranspiler(filepath.Join(workspace, ".clavesa", "cache", "transpile"), transpileSidecar.ToServing)
 
 			// Eager Spark warmup: the Catalog landing page itself doesn't
 			// fire a Spark query (it reads from Glue + filesystem state),
@@ -755,6 +762,7 @@ Examples:
 				WithResolver(resolver).
 				WithNotebookRunner(nbRunner).
 				WithSQLParser(sqlParser).
+				WithTranspiler(transpiler).
 				WithMetastoreEnsurer(metastoreEnsurer())
 			// lineageAdapter shims the JSON shape the api package owns onto the
 			// derivation owned by service. Two shapes mirror each other field-
@@ -807,7 +815,12 @@ Examples:
 			// via the service layer, plus a Provider-dispatched query route
 			// for widget SQL. Cloud fallback lights up when the resolver
 			// can't dispatch on a dir.
-			dashboardsHandler := api.NewDashboardsHandler(dashboardStoreBridge{svc: svc}, cloudProv).WithResolver(resolver)
+			dashboardsHandler := api.NewDashboardsHandler(dashboardStoreBridge{svc: svc}, cloudProv).
+				WithResolver(resolver).
+				// Share the same cached transpiler save/render use, so an
+				// ad-hoc cloud /query whose SQL was transpiled at save is a
+				// cache hit; local-mode requests skip the hook entirely.
+				WithTranspiler(transpiler.ToServing)
 			sourcesHandler := api.NewSourcesHandler(sourceRegistryBridge{svc: svc})
 			credentialsHandler := api.NewCredentialsHandler(credentialRegistryBridge{svc: svc})
 			notebooksHandler := api.NewNotebooksHandler(notebookRegistryBridge{svc: svc})
@@ -882,6 +895,7 @@ Examples:
 			// be blocked, so we release on exit rather than on next start.
 			shutdown := func() {
 				warmQuery.Close()
+				transpileSidecar.Close()
 				observability.StopMetastore(workspace)
 			}
 			srv := &http.Server{Addr: addr, Handler: mux}

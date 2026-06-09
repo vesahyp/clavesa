@@ -2,3 +2,4 @@ pyspark[connect]==4.0.2
 pandas>=2.0
 setuptools>=68  # provides distutils on Python 3.12 for pyspark
 boto3>=1.34
+sqlglot==30.9.0  # pure-Python Spark→Athena/Trino SQL transpile (CLAVESA_TRANSPILE_SERVER)

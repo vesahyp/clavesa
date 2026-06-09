@@ -108,15 +108,23 @@ func NewPersistentQueryRunner(workspaceRoot string) *persistentDockerQueryRunner
 	}
 }
 
-// resolveImage returns the workspace-scoped runner image tag, resolved
-// fresh from clavesa.json each call. Cheap (one small file read) and
-// rare (once per warehouse spawn) — and it has to be lazy so a workspace
-// created after `clavesa ui` started is picked up without a restart.
-func (p *persistentDockerQueryRunner) resolveImage() string {
-	if m, _ := workspace.Load(p.workspaceRoot); m != nil {
+// resolveRunnerImage returns the workspace-scoped runner image tag,
+// resolved fresh from clavesa.json each call. Cheap (one small file read)
+// and rare (once per spawn) — and it has to be lazy so a workspace created
+// after `clavesa ui` started is picked up without a restart. Shared by the
+// warm query runner and the transpile sidecar (both spawn the same runner
+// image, just with a different server-mode env var).
+func resolveRunnerImage(workspaceRoot string) string {
+	if m, _ := workspace.Load(workspaceRoot); m != nil {
 		return runner.LocalImageName(m.Name) + ":latest"
 	}
 	return runner.LocalImageName("") + ":latest"
+}
+
+// resolveImage returns the workspace-scoped runner image tag for this
+// warm runner; delegates to the package-level resolveRunnerImage.
+func (p *persistentDockerQueryRunner) resolveImage() string {
+	return resolveRunnerImage(p.workspaceRoot)
 }
 
 // metastoreWorkspaceName resolves the workspace name EnsureMetastore needs

@@ -173,6 +173,32 @@ type ParseError struct {
 
 func (e *ParseError) Error() string { return e.Message }
 
+// Transpiler converts one SparkSQL statement into the Trino/Athena serving
+// dialect via the long-lived, non-Spark sqlglot sidecar (the runner's
+// CLAVESA_TRANSPILE_SERVER mode). Implementations route to POST /transpile
+// — the seam that lets authored SparkSQL serve through Athena without a
+// hand-maintained second dialect. Returns *observability.DialectError when
+// the server rejected the input (unparseable, or a construct it can't map);
+// any other error means transport/runner failure. Nil-safe at the
+// service-method level: TranspileServing passes the SQL through unchanged
+// when no transpiler is wired, so CLI integration tests stay docker-free.
+type Transpiler interface {
+	ToServing(ctx context.Context, sparkSQL string) (string, error)
+}
+
+// DialectError is the service-layer representation of a transpile
+// rejection. Mirrors observability.DialectError so callers in
+// internal/cli + internal/api can `errors.As(&service.DialectError{})`
+// without depending on the observability package. Line/Col are 1-based
+// when the server pinpointed the failure, 0 when unspecified.
+type DialectError struct {
+	Message string
+	Line    int
+	Col     int
+}
+
+func (e *DialectError) Error() string { return e.Message }
+
 // Service provides direct access to pipeline operations without HTTP.
 type Service struct {
 	workspace string
@@ -180,8 +206,9 @@ type Service struct {
 	s3Client  dataquery.S3Client
 	s3Once    sync.Once
 	s3Err     error
-	evictor   WarehouseEvictor
-	sqlParser SQLParser
+	evictor    WarehouseEvictor
+	sqlParser  SQLParser
+	transpiler Transpiler
 
 	// runsInFlight tracks pipelines with an async StartRun executing,
 	// keyed by absolute dir. Guards against a double-dispatch the
@@ -291,6 +318,42 @@ func (s *Service) ValidateSQL(ctx context.Context, sql string) error {
 		return &ParseError{Message: oe.Message}
 	}
 	return err
+}
+
+// WithTranspiler wires the SparkSQL→Trino/Athena transpiler (the
+// long-lived sqlglot sidecar) so serving paths (Slices 4/5: dashboard
+// save, render, ad-hoc query) can materialize the Athena dialect from
+// authored SparkSQL. Without it, TranspileServing passes SQL through
+// unchanged — keeps unit-test Service instances free of docker / sidecar
+// dependencies (the same pass-through-when-nil contract as WithSQLParser).
+func (s *Service) WithTranspiler(t Transpiler) *Service {
+	s.transpiler = t
+	return s
+}
+
+// TranspileServing converts a SparkSQL statement into the Trino/Athena
+// serving dialect via the wired transpiler. Returns *DialectError when the
+// server rejected the input; any other error means transport/runner
+// failure. When no transpiler is wired (CLI integration tests, local-only
+// paths) it returns the SQL unchanged — those paths don't serve through
+// Athena, so forcing a sidecar dependency here would block docker-free
+// test runs. This is the seam Slices 4/5 call.
+func (s *Service) TranspileServing(ctx context.Context, sparkSQL string) (string, error) {
+	if s.transpiler == nil {
+		return sparkSQL, nil
+	}
+	out, err := s.transpiler.ToServing(ctx, sparkSQL)
+	if err == nil {
+		return out, nil
+	}
+	// Translate the observability-layer dialect rejection into the
+	// service-layer one so callers in cli / api can detect it without
+	// reaching into the observability package.
+	var de *observability.DialectError
+	if errors.As(err, &de) {
+		return "", &DialectError{Message: de.Message, Line: de.Line, Col: de.Col}
+	}
+	return "", err
 }
 
 func (s *Service) resolveDir(dir string) string {

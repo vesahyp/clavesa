@@ -12,6 +12,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/service"
+	"github.com/vesahyp/clavesa/internal/servingsql"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -239,7 +240,10 @@ func newService(cmd *cobra.Command) (*service.Service, string, error) {
 	warm := observability.NewPersistentQueryRunner(workspace)
 	parser := warm.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
 	registerCloseable(warm.Close)
-	svc = svc.WithSQLParser(parser).WithMetastoreEnsurer(metastoreEnsurer())
+	sidecar := observability.NewTranspileSidecar(workspace)
+	registerCloseable(sidecar.Close)
+	transpiler := servingsql.NewCachedTranspiler(filepath.Join(workspace, ".clavesa", "cache", "transpile"), sidecar.ToServing)
+	svc = svc.WithSQLParser(parser).WithTranspiler(transpiler).WithMetastoreEnsurer(metastoreEnsurer())
 	return svc, workspace, nil
 }
 

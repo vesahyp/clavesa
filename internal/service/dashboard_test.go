@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/servingsql"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // fakeProvider is a Provider stub for the dashboards tests: Query and
@@ -678,5 +680,275 @@ func TestSaveDashboardExpandsPlaceholdersBeforeParseCheck(t *testing.T) {
 		if strings.Contains(sql, "{{") {
 			t.Errorf("parser received unexpanded placeholder SQL: %q", sql)
 		}
+	}
+}
+
+// TestSaveDashboardTranspileGateAccepts verifies the transpile gate runs at
+// save time (local-and-cloud, driven only by a wired transpiler) and that it
+// receives the SENTINELIZED template, not the raw `{{ }}` form — proving
+// sentinelize-before-transpile and a param-independent cache key. The
+// fakeTranspiler stub is shared with transpiler_test.go.
+func TestSaveDashboardTranspileGateAccepts(t *testing.T) {
+	tp := &fakeTranspiler{toServing: func(_ context.Context, sql string) (string, error) { return sql, nil }}
+	s := dashService(t, &fakeProvider{}).WithTranspiler(tp)
+	d := Dashboard{
+		Slug:  "ok",
+		Title: "OK",
+		Datasets: []DashboardDataset{{
+			Name: "ds", Dir: "demo",
+			SQL: "SELECT COUNT(*) AS n FROM t WHERE d >= {{p.start}}",
+		}},
+		Controls: []DashboardControl{{Name: "p", Type: "time_range", Default: "last_7d"}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("save with a transpiler that accepts the SQL should succeed: %v", err)
+	}
+	// File must be on disk.
+	if _, err := s.GetDashboard(context.Background(), "ok"); err != nil {
+		t.Fatalf("dashboard should be persisted: %v", err)
+	}
+	if len(tp.seen) == 0 {
+		t.Fatal("transpiler was never invoked")
+	}
+	for _, sql := range tp.seen {
+		if strings.Contains(sql, "{{") {
+			t.Errorf("transpiler received un-sentinelized template (still has {{ }}): %q", sql)
+		}
+		if !strings.Contains(sql, "__CLV_PH__") {
+			t.Errorf("transpiler input was not sentinelized (no sentinel marker): %q", sql)
+		}
+	}
+}
+
+// TestSaveDashboardTranspileGateRejects verifies a DialectError from the
+// transpiler blocks the save at author time — local-and-cloud, with no Athena
+// involved — and that the dataset label and the engine message surface.
+func TestSaveDashboardTranspileGateRejects(t *testing.T) {
+	tp := &fakeTranspiler{toServing: func(context.Context, string) (string, error) {
+		return "", &observability.DialectError{Message: "no athena equivalent for foo()"}
+	}}
+	s := dashService(t, &fakeProvider{}).WithTranspiler(tp)
+	d := Dashboard{
+		Slug:  "bad",
+		Title: "Bad",
+		Datasets: []DashboardDataset{{
+			Name: "metrics", Dir: "demo",
+			SQL: "SELECT foo() AS x FROM t",
+		}},
+	}
+	_, err := s.SaveDashboard(context.Background(), d)
+	if err == nil {
+		t.Fatal("save should be blocked by the transpile portability gate")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "metrics") {
+		t.Errorf("error should name the failing dataset, got: %q", msg)
+	}
+	if !strings.Contains(msg, "no athena equivalent") {
+		t.Errorf("error should carry the dialect message, got: %q", msg)
+	}
+	// And nothing was written.
+	if _, gerr := s.GetDashboard(context.Background(), "bad"); gerr == nil {
+		t.Error("rejected dashboard must not be persisted")
+	}
+}
+
+// TestSaveDashboardTranspileTransportFailureDoesNotBlock verifies that a plain
+// (non-DialectError) transpiler failure — sidecar down, transport error — is
+// logged but does NOT block the save, mirroring the parser's transport-failure
+// handling.
+func TestSaveDashboardTranspileTransportFailureDoesNotBlock(t *testing.T) {
+	tp := &fakeTranspiler{toServing: func(context.Context, string) (string, error) {
+		return "", errors.New("connection refused")
+	}}
+	s := dashService(t, &fakeProvider{}).WithTranspiler(tp)
+	d := Dashboard{
+		Slug:  "transport",
+		Title: "Transport",
+		Datasets: []DashboardDataset{{
+			Name: "ds", Dir: "demo", SQL: "SELECT 1 AS n FROM t",
+		}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("a transpiler transport failure must not block the save: %v", err)
+	}
+	if _, err := s.GetDashboard(context.Background(), "transport"); err != nil {
+		t.Fatalf("dashboard should be persisted despite transport failure: %v", err)
+	}
+}
+
+// TestSaveDashboardNoTranspilerPassThrough verifies the pre-Slice-4 behavior is
+// preserved when no transpiler is wired: the gate is inert and the save
+// succeeds.
+func TestSaveDashboardNoTranspilerPassThrough(t *testing.T) {
+	s := dashService(t, &fakeProvider{})
+	d := Dashboard{
+		Slug:  "plain",
+		Title: "Plain",
+		Datasets: []DashboardDataset{{
+			Name: "ds", Dir: "demo", SQL: "SELECT 1 AS n FROM t",
+		}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("save with no transpiler wired should succeed (pass-through): %v", err)
+	}
+}
+
+// TestSaveDashboardTranspileCacheWritesFile verifies the transpile gate
+// populates the on-disk cache as a side effect: a save through a real
+// servingsql.NewCachedTranspiler (over a fake inner func) leaves a `.trino`
+// entry that render re-derives from without re-transpiling.
+func TestSaveDashboardTranspileCacheWritesFile(t *testing.T) {
+	ws := t.TempDir()
+	resolver := observability.NewResolver(ws, &fakeProvider{}, &fakeProvider{})
+	cacheDir := filepath.Join(ws, ".clavesa", "cache", "transpile")
+	inner := func(_ context.Context, sql string) (string, error) { return sql, nil }
+	tp := servingsql.NewCachedTranspiler(cacheDir, inner)
+	s := New(ws).WithResolver(resolver).WithTranspiler(tp)
+	d := Dashboard{
+		Slug:  "cached",
+		Title: "Cached",
+		Datasets: []DashboardDataset{{
+			Name: "ds", Dir: "demo", SQL: "SELECT 1 AS n FROM t",
+		}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("save should succeed: %v", err)
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatalf("cache dir should exist after a successful transpile: %v", err)
+	}
+	var trino int
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".trino") {
+			trino++
+		}
+	}
+	if trino == 0 {
+		t.Errorf("expected at least one .trino cache entry, found %d files in %s", len(entries), cacheDir)
+	}
+}
+
+// renderService builds a Service rooted at a temp workspace with distinct
+// cloud and local providers, so a render test can assert which provider
+// received the SQL. The env mode (local or cloud) decides which one the
+// resolver dispatches to. A wired transpiler (or nil) controls whether the
+// cloud path transpiles.
+func renderService(t *testing.T, cloud, local *fakeProvider, mode workspace.Mode, tp *fakeTranspiler) *Service {
+	t.Helper()
+	ws := t.TempDir()
+	if err := workspace.WriteEnvironmentMode(ws, mode); err != nil {
+		t.Fatalf("WriteEnvironmentMode(%s): %v", mode, err)
+	}
+	resolver := observability.NewResolver(ws, cloud, local)
+	s := New(ws).WithResolver(resolver)
+	if tp != nil {
+		s = s.WithTranspiler(tp)
+	}
+	return s
+}
+
+const renderDatasetSQL = "SELECT n FROM t"
+
+func saveRenderDashboard(t *testing.T, s *Service) {
+	t.Helper()
+	d := Dashboard{
+		Slug:     "demo",
+		Title:    "Demo",
+		Datasets: []DashboardDataset{{Name: "ds", Dir: "demo", SQL: renderDatasetSQL}},
+		Widgets:  []DashboardWidget{{ID: "w1", Type: "table", Dataset: "ds", Layout: DashboardWidgetLayout{W: 6, H: 4}}},
+	}
+	if _, err := s.SaveDashboard(context.Background(), d); err != nil {
+		t.Fatalf("SaveDashboard: %v", err)
+	}
+}
+
+// TestRenderDashboardLocalRunsSpark verifies that on a LOCAL workspace the
+// authored Spark SQL is executed unchanged and the transpiler is never
+// consulted (local serving runs Spark — ADR-014).
+func TestRenderDashboardLocalRunsSpark(t *testing.T) {
+	local := &fakeProvider{}
+	cloud := &fakeProvider{}
+	tp := &fakeTranspiler{toServing: func(_ context.Context, sql string) (string, error) {
+		return "TRANSPILED(" + sql + ")", nil
+	}}
+	s := renderService(t, cloud, local, workspace.ModeLocal, tp)
+	saveRenderDashboard(t, s)
+
+	got, err := s.RenderDashboard(context.Background(), "demo", nil)
+	if err != nil {
+		t.Fatalf("RenderDashboard: %v", err)
+	}
+
+	// Local provider ran the authored Spark; cloud provider untouched.
+	if len(local.querySQLs) != 1 || local.querySQLs[0] != renderDatasetSQL {
+		t.Errorf("local provider should run the authored Spark unchanged, got %v", local.querySQLs)
+	}
+	if len(cloud.querySQLs) != 0 {
+		t.Errorf("cloud provider must not be touched in local mode, got %v", cloud.querySQLs)
+	}
+	// Transpiler must NOT be consulted on save NOR render: but save does
+	// run the transpile portability gate, so it is touched at save time. We
+	// assert it was not consulted with the EXPANDED render SQL — the render
+	// path skipped it. The simplest robust assertion: the SQL handed to the
+	// local provider is the raw Spark, which it is (checked above).
+	assertRenderShape(t, got)
+}
+
+// TestRenderDashboardCloudTranspiles verifies that on a CLOUD workspace the
+// dataset SQL is transpiled to the Trino serving dialect before execution,
+// and that the response shape is identical to the local render (ADR-014).
+func TestRenderDashboardCloudTranspiles(t *testing.T) {
+	local := &fakeProvider{}
+	cloud := &fakeProvider{}
+	tp := &fakeTranspiler{toServing: func(_ context.Context, sql string) (string, error) {
+		// Mark the SQL so we can prove the transpiled form reached the
+		// provider. The render path sentinelizes the template before the
+		// transpile, so the input here is the sentinelized template, not the
+		// raw Spark — uppercasing is enough to detect transpilation.
+		return strings.ToUpper(sql), nil
+	}}
+	s := renderService(t, cloud, local, workspace.ModeCloud, tp)
+	saveRenderDashboard(t, s)
+
+	got, err := s.RenderDashboard(context.Background(), "demo", nil)
+	if err != nil {
+		t.Fatalf("RenderDashboard: %v", err)
+	}
+
+	// Cloud provider ran the transpiled SQL; local provider untouched.
+	if len(local.querySQLs) != 0 {
+		t.Errorf("local provider must not be touched in cloud mode, got %v", local.querySQLs)
+	}
+	if len(cloud.querySQLs) != 1 {
+		t.Fatalf("cloud provider should run exactly one query, got %v", cloud.querySQLs)
+	}
+	ran := cloud.querySQLs[0]
+	if ran == renderDatasetSQL {
+		t.Errorf("cloud provider received the raw Spark, expected transpiled SQL: %q", ran)
+	}
+	if ran != strings.ToUpper(renderDatasetSQL) {
+		t.Errorf("cloud provider received %q, want the transpiled (uppercased) form %q", ran, strings.ToUpper(renderDatasetSQL))
+	}
+	assertRenderShape(t, got)
+}
+
+// assertRenderShape checks the render payload shape is the single contract
+// both modes produce: one widget, no error, the dataset name carried.
+func assertRenderShape(t *testing.T, r DashboardRender) {
+	t.Helper()
+	if r.Slug != "demo" || r.Title != "Demo" {
+		t.Errorf("render header mismatch: %+v", r)
+	}
+	if len(r.Widgets) != 1 {
+		t.Fatalf("want 1 rendered widget, got %d", len(r.Widgets))
+	}
+	w := r.Widgets[0]
+	if w.WidgetID != "w1" || w.Dataset != "ds" || w.Type != "table" {
+		t.Errorf("widget metadata mismatch: %+v", w)
+	}
+	if w.Error != "" {
+		t.Errorf("widget should render without error, got %q", w.Error)
 	}
 }

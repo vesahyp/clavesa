@@ -13,6 +13,7 @@ import (
 
 	"github.com/vesahyp/clavesa/internal/api"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // fakeStore is an in-memory api.DashboardStore for the handler tests.
@@ -276,6 +277,84 @@ func TestDashboardsQueryDispatch(t *testing.T) {
 	}
 	if prov.gotDir != "demo" {
 		t.Errorf("provider got dir = %q, want demo", prov.gotDir)
+	}
+}
+
+// TestDashboardsQueryCloudTranspiles confirms that on a CLOUD workspace the
+// ad-hoc query route transpiles the expanded SQL (via the injected hook)
+// before dispatching to the provider. The response shape is the provider's
+// QueryResult either way (ADR-014).
+func TestDashboardsQueryCloudTranspiles(t *testing.T) {
+	prov := &fakeQueryProvider{
+		result: &observability.QueryResult{
+			Columns: []observability.SampleTableColumn{{Name: "n"}},
+			Rows:    [][]string{{"42"}},
+		},
+	}
+	ws := t.TempDir()
+	if err := workspace.WriteEnvironmentMode(ws, workspace.ModeCloud); err != nil {
+		t.Fatalf("WriteEnvironmentMode(cloud): %v", err)
+	}
+	resolver := observability.NewResolver(ws, prov, prov)
+	var hookCalls int
+	h := api.NewDashboardsHandler(newFakeStore(), prov).
+		WithResolver(resolver).
+		WithTranspiler(func(_ context.Context, sql string) (string, error) {
+			hookCalls++
+			return "TRANSPILED " + sql, nil
+		})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	body := `{"dir":"demo","sql":"SELECT 42 AS n"}`
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(body))))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	if hookCalls != 1 {
+		t.Errorf("transpile hook should be called once on cloud, got %d", hookCalls)
+	}
+	if prov.gotSQL != "TRANSPILED SELECT 42 AS n" {
+		t.Errorf("provider got SQL = %q, want the transpiled form", prov.gotSQL)
+	}
+}
+
+// TestDashboardsQueryLocalRunsRaw confirms that on a LOCAL workspace the
+// ad-hoc query route runs the authored Spark SQL unchanged and never calls
+// the transpile hook (local serving runs Spark — ADR-014).
+func TestDashboardsQueryLocalRunsRaw(t *testing.T) {
+	prov := &fakeQueryProvider{
+		result: &observability.QueryResult{
+			Columns: []observability.SampleTableColumn{{Name: "n"}},
+			Rows:    [][]string{{"42"}},
+		},
+	}
+	ws := t.TempDir() // no environment.json → local mode
+	resolver := observability.NewResolver(ws, prov, prov)
+	var hookCalls int
+	h := api.NewDashboardsHandler(newFakeStore(), prov).
+		WithResolver(resolver).
+		WithTranspiler(func(_ context.Context, sql string) (string, error) {
+			hookCalls++
+			return "TRANSPILED " + sql, nil
+		})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	body := `{"dir":"demo","sql":"SELECT 42 AS n"}`
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(body))))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+	}
+	if hookCalls != 0 {
+		t.Errorf("transpile hook must not be called on local, got %d calls", hookCalls)
+	}
+	if prov.gotSQL != "SELECT 42 AS n" {
+		t.Errorf("local provider got SQL = %q, want the raw Spark unchanged", prov.gotSQL)
 	}
 }
 

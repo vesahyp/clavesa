@@ -194,7 +194,7 @@ The editor splits authoring into three tabs. Under **Datasets**, add one or more
 
 ![Dashboard editor — the Datasets tab, with a SQL query, the catalog browser listing the pipeline's tables and columns, and a Run button for an inline preview](docs/images/dashboard-editor.png)
 
-A dashboard is just a spec of datasets and widgets, so the CLI authors the same thing: `clavesa dashboards apply <file>.json` writes one from a file, with `list` / `show` / `render` / `delete` rounding out the surface (ADR-015 parity). The spec is portable across compute targets — Athena and the local runner answer identical SQL, so the same dashboard works against a cloud-deployed pipeline and a local one.
+Dataset SQL is plain Spark SQL, the same dialect you write for transforms. On a local pipeline it runs on the Spark runner; on a cloud pipeline clavesa transpiles it to Athena/Trino for you, so one dashboard spec serves both without a second dialect to learn (ADR-023). A dashboard is just a spec of datasets and widgets, so the CLI authors the same thing: `clavesa dashboards apply <file>.json` writes one from a file, with `list` / `show` / `render` / `delete` rounding out the surface (ADR-015 parity).
 
 ### Deploy to AWS
 

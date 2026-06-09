@@ -10,7 +10,18 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
-## [Unreleased]
+## [v2.8.1] — 2026-06-09
+
+### Changed
+
+- Serving SQL (dashboard datasets, widgets, ad-hoc `/query`) is now authored in **Spark SQL** and transpiled to Athena/Trino for cloud serving; local runs the authored Spark unchanged. Previously serving SQL had to be hand-written in the Trino-portable subset. Existing dashboards keep working with no migration, and Spark-only serving SQL is now caught at author time on local workspaces instead of breaking only after a cloud deploy. See ADR-023.
+
+### Fixed
+
+- `clavesa workspace deploy` now always pushes the runner image to ECR. Previously the push was gated on the runner version, so rebuilding the image with new content under the same version (e.g. adding a pip dependency) left ECR — and the deployed Lambda — on the stale image. (#35)
+- `clavesa pipeline backfill stage`/`promote`/`discard` on a deployed cloud pipeline silently did nothing — they returned `status: ok` in ~40 ms without running Spark, materializing a staging table, or executing the promote/discard. (The per-pipeline runner Lambda only dispatched full-pipeline runs and ignored single-node backfill/operation payloads.) Backfill stage also now exits non-zero with an accurate message when the staging run is skipped/fails or the staging table can't be registered in Glue, instead of printing "Backfill staged".
+- Cloud backfill against a source with event-driven triggers read 0 rows — the runner's notification-queue drain short-circuited before the backfill window was read. The historical window now takes precedence over the live queue.
+- Cloud `backfill promote` on the first backfill for a node (no canonical table yet) failed with `TABLE_OR_VIEW_NOT_FOUND`. It now creates the canonical target from the staging table, as the diff output already promised.
 
 ## [v2.8.0] — 2026-06-08
 

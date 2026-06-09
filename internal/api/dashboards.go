@@ -120,6 +120,14 @@ type DashboardsHandler struct {
 	store    DashboardStore
 	cloud    observability.Provider
 	resolver *observability.Resolver
+	// transpile, when set, transpiles ad-hoc /query SQL from the authored
+	// Spark dialect to the Trino/Athena serving dialect before it is
+	// dispatched to a CLOUD provider. nil-safe: a local-mode request (or a
+	// handler with no hook wired) runs the authored Spark unchanged. The
+	// api package deliberately does not import internal/service, so the hook
+	// is injected (the cli package shares the same cached transpiler used by
+	// dashboard save/render).
+	transpile func(ctx context.Context, sql string) (string, error)
 }
 
 // NewDashboardsHandler wires the handler against a service-layer store and
@@ -132,6 +140,17 @@ func NewDashboardsHandler(store DashboardStore, cloud observability.Provider) *D
 // query route.
 func (h *DashboardsHandler) WithResolver(r *observability.Resolver) *DashboardsHandler {
 	h.resolver = r
+	return h
+}
+
+// WithTranspiler injects the Spark-to-Trino serving transpile hook the
+// ad-hoc /query route applies before dispatching to a cloud provider.
+// Local-mode requests never call it (local serving runs the authored
+// Spark). Wiring the SAME cached transpiler the service layer uses for
+// dashboard save/render means a query whose SQL was already transpiled at
+// save is a cache hit here.
+func (h *DashboardsHandler) WithTranspiler(fn func(ctx context.Context, sql string) (string, error)) *DashboardsHandler {
+	h.transpile = fn
 	return h
 }
 
@@ -256,8 +275,26 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// On a CLOUD workspace, transpile the (already-expanded) Spark SQL to
+	// the Trino/Athena serving dialect before dispatch — local serving runs
+	// the authored Spark unchanged (ADR-014). Ad-hoc SQL carries no `{{ }}`
+	// here (it is expanded above), so transpile the expanded form directly;
+	// no sentinel scheme is needed.
+	sqlToRun := expanded
+	if h.resolver != nil && !h.resolver.IsLocal() && h.transpile != nil {
+		t, terr := h.transpile(r.Context(), expanded)
+		if terr != nil {
+			// A dialect rejection is the author's problem (400); the
+			// transpile hook returns a plain error otherwise. Surface 400 so
+			// the editor shows it inline rather than as a 500.
+			httputil.WriteError(w, http.StatusBadRequest, terr.Error())
+			return
+		}
+		sqlToRun = t
+	}
+
 	res, err := provider.Query(r.Context(), observability.QueryQuery{
-		SQL:         expanded,
+		SQL:         sqlToRun,
 		PipelineDir: req.Dir,
 		MaxRows:     queryMaxRowsCap,
 	})

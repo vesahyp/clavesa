@@ -13,6 +13,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/dashboards"
 	"github.com/vesahyp/clavesa/internal/dashboardsql"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/servingsql"
 )
 
 // Dashboards are workspace-level IaC definitions (ADR-021): one JSON file
@@ -246,42 +247,59 @@ func (s *Service) SaveDashboard(ctx context.Context, d Dashboard) (Dashboard, er
 	return s.GetDashboard(ctx, d.Slug)
 }
 
-// validateDashboardSQL parse-checks every dataset's SQL (and any
-// select-control SQL) via the wired parser (Slice 3). Aggregates
-// failures so the user sees every bad dataset in one shot — saving a
-// dashboard with three broken datasets one-by-one would be
-// infuriating. No-op when no parser is wired (CLI integration tests).
-// Transport failures (warm worker dead, missing image) are logged but
-// don't block the save — render-time will surface real parse errors.
-func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
-	// Trino/Athena portability gate (ADR-022). A dashboard is a SERVING
-	// surface: on a cloud workspace its SQL runs on Athena (Trino), not Spark,
-	// so Spark-only SQL (`to_date(x)`, `APPROX_COUNT_DISTINCT`, a bare
-	// timestamp-vs-string compare, …) parses fine on the Spark parser below but
-	// 500s at render. Dry-run each statement via Athena `EXPLAIN` — it
-	// validates dialect, functions and types without scanning data — and
-	// reject the save with the engine's own message. Cloud-only: a local
-	// workspace has no Athena to validate against (its serving SQL runs on
-	// Spark), so the gate is skipped there — the known portability gap is
-	// local-authored SQL that only breaks once deployed to cloud (ADR-022).
-	var trinoProv observability.Provider
-	if s.dashResolver != nil && !s.dashResolver.IsLocal() {
-		if p, perr := s.dashboardProvider(); perr == nil {
-			trinoProv = p
-		}
+// transpileServingTemplate transpiles a Spark serving-SQL TEMPLATE (with
+// {{name}} placeholders intact) to the Trino/Athena serving dialect and
+// restores the placeholders, returning a Trino template. Placeholders are
+// sentinelized to string literals so sqlglot can parse the template, then
+// restored after transpile; because the cache (wired into the transpiler)
+// keys on the sentinelized template, the cached entry is param-independent
+// — render-time fills the same template with runtime params and never
+// re-transpiles. Pass-through when no transpiler is wired (TranspileServing
+// returns the sentinelized input unchanged, which desentinelizes back to
+// the original template).
+func (s *Service) transpileServingTemplate(ctx context.Context, sparkTemplate string) (string, error) {
+	sent := servingsql.SentinelizeTemplate(sparkTemplate)
+	out, err := s.TranspileServing(ctx, sent)
+	if err != nil {
+		return "", err
 	}
-	// Neither check is available (no SparkSQL parser wired AND no cloud serving
-	// engine) — nothing to validate. Common in CLI/unit paths with no docker.
-	if s.sqlParser == nil && trinoProv == nil {
+	return servingsql.DesentinelizeTrino(out), nil
+}
+
+// validateDashboardSQL runs a two-step author-time gate over every
+// dataset's SQL (and any select-control SQL): a Spark /parse check in the
+// author dialect, then a sqlglot transpile gate that confirms the SQL is
+// portable to the Trino/Athena serving dialect AND populates the transpile
+// cache as a side effect (render re-derives from that cache, never
+// re-transpiling). Failures are aggregated so the user sees every bad
+// dataset in one shot — saving a dashboard with three broken datasets
+// one-by-one would be infuriating.
+//
+// Unlike the prior Athena-EXPLAIN portability gate (ADR-022), the transpile
+// gate runs on BOTH local and cloud workspaces — portability is a property
+// of the SQL, not the deployment, so it is checked at author time even
+// locally. This closes the ADR-022 gap where local-authored serving SQL
+// only broke after a cloud deploy.
+//
+// No-op when neither a parser nor a transpiler is wired (CLI integration
+// tests, dry runs). Transport failures (warm worker dead, sidecar down)
+// are logged but never block the save — render-time still surfaces real
+// errors.
+func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
+	// Nothing wired to validate against — common in CLI/unit paths with no
+	// docker.
+	if s.sqlParser == nil && s.transpiler == nil {
 		return nil
 	}
 
-	// Expand control-placeholder defaults before parsing. Dataset / control
-	// SQL carries `{{name}}` placeholders (e.g. `{{period.start}}`) that are
-	// not valid SQL until substituted — the parser chokes on `{{`. Resolve
-	// the dashboard's declared control defaults exactly as RenderDashboard
-	// does, so we parse-check the SQL the engine will actually run rather
-	// than the raw template.
+	// Expand control-placeholder defaults for the Spark PARSE check. Dataset /
+	// control SQL carries `{{name}}` placeholders (e.g. `{{period.start}}`)
+	// that are not valid SQL until substituted — the warm worker chokes on
+	// `{{`. Resolve the dashboard's declared control defaults exactly as
+	// RenderDashboard does, so we parse-check the SQL the engine will actually
+	// run rather than the raw template. (The transpile gate, by contrast,
+	// runs on the RAW template — the sentinel scheme handles `{{ }}` and keeps
+	// the cache param-independent.)
 	effective := map[string]string{}
 	resolveControlDefaults(d.Controls, effective, time.Now())
 
@@ -295,6 +313,9 @@ func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
 			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped for %s (unresolved placeholder: %v)\n", label, expErr)
 			return
 		}
+		// Step 1: Spark /parse on the expanded SQL. Invalid Spark is the
+		// author's first problem (best error positions), so on a parse error
+		// we report it and skip the transpile gate entirely.
 		if err := s.ValidateSQL(ctx, expanded); err != nil {
 			var pe *ParseError
 			if errors.As(err, &pe) {
@@ -304,23 +325,21 @@ func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
 			fmt.Fprintf(os.Stderr, "warn: SQL parse-check skipped for %s: %v\n", label, err)
 			return
 		}
-		// SparkSQL parsed clean; now gate on Trino dialect for cloud serving.
-		if trinoProv == nil {
-			return
-		}
-		if _, qErr := trinoProv.Query(ctx, observability.QueryQuery{
-			SQL:         "EXPLAIN " + expanded,
-			PipelineDir: dir,
-			MaxRows:     1,
-		}); qErr != nil {
-			if hint, isDialect := servingDialectError(qErr); isDialect {
-				failures = append(failures, label+": "+hint)
+		// Step 2: transpile-portability gate on the RAW template (not the
+		// expanded form — we transpile the template so the cache is
+		// param-independent; the sentinel scheme handles the `{{ }}`). A
+		// successful transpile is discarded: its side effect is populating the
+		// cache, which render re-derives from.
+		if _, err := s.transpileServingTemplate(ctx, sql); err != nil {
+			var de *DialectError
+			if errors.As(err, &de) {
+				failures = append(failures, label+": "+de.Message)
 				return
 			}
-			// A non-dialect EXPLAIN failure (table not deployed yet, a
-			// transient Athena error) must not block authoring — log and move
-			// on so the save still succeeds.
-			fmt.Fprintf(os.Stderr, "warn: Trino EXPLAIN check skipped for %s: %v\n", label, qErr)
+			// A sidecar-down / transport failure must NOT block authoring —
+			// log and move on so the save still succeeds (mirrors the prior
+			// EXPLAIN transport-failure handling).
+			fmt.Fprintf(os.Stderr, "warn: transpile check skipped for %s: %v\n", label, err)
 		}
 	}
 	for _, ds := range d.Datasets {
@@ -339,34 +358,6 @@ func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
 		return nil
 	}
 	return &ParseError{Message: "Dashboard SQL validation failed:\n  " + strings.Join(failures, "\n  ")}
-}
-
-// servingDialectError reports whether an Athena/Trino EXPLAIN failure is a
-// SQL-dialect/portability problem the author must fix (a Spark-only function,
-// a type mismatch from an implicit Spark cast, a syntax error) versus an
-// environmental one (table not deployed, transient backend error) that should
-// not block a save. Returns a trimmed, user-facing hint for the former.
-func servingDialectError(err error) (string, bool) {
-	if err == nil {
-		return "", false
-	}
-	msg := err.Error()
-	// Trino error codes that mean "this SQL won't run on Athena as written".
-	for _, code := range []string{
-		"FUNCTION_NOT_FOUND",
-		"TYPE_MISMATCH",
-		"SYNTAX_ERROR",
-		"INVALID_FUNCTION_ARGUMENT",
-		"NOT_SUPPORTED",
-		"AMBIGUOUS_FUNCTION_CALL",
-	} {
-		if idx := strings.Index(msg, code); idx >= 0 {
-			// Surface from the code onward — that's the actionable part
-			// ("FUNCTION_NOT_FOUND: line 1:153: Unexpected parameters …").
-			return msg[idx:], true
-		}
-	}
-	return "", false
 }
 
 // ApplyDashboardFile parses a dashboard JSON document (legacy or
@@ -414,12 +405,31 @@ type DashboardRender struct {
 	Widgets []RenderedWidget `json:"widgets"`
 }
 
+// servingTemplate returns the dialect-appropriate SQL template for the
+// workspace environment mode: on a cloud workspace the cached Trino
+// transpilation of the Spark template (populated at save), on a local
+// workspace the Spark template unchanged (local serving runs Spark). A
+// nil/local resolver means local. Errors only on a cloud transpile failure
+// (surfaced as the widget's inline error).
+func (s *Service) servingTemplate(ctx context.Context, sparkTemplate string) (string, error) {
+	if s.dashResolver == nil || s.dashResolver.IsLocal() {
+		return sparkTemplate, nil
+	}
+	return s.transpileServingTemplate(ctx, sparkTemplate)
+}
+
 // RenderDashboard executes every widget's bound dataset and returns the
 // results. Datasets are executed once and shared across the widgets that
 // reference them — the same execute-once the UI gets from its query
 // cache. Used by `clavesa dashboards render` for cron / CI smoke
 // tests; a widget whose dataset errors carries the error inline rather
 // than failing the whole render.
+//
+// On a cloud workspace each dataset's SQL is transpiled to the Trino
+// serving dialect (cached from save) before execution; a local workspace
+// runs the authored Spark unchanged. The single-dialect contract
+// (ADR-014) keeps the response shape identical either way — only the SQL
+// handed to the Provider differs.
 //
 // `params` are substituted into dataset SQL via {{name}} placeholders.
 // Keys not provided are filled from the dashboard's declared control
@@ -466,23 +476,30 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string, params map[s
 		}
 		r, done := results[w.Dataset]
 		if !done {
-			expanded, expErr := expandPlaceholders(ds.SQL, effective)
-			if expErr != nil {
-				r = execd{err: expErr}
+			// Resolve the dialect-appropriate template first: Trino
+			// (cached from save) on cloud, the authored Spark on local.
+			serving, sErr := s.servingTemplate(ctx, ds.SQL)
+			if sErr != nil {
+				r = execd{err: sErr}
 			} else {
-				res, qErr := prov.Query(ctx, observability.QueryQuery{
-					SQL:         expanded,
-					PipelineDir: ds.Dir,
-					MaxRows:     10_000,
-				})
-				if qErr != nil {
-					r = execd{err: qErr}
+				expanded, expErr := expandPlaceholders(serving, effective)
+				if expErr != nil {
+					r = execd{err: expErr}
 				} else {
-					cols := make([]string, len(res.Columns))
-					for i, c := range res.Columns {
-						cols[i] = c.Name
+					res, qErr := prov.Query(ctx, observability.QueryQuery{
+						SQL:         expanded,
+						PipelineDir: ds.Dir,
+						MaxRows:     10_000,
+					})
+					if qErr != nil {
+						r = execd{err: qErr}
+					} else {
+						cols := make([]string, len(res.Columns))
+						for i, c := range res.Columns {
+							cols[i] = c.Name
+						}
+						r = execd{cols: cols, rows: res.Rows}
 					}
-					r = execd{cols: cols, rows: res.Rows}
 				}
 			}
 			results[w.Dataset] = r

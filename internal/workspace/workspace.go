@@ -130,8 +130,7 @@ func Init(root, name, cloud, catalog, moduleVersion string) error {
 	// Write main.tf
 	mainTF := fmt.Sprintf(`terraform {
   required_providers {
-    aws  = { source = "hashicorp/aws" }
-    null = { source = "hashicorp/null" }
+    aws = { source = "hashicorp/aws" }
   }
   backend "local" {}
 }
@@ -149,9 +148,6 @@ provider "aws" {
   }
 }
 
-data "aws_caller_identity" "current" {}
-data "aws_region" "current" {}
-
 module "workspace" {
   # Terraform 1.x rejects bare module paths without a leading "./"
   # prefix as "ambiguous registry / local" — v1.1.6 fix. Older
@@ -168,27 +164,7 @@ resource "aws_ecr_repository" "runner" {
   force_delete = true
   tags         = { "clavesa:workspace" = var.workspace_name }
 }
-
-resource "null_resource" "push_runner" {
-  triggers = { runner_version = var.runner_version }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      aws ecr get-login-password --region ${data.aws_region.current.region} | \
-        docker login --username AWS --password-stdin ${data.aws_caller_identity.current.account_id}.dkr.ecr.${data.aws_region.current.region}.amazonaws.com
-      docker tag %s:${var.runner_version} ${aws_ecr_repository.runner.repository_url}:${var.runner_version}
-      docker tag %s:${var.runner_version} ${aws_ecr_repository.runner.repository_url}:latest
-      docker push ${aws_ecr_repository.runner.repository_url}:${var.runner_version}
-      docker push ${aws_ecr_repository.runner.repository_url}:latest
-    EOT
-  }
-
-  provisioner "local-exec" {
-    when    = destroy
-    command = "docker rmi %s:${self.triggers.runner_version} %s:latest 2>/dev/null || true"
-  }
-}
-`, moduleVersion, runner.LocalImageName(name), runner.LocalImageName(name), runner.LocalImageName(name), runner.LocalImageName(name))
+`, moduleVersion)
 	if err := os.WriteFile(filepath.Join(root, "main.tf"), []byte(mainTF), 0o644); err != nil {
 		return fmt.Errorf("write main.tf: %w", err)
 	}

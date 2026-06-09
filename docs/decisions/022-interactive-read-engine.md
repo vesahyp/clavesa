@@ -1,6 +1,6 @@
 # ADR 022: Interactive read engine and the serving-vs-authoring SQL contract
 
-**Status**: Accepted (2026-05-31)
+**Status**: Accepted (2026-05-31). Partially superseded by [ADR-023](023-single-serving-dialect-spark-transpile.md) (2026-06-09): the serving-SQL contract is now "author Spark, transpile to Trino" rather than the Trino-portable subset of §Decision-3, and the transpiler the §Consequences bullet deferred has shipped. The serving-vs-authoring taxonomy and the option-B engine choice (Athena in cloud) below still stand.
 
 ## Context
 
@@ -25,7 +25,7 @@ PySpark is the fixed point: it cannot run on Athena, ever. So authoring surfaces
 
 2. **Authoring surfaces** (node preview, notebooks, promote-to-transform) run on Spark always. In the self-managed deploy that is the local docker runner. They are never routed through Athena.
 
-3. **The serving-SQL contract is Trino-portable.** All serving SQL — dashboard datasets, widget SQL, `/query`, saved queries — is authored in the Athena/Trino-compatible subset. Spark is a superset of that subset, so the same SQL runs unchanged on both engines. This is the binding rule: it is what lets a dashboard authored locally run against Athena in cloud, and it is baked into authored artifacts the moment a user writes them. Authoring SQL/PySpark (transform logic) remains full-power Spark, because it never executes on Athena.
+3. **The serving-SQL contract is Trino-portable.** *(Superseded by ADR-023: serving SQL is now authored in Spark and transpiled to Trino/Athena for cloud serving, so authors no longer write the portable subset by hand.)* All serving SQL — dashboard datasets, widget SQL, `/query`, saved queries — is authored in the Athena/Trino-compatible subset. Spark is a superset of that subset, so the same SQL runs unchanged on both engines. This is the binding rule: it is what lets a dashboard authored locally run against Athena in cloud, and it is baked into authored artifacts the moment a user writes them. Authoring SQL/PySpark (transform logic) remains full-power Spark, because it never executes on Athena.
 
 4. **The Provider seam is preserved as the future hedge.** The ADR-014 read interface (`LocalProvider` / `AthenaProvider`, matching response shapes) can gain a `SparkConnectProvider` later without reshaping any caller. The B-vs-C choice then becomes a per-deployment flag, not a code fork.
 
@@ -33,7 +33,7 @@ PySpark is the fixed point: it cannot run on Athena, ever. So authoring surfaces
 
 - The web-traffic dashboard `PARSE_SYNTAX_ERROR` is fixed by rewriting its dataset SQL to the portable subset, not by swapping engines. This becomes the rule for all dashboard/`/query` SQL going forward.
 - Authoring surfaces carry a hard dependency on Spark compute being reachable. Self-managed: local docker. This is acceptable and already how preview works.
-- We accept that serving authors lose Spark-only SQL functions in dashboards and ad-hoc queries. A future transpiler (e.g. SQLGlot) could widen the writable surface, but it leaks on complex types and UDFs and is not part of this decision.
+- We accept that serving authors lose Spark-only SQL functions in dashboards and ad-hoc queries. A future transpiler (e.g. SQLGlot) could widen the writable surface, but it leaks on complex types and UDFs and is not part of this decision. *(Superseded by ADR-023: the SQLGlot transpiler shipped; a fidelity test against the real dashboards showed the "leaks on complex types" worry did not materialize for serving SQL, so serving authors write full Spark again.)*
 - Athena's column-read of Spark-written Delta tables requires the Glue table to carry `table_type = DELTA`; the runner must stamp it (separate slice). Without it, no serving read works in cloud regardless of dialect.
 
 ### When option C reopens

@@ -1363,13 +1363,13 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         if not prefix.endswith("/"):
             prefix += "/"
 
-        drained = _drain_if_configured(spark, alias, src, bucket, prefix)
-        if drained is not None:
-            return drained
-
-        all_partitions = _list_partition_tree(bucket, prefix, partition_names)
-
+        # Backfill overrides the live read entirely: read the explicit
+        # [from, to] partition window by listing the tree. This must run
+        # BEFORE the notification-drain check — a backfill against a
+        # trigger-enabled source must not short-circuit on an empty drain
+        # queue (the historical window is independent of the live queue).
         if backfill is not None:
+            all_partitions = _list_partition_tree(bucket, prefix, partition_names)
             from_cursor = tuple(backfill.get("from_cursor") or ())
             to_cursor = tuple(backfill.get("to_cursor") or ())
             if not from_cursor or not to_cursor:
@@ -1382,6 +1382,12 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
             print(f"[clavesa] input {alias!r}: backfill reading {len(paths)} partitions ({new_partitions[0][0]} → {new_partitions[-1][0]})", file=sys.stderr)
             df = spark.read.option("basePath", f"s3://{bucket}/{prefix}").parquet(*paths)
             return df, None
+
+        drained = _drain_if_configured(spark, alias, src, bucket, prefix)
+        if drained is not None:
+            return drained
+
+        all_partitions = _list_partition_tree(bucket, prefix, partition_names)
 
         watermark_uri = _watermark_uri(alias)
         cursor = _read_watermark(watermark_uri)
@@ -1900,6 +1906,28 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
         merge_keys = list(event.get("merge_keys") or [])
         force_dedup = event.get("force_dedup", "")
         allow_dupes = bool(event.get("allow_duplicates"))
+
+        # First backfill for this node: no canonical target exists yet (the
+        # diff advertises "first backfill creates target"). There's nothing
+        # to MERGE into or schema-evolve — create the target from staging
+        # the same way the transform path writes a Delta output, then drop
+        # staging. Skips the merge/append branches below.
+        if not spark.catalog.tableExists(target):
+            print(
+                f"[clavesa] backfill_promote: target {target} does not exist; creating it from staging",
+                file=sys.stderr,
+            )
+            spark.table(staging).write.format("delta").mode("overwrite").saveAsTable(target)
+            _sync_glue_table_schema(target, spark.table(target).schema)
+            spark.sql(f"DROP TABLE IF EXISTS {staging}")
+            return {
+                "status": "ok",
+                "operation": op,
+                "target": target,
+                "staging_dropped": staging,
+                "columns_added": [],
+                "created_target": True,
+            }
 
         # Evolve the target schema to absorb any new columns the user added
         # to the transform between the canonical run and the backfill —
@@ -3595,7 +3623,30 @@ def pipeline_handler(event, context):
 
     Stops on first transform failure — downstream transforms would fail
     anyway with missing input tables.
+
+    The Lambda image CMD points here, but single-node payloads — backfill
+    stage (`_backfill`), promote/discard (`_operation`), ad-hoc invokes —
+    carry no `_pipeline_run` bundle. Route them to ``handler`` (the consumer
+    of `_backfill`/`_operation`), mirroring ``run_local``'s dispatch. Without
+    this the bundle loop below sees ``transforms == []`` and returns a no-op
+    ``status: ok`` in ~40ms, never running the staging compute. The single
+    per-pipeline Lambda doesn't bake per-node CLAVESA_NODE / _LANGUAGE /
+    _LOGIC_S3_PATH env (``pipeline_handler`` sets them per transform), so seed
+    them from the backfill payload before delegating; handler() reads them
+    from ``os.environ``. ``_operation`` payloads need none of this — handler()
+    routes them to ``_run_operation`` before any node logic runs.
     """
+    if isinstance(event, dict) and not event.get("_pipeline_run"):
+        bf = event.get("_backfill")
+        if isinstance(bf, dict):
+            if bf.get("node"):
+                os.environ["CLAVESA_NODE"] = str(bf["node"])
+            if event.get("language"):
+                os.environ["CLAVESA_LANGUAGE"] = str(event["language"])
+            if event.get("logic_path"):
+                os.environ["CLAVESA_LOGIC_S3_PATH"] = str(event["logic_path"])
+        return handler(event, context)
+
     transforms = event.get("transforms", []) or []
     # Defensive: the emitter SHOULD already topo-order this list, but a
     # mis-ordered payload (GH #6) would otherwise run a consumer before its
@@ -4049,6 +4100,47 @@ def _parse_sql(sql: str) -> dict:
         return {"ok": False, "error": msg}
 
 
+def _transpile_sql(sql: str) -> dict:
+    """Transpile Spark SQL → Athena/Trino SQL via sqlglot.
+
+    Returns {"ok": True, "trino": "<sql>"} on success or
+    {"ok": False, "error": "<msg>", "line": <int|None>, "col": <int|None>}
+    on failure. Like ``_parse_sql`` this NEVER raises — the HTTP layer
+    forwards the envelope as 200 and the client inspects ``ok``.
+
+    sqlglot is imported lazily so the stdlib-only unit test can stub it
+    via sys.modules (the same trick used for pyspark/boto3). RAISE level
+    is required so genuinely unmappable Spark constructs error out
+    instead of silently emitting wrong SQL.
+    """
+    import sqlglot  # noqa: PLC0415
+
+    try:
+        out = sqlglot.transpile(
+            sql,
+            read="spark",
+            write="athena",
+            unsupported_level=sqlglot.ErrorLevel.RAISE,
+        )
+        return {"ok": True, "trino": out[0]}
+    except sqlglot.errors.ParseError as exc:
+        # ParseError carries a .errors list of dicts with line/col/description
+        # pointing at the offending token in the input Spark SQL.
+        line = None
+        col = None
+        errs = getattr(exc, "errors", None)
+        if errs:
+            first = errs[0]
+            line = first.get("line")
+            col = first.get("col")
+        return {"ok": False, "error": str(exc), "line": line, "col": col}
+    except sqlglot.errors.UnsupportedError as exc:
+        # Valid Spark, but no Athena equivalent — no positional info.
+        return {"ok": False, "error": str(exc), "line": None, "col": None}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "line": None, "col": None}
+
+
 def run_query_server() -> None:
     """CLAVESA_QUERY_SERVER=1 mode — warm Spark Connect server + HTTP query proxy.
 
@@ -4183,6 +4275,78 @@ def run_query_server() -> None:
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
+def run_transpile_server() -> None:
+    """CLAVESA_TRANSPILE_SERVER=1 mode — long-lived, NON-Spark sqlglot transpile server.
+
+    Wired by `clavesa ui` to transpile authored Spark serving-SQL to
+    Athena/Trino for cloud serving. No Spark, no Connect, no pyspark — just
+    a pure-Python HTTP server over sqlglot, so it starts in milliseconds and
+    carries none of the JVM cold-start weight of the query server.
+
+    Routes:
+      GET  /healthz   → 200 once sqlglot is imported (done at startup, so a
+                        200 means the next /transpile won't pay an import).
+      POST /transpile → body: {"sql": "..."}. Returns {"ok": True, "trino":
+                        "..."} or {"ok": False, "error": "...", "line": ...,
+                        "col": ...} (200 either way — client inspects ``ok``,
+                        exactly like /parse). Empty sql → 400.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: PLC0415
+    # Import once at startup so a failed import surfaces immediately and
+    # /healthz only returns 200 once the transpiler is actually loadable.
+    import sqlglot  # noqa: PLC0415, F401
+
+    port = int(os.environ.get("CLAVESA_TRANSPILE_SERVER_PORT", "8770"))
+    print(f"clavesa transpile server listening on :{port}", flush=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/healthz":
+                # sqlglot imported at startup ⇒ ready.
+                self._respond(200, b"ok", content_type="text/plain")
+                return
+            self._respond(404, b"", content_type="text/plain")
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/transpile":
+                self._respond(404, b"", content_type="text/plain")
+                return
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            try:
+                req = json.loads(body) if body else {}
+                sql = (req.get("sql") or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                self._json(400, {"ok": False, "error": f"bad request body: {exc}"})
+                return
+            if not sql:
+                self._json(400, {"ok": False, "error": "empty SQL"})
+                return
+            # _transpile_sql never raises — it returns the {ok,error}
+            # envelope. The HTTP layer forwards it as 200; the client
+            # inspects ``ok`` to distinguish transpile failure from
+            # transport failure.
+            self._json(200, _transpile_sql(sql))
+
+        def _json(self, code: int, payload: dict) -> None:
+            data = json.dumps(payload).encode("utf-8")
+            self._respond(code, data, content_type="application/json")
+
+        def _respond(self, code: int, data: bytes, *, content_type: str) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+
+        def log_message(self, fmt: str, *args) -> None:  # noqa: ARG002
+            # Quiet — match the rest of the runner's stdout discipline.
+            return
+
+    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
 def run_connect_server() -> None:
     """CLAVESA_CONNECT_SERVER=1 mode — Spark Connect server only, no HTTP proxy.
 
@@ -4305,6 +4469,12 @@ elif os.environ.get("CLAVESA_CONNECT_SERVER") == "1":
 elif os.environ.get("CLAVESA_RECORD_RUN") == "1":
     try:
         run_record_run()
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+        sys.exit(1)
+elif os.environ.get("CLAVESA_TRANSPILE_SERVER") == "1":
+    try:
+        run_transpile_server()
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
         sys.exit(1)

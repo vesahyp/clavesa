@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -12,9 +13,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
+	"github.com/vesahyp/clavesa/internal/runner"
+	"github.com/vesahyp/clavesa/internal/version"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -32,12 +37,12 @@ type deployFlow struct {
 	// for `workspace deploy`, equal to a pipeline subdirectory for
 	// `pipeline deploy`.
 	TfDir string
-	// BuildRunnerImage gates `workspace deploy` only — the workspace's
-	// `null_resource.push_runner` retags + pushes the local image, so the
-	// local image must exist and be current before terraform runs. We build
-	// it here (docker decides what work is needed) rather than verifying a
-	// possibly-missing one. Pipeline deploys don't push images (they pin the
-	// Lambda to an ECR digest), so skip there.
+	// BuildRunnerImage gates `workspace deploy` only — it owns the runner
+	// image lifecycle. The local image is rebuilt in preflight (docker
+	// decides what work is needed), and after the apply that creates the ECR
+	// repository the image is pushed to ECR unconditionally (see
+	// pushRunnerImage). Pipeline deploys don't build or push images (they pin
+	// the Lambda to an ECR digest), so both steps skip there.
 	BuildRunnerImage bool
 	// AutoApprove skips the interactive "Apply this plan? [y/N]" prompt.
 	// For scripted / CI use; the prompt is the default safety.
@@ -119,6 +124,19 @@ func (d deployFlow) Run() error {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 
+	// Workspace deploy owns the runner-image lifecycle. The image was rebuilt
+	// in preflight; now (with the ECR repository created by the apply above)
+	// push it. The push is unconditional — no staleness gate — so a rebuild
+	// under an unchanged module version still reaches ECR. ECR's
+	// content-addressed layers dedup, so an unchanged image re-pushes only
+	// metadata. This replaces the version-gated null_resource.push_runner,
+	// which skipped the push whenever runner_version was unchanged.
+	if d.BuildRunnerImage {
+		if err := d.pushRunnerImage(); err != nil {
+			return err
+		}
+	}
+
 	// Success: remove the saved plan. A plan that already applied is
 	// strictly worse than no plan — terraform apply against the same
 	// file again would either no-op or error.
@@ -144,8 +162,8 @@ func (d deployFlow) preflight() error {
 	}
 
 	// Build the local runner image (docker's layer cache decides what work is
-	// needed) so the `null_resource.push_runner` provisioner has a current
-	// `:<version>` tag to push. Cheap when nothing changed.
+	// needed) so a current `:<version>` tag exists for the post-apply push.
+	// Cheap when nothing changed.
 	if _, err := workspace.EnsureLocalRunnerImage(d.WorkspaceRoot); err != nil {
 		return fmt.Errorf("build runner image before deploy: %w", err)
 	}
@@ -179,6 +197,101 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// pushRunnerImage tags the freshly-built local runner image into the
+// workspace ECR repository and pushes it — unconditionally. The local image
+// is rebuilt on every deploy (preflight), so the push mirrors that: always
+// push, let ECR's content-addressed layers decide what actually uploads (an
+// unchanged image re-pushes only metadata). Must run after the apply that
+// creates aws_ecr_repository.runner. Called for workspace deploy only.
+func (d deployFlow) pushRunnerImage() error {
+	fmt.Fprintf(d.stdout(), "\n→ Pushing runner image to ECR…\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	m, err := workspace.Load(d.WorkspaceRoot)
+	if err != nil {
+		return fmt.Errorf("push runner image: load workspace: %w", err)
+	}
+	if m == nil {
+		return fmt.Errorf("push runner image: %s is not a clavesa workspace", d.WorkspaceRoot)
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("push runner image: load AWS config: %w", err)
+	}
+	region := cfg.Region
+	if region == "" {
+		return fmt.Errorf("push runner image: no AWS region configured (set AWS_REGION or a profile region)")
+	}
+	ident, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return fmt.Errorf("push runner image: resolve AWS account: %w", err)
+	}
+
+	registry := fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com", derefStr(ident.Account), region)
+	// Mirrors aws_ecr_repository.runner.name in the workspace main.tf.
+	repoURL := fmt.Sprintf("%s/clavesa-%s/transform-runner", registry, m.Name)
+	// The build (EnsureLocalRunnerImage) always tags the local image with the
+	// binary's version.Module, so that tag is guaranteed present here.
+	localImage := runner.LocalImageName(m.Name) + ":" + version.Module
+
+	if err := dockerLoginECR(ctx, cfg, registry, d.stderr()); err != nil {
+		return fmt.Errorf("push runner image: %w", err)
+	}
+
+	// pipeline deploy pins the Lambda to the :latest digest, so :latest must
+	// always carry the current image; also push the versioned tag for refs.
+	for _, tag := range []string{version.Module, "latest"} {
+		if err := d.docker(ctx, "tag", localImage, repoURL+":"+tag); err != nil {
+			return fmt.Errorf("push runner image: docker tag %s: %w", tag, err)
+		}
+	}
+	for _, tag := range []string{version.Module, "latest"} {
+		if err := d.docker(ctx, "push", repoURL+":"+tag); err != nil {
+			return fmt.Errorf("push runner image: docker push %s: %w", tag, err)
+		}
+	}
+	return nil
+}
+
+func (d deployFlow) docker(ctx context.Context, args ...string) error {
+	c := exec.CommandContext(ctx, "docker", args...)
+	c.Stdout = d.stderr()
+	c.Stderr = d.stderr()
+	return c.Run()
+}
+
+// dockerLoginECR fetches an ECR authorization token via the AWS SDK and runs
+// `docker login --password-stdin`, so the deploy flow needs only the AWS SDK
+// credential chain — not the `aws` CLI the old null_resource.push_runner
+// provisioner shelled out to.
+func dockerLoginECR(ctx context.Context, cfg aws.Config, registry string, errOut io.Writer) error {
+	out, err := ecr.NewFromConfig(cfg).GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
+	if err != nil {
+		return fmt.Errorf("ECR authorization: %w", err)
+	}
+	if len(out.AuthorizationData) == 0 || out.AuthorizationData[0].AuthorizationToken == nil {
+		return fmt.Errorf("ECR authorization: empty token")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*out.AuthorizationData[0].AuthorizationToken)
+	if err != nil {
+		return fmt.Errorf("decode ECR token: %w", err)
+	}
+	creds := strings.SplitN(string(decoded), ":", 2)
+	if len(creds) != 2 {
+		return fmt.Errorf("malformed ECR token")
+	}
+	c := exec.CommandContext(ctx, "docker", "login", "--username", "AWS", "--password-stdin", registry)
+	c.Stdin = strings.NewReader(creds[1])
+	c.Stdout = errOut
+	c.Stderr = errOut
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("docker login to %s: %w", registry, err)
+	}
+	return nil
 }
 
 func (d deployFlow) tf(args ...string) error {

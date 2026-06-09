@@ -31,9 +31,9 @@ func TestNodeIOFromDefinition(t *testing.T) {
 	          "_pipeline_run": true,
 	          "pipeline": "web-traffic",
 	          "transforms": [
-	            {"node":"cloudfront_raw","language":"sql","inputs":{"src":"sources.cf"},"outputs":{"default":"clavesa_wt__bronze.cloudfront_raw"},"parents":[]},
-	            {"node":"sessions","language":"python","inputs":{"cloudfront_raw":"clavesa_wt__bronze.cloudfront_raw"},"outputs":{"default":"clavesa_wt__silver.sessions"},"parents":["cloudfront_raw"]},
-	            {"node":"daily_rollup","language":"sql","inputs":{"sessions":"clavesa_wt__silver.sessions"},"outputs":{"default":"clavesa_wt__gold.daily_rollup"},"parents":["sessions"]}
+	            {"node":"cloudfront_raw","language":"sql","logic_path":"s3://wt-clavesa/web-traffic/cloudfront_raw/logic.sql","inputs":{"src":"sources.cf"},"outputs":{"default":"clavesa_wt__bronze.cloudfront_raw"},"parents":[]},
+	            {"node":"sessions","language":"python","logic_path":"s3://wt-clavesa/web-traffic/sessions/logic.py","inputs":{"cloudfront_raw":"clavesa_wt__bronze.cloudfront_raw"},"outputs":{"default":"clavesa_wt__silver.sessions"},"parents":["cloudfront_raw"]},
+	            {"node":"daily_rollup","language":"sql","logic_path":"s3://wt-clavesa/web-traffic/daily_rollup/logic.sql","inputs":{"sessions":"clavesa_wt__silver.sessions"},"outputs":{"default":"clavesa_wt__gold.daily_rollup"},"parents":["sessions"]}
 	          ],
 	          "_sf_execution_arn.$": "$$.Execution.Id"
 	        }
@@ -54,7 +54,7 @@ func TestNodeIOFromDefinition(t *testing.T) {
 	    },
 	    "sessions": {
 	      "Type": "Task",
-	      "Parameters": {"Payload": {"inputs":{"cloudfront_raw":"clavesa_wt__bronze.cloudfront_raw"},"outputs":{"default":"clavesa_wt__silver.sessions"}}},
+	      "Parameters": {"Payload": {"language":"python","logic_path":"s3://wt-clavesa/web-traffic/sessions/logic.py","inputs":{"cloudfront_raw":"clavesa_wt__bronze.cloudfront_raw"},"outputs":{"default":"clavesa_wt__silver.sessions"}}},
 	      "End": true
 	    }
 	  }
@@ -75,34 +75,42 @@ func TestNodeIOFromDefinition(t *testing.T) {
 	}`
 
 	cases := []struct {
-		name        string
-		def         string
-		node        string
-		wantInputs  map[string]any
-		wantOutputs map[string]any
-		wantErr     string // substring; "" means no error
+		name          string
+		def           string
+		node          string
+		wantInputs    map[string]any
+		wantOutputs   map[string]any
+		wantLanguage  string
+		wantLogicPath string
+		wantErr       string // substring; "" means no error
 	}{
 		{
-			name:        "new shape, first transform",
-			def:         newShape,
-			node:        "cloudfront_raw",
-			wantInputs:  map[string]any{"src": "sources.cf"},
-			wantOutputs: map[string]any{"default": "clavesa_wt__bronze.cloudfront_raw"},
+			name:          "new shape, first transform",
+			def:           newShape,
+			node:          "cloudfront_raw",
+			wantInputs:    map[string]any{"src": "sources.cf"},
+			wantOutputs:   map[string]any{"default": "clavesa_wt__bronze.cloudfront_raw"},
+			wantLanguage:  "sql",
+			wantLogicPath: "s3://wt-clavesa/web-traffic/cloudfront_raw/logic.sql",
 		},
 		{
 			// The symptom node from the bug report — proves the fix end to end.
-			name:        "new shape, middle transform (not index 0)",
-			def:         newShape,
-			node:        "sessions",
-			wantInputs:  map[string]any{"cloudfront_raw": "clavesa_wt__bronze.cloudfront_raw"},
-			wantOutputs: map[string]any{"default": "clavesa_wt__silver.sessions"},
+			name:          "new shape, middle transform (not index 0)",
+			def:           newShape,
+			node:          "sessions",
+			wantInputs:    map[string]any{"cloudfront_raw": "clavesa_wt__bronze.cloudfront_raw"},
+			wantOutputs:   map[string]any{"default": "clavesa_wt__silver.sessions"},
+			wantLanguage:  "python",
+			wantLogicPath: "s3://wt-clavesa/web-traffic/sessions/logic.py",
 		},
 		{
-			name:        "new shape, last transform",
-			def:         newShape,
-			node:        "daily_rollup",
-			wantInputs:  map[string]any{"sessions": "clavesa_wt__silver.sessions"},
-			wantOutputs: map[string]any{"default": "clavesa_wt__gold.daily_rollup"},
+			name:          "new shape, last transform",
+			def:           newShape,
+			node:          "daily_rollup",
+			wantInputs:    map[string]any{"sessions": "clavesa_wt__silver.sessions"},
+			wantOutputs:   map[string]any{"default": "clavesa_wt__gold.daily_rollup"},
+			wantLanguage:  "sql",
+			wantLogicPath: "s3://wt-clavesa/web-traffic/daily_rollup/logic.sql",
 		},
 		{
 			name:    "new shape, node absent",
@@ -111,18 +119,24 @@ func TestNodeIOFromDefinition(t *testing.T) {
 			wantErr: `node "no_such_node" not found`,
 		},
 		{
-			name:        "legacy shape, top-level node",
-			def:         legacyShape,
-			node:        "sessions",
-			wantInputs:  map[string]any{"cloudfront_raw": "clavesa_wt__bronze.cloudfront_raw"},
-			wantOutputs: map[string]any{"default": "clavesa_wt__silver.sessions"},
+			name:          "legacy shape, top-level node",
+			def:           legacyShape,
+			node:          "sessions",
+			wantInputs:    map[string]any{"cloudfront_raw": "clavesa_wt__bronze.cloudfront_raw"},
+			wantOutputs:   map[string]any{"default": "clavesa_wt__silver.sessions"},
+			wantLanguage:  "python",
+			wantLogicPath: "s3://wt-clavesa/web-traffic/sessions/logic.py",
 		},
 		{
-			name:        "legacy shape, parallel-branch node",
-			def:         legacyParallel,
-			node:        "branch_a",
-			wantInputs:  map[string]any{"x": "db.x"},
-			wantOutputs: map[string]any{"default": "db.branch_a"},
+			// Legacy parallel branch carries no language/logic_path — the
+			// extractor tolerates the absence and returns empty strings.
+			name:          "legacy shape, parallel-branch node",
+			def:           legacyParallel,
+			node:          "branch_a",
+			wantInputs:    map[string]any{"x": "db.x"},
+			wantOutputs:   map[string]any{"default": "db.branch_a"},
+			wantLanguage:  "",
+			wantLogicPath: "",
 		},
 		{
 			name:    "malformed definition",
@@ -140,7 +154,7 @@ func TestNodeIOFromDefinition(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			in, out, err := nodeIOFromDefinition(c.def, c.node)
+			in, out, language, logicPath, err := nodeIOFromDefinition(c.def, c.node)
 			if c.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 					t.Fatalf("err = %v, want substring %q", err, c.wantErr)
@@ -155,6 +169,12 @@ func TestNodeIOFromDefinition(t *testing.T) {
 			}
 			if !reflect.DeepEqual(out, any(c.wantOutputs)) {
 				t.Errorf("outputs = %#v, want %#v", out, c.wantOutputs)
+			}
+			if language != c.wantLanguage {
+				t.Errorf("language = %q, want %q", language, c.wantLanguage)
+			}
+			if logicPath != c.wantLogicPath {
+				t.Errorf("logic_path = %q, want %q", logicPath, c.wantLogicPath)
 			}
 		})
 	}

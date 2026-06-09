@@ -853,11 +853,9 @@ func emitUpstreamTriggers(b *strings.Builder, p Pipeline) {
 	}
 
 	// data sources for account + region — built once even with multiple
-	// producers. `data.aws_caller_identity.current` and
-	// `data.aws_region.current` already exist at workspace level in the
-	// generated workspace main.tf, but emitting them again here is a
-	// no-op (Terraform deduplicates by address); cheaper than threading
-	// the workspace declarations through.
+	// producers. Declared with a pipeline-local name (`clavesa_upstream`) so
+	// they're self-contained in this pipeline's orchestration.tf and don't
+	// rely on any workspace-root declarations.
 	fmt.Fprintf(b, "# Cross-pipeline auto-trigger — one EventBridge rule per upstream\n")
 	fmt.Fprintf(b, "# producer pipeline (derived from `external_inputs` references at\n")
 	fmt.Fprintf(b, "# sync time). Each rule starts this pipeline's state machine when\n")

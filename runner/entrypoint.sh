@@ -1,5 +1,5 @@
 #!/bin/sh
-# Eight modes:
+# Nine modes:
 #   CLAVESA_METASTORE_SERVER=1 — long-lived Derby Network Server. Owns
 #                                 $CLAVESA_WAREHOUSE/_metastore/metastore_db and serves it over JDBC
 #                                 on port 1527 so the warm query worker and on-demand pipeline-run
@@ -20,8 +20,12 @@
 #                                 testing via `docker run -e CLAVESA_CONNECT_SERVER=1 ...`.
 #   CLAVESA_RECORD_RUN=1     — local pipeline-rollup path; reads one runs-table row from stdin, appends to <pipeline>.runs.
 #                                 Driven by service.RunPipeline at end-of-run; the local twin of the cloud runs_writer Lambda.
+#   CLAVESA_TRANSPILE_SERVER=1 — long-lived, NON-Spark sqlglot transpile server. Serves GET /healthz +
+#                                 POST /transpile on CLAVESA_TRANSPILE_SERVER_PORT (default 8770). Wired by
+#                                 `clavesa ui` to transpile authored Spark serving-SQL to Athena/Trino for
+#                                 cloud serving. No Spark/Connect/pyspark — pure-Python, starts in ms.
 #   default                     — Lambda runtime; hand off to the standard bootstrap.
-if [ "$CLAVESA_METASTORE_SERVER" = "1" ] || [ "$CLAVESA_PREVIEW" = "1" ] || [ "$CLAVESA_RUN" = "1" ] || [ "$CLAVESA_QUERY" = "1" ] || [ "$CLAVESA_QUERY_SERVER" = "1" ] || [ "$CLAVESA_CONNECT_SERVER" = "1" ] || [ "$CLAVESA_RECORD_RUN" = "1" ]; then
+if [ "$CLAVESA_METASTORE_SERVER" = "1" ] || [ "$CLAVESA_PREVIEW" = "1" ] || [ "$CLAVESA_RUN" = "1" ] || [ "$CLAVESA_QUERY" = "1" ] || [ "$CLAVESA_QUERY_SERVER" = "1" ] || [ "$CLAVESA_CONNECT_SERVER" = "1" ] || [ "$CLAVESA_RECORD_RUN" = "1" ] || [ "$CLAVESA_TRANSPILE_SERVER" = "1" ]; then
     exec python /var/task/runner.py
 else
     exec /lambda-entrypoint.sh "$@"
