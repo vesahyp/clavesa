@@ -80,50 +80,42 @@ brew install mise && mise install && make build
 
 ### Local-only: laptop to working dashboard, no AWS
 
-Two terminal commands to get the UI up; everything after that is point-and-click. The CLI alternative for the same flow is shown below. Both surfaces write the same `.tf`, so you can mix and match.
+Two terminal commands get the UI up; everything after that is point-and-click. (Prefer the terminal? See the CLI pointer below.)
 
 ```bash
-# From a checkout of this repo:
-make build                         # produces ./bin/clavesa with embedded UI
-
 # Pick a workspace dir (any path you like).
 WS=/tmp/clavesa-demo
 mkdir -p $WS
 
-# 1. Init the workspace. Builds the runner Docker image; docker's layer
-#    cache makes the rebuild a fast no-op when nothing changed.
-#    `init` also records this dir as your active workspace, so the UI
-#    (and any later CLI calls) pick it up without --workspace.
-bin/clavesa workspace init demo-ws --workspace $WS
+# 1. Init the workspace. Builds the runner Docker image (docker's layer
+#    cache makes a no-change rebuild fast), and records this dir as your
+#    active workspace so the UI picks it up without --workspace.
+clavesa workspace init demo-ws --workspace $WS
 
 # 2. Start the UI. Browser opens to the Catalog at http://localhost:8080/,
-#    which renders a 3-step welcome card on an empty workspace.
-bin/clavesa ui
+#    which shows a 3-step welcome card on an empty workspace.
+clavesa ui
 ```
 
 Now drive the rest from the browser:
 
-1. **Register a source.** Click **Manage sources** on the Catalog welcome card (or **Sources** in the nav). Click **Register source**. Type `src_trips` as the name, paste this URL, click **Register**:
+1. **Register a source.** Click **Manage sources** on the Catalog welcome card (or **Sources** in the nav), then **Register source**. Name it `src_trips`, paste this URL, click **Register**:
 
    ```
    https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
    ```
 
-   That's NYC TLC Yellow Taxi trips for Jan 2024 (~50 MB / ~3M rows, CloudFront-cached, no auth). The runner fetches it at execution time. Nothing is staged.
+   NYC TLC Yellow Taxi trips for Jan 2024 (~50 MB / ~3M rows, CloudFront-cached, no auth). The runner fetches it at execution time; nothing is staged.
 
-2. **Create a pipeline.** Back on the Catalog welcome card click **Create a pipeline** (or **Pipelines** in the nav → **New pipeline**). Name it `demo`. Clavesa lands you in the editor for the new pipeline.
+2. **Create a pipeline.** On the welcome card click **Create a pipeline** (or **Pipelines** → **New pipeline**). Name it `demo`. Clavesa drops you in the editor.
 
-3. **Add the raw landing transform.** In the left palette, type `trips` into the **Node name** field, then click **+ SQL Transform**. Click the new transform to select it, scroll to the **Output** section in the right config panel, and tick **Compute column stats** — that opts this table's outputs into a per-column profile (null %, distinct count, top values, min/max, p50/p95) that renders on its catalog page.
-
-4. **Wire and write the landing SQL.** In the right panel, **Inputs** → **Add**. The **Source** dropdown is pre-populated with `src_trips`; alias defaults to `src_trips`. Click **Attach**. Paste this in the SQL editor below and click **Save**:
+3. **Build the landing transform.** Type `trips` into **Node name**, click **+ SQL Transform**, select it. In the right panel tick **Compute column stats** under **Output** (this opts the table into a per-column profile on its catalog page). Then **Inputs** → **Add**: the **Source** dropdown is pre-filled with `src_trips`, click **Attach**. Paste the SQL and **Save**:
 
    ```sql
    SELECT * FROM src_trips
    ```
 
-   The `trips` transform passes the full NYC TLC schema through to its own Delta table — that's what gives the column profile something interesting to show.
-
-5. **Add the aggregation transform.** Back in the palette, type `revenue_by_payment` → **+ SQL Transform**. Select it, **Inputs** → **Add**, wire `trips` (alias `trips`), **Attach**. Paste and **Save**:
+4. **Build the aggregation transform.** Type `revenue_by_payment` → **+ SQL Transform**. Select it, **Inputs** → **Add**, wire `trips`, **Attach**. Paste and **Save**:
 
    ```sql
    SELECT
@@ -136,71 +128,43 @@ Now drive the rest from the browser:
    ORDER BY revenue DESC
    ```
 
-6. **Run it.** Click the `demo` breadcrumb in the editor header to open the pipeline dashboard, then click **Run pipeline**. ~30–60s end-to-end including Spark cold start. When the run finishes the page auto-navigates to the run detail view, where the DAG shows both transforms marked **ok** and the per-node breakdown is populated.
+5. **Run it.** Click the `demo` breadcrumb to open the pipeline dashboard, then **Run pipeline**. Roughly 30-60s end to end including Spark cold start. The page navigates to the run detail when it finishes: the DAG shows both transforms **ok**, with a per-node breakdown.
 
-7. **Browse the result.** Click **Catalog** in the nav. Two new Delta tables show up under your `demo` pipeline — open `trips` first: schema + sample rows + the **Column profile** card with one row per column showing null %, distinct count (a handful for `payment_type`, millions for `tpep_pickup_datetime`), top-K bars where the cardinality is low, and p50/p95 for numeric columns like `fare_amount` and `total_amount`. Then `revenue_by_payment` for the aggregated view (no column profile here — that transform didn't opt in). Run the pipeline two more times (back to the dashboard, **Run pipeline**) to get more than one data point on the seeded `/dashboards/pipeline-runs-demo` duration chart.
+   ![Per-execution run detail with DAG, triage strip, and per-node breakdown](docs/images/run-detail.png)
 
-#### Or: drive everything from the CLI
+   Run it twice more (back to the dashboard, **Run pipeline**) so the seeded `/dashboards/pipeline-runs-demo` duration chart has more than one point:
 
-Same pipeline, terminal-only. CLI and UI write the same `.tf` (per [ADR-015](docs/decisions/015-cli-ui-parity.md)). Pick whichever surface you prefer, or use both:
+   ![Pipeline runs dashboard for the demo pipeline, five widgets driven by the seeded JSON and populated by three local runs](docs/images/dashboard.png)
 
-```bash
-# After steps 1-2 above (workspace init + ui), in another terminal:
+6. **Browse the result.** Click **Catalog**. Two new Delta tables sit under your `demo` pipeline. Open `trips`: schema, sample rows of real trip data, a snapshot timeline (one commit per run), lineage, and the **Column profile** card with null %, distinct count (a handful for `payment_type`, millions for `tpep_pickup_datetime`), top-K bars, and p50/p95 for numerics like `fare_amount`. `revenue_by_payment` has the same pages without the profile, since that transform didn't opt in.
 
-# Register the same source.
-bin/clavesa source register src_trips \
-  --from https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
+   ![Per-table view of revenue_by_payment showing schema, sample rows, snapshot history, and lineage](docs/images/table-detail.png)
 
-# Create the pipeline.
-bin/clavesa pipeline create demo
+> **Prefer the terminal?** Every step above has a `clavesa` command, and CLI and UI write the same `.tf` ([ADR-015](docs/decisions/015-cli-ui-parity.md)), so you can mix the two. The full terminal-only walkthrough lives in the [cookbook](docs/cookbook/README.md).
 
-# Raw landing transform — full schema passthrough, with the per-column
-# profile turned on so the catalog page shows null %, distinct, top
-# values, percentiles.
-bin/clavesa node add demo --type transform --name trips
-bin/clavesa source attach demo src_trips --to trips --as src_trips
-bin/clavesa node edit demo trips \
-  --set "sql=SELECT * FROM src_trips" \
-  --output-stats
+### Build a dashboard from the demo data
 
-# Aggregation transform reading from trips.
-bin/clavesa node add demo --type transform --name revenue_by_payment
-bin/clavesa node connect demo --from trips --to revenue_by_payment
-bin/clavesa node edit demo revenue_by_payment \
-  --set "sql=SELECT payment_type, COUNT(*) AS trips, ROUND(SUM(total_amount), 2) AS revenue, ROUND(AVG(tip_amount / NULLIF(fare_amount, 0)) * 100, 1) AS avg_tip_pct FROM trips GROUP BY payment_type ORDER BY revenue DESC"
+Dashboards live in the `dashboards` system Delta table, in the same catalog as your data and shared with everyone who has workspace access. From `/dashboards` click **New dashboard**, name it, and pick **Blank** to start.
 
-# Run.
-bin/clavesa pipeline run demo
+Chart the `revenue_by_payment` table you just built. Click **Add widget** → **Bar chart**. In the widget panel, leave it on **Inline query**, choose the `demo` pipeline, and click `revenue_by_payment` in the **Tables** browser to drop its identifier into the editor:
+
+```sql
+SELECT payment_type, revenue FROM clavesa_demo_ws__demo.revenue_by_payment ORDER BY revenue DESC
 ```
 
-Working in multiple terminals or switching between workspaces? Use either:
+The query auto-runs on the Spark runner; when the result preview fills in, set the **X field** to `payment_type` and the **Y field** to `revenue`. **Save**, then drag or resize the widget on the grid. That's a working revenue-by-payment-type chart off the pipeline you ran a minute ago.
 
-```bash
-export CLAVESA_WORKSPACE=$WS    # per-shell override
-bin/clavesa workspace use $WS   # switch the recorded active workspace
-```
+![Dashboard editor: a bar widget with its inline SQL query, the Tables browser that inserts table identifiers, and the live result preview](docs/images/dashboard-editor.png)
 
-Here's what you'll see in the UI once the pipeline has run. The Catalog (top of this README) is the landing page. The seeded `/dashboards/pipeline-runs-demo` is populated by the runs. Re-run the pipeline a couple more times to get more than one data point in the duration line chart:
+A widget's inline query can be promoted to a **shared dataset** for reuse across widgets, and **Controls** add dashboard-level filters (a time-range picker or a select), referenced from SQL as `{{name}}` (or `{{name.start}}` / `{{name.end}}` for a range) and round-tripped through URL params so a filtered view is shareable. Eight widget types are available: big number, line, bar, stacked bar, bar + line, pie, donut, table. One dashboard can blend tables from several pipelines and mix local with cloud, since each widget picks its own pipeline.
 
-![Pipeline runs dashboard for the demo pipeline with five widgets driven by the seeded JSON, populated by three local runs](docs/images/dashboard.png)
+Widget SQL is plain Spark SQL, the same dialect you write for transforms, and addresses tables by their `<catalog>__<schema>.<table>` identifier (the Tables browser inserts it for you). On a local pipeline it runs on the Spark runner; on a cloud pipeline clavesa transpiles it to Athena/Trino, so one spec serves both (ADR-023). The CLI authors the same dashboards: `clavesa dashboards apply <file>.json`, with `list` / `show` / `render` / `delete` rounding out the surface (ADR-015 parity).
 
-The two output tables (`trips` and `revenue_by_payment`) live at `/tables/<catalog>/<schema>/<table>`. Each page shows schema, sample rows of real NYC TLC trip data, commit timeline (one commit per run), and a lineage panel showing upstream sources and transforms. `trips` also renders the per-column profile card — null %, distinct count, top-K bars, percentiles for numerics — because the transform opted in via the **Compute column stats** checkbox. Clicking any run row in the pipeline dashboard opens the per-execution view with the DAG colored by per-node status and a per-node breakdown.
+### Deploy to AWS in one command
 
-### Author your own dashboard
+Everything above runs locally. When you want it in the cloud, `clavesa deploy` applies the workspace infra (its own S3 bucket, ECR repo, runner image push, system catalog) and every pipeline in it, in one pass. Nothing is centrally hosted; nothing leaves your account.
 
-Dashboards live in the `dashboards` system Delta table, shared with everyone who has workspace access, in the same catalog as your data. From `/dashboards` click **New dashboard** to open the editor.
-
-The editor splits authoring into three tabs. Under **Datasets**, add one or more named SQL queries; each query picks its own pipeline, so one dashboard can blend tables from several pipelines and mix local with cloud. A catalog browser sits beside the SQL editor: click a table or column to insert its identifier, then hit **Run** for an inline preview of the result before saving. Under **Controls**, add dashboard-level filters — a time-range picker or a select dropdown — referenced from dataset SQL as `{{name}}` (or `{{name.start}}` / `{{name.end}}` for a time range); the rendered dashboard surfaces the controls in a strip above the grid and round-trips selections through URL search params so a filtered view is shareable. Under **Widgets**, **Add widget** opens a type picker with eight types (big number, line, bar, stacked bar, bar + line, pie, donut, table); each widget binds to a dataset and picks its fields from that dataset's actual result columns. Drag a widget on the layout grid to move it, or drag its corner to resize. **Save** writes the whole dashboard back to the system table.
-
-![Dashboard editor — the Datasets tab, with a SQL query, the catalog browser listing the pipeline's tables and columns, and a Run button for an inline preview](docs/images/dashboard-editor.png)
-
-Dataset SQL is plain Spark SQL, the same dialect you write for transforms. On a local pipeline it runs on the Spark runner; on a cloud pipeline clavesa transpiles it to Athena/Trino for you, so one dashboard spec serves both without a second dialect to learn (ADR-023). A dashboard is just a spec of datasets and widgets, so the CLI authors the same thing: `clavesa dashboards apply <file>.json` writes one from a file, with `list` / `show` / `render` / `delete` rounding out the surface (ADR-015 parity).
-
-### Deploy to AWS
-
-Each workspace's `main.tf` creates its own S3 bucket and ECR repo and pushes the runner image. Nothing centrally hosted; nothing leaves your account.
-
-**Lake Formation-enabled accounts** (default on AWS accounts created after Aug 2023): the deploying principal must be a Lake Formation `DataLakeAdmin` before the first `workspace deploy`, otherwise the per-pipeline Glue database grants will fail to apply. One-time setup per account:
+**Lake Formation-enabled accounts** (default on AWS accounts created after Aug 2023): the deploying principal must be a Lake Formation `DataLakeAdmin` before the first deploy, otherwise the per-pipeline Glue database grants will fail to apply. One-time setup per account:
 
 ```bash
 ACCT=$(aws sts get-caller-identity --query Account --output text)
@@ -212,35 +176,12 @@ aws lakeformation put-data-lake-settings --data-lake-settings \
 If `aws lakeformation get-data-lake-settings` shows `CreateDatabaseDefaultPermissions: []`, your account is LF-gated and the step above is required. Older accounts (`IAMAllowedPrincipals` in the default permissions) inherit the IAM-only path and don't need it.
 
 ```bash
-# Deploy the workspace (S3 bucket, ECR repo, runner image push, system catalog).
-AWS_PROFILE=my-account bin/clavesa workspace deploy --workspace $WS
-
-# Deploy the pipeline (transform Lambda, Step Functions, IAM).
-AWS_PROFILE=my-account bin/clavesa pipeline deploy demo --workspace $WS
-
-# Trigger a cloud execution. `pipeline run` dispatches by the workspace
-# environment mode (default "local"); --env cloud overrides it for this
-# run and starts the deployed Step Functions execution.
-AWS_PROFILE=my-account bin/clavesa pipeline run demo --env cloud --workspace $WS
+AWS_PROFILE=my-account clavesa deploy --workspace $WS
 ```
 
-To operate against the cloud deployment by default — so `pipeline run`, the dashboards, and the catalog all read the deployed pipeline without a per-command flag — switch the workspace into cloud mode: `clavesa workspace use --env cloud`. Switch back with `--env local`. The mode is per-workspace and gitignored.
+`clavesa plan` is the no-apply dry run. Both wrap `terraform init -upgrade → plan -out=tfplan → apply tfplan` behind an AWS credential preflight, applying the workspace first (pipelines read its remote state) and then each pipeline. Re-running is a cheap no-op: terraform and the ECR digest decide what actually changed, so there's nothing to track by hand. The saved plan pauses for a `yes` per target; pass `--yes` for non-interactive runs. Tear down with `clavesa pipeline destroy <pipeline>` (sweeps runtime-created Glue tables first) then `clavesa workspace destroy`. (`clavesa workspace deploy` and `clavesa pipeline deploy <name>` still exist for deploying one target at a time.)
 
-Both deploy commands wrap `terraform init -upgrade → plan -out=tfplan → apply tfplan` with a preflight that checks AWS credentials (via `sts:GetCallerIdentity`) and — for `workspace deploy` — verifies the local runner image matches the embedded sources before pushing. The saved plan pauses for a `yes` confirmation by default; pass `--yes` for non-interactive runs and `--plan-only` to stop after `plan`. Tear down with `clavesa pipeline destroy <pipeline>` (sweeps runtime-created Glue tables first) then `clavesa workspace destroy`.
-
-The pipeline's run history shows up in the same `/dashboards` UI. Response shapes are identical; widgets are interchangeable between cloud and local.
-
----
-
-## Screenshots
-
-**Browse any table in the catalog.** Schema, sample rows, commit history, and a lineage panel for every Delta table the workspace produces. Athena pulls sample rows in the cloud and PySpark pulls them locally, against identical SQL.
-
-![Per-table view of revenue_by_payment showing schema, sample rows, snapshot history, and lineage](docs/images/table-detail.png)
-
-**Triage any run.** DAG colored by per-node status, module version and runner image digest, per-node row counts and durations, and inline log excerpts when a step fails.
-
-![Per-execution run detail with DAG, triage strip, and per-node breakdown](docs/images/run-detail.png)
+**Operate.** A deployed pipeline doesn't run on its own. Trigger it with `clavesa pipeline run demo --env cloud`, or switch the whole workspace to cloud mode so `pipeline run`, the dashboards, and the catalog all read the deployment without a per-command flag: `clavesa workspace use --env cloud` (back with `--env local`). Scheduling is opt-in by design, not a default, since a schedule spends money you didn't ask to spend: set `trigger_schedule` on a pipeline to run it on a fixed interval. The cloud run history, tables, and dashboards all render in the same UI against identical response shapes (ADR-014), so widgets are interchangeable between cloud and local.
 
 ---
 

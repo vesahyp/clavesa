@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -55,6 +56,7 @@ Examples:
 		newPipelinePlanCmd(),
 		newPipelineDeployCmd(),
 		newPipelineDestroyCmd(),
+		newPipelineResetCmd(),
 		newPipelineRunCmd(),
 		newPipelineStatusCmd(),
 		newPipelineRightsizeCmd(),
@@ -453,6 +455,127 @@ still echoed to stderr before any AWS calls.
 	cmd.Flags().BoolVar(&skipSweep, "skip-sweep", false, "skip the Glue-table sweep preflight")
 	cmd.Flags().StringVar(&glueDB, "glue-db", "", "explicit Glue DB to sweep (default: <catalog>__sanitize(<pipeline>))")
 	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive confirmation prompt")
+	return cmd
+}
+
+func newPipelineResetCmd() *cobra.Command {
+	var node string
+	var includeWatermarks bool
+	var autoApprove bool
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "reset [pipeline-dir]",
+		Short: "Drop a pipeline's output tables and watermarks so the next run rebuilds from scratch",
+		Long: `Drop the canonical output tables of a pipeline's transforms — and by
+default the CDF watermarks feeding them — so the next run rebuilds
+everything from source. Reset is a data operation: it never touches the
+deployed Lambda / Step Functions / IAM stack — tearing that down is
+` + "`pipeline destroy`" + `.
+
+--include-watermarks defaults to true on purpose: for a CDF consumer,
+dropping the table but keeping the watermark leaves the table empty on
+the next run, because CDF reads only the not-yet-consumed range and
+that range is empty after a drop. Clearing the watermark replays
+upstream history from version 0, which is exactly the rebuild a reset
+is for. Pass --include-watermarks=false to keep the cursors and drop
+data only (rare).
+
+In local mode this deletes warehouse table directories and watermark
+files; in cloud mode it deletes the S3 warehouse prefixes, the Glue
+catalog entries, and the S3 watermark objects.
+
+` + pipelineDirHelp,
+		Args: cobra.RangeArgs(0, 1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if jsonOut && !autoApprove {
+				return fmt.Errorf("--json implies non-interactive use; pass --yes to confirm")
+			}
+			dir, _, ws, err := resolvePipelineDir(cmd, args, 0)
+			if err != nil {
+				return err
+			}
+			svc, _, err := newService(cmd)
+			if err != nil {
+				return err
+			}
+			req := service.PipelineResetRequest{
+				Dir:               dir,
+				Node:              node,
+				IncludeWatermarks: includeWatermarks,
+			}
+			plan, err := svc.PipelineResetPlan(cmd.Context(), req)
+			if err != nil {
+				return err
+			}
+			if len(plan.TablesDropped) == 0 && len(plan.WatermarksCleared) == 0 {
+				if jsonOut {
+					return printJSON(os.Stdout, plan)
+				}
+				fmt.Println("(nothing to reset)")
+				return nil
+			}
+			if !jsonOut {
+				printTargetContext("reset "+filepath.Base(dir), ws, workspace.Mode(plan.Mode))
+				fmt.Printf("\nWill drop %d output table(s):\n", len(plan.TablesDropped))
+				for _, t := range plan.TablesDropped {
+					fmt.Printf("  - %s  (%s)\n", t.Table, t.Location)
+				}
+				if len(plan.WatermarksCleared) > 0 {
+					fmt.Printf("\nWill clear %d watermark(s):\n", len(plan.WatermarksCleared))
+					for _, w := range plan.WatermarksCleared {
+						fmt.Printf("  - %s ← %s  (%s)\n", w.Consumer, w.Alias, w.Path)
+					}
+				}
+				if !autoApprove {
+					fmt.Printf("\nType 'yes' to drop these %d table(s) and %d watermark(s) (infra stays): ",
+						len(plan.TablesDropped), len(plan.WatermarksCleared))
+					r := bufio.NewReader(os.Stdin)
+					line, _ := r.ReadString('\n')
+					if strings.TrimSpace(line) != "yes" {
+						return fmt.Errorf("pipeline reset cancelled")
+					}
+				}
+			}
+			res, err := svc.PipelineReset(cmd.Context(), req)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(os.Stdout, res)
+			}
+			// The receipt lists only what actually existed and was deleted;
+			// echo planned-but-absent entries too so the gap between the
+			// confirmation list and the receipt is never a mystery.
+			droppedTables := map[string]bool{}
+			for _, t := range res.TablesDropped {
+				droppedTables[t.Table] = true
+			}
+			for _, t := range plan.TablesDropped {
+				if droppedTables[t.Table] {
+					fmt.Printf("  ✓ dropped %s\n", t.Table)
+				} else {
+					fmt.Printf("  - %s (did not exist; skipped)\n", t.Table)
+				}
+			}
+			clearedWMs := map[string]bool{}
+			for _, w := range res.WatermarksCleared {
+				clearedWMs[w.Consumer+"__"+w.Alias] = true
+			}
+			for _, w := range plan.WatermarksCleared {
+				name := w.Consumer + "__" + w.Alias
+				if clearedWMs[name] {
+					fmt.Printf("  ✓ cleared watermark %s\n", name)
+				} else {
+					fmt.Printf("  - %s (did not exist; skipped)\n", name)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&node, "node", "", "reset only this node's output (default: all transform nodes)")
+	cmd.Flags().BoolVar(&includeWatermarks, "include-watermarks", true, "clear CDF watermark state so the next run replays upstream history from version 0")
+	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive confirmation prompt")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable output (requires --yes)")
 	return cmd
 }
 

@@ -516,7 +516,7 @@ func splitCatalogSchema(database string) (catalog, schema string, ok bool) {
 	return database[:idx], database[idx+2:], true
 }
 
-// resolveLocalTablePath returns the on-disk path for a Delta table under
+// ResolveLocalTablePath returns the on-disk path for a Delta table under
 // the workspace's local warehouse. Probes three layouts in order:
 //
 //  1. ADR-019 V2 (Slice 4): “<warehouse>/<catalog>/<schema>/<table>/“
@@ -525,7 +525,9 @@ func splitCatalogSchema(database string) (catalog, schema string, ok bool) {
 //
 // Returns the V2 layout path when none of the probes find a
 // “_delta_log/“ so downstream errors point at the canonical location.
-func resolveLocalTablePath(warehouse, database, table string) string {
+// Exported for the service layer (pipeline reset resolves the same
+// layout question when computing what a drop will delete).
+func ResolveLocalTablePath(warehouse, database, table string) string {
 	if catalog, schema, ok := splitCatalogSchema(database); ok {
 		v2 := filepath.Join(warehouse, catalog, schema, table)
 		if _, err := os.Stat(filepath.Join(v2, "_delta_log")); err == nil {
@@ -560,7 +562,7 @@ func resolveLocalTablePath(warehouse, database, table string) string {
 }
 
 // resolveLocalTableName picks the on-disk table-name variant for SQL.
-// Same back-compat rule as resolveLocalTablePath: prefer the asked name,
+// Same back-compat rule as ResolveLocalTablePath: prefer the asked name,
 // fall back to `<asked>__default` when only the legacy directory exists.
 // The asked name is correct under the V2 layout (no “__default“ peer
 // on writes after Slice 3), so the legacy probe is the only fallback.
@@ -849,7 +851,7 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	// per snapshot fetch. The local-mode Hive layout puts the table at
 	// `<warehouse>/<db>.db/<table>/_delta_log/`.
 	warehouse := workspace.LocalWarehouseDir(p.workspaceRoot)
-	tablePath := resolveLocalTablePath(warehouse, q.Database, q.Table)
+	tablePath := ResolveLocalTablePath(warehouse, q.Database, q.Table)
 	schema, commits, err := delta.ReadCurrentFromPath(tablePath)
 	_ = schema // unused — caller is asking for snapshots only
 	if err != nil {

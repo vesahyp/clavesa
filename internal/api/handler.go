@@ -334,16 +334,26 @@ func (h *Handler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Parse-check inline SQL before the write (Slice 3). The UI's SQL
-	// editor sends a literal string in req.Attributes["sql"]; file()-
-	// referenced or expression SQL arrives as a non-string and bypasses
-	// the check (file refs are out of scope here, parsed at preview /
-	// run time). Reject with 400 so the editor can render the parser
-	// message inline above the Save button. Transport failures (warm
-	// worker dead, docker gone) are logged but don't block the write —
-	// the run path will surface a real parse error anyway.
-	if rawSQL, ok := req.Attributes["sql"].(string); ok && rawSQL != "" {
-		if err := h.service().ValidateSQL(r.Context(), rawSQL); err != nil {
+	// Parse-check the SQL before the write (Slice 3). The UI's editor
+	// sends either inline SQL or the `file("<node>.sql")` idiom as a
+	// plain string — for a file ref, the editor has already PUT the
+	// script, so validate the file's current content; an unreadable ref
+	// skips the check (dangling refs surface at preview / run time, as
+	// before the check existed). Reject with 400 so the editor can
+	// render the parser message inline above the Save button. Transport
+	// failures (warm worker dead, docker gone) are logged but don't
+	// block the write — the run path will surface a real parse error
+	// anyway.
+	checkSQL, _ := req.Attributes["sql"].(string)
+	if path, isRef := service.ParseFileRef(checkSQL); isRef {
+		if data, err := os.ReadFile(filepath.Join(req.Dir, path)); err == nil {
+			checkSQL = string(data)
+		} else {
+			checkSQL = ""
+		}
+	}
+	if checkSQL != "" {
+		if err := h.service().ValidateSQL(r.Context(), checkSQL); err != nil {
 			var pe *service.ParseError
 			if errors.As(err, &pe) {
 				httputil.WriteError(w, http.StatusBadRequest, pe.Message)

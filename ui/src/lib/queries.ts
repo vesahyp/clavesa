@@ -1477,6 +1477,78 @@ export async function discardBackfill(
   throw new Error(`POST /backfills/${runID}/discard → ${res.status}: ${text}`);
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline reset — drop canonical output tables (+ optionally watermarks)
+// ---------------------------------------------------------------------------
+
+const PipelineResetTarget = z.object({
+  node: z.string(),
+  output_key: z.string().optional().default(""),
+  table: z.string(),
+  glue_db: z.string().optional().default(""),
+  location: z.string().optional().default(""),
+});
+export type PipelineResetTarget = z.infer<typeof PipelineResetTarget>;
+
+const PipelineResetWatermark = z.object({
+  consumer: z.string(),
+  alias: z.string(),
+  path: z.string().optional().default(""),
+});
+export type PipelineResetWatermark = z.infer<typeof PipelineResetWatermark>;
+
+const PipelineResetResult = z.object({
+  pipeline: z.string().optional().default(""),
+  mode: z.string().optional().default(""),
+  tables_dropped: z.array(PipelineResetTarget).default([]),
+  watermarks_cleared: z.array(PipelineResetWatermark).default([]),
+});
+export type PipelineResetResult = z.infer<typeof PipelineResetResult>;
+
+/**
+ * POST /api/pipeline/reset/plan — dry resolve of what a reset would
+ * delete (the confirm modal's list). Same body as the execute call;
+ * nothing is deleted.
+ */
+export async function planPipelineReset(body: {
+  dir: string;
+  node?: string;
+  include_watermarks?: boolean;
+}): Promise<PipelineResetResult> {
+  const res = await fetch(`${BASE_URL}/pipeline/reset/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`POST /pipeline/reset/plan → ${res.status}: ${text}`);
+  }
+  return PipelineResetResult.parse(await res.json());
+}
+
+/**
+ * POST /api/pipeline/reset — execute the reset. The receipt lists only
+ * what was actually deleted (planned targets that didn't exist are
+ * omitted). Deployed infra is never touched.
+ */
+export async function resetPipeline(body: {
+  dir: string;
+  node?: string;
+  include_watermarks?: boolean;
+}): Promise<PipelineResetResult> {
+  const res = await fetch(`${BASE_URL}/pipeline/reset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`POST /pipeline/reset → ${res.status}: ${text}`);
+  }
+  return PipelineResetResult.parse(await res.json());
+}
+
 // Optimize — Delta table maintenance (compact / re-cluster / vacuum)
 const OptimizeTableResult = z.object({
   table: z.string(),

@@ -1732,7 +1732,7 @@ func readNodeLogic(node *graph.Node, language, pipelineDir string) (string, erro
 	if raw == "" {
 		return "", fmt.Errorf("node has no %s configuration", language)
 	}
-	if path, ok := parseFileRef(raw); ok {
+	if path, ok := ParseFileRef(raw); ok {
 		data, err := os.ReadFile(filepath.Join(pipelineDir, path))
 		if err != nil {
 			return "", fmt.Errorf("read %s file %s: %w", language, path, err)
@@ -1742,8 +1742,12 @@ func readNodeLogic(node *graph.Node, language, pipelineDir string) (string, erro
 	return raw, nil
 }
 
-// parseFileRef recognises `file("relative/path")` HCL idiom.
-func parseFileRef(expr string) (string, bool) {
+// ParseFileRef recognises the `file("relative/path")` HCL idiom. Exported
+// because the same string reaches the API layer verbatim: the UI's editor
+// saves `sql = file("<node>.sql")` as a plain string, and the run path,
+// the editor, and the authoring parse-check must all agree on what counts
+// as a file reference rather than inline SQL.
+func ParseFileRef(expr string) (string, bool) {
 	expr = strings.TrimSpace(expr)
 	if !strings.HasPrefix(expr, "file(") || !strings.HasSuffix(expr, ")") {
 		return "", false

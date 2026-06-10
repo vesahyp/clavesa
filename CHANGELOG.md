@@ -10,6 +10,17 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.9.0] — 2026-06-10
+
+### Added
+
+- `clavesa deploy` applies the workspace infra and every pipeline in one command (workspace first, since pipelines read its remote state). `clavesa plan` is the no-apply dry run. Re-running is a cheap no-op; terraform decides what actually changes.
+- `clavesa pipeline reset` drops a pipeline's canonical output tables (Delta data + Glue catalog entries) and, by default, its CDF watermarks, so the next run rebuilds everything from source — without touching the deployed Lambda/SFN/IAM stack. `--node` scopes to one transform; `--include-watermarks=false` keeps cursors. Also available from the pipeline dashboard ("Reset data"). (#10)
+
+### Fixed
+
+- Saving SQL from the UI editor failed with a parse error (`Syntax error at or near 'file'`) whenever the warm Spark worker was up — the authoring parse-check validated the editor's `file("<node>.sql")` reference instead of the SQL it points at, leaving the node half-saved. The check now validates the referenced file's content.
+
 ## [v2.8.1] — 2026-06-09
 
 ### Changed

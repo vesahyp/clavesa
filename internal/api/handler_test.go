@@ -2,16 +2,20 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/vesahyp/clavesa/internal/api"
 	"github.com/vesahyp/clavesa/internal/fileops"
 	"github.com/vesahyp/clavesa/internal/graph"
+	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // ---------------------------------------------------------------------------
@@ -468,6 +472,85 @@ func TestUpdateNode(t *testing.T) {
 			if tt.wantStatus == http.StatusOK && tt.checkGraph != nil {
 				g := decodeGraph(t, rr)
 				tt.checkGraph(t, g)
+			}
+		})
+	}
+}
+
+// recordingParser stubs service.SQLParser: it records what it was asked
+// to parse and rejects anything containing "BROKEN".
+type recordingParser struct {
+	got []string
+}
+
+func (p *recordingParser) Parse(_ context.Context, sql string) error {
+	p.got = append(p.got, sql)
+	if strings.Contains(sql, "BROKEN") {
+		return &observability.ParseError{Message: "syntax error near BROKEN"}
+	}
+	return nil
+}
+
+// TestUpdateNodeFileRefSQL covers the UI editor's save shape: the PUT
+// carries `sql = file("<node>.sql")` as a plain string, with the script
+// already written. The parse-check must validate the file's content —
+// never the file() expression itself (which can't parse as SQL) — and
+// skip silently when the referenced file is unreadable.
+func TestUpdateNodeFileRefSQL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		fileContent string // "" = don't write the file
+		wantStatus  int
+		wantParsed  string // "" = parser must not be called
+	}{
+		{
+			name:        "valid file content passes and is what gets parsed",
+			fileContent: "SELECT id FROM raw",
+			wantStatus:  http.StatusOK,
+			wantParsed:  "SELECT id FROM raw",
+		},
+		{
+			name:        "broken file content is rejected with the parser message",
+			fileContent: "BROKEN sql",
+			wantStatus:  http.StatusBadRequest,
+			wantParsed:  "BROKEN sql",
+		},
+		{
+			name:       "dangling ref skips the check and writes",
+			wantStatus: http.StatusOK,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := setupDir(t, twoNodeTF)
+			if tt.fileContent != "" {
+				if err := os.WriteFile(filepath.Join(dir, "validate.sql"), []byte(tt.fileContent), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			}
+			parser := &recordingParser{}
+			fo := fileops.New()
+			h := api.New(fo, "").WithService(service.New("").WithSQLParser(parser))
+			mux := http.NewServeMux()
+			h.RegisterRoutes(mux)
+
+			body := map[string]interface{}{
+				"dir": dir,
+				"attributes": map[string]interface{}{
+					"sql": `file("validate.sql")`,
+				},
+			}
+			rr := doRequest(t, mux, http.MethodPut, "/pipeline/nodes/validate", body)
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", rr.Code, tt.wantStatus, rr.Body.String())
+			}
+			if tt.wantParsed == "" {
+				if len(parser.got) != 0 {
+					t.Errorf("parser called with %q, want no call", parser.got)
+				}
+			} else if len(parser.got) != 1 || parser.got[0] != tt.wantParsed {
+				t.Errorf("parser got %q, want exactly [%q]", parser.got, tt.wantParsed)
 			}
 		})
 	}

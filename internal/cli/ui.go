@@ -532,6 +532,67 @@ func toAPIBackfillRun(r *tuiservice.BackfillRun) *api.BackfillRun {
 	return out
 }
 
+// resetBridge adapts service.Service onto api.Resetter. Same seam as
+// backfillBridge: the service and API types mirror each other
+// field-for-field so internal/api stays free of an internal/service
+// import.
+type resetBridge struct {
+	svc *tuiservice.Service
+}
+
+func (b resetBridge) PipelineResetPlan(ctx context.Context, req api.PipelineResetRequest) (*api.PipelineResetResult, error) {
+	res, err := b.svc.PipelineResetPlan(ctx, toServiceResetRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	return toAPIResetResult(res), nil
+}
+
+func (b resetBridge) PipelineReset(ctx context.Context, req api.PipelineResetRequest) (*api.PipelineResetResult, error) {
+	res, err := b.svc.PipelineReset(ctx, toServiceResetRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	return toAPIResetResult(res), nil
+}
+
+func toServiceResetRequest(req api.PipelineResetRequest) tuiservice.PipelineResetRequest {
+	return tuiservice.PipelineResetRequest{
+		Dir:               req.Dir,
+		Node:              req.Node,
+		IncludeWatermarks: req.IncludeWatermarks,
+	}
+}
+
+func toAPIResetResult(r *tuiservice.PipelineResetResult) *api.PipelineResetResult {
+	if r == nil {
+		return nil
+	}
+	out := &api.PipelineResetResult{
+		Pipeline:          r.Pipeline,
+		Mode:              r.Mode,
+		TablesDropped:     make([]api.ResetTarget, len(r.TablesDropped)),
+		WatermarksCleared: make([]api.WatermarkTarget, len(r.WatermarksCleared)),
+	}
+	for i, t := range r.TablesDropped {
+		out.TablesDropped[i] = api.ResetTarget{
+			Node:      t.Node,
+			OutputKey: t.OutputKey,
+			Table:     t.Table,
+			GlueDB:    t.GlueDB,
+			Location:  t.Location,
+		}
+	}
+	for i, w := range r.WatermarksCleared {
+		out.WatermarksCleared[i] = api.WatermarkTarget{
+			Consumer: w.Consumer,
+			Alias:    w.Alias,
+			Path:     w.Path,
+		}
+	}
+	return out
+}
+
 func (b lineageBridge) Lineage(dir string) (*lineagetype.Response, error) {
 	return b.svc.Lineage(dir)
 }
@@ -830,6 +891,7 @@ Examples:
 			// api.RunnerRequirementsService directly.
 			runnerHandler := api.NewRunnerHandler(svc)
 			backfillHandler := api.NewBackfillHandler(backfillBridge{svc: svc})
+			resetHandler := api.NewResetHandler(resetBridge{svc: svc})
 			optimizeHandler := api.NewOptimizeHandler(optimizeBridge{svc: svc})
 			runtimeHandler := api.NewRuntimeHandler(warmQuery, awsIdentity)
 
@@ -861,6 +923,7 @@ Examples:
 			notebooksHandler.RegisterRoutes(apiMux)
 			runnerHandler.RegisterRoutes(apiMux)
 			backfillHandler.RegisterRoutes(apiMux)
+			resetHandler.RegisterRoutes(apiMux)
 			optimizeHandler.RegisterRoutes(apiMux)
 			runtimeHandler.RegisterRoutes(apiMux)
 			apiMux.Handle("/data/", dataHandler)

@@ -45,6 +45,7 @@ import { PipelineHealthHeader } from "@/components/PipelineHealthHeader";
 import { NodesGrid, type NodeInfo } from "@/components/NodesGrid";
 import type { NodeSpec } from "@/components/NodeDetailDrawer";
 import { BackfillStageDialog } from "@/components/BackfillStageDialog";
+import { PipelineResetDialog } from "@/components/PipelineResetDialog";
 import { ConfigPanel } from "@/components/ConfigPanel";
 import { NodePalette } from "@/components/NodePalette";
 import { DataPreview } from "@/components/DataPreview";
@@ -373,6 +374,7 @@ export function PipelineDashboard() {
     [graph],
   );
   const [bfDialogOpen, setBfDialogOpen] = useState(false);
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
 
   // Optimize (Delta maintenance) — local + cloud (ADR-014). Compacts every
   // transform output table; recluster migrates pre-clustering tables to
@@ -948,14 +950,25 @@ export function PipelineDashboard() {
                   <History className="h-4 w-4 text-muted-foreground" />
                   Backfills
                 </CardTitle>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setBfDialogOpen(true)}
-                  disabled={transformNodeIds.length === 0}
-                >
-                  Stage backfill
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-destructive hover:text-destructive"
+                    onClick={() => setResetDialogOpen(true)}
+                    disabled={transformNodeIds.length === 0}
+                  >
+                    Reset data
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setBfDialogOpen(true)}
+                    disabled={transformNodeIds.length === 0}
+                  >
+                    Stage backfill
+                  </Button>
+                </div>
               </CardHeader>
               <CardContent className="p-0">
                 {backfills.isLoading && (
@@ -1269,6 +1282,19 @@ export function PipelineDashboard() {
           navigate(
             `/backfills?dir=${encodeURIComponent(dir)}&run=${encodeURIComponent(run.run_id)}`,
           );
+        }}
+      />
+
+      <PipelineResetDialog
+        open={resetDialogOpen}
+        onOpenChange={setResetDialogOpen}
+        dir={dir}
+        onReset={() => {
+          // Dropped tables disappear from the catalog and the freshness
+          // card; run history (system DB) is untouched, so runs queries
+          // stay as they are.
+          void qc.invalidateQueries({ queryKey: ["catalog"] });
+          void qc.invalidateQueries({ queryKey: ["tables-state"] });
         }}
       />
 
