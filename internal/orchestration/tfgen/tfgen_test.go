@@ -58,6 +58,9 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`package_type  = "Image"`,
 		`timeout       = 900`,
 		`memory_size   = 3008`,
+		// GH #43: 10 GB ephemeral storage — Spark shuffle/spill space.
+		`ephemeral_storage {`,
+		`size = 10240`,
 
 		// Env vars — workspace-level invariants. pipeline_handler sets
 		// per-transform CLAVESA_NODE / CLAVESA_LANGUAGE / CLAVESA_LOGIC_S3_PATH

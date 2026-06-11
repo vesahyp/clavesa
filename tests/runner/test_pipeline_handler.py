@@ -95,6 +95,97 @@ def _drive(mod, transforms, handler_responses):
         mod.handler = orig_handler  # type: ignore[assignment]
 
 
+def _drive_event(mod, event, handler_responses):
+    """Like _drive, but takes the full pipeline_handler event so tests can
+    shape the cloud (nested _execution_input) vs local (flat) envelopes.
+    Captures each sub_event the stubbed handler() receives."""
+    sub_events: list[dict] = []
+
+    def fake_handler(sub_event, context):
+        import os as _os
+        node = _os.environ.get("CLAVESA_NODE", "")
+        sub_events.append(dict(sub_event))
+        resp = handler_responses.get(node, {"status": "ok"})
+        if isinstance(resp, BaseException):
+            raise resp
+        return resp
+
+    orig_handler = mod.handler
+    mod.handler = fake_handler  # type: ignore[assignment]
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = mod.pipeline_handler(event, None)
+        return result, sub_events
+    finally:
+        mod.handler = orig_handler  # type: ignore[assignment]
+
+
+_FORCE_TRANSFORMS = [
+    {"node": "a", "language": "sql", "logic_path": "/tmp/a.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+    {"node": "b", "language": "sql", "logic_path": "/tmp/b.txt", "inputs": {"a": "..."}, "outputs": {"default": ""}, "parents": ["a"]},
+]
+
+
+def test_force_and_trigger_from_nested_execution_input():
+    """Cloud shape: the SFN single-Task ASL nests the CLI's StartExecution
+    input under _execution_input — no top-level _force/_trigger. Every
+    sub_event must still carry the force flag and trigger."""
+    mod = _load_runner()
+    result, sub_events = _drive_event(mod, {
+        "_pipeline_run": True,
+        "run_id": "test-run",
+        "transforms": _FORCE_TRANSFORMS,
+        "_sf_execution_arn": "arn:test",
+        "_execution_input": {"_trigger": "manual", "_force": True},
+    }, {})
+
+    assert result["status"] == "ok"
+    assert len(sub_events) == 2, sub_events
+    for se in sub_events:
+        assert se.get("_force") is True, f"sub_event missing _force: {se}"
+        assert se.get("_trigger") == "manual", f"sub_event trigger wrong: {se}"
+
+
+def test_force_nodes_from_nested_execution_input():
+    """Cloud shape with scoped force: _force_nodes nested under
+    _execution_input must be forwarded into every sub_event."""
+    mod = _load_runner()
+    result, sub_events = _drive_event(mod, {
+        "_pipeline_run": True,
+        "run_id": "test-run",
+        "transforms": _FORCE_TRANSFORMS,
+        "_sf_execution_arn": "arn:test",
+        "_execution_input": {"_force": True, "_force_nodes": ["a"]},
+    }, {})
+
+    assert result["status"] == "ok"
+    assert len(sub_events) == 2, sub_events
+    for se in sub_events:
+        assert se.get("_force") is True, f"sub_event missing _force: {se}"
+        assert se.get("_force_nodes") == ["a"], f"sub_event force_nodes wrong: {se}"
+
+
+def test_force_from_top_level_still_works():
+    """Local bundle shape: _force/_trigger flat on the event (no
+    _execution_input) keeps working unchanged."""
+    mod = _load_runner()
+    result, sub_events = _drive_event(mod, {
+        "_pipeline_run": True,
+        "run_id": "test-run",
+        "transforms": _FORCE_TRANSFORMS,
+        "_sf_execution_arn": "test-run",
+        "_trigger": "manual",
+        "_force": True,
+    }, {})
+
+    assert result["status"] == "ok"
+    assert len(sub_events) == 2, sub_events
+    for se in sub_events:
+        assert se.get("_force") is True, f"sub_event missing _force: {se}"
+        assert se.get("_trigger") == "manual", f"sub_event trigger wrong: {se}"
+
+
 def test_three_transforms_all_succeed():
     mod = _load_runner()
     transforms = [
@@ -278,6 +369,9 @@ def test_topo_sort_cycle_falls_back_to_input_order():
 
 
 if __name__ == "__main__":
+    test_force_and_trigger_from_nested_execution_input()
+    test_force_nodes_from_nested_execution_input()
+    test_force_from_top_level_still_works()
     test_three_transforms_all_succeed()
     test_cascade_skip_when_all_parents_skip()
     test_failure_stops_pipeline()

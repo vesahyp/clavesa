@@ -647,7 +647,7 @@ function TableBody2({ data }: TableBodyProps) {
         </TableHeader>
         <TableBody>
           {data.rows.map((row, i) => (
-            <TableRow key={i}>
+            <TableRow key={i} data-testid="recent-runs-row">
               {row.map((cell, j) => (
                 <TableCell key={j} className="whitespace-nowrap font-mono text-xs">
                   {cell === "" || cell == null ? (

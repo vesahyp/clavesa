@@ -232,7 +232,7 @@ export function TableDetail() {
             from the sample) otherwise. Either way, this replaces the
             Schema-on-left / Sample-on-right grid — row data lives in the
             Query pane below now. */}
-        <div>
+        <div data-testid="table-schema">
           {isClavesaManaged && columnStats.data && columnStats.data.stats.length > 0 ? (
             <ColumnStatsCard data={columnStats.data} />
           ) : (
@@ -317,7 +317,7 @@ interface VolumeTimelineCardProps {
 
 function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps) {
   return (
-    <Card>
+    <Card data-testid="commit-timeline">
       <CardHeader className="flex-row items-center justify-between pb-3">
         <CardTitle>Commit timeline</CardTitle>
         {data && data.snapshots.length > 0 && (
@@ -494,7 +494,7 @@ function formatCount(n: number | null | undefined): string {
 
 function ColumnStatsCard({ data }: { data: ColumnStatsResult }) {
   return (
-    <Card>
+    <Card data-testid="column-profile">
       <CardHeader className="flex-row items-center justify-between pb-3">
         <CardTitle>Column profile</CardTitle>
         <span className="text-xs text-muted-foreground">
@@ -722,7 +722,7 @@ function TableQueryPane({
 }) {
   const [open, setOpen] = useState(!!defaultOpen);
   return (
-    <Card>
+    <Card data-testid="table-sample-rows">
       <CardHeader className="flex-row items-center justify-between pb-2">
         <button
           type="button"

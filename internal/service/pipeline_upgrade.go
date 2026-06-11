@@ -202,10 +202,10 @@ func (s *Service) UpgradePipeline(dir, targetRef string) (currentRef, finalRef s
 	// Sync orchestration.tf — the emitter's output shape can change
 	// between versions. Run whenever we touched source lines OR migrated
 	// a compute attribute, since the orchestration emit also encodes the
-	// rewritten compute structure. Unconditional: pipelines whose
-	// directory never had an orchestration.tf (older `pipeline create`
-	// flows, or hand-authored directories) get one generated, instead of
-	// the silent skip that left them deploy-broken (GH #3).
+	// rewritten compute structure. NB: when the pipeline is already at
+	// finalRef this whole block is skipped — emitter changes within an
+	// unreleased version reach deployments via `pipeline deploy` /
+	// `clavesa deploy`, which re-sync unconditionally (GH #43 follow-up).
 	if updated > 0 || migrated > 0 {
 		if syncErr := s.SyncOrchestration(dir, ""); syncErr != nil {
 			return currentRef, finalRef, updated, migrated, fmt.Errorf("sync orchestration.tf: %w", syncErr)

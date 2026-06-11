@@ -90,7 +90,10 @@ export function PipelineHealthHeader({
 }: PipelineHealthHeaderProps) {
   const h = HEALTH[state];
   return (
-    <div className="sticky top-0 z-30 -mx-6 -mt-8 mb-6 border-b border-border bg-background px-6 py-4">
+    <div
+      className="sticky top-0 z-30 -mx-6 -mt-8 mb-6 border-b border-border bg-background px-6 py-4"
+      data-testid="deployment-status"
+    >
       <div className="flex flex-wrap items-center justify-between gap-x-8 gap-y-3">
         <div className="flex items-center gap-3">
           <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", h.dot)} />

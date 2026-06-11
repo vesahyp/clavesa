@@ -60,6 +60,8 @@ export function WidgetShell({
     <Card
       style={style}
       className={inGrid ? "flex h-full w-full flex-col" : "flex flex-col"}
+      data-testid="dashboard-widget"
+      data-widget-title={title}
     >
       <CardHeader className="flex flex-row items-center justify-between gap-3 pb-3">
         <CardTitle className="text-sm font-medium text-foreground">

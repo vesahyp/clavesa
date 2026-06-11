@@ -346,8 +346,14 @@ func newPipelineDeployCmd() *cobra.Command {
 		Long: `Run the substantive deploy lifecycle against the pipeline's terraform.
 
 Preflight checks clavesa.json at the workspace root (the pipeline's
-parent). Saves the plan to <pipeline>/tfplan and pauses for a 'yes'
-confirmation before applying; the plan is cleaned up on success.
+parent), then regenerates orchestration.tf from the current pipeline
+graph and this binary's emitter — deploy always applies the orchestration
+shape the installed version produces, so emitter fixes reach deployed
+pipelines without a separate sync step. orchestration.tf is a generated
+file; manual edits to it do not survive a deploy.
+
+Saves the plan to <pipeline>/tfplan and pauses for a 'yes' confirmation
+before applying; the plan is cleaned up on success.
 
 The runner image isn't re-checked here — pipeline deploys pin the Lambda
 to an ECR digest and don't push, so a stale local image isn't a risk.
@@ -361,20 +367,18 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 				return err
 			}
 			printTargetContext("deploy "+filepath.Base(dir), ws, "")
-			// ADR-016 §5 preflight: refuse to deploy a pipeline whose
-			// schema is owned by another pipeline. Deploy doesn't re-emit
-			// orchestration.tf, so this is the last gate before terraform.
 			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}
-			if err := svc.ValidateSchemaOwnership(dir); err != nil {
+			// Regenerate orchestration.tf before terraform so the deploy
+			// applies this binary's emitter output, not whatever an older
+			// version left behind. SyncOrchestration also enforces the
+			// ADR-016 §5 schema-ownership gate, so no separate preflight.
+			if err := svc.SyncOrchestration(dir, ""); err != nil {
 				return err
 			}
-			if _, statErr := os.Stat(filepath.Join(dir, "orchestration.tf")); os.IsNotExist(statErr) {
-				return fmt.Errorf("orchestration.tf missing in %s — run `clavesa pipeline upgrade %s` (regenerates it) or `clavesa pipeline orchestration sync %s`",
-					displayDir(ws, dir), filepath.Base(dir), filepath.Base(dir))
-			}
+			fmt.Printf("Synced orchestration.tf (emitter %s).\n", service.ModuleVersion)
 			return deployFlow{
 				WorkspaceRoot:    ws,
 				TfDir:            dir,

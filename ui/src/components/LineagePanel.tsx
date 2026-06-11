@@ -71,7 +71,7 @@ export function LineagePanel({ dir, database, table, owningNode }: LineagePanelP
   }
 
   return (
-    <Card>
+    <Card data-testid="lineage-panel">
       <CardHeader className="pb-3">
         <CardTitle>Lineage</CardTitle>
       </CardHeader>

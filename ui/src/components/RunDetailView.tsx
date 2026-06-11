@@ -512,13 +512,13 @@ function TriageStrip({ rows }: { rows: NodeRun[] }) {
   return (
     <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
       {version && (
-        <span>
+        <span data-testid="triage-module-version">
           Module&nbsp;
           <code className="font-mono text-foreground">{version}</code>
         </span>
       )}
       {digest && (
-        <span title={digest}>
+        <span title={digest} data-testid="triage-runner-digest">
           Runner&nbsp;
           <code className="font-mono text-foreground">
             {digest.slice(7, 19)}
@@ -536,7 +536,11 @@ function TriageStrip({ rows }: { rows: NodeRun[] }) {
 function PerNodeRow({ row }: { row: NodeRun }) {
   const variant = nodeVariant(row.status);
   return (
-    <li className="flex flex-col gap-1 px-6 py-3">
+    <li
+      className="flex flex-col gap-1 px-6 py-3"
+      data-testid="node-breakdown-row"
+      data-node={row.node}
+    >
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <Badge variant={variant} className="font-mono text-[10px] uppercase">

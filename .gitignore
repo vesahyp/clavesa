@@ -24,3 +24,5 @@ bin/
 e2e/.e2e-workspace
 /clavesa
 __pycache__/
+# Cloud smoke gate stamp (written by scripts/cloud-smoke.sh, read by release-check)
+.cloud-smoke-green.json

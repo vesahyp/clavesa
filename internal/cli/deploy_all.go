@@ -28,9 +28,11 @@ data.terraform_remote_state.workspace from ../terraform.tfstate, so a
 pipeline can't plan against a workspace that hasn't been applied. If the
 workspace apply fails the run aborts before touching any pipeline.
 
-Each pipeline runs its own init → plan → apply lifecycle. A pipeline
-failure is reported and the run continues to the next pipeline; the
-command exits non-zero if any pipeline failed.
+Each pipeline first regenerates its orchestration.tf from this binary's
+emitter (orchestration.tf is a generated file; manual edits don't survive),
+then runs its own init → plan → apply lifecycle. A pipeline failure is
+reported and the run continues to the next pipeline; the command exits
+non-zero if any pipeline failed.
 
 Re-running is a cheap no-op. Terraform's plan and the ECR image digest
 decide what actually changes; there's no hand-rolled staleness check, so a
@@ -130,6 +132,16 @@ func deployAll(cmd *cobra.Command, autoApprove, planOnly bool) error {
 			continue
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "\n=== Pipeline %s ===\n", info.Name)
+		// Regenerate orchestration.tf from this binary's emitter before
+		// terraform — `clavesa deploy` means "make everything current",
+		// and that includes the orchestration shape, not just the apply.
+		// Runs in plan-only mode too so `clavesa plan` previews exactly
+		// what `clavesa deploy` would apply.
+		if err := svc.SyncOrchestration(absDir, ""); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Pipeline %s failed: orchestration sync: %v\n", info.Name, err)
+			failures = append(failures, fmt.Sprintf("%s: orchestration sync: %v", info.Name, err))
+			continue
+		}
 		if err := (deployFlow{
 			WorkspaceRoot:    root,
 			TfDir:            absDir,

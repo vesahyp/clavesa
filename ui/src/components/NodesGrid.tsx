@@ -409,6 +409,8 @@ export function NodesGrid({
                     onClick={() => onRunSelect(r.run_id)}
                     title={`${r.status} · ${runWhen(r.started_at)} · ${formatDuration(r.duration_ms)}`}
                     aria-label={`Run ${r.run_id} · ${r.status} · ${formatDuration(r.duration_ms)}`}
+                    data-testid="run-column"
+                    data-run-id={r.run_id}
                     className="flex w-14 flex-col items-center gap-1 rounded-md pb-1 pt-1.5 transition-colors hover:bg-muted/60"
                   >
                     {/* Airflow-style runtime bar — height ∝ duration_ms,

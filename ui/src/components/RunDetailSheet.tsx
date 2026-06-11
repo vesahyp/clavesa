@@ -30,7 +30,7 @@ export function RunDetailSheet({ dir, runId, onClose }: RunDetailSheetProps) {
         if (!o) onClose();
       }}
     >
-      <SheetContent>
+      <SheetContent data-testid="run-detail-sheet">
         <SheetHeader>
           <SheetTitle className="font-mono text-sm">
             Run{runId ? ` ${runId.slice(0, 12)}` : ""}

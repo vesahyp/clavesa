@@ -286,15 +286,21 @@ function SourceForm({
             value={name}
             onChange={(e) => setName(e.target.value)}
             disabled={busy || isEdit}
+            data-testid="source-name-input"
           />
           <Input
             placeholder="https://example.com/data.parquet  or  s3://bucket/prefix/"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             disabled={busy}
+            data-testid="source-url-input"
           />
           <div className="flex gap-2">
-            <Button onClick={submit} disabled={busy || !name || !url}>
+            <Button
+              onClick={submit}
+              disabled={busy || !name || !url}
+              data-testid="register-source-submit"
+            >
               {isEdit ? "Save changes" : "Register"}
             </Button>
             {onCancel && (
@@ -526,7 +532,7 @@ function SourceRow({
   }
 
   return (
-    <li className="min-w-0">
+    <li className="min-w-0" data-testid="source-row" data-source={spec.name}>
       <Card>
         <CardContent className="flex items-center gap-3 p-4">
           <Database className="h-4 w-4 flex-shrink-0 text-muted-foreground" />

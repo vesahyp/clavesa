@@ -690,8 +690,17 @@ _DRAIN_SRC = {
 }
 
 
+def _arm_drain(runner, alias: str = "raw", cursor: tuple[str, ...] = ("2026-04-01", "00")):
+    """Commit the watermark that arms the drain path for a partitioned source.
+    The queue takes over only after the first listed run has committed a
+    cursor — `start_from` governs the first run (see _resolve_input)."""
+    os.environ["CLAVESA_WATERMARKS"] = "s3://wm/pipe/_watermarks/"
+    runner._write_watermark(f"s3://wm/pipe/_watermarks/{alias}.json", cursor)
+
+
 def test_drain_reads_new_keys_and_returns_ack():
     runner = _load_runner()
+    _arm_drain(runner)
     sqs = runner._FAKE_SQS
     sqs.reset()
     sqs.add_object_event("logs", "cf/day=2026-04-26/hour=00/a.parquet", "h1")
@@ -713,6 +722,7 @@ def test_drain_reads_new_keys_and_returns_ack():
 
 def test_drain_url_decodes_object_keys():
     runner = _load_runner()
+    _arm_drain(runner)
     sqs = runner._FAKE_SQS
     sqs.reset()
     # S3 event keys arrive percent-encoded: '+' is a space, %3D is '='.
@@ -724,6 +734,7 @@ def test_drain_url_decodes_object_keys():
 
 def test_drain_empty_queue_skips_run():
     runner = _load_runner()
+    _arm_drain(runner)
     runner._FAKE_SQS.reset()
     spark = _FakeSpark()
     df, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
@@ -733,6 +744,7 @@ def test_drain_empty_queue_skips_run():
 
 def test_drain_dedups_object_but_acks_all_handles():
     runner = _load_runner()
+    _arm_drain(runner)
     sqs = runner._FAKE_SQS
     sqs.reset()
     # Same object enqueued twice (at-least-once delivery): read once, ack both.
@@ -746,6 +758,7 @@ def test_drain_dedups_object_but_acks_all_handles():
 
 def test_drain_leaves_unparseable_message_on_queue():
     runner = _load_runner()
+    _arm_drain(runner)
     sqs = runner._FAKE_SQS
     sqs.reset()
     sqs.add_object_event("logs", "cf/day=2026-04-26/hour=00/a.parquet", "h1")
@@ -760,6 +773,7 @@ def test_drain_leaves_unparseable_message_on_queue():
 
 def test_drain_caps_batch_and_leaves_remainder():
     runner = _load_runner()
+    _arm_drain(runner)
     sqs = runner._FAKE_SQS
     sqs.reset()
     for i in range(25):
@@ -775,6 +789,84 @@ def test_drain_caps_batch_and_leaves_remainder():
     assert df == "DF"
     assert 0 < len(spark.read_keys) < 25
     assert len(sqs.messages) > 0
+
+
+def test_drain_not_consulted_before_first_watermark_start_from_applies():
+    """queue_url set but NO committed watermark: the drain must not run —
+    `start_from` governs the first run via the listing path. A fresh cloud
+    deploy over pre-existing objects has an empty queue (the files predate
+    it); draining unconditionally skipped the run forever and `start_from`
+    was dead. The queued message must also survive untouched for the next
+    run (drain only takes over after the first listed commit)."""
+    runner = _load_runner()
+    s3 = runner._FAKE_S3
+    _seed_cloudfront_partitions(s3, "logs", "cf/", [
+        ("2026-04-26", "23"),
+        ("2026-04-27", "00"),
+    ])
+    os.environ["CLAVESA_WATERMARKS"] = "s3://wm/pipe/_watermarks/"
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.add_object_event("logs", "cf/day=2026-04-27/hour=00/a.parquet", "h1")
+
+    spark = _FakeSpark()
+    src = dict(_DRAIN_SRC, start_from="2026-04-27")
+    df, advance = runner._resolve_input(spark, "raw", src)
+    assert df == "DF"
+    # Listing path, filtered by the start_from cursor — not the drain.
+    assert spark.read_keys == ["s3://logs/cf/day=2026-04-27/hour=00/"]
+    assert advance == {"uri": "s3://wm/pipe/_watermarks/raw.json",
+                       "new_cursor": ("2026-04-27", "00")}
+    # Queue untouched: the message is still there for the first drain run.
+    assert len(sqs.messages) == 1
+
+
+def test_drain_consulted_after_watermark_commit():
+    """queue_url set + committed watermark + not forced: the drain IS the
+    cursor — its non-empty result is returned (ack record, no listing)."""
+    runner = _load_runner()
+    _arm_drain(runner)
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.add_object_event("logs", "cf/day=2026-04-27/hour=01/b.parquet", "h1")
+    spark = _FakeSpark()
+    df, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC))
+    assert df == "DF"
+    assert spark.read_keys == ["s3://logs/cf/day=2026-04-27/hour=01/b.parquet"]
+    assert advance == {
+        "ack": {"queue_url": "https://sqs.local/q", "handles": ["h1"], "region": None}
+    }
+
+
+def test_drain_bypassed_when_forced_full_range_reread():
+    """forced=True bypasses the queue entirely and takes the listing branch's
+    forced full-range re-read. Queue messages are deliberately NOT consumed —
+    the next unforced drain redelivers them (at-least-once, absorbed by
+    replace/merge outputs)."""
+    runner = _load_runner()
+    s3 = runner._FAKE_S3
+    _seed_cloudfront_partitions(s3, "logs", "cf/", [
+        ("2026-04-26", "00"),
+        ("2026-04-27", "00"),
+    ])
+    # Watermark already at the max partition: an unforced listing run would skip.
+    _arm_drain(runner, cursor=("2026-04-27", "00"))
+    sqs = runner._FAKE_SQS
+    sqs.reset()
+    sqs.add_object_event("logs", "cf/day=2026-04-27/hour=00/a.parquet", "h1")
+
+    spark = _FakeSpark()
+    df, advance = runner._resolve_input(spark, "raw", dict(_DRAIN_SRC), forced=True)
+    # Forced full-range re-read via the listing branch, not the drain.
+    assert df == "DF"
+    assert spark.read_keys == [
+        "s3://logs/cf/day=2026-04-26/hour=00/",
+        "s3://logs/cf/day=2026-04-27/hour=00/",
+    ]
+    assert advance == {"uri": "s3://wm/pipe/_watermarks/raw.json",
+                       "new_cursor": ("2026-04-27", "00")}
+    # Queue untouched: forced runs don't consume messages.
+    assert len(sqs.messages) == 1
 
 
 def test_drain_flat_s3_source_also_drains():

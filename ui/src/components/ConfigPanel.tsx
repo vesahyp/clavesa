@@ -506,6 +506,7 @@ function TransformOutputSection({
           className="mt-0.5"
           checked={stats}
           onChange={(e) => setStats(e.target.checked)}
+          data-testid="stats-checkbox"
         />
         <span>
           Compute column stats
@@ -517,7 +518,13 @@ function TransformOutputSection({
       </label>
       <ExtraOutputsField dir={dir} nodeId={nodeId} config={config} onSaved={onSaved} />
       <div className="flex items-center gap-2">
-        <Button onClick={handleSave} disabled={saving} size="sm" variant="outline">
+        <Button
+          onClick={handleSave}
+          disabled={saving}
+          size="sm"
+          variant="outline"
+          data-testid="save-output-config"
+        >
           {saving ? (
             <>
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -1670,6 +1677,7 @@ export function ConfigPanel({
             <button
               onClick={onClose}
               aria-label="Close"
+              data-testid="close-node-panel"
               className="-mr-1 flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             >
               <X className="h-4 w-4" />
@@ -1685,6 +1693,7 @@ export function ConfigPanel({
             <button
               key={m}
               onClick={() => setMode(m)}
+              data-testid={m === "settings" ? "node-settings" : undefined}
               className={cn(
                 "border-b-2 px-3 py-1.5 text-xs font-semibold capitalize transition-colors",
                 mode === m

@@ -246,7 +246,10 @@ export function TransformEditor({ dir, nodeId, config, sqlInputs, output, onSave
         </div>
       ) : (
         <div className="flex gap-2">
-          <div className="min-w-0 flex-1 overflow-hidden rounded-md border border-border">
+          <div
+            className="min-w-0 flex-1 overflow-hidden rounded-md border border-border"
+            data-testid="sql-editor"
+          >
             <CodeEditor
               value={editorValue}
               onValueChange={(v) => {
@@ -289,6 +292,7 @@ export function TransformEditor({ dir, nodeId, config, sqlInputs, output, onSave
         disabled={saving || editorLoading}
         size="sm"
         className="mt-2"
+        data-testid="save-sql"
       >
         {saving ? (
           <>

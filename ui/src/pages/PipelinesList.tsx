@@ -285,6 +285,8 @@ export function PipelinesList() {
                   navigate(`/pipelines/dashboard?dir=${encodeURIComponent(p.dir)}`)
                 }
                 className="group cursor-pointer transition-colors hover:border-primary/50"
+                data-testid="pipeline-card"
+                data-pipeline={p.dir}
               >
                 <CardContent className="flex items-center gap-3 p-4">
                   <Workflow className="h-4 w-4 flex-shrink-0 text-muted-foreground" />

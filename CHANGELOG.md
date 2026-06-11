@@ -10,6 +10,21 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.10.0] — 2026-06-11
+
+### Changed
+
+- `pipeline deploy` and `clavesa deploy`/`plan` now regenerate `orchestration.tf` from the installed binary's emitter before terraform runs. Emitter fixes reach deployed pipelines on the next deploy instead of waiting for a version-bump `upgrade`. `orchestration.tf` is a generated file — manual edits to it no longer survive a deploy.
+- `make test` now includes the docker-gated runner suite (`test-runner`); docker is required, no silent skip.
+- New cloud smoke gate: `make smoke-cloud` verifies a release end-to-end against a deployed AWS workspace (SFN run, Athena/Glue readback, UI API, backfill cycle); `make release-check` requires a green stamp for the version being released.
+
+### Fixed
+
+- Lambda runner `/tmp` exhaustion during large Spark shuffles (GH #43): ephemeral storage raised from 512 MB to 10 GB in generated `orchestration.tf`; the Spark session is recycled after any failure (transform, backfill stage, or operation — Spark's shutdown hooks clean blockmgr/spill dirs) and before any invocation when `/tmp` is already >50% full on a warm Lambda container. The pressure check is Lambda-only: local Docker containers see the host disk there, and recycling on a half-full laptop would defeat warm-session bundling.
+- Fresh cloud deploys with a partitioned s3 source never ingested pre-existing files: the trigger queue (empty, since the files predate it) was consulted before the first-run `start_from` listing, so every run skipped. The queue now takes over only after the first listed run commits its watermark. The flat-source variant is GH #44.
+- `pipeline run --force` now actually forces past an empty trigger queue (full-range listing re-read; queued messages are left for the next unforced drain). On cloud the flag never reached the runner at all — the orchestrator read it from the wrong event level.
+- Cloud runs stamp `clavesa.trigger` on Delta commits again (the manual/scheduled/upstream badges on the table volume timeline) — same wrong-event-level read.
+
 ## [v2.9.0] — 2026-06-10
 
 ### Added

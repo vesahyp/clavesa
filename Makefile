@@ -1,4 +1,4 @@
-.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py release-check release-public validate-examples
+.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme release-check release-public validate-examples
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -43,10 +43,10 @@ build-ui: ui/node_modules ## Build the React frontend → internal/ui/dist/
 	cd ui && npm run build
 	@touch internal/ui/dist/.gitkeep
 
-build: build-ui sync-modules ## Build everything → bin/clavesa (UI + modules embedded)
+build: build-ui sync-modules sync-runner ## Build everything → bin/clavesa (UI + modules + runner files embedded)
 	go build -o bin/clavesa ./cmd/clavesa
 
-test: test-go test-runner-py test-cli ## Run all tests
+test: test-go test-runner-py test-cli test-runner ## Run all tests (incl. docker-gated runner suite — GH #27)
 
 test-go: ## Go unit tests (fast, no binary)
 	go test -v ./...
@@ -55,6 +55,11 @@ test-cli: build-bin ## Build binary + CLI pipeline cycle (Go-driven)
 	go test -v -tags integration ./tests/cli/...
 
 test-runner: ## Docker-gated runner integration tests (preview + handler)
+	@docker info >/dev/null 2>&1 || { \
+	  echo "✗ docker is required for test-runner (GH #27 — it is part of the release gate);"; \
+	  echo "  start Docker or run the individual suites (test-go / test-runner-py / test-cli)."; \
+	  exit 1; \
+	}
 	go test -v -tags integration ./tests/runner/...
 
 test-runner-py: ## Pure-Python runner unit tests (stdlib only, no docker, no Spark)
@@ -76,7 +81,7 @@ validate-examples: ## terraform validate every modules/*/aws/examples/* (catches
 	 done; \
 	 exit $$status
 
-release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, examples validate, tag not yet created
+release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, cloud-smoke stamp, examples validate, tag not yet created
 	@VERSION=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
 	 echo "→ ModuleVersion: $$VERSION"; \
 	 grep -qE "^## \[$$VERSION\]" CHANGELOG.md || { \
@@ -85,6 +90,30 @@ release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, exam
 	   exit 1; \
 	 }; \
 	 echo "✓ CHANGELOG.md has an entry for $$VERSION"; \
+	 if [ "$$CLAVESA_SKIP_SMOKE" = "1" ]; then \
+	   echo "##############################################################"; \
+	   echo "## WARNING: CLAVESA_SKIP_SMOKE=1 — cloud smoke gate BYPASSED."; \
+	   echo "## $$VERSION ships without cloud verification. Document why"; \
+	   echo "## in the release commit message."; \
+	   echo "##############################################################"; \
+	 else \
+	   if [ ! -f .cloud-smoke-green.json ]; then \
+	     echo "✗ .cloud-smoke-green.json is missing — the cloud smoke gate has not passed."; \
+	     echo "  run 'make smoke-cloud' (or CLAVESA_SKIP_SMOKE=1 to bypass — document why in the release commit)"; \
+	     exit 1; \
+	   fi; \
+	   if command -v jq >/dev/null 2>&1; then \
+	     STAMP=$$(jq -r .version .cloud-smoke-green.json); \
+	   else \
+	     STAMP=$$(grep -oE '"version"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' .cloud-smoke-green.json | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+'); \
+	   fi; \
+	   if [ "$$STAMP" != "$$VERSION" ]; then \
+	     echo "✗ cloud smoke stamp is for $$STAMP, but releasing $$VERSION."; \
+	     echo "  run 'make smoke-cloud' (or CLAVESA_SKIP_SMOKE=1 to bypass — document why in the release commit)"; \
+	     exit 1; \
+	   fi; \
+	   echo "✓ cloud smoke stamp matches $$VERSION ($$(grep -oE '"timestamp"[^,}]*' .cloud-smoke-green.json))"; \
+	 fi; \
 	 if git tag --list | grep -qx "$$VERSION"; then \
 	   echo "✗ git tag $$VERSION already exists locally — bump ModuleVersion or delete the stale tag."; \
 	   exit 1; \
@@ -94,6 +123,15 @@ release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, exam
 
 release-public: release-check ## Snapshot the dev tree into the public clavesa repo, commit + tag, then prompt before push
 	@./scripts/release-public.sh
+
+smoke-cloud: build ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
+	@./scripts/cloud-smoke.sh run
+
+verify-readme: build ## Walk the README quick-start literally (UI via playwright-cli) and assert the mandatory pages (CLAVESA_VERIFY_ADDR to override the :8080 UI port)
+	@./scripts/verify-readme.sh
+
+smoke-cloud-setup: build ## One-time: create + deploy the persistent cloud smoke workspace (SMOKE_WS / SMOKE_PROFILE env-overridable)
+	@./scripts/cloud-smoke.sh setup
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-16s %s\n", $$1, $$2}'

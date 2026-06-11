@@ -733,7 +733,7 @@ export function PipelineDashboard() {
           {/* Runs — node × run matrix: one row per node, columns are recent runs.
               Cloud-only execution / backfill cards sit below it. */}
           <TabsContent value="runs" className="space-y-6">
-            <Card>
+            <Card data-testid="run-history">
               <CardHeader className="flex-row items-center justify-between pb-3">
                 <CardTitle>Runs</CardTitle>
                 <div className="flex items-center gap-3">

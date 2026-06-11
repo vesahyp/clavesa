@@ -109,7 +109,7 @@ Now drive the rest from the browser:
 
 2. **Create a pipeline.** On the welcome card click **Create a pipeline** (or **Pipelines** → **New pipeline**). Name it `demo`. Clavesa drops you in the editor.
 
-3. **Build the landing transform.** Type `trips` into **Node name**, click **+ SQL Transform**, select it. In the right panel tick **Compute column stats** under **Output** (this opts the table into a per-column profile on its catalog page). Then **Inputs** → **Add**: the **Source** dropdown is pre-filled with `src_trips`, click **Attach**. Paste the SQL and **Save**:
+3. **Build the landing transform.** Type `trips` into **Node name**, click **+ SQL Transform**, select it. In the right panel open the **settings** tab, tick **Compute column stats** under **Output**, and click **Save Output Config** (this opts the table into a per-column profile on its catalog page). Back on the **code** tab, **Inputs** → **Add**: the **Source** dropdown is pre-filled with `src_trips`, click **Attach**. Paste the SQL and **Save**:
 
    ```sql
    SELECT * FROM src_trips
@@ -128,7 +128,7 @@ Now drive the rest from the browser:
    ORDER BY revenue DESC
    ```
 
-5. **Run it.** Click the `demo` breadcrumb to open the pipeline dashboard, then **Run pipeline**. Roughly 30-60s end to end including Spark cold start. The page navigates to the run detail when it finishes: the DAG shows both transforms **ok**, with a per-node breakdown.
+5. **Run it.** Close the node panel, then click **Run pipeline**. A couple of minutes end to end including Spark cold start (the very first run also builds the runner image, which takes longer). When it finishes, open the run from the **Runs** tab: the DAG shows both transforms **ok**, with a per-node breakdown.
 
    ![Per-execution run detail with DAG, triage strip, and per-node breakdown](docs/images/run-detail.png)
 

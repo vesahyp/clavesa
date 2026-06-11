@@ -267,6 +267,35 @@ def _reset_spark_session() -> None:
             pass
 
 
+def _tmp_pressure_exceeded(threshold: float = 0.5) -> bool:
+    """True when running on Lambda AND /tmp is more than ``threshold``
+    (default 50%) full.
+
+    Lambda-only on purpose: there /tmp is a dedicated ephemeral volume, so
+    the ratio measures real spill-space pressure. In a local Docker container
+    /tmp sits on the overlay filesystem and ``disk_usage`` reports the HOST
+    disk — a half-full laptop would recycle the session before every
+    transform and defeat warm-session bundling entirely. Local containers
+    are one-shot per `pipeline run` anyway, so there is nothing to clean.
+
+    SparkContext.stop() triggers Spark's own shutdown hooks which delete the
+    blockmgr and spill directories — so recycling the session is the right
+    lever here rather than hand-rolling an rm sweep. Known gap: the recycle
+    does NOT free /tmp/clavesa-src-* (the persistent http download cache) or
+    finalized event logs; with 10 GB of ephemeral storage those are noise.
+    Best-effort: any stat failure returns False so the fast warm path is
+    never accidentally skipped. GH #43.
+    """
+    if not os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return False
+    try:
+        import shutil  # noqa: PLC0415
+        usage = shutil.disk_usage("/tmp")
+        return usage.used / usage.total > threshold
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _load_script(source: str) -> types.ModuleType:
     mod = types.ModuleType("_user_transform")
     exec(compile(source, "<clavesa_script>", "exec"), mod.__dict__)  # noqa: S102
@@ -1383,14 +1412,24 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
             df = spark.read.option("basePath", f"s3://{bucket}/{prefix}").parquet(*paths)
             return df, None
 
-        drained = _drain_if_configured(spark, alias, src, bucket, prefix)
-        if drained is not None:
-            return drained
+        # The queue takes over only AFTER the first listed run has committed
+        # a watermark — `start_from` governs the first run. Objects that
+        # predate the queue never produced S3 events, so a fresh deploy that
+        # drained unconditionally would skip forever on an empty queue and
+        # never ingest the pre-existing files. A forced run also bypasses the
+        # queue and falls through to the listing branch's full-range re-read;
+        # it deliberately does NOT consume queue messages — the next unforced
+        # drain redelivers those keys (at-least-once, absorbed by replace/
+        # merge outputs, same documented semantics as watermark re-reads).
+        watermark_uri = _watermark_uri(alias)
+        cursor = _read_watermark(watermark_uri)
+        if cursor is not None and not forced:
+            drained = _drain_if_configured(spark, alias, src, bucket, prefix)
+            if drained is not None:
+                return drained
 
         all_partitions = _list_partition_tree(bucket, prefix, partition_names)
 
-        watermark_uri = _watermark_uri(alias)
-        cursor = _read_watermark(watermark_uri)
         if cursor is None:
             cursor = _resolve_initial_cursor(start_from, all_partitions)
 
@@ -3645,7 +3684,23 @@ def pipeline_handler(event, context):
                 os.environ["CLAVESA_LANGUAGE"] = str(event["language"])
             if event.get("logic_path"):
                 os.environ["CLAVESA_LOGIC_S3_PATH"] = str(event["logic_path"])
-        return handler(event, context)
+        # GH #43: single-node payloads (backfill stage, promote/discard,
+        # ad-hoc) run on the same warm container as bundles — give them the
+        # same /tmp-pressure recycle on entry and session reset on failure,
+        # or a failed backfill stage leaves a poisoned session for the next
+        # invocation.
+        if _tmp_pressure_exceeded():
+            print(
+                "[clavesa] /tmp >50% full at handler entry — recycling Spark session",
+                file=sys.stderr,
+                flush=True,
+            )
+            _reset_spark_session()
+        try:
+            return handler(event, context)
+        except Exception:
+            _reset_spark_session()
+            raise
 
     transforms = event.get("transforms", []) or []
     # Defensive: the emitter SHOULD already topo-order this list, but a
@@ -3663,11 +3718,20 @@ def pipeline_handler(event, context):
         if isinstance(t, dict)
     }
     sf_execution_arn = str(event.get("_sf_execution_arn", "") or "")
-    trigger = str(event.get("_trigger", "") or "")
+    # The CLI's StartExecution input lands nested under _execution_input
+    # (ASL threads $$.Execution.Input there); only the ASL-hoisted keys are
+    # top-level. Read both so local bundle invocations (flat) and cloud SFN
+    # invocations (nested) behave identically.
+    exec_input = event.get("_execution_input")
+    if not isinstance(exec_input, dict):
+        exec_input = {}
+    trigger = str(event.get("_trigger") or exec_input.get("_trigger") or "")
     # Forward force flags into every sub_event so handler() / _resolve_input
     # see them on a per-node basis (force_nodes scopes the bypass when set).
-    force_flag = bool(event.get("_force"))
-    force_nodes = list(event.get("_force_nodes") or [])
+    force_flag = bool(event.get("_force") or exec_input.get("_force"))
+    force_nodes = list(
+        event.get("_force_nodes") or exec_input.get("_force_nodes") or []
+    )
 
     results: list[dict[str, Any]] = []
     skipped_set: set[str] = set()
@@ -3718,6 +3782,19 @@ def pipeline_handler(event, context):
             if force_nodes:
                 sub_event["_force_nodes"] = force_nodes
 
+        # GH #43: if a prior successful run left enough shuffle/spill residue
+        # that /tmp is already half-full, recycle the session now so Spark's
+        # shutdown hooks clean its own temp dirs before we start fresh. This
+        # keeps the fast warm path for the common case while preventing slow
+        # accumulation from filling the disk mid-transform.
+        if _tmp_pressure_exceeded():
+            print(
+                "[clavesa] /tmp >50% full before transform — recycling Spark session",
+                file=sys.stderr,
+                flush=True,
+            )
+            _reset_spark_session()
+
         print(json.dumps({"_event": "entered", "node": node}), flush=True)
 
         # Live in-flight progress: a per-node daemon poller reads the Spark
@@ -3756,6 +3833,11 @@ def pipeline_handler(event, context):
             })
             overall_status = "failed"
             failed_node = node
+            # GH #43: recycle the session after any transform failure so a
+            # corrupt/poisoned SparkContext doesn't survive into the next warm
+            # invocation. SparkContext.stop() triggers Spark's own shutdown
+            # hooks, which delete blockmgr and spill dirs under /tmp.
+            _reset_spark_session()
             break
         finally:
             poller.stop()
