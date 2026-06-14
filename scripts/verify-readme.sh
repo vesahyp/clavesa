@@ -230,6 +230,28 @@ check_text() {
   fi
 }
 
+# check_testid <testid> <timeout_s> <description> [poll_interval_s] —
+# presence assertion against the data-testid contract. Some contract
+# elements (e.g. the ADR-024 engine badge) have no stable display text,
+# so snapshot grepping is the wrong tool — probe the DOM directly.
+check_testid() {
+  local id="$1" timeout="$2" desc="$3" interval="${4:-2}"
+  local deadline out
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    out="$(pw eval "() => !!document.querySelector('[data-testid=\"$id\"]')" || true)"
+    if grep -qw "true" <<<"$out"; then
+      pass "$desc"
+      return 0
+    fi
+    if (( $(date +%s) > deadline )); then
+      fail "$desc — [data-testid=$id] not found on $CURRENT_PAGE"
+      return 0
+    fi
+    sleep "$interval"
+  done
+}
+
 # check_absent <ERE> <description> — asserts against the current snapshot
 # (call only after the page has demonstrably rendered).
 check_absent() {
@@ -314,13 +336,11 @@ wait_runs_terminal() {
 
 # wait_run_recorded <run_id> <timeout_s> — block until the run's node_runs
 # rows are queryable from the Delta table (the arn-filtered query goes
-# through Spark, not the state.json fast path). Two jobs in one:
-#   1. It IS mandatory assertion 1 — one status=ok node_runs row per
-#      transform for this exact run.
-#   2. The runs API reads state.json, which goes terminal BEFORE the
-#      end-of-run Delta rollup write (recordLocalRun) releases the
-#      in-flight run lock — clicking Run in that window 409s. Delta-row
-#      visibility means the rollup finished, so the next click is safe.
+# through Spark, not the state.json fast path). This IS mandatory
+# assertion 1 — one status=ok node_runs row per transform for this exact
+# run. (It also used to be the GH #48 guard against clicking Run while the
+# previous run's lock outlived its rollup; the lock now releases at
+# terminal, so that job is gone.)
 wait_run_recorded() {
   local run_id="$1" timeout="$2"
   local deadline json nok
@@ -346,13 +366,14 @@ wait_run_recorded() {
 }
 
 # dispatch_run <n> — click Run pipeline until run #n actually exists
-# server-side. A click that lands while the previous run's lock is still
-# held is rejected with "a run is already in progress" (GH #48) — and the
-# lock has been observed to outlive the terminal runs-API status AND the
-# Delta rollup by 30s+ under docker load, so a single click is not enough.
-# This is exactly what a human does with the 409 toast: click again.
-# Each rejected click logs a browser console error; the console is cleared
-# after a successful dispatch so later per-page checks aren't polluted.
+# server-side. The GH #48 lock-outlives-the-run window is fixed (the run
+# lock releases the moment the previous run is terminal), so the first
+# click should dispatch; the retry loop stays as the same defensive move a
+# human makes on a 409 toast (a genuinely still-running pipeline, a slow
+# dispatch). Each rejected click logs a browser console error; the console
+# is cleared after a successful dispatch so later per-page checks aren't
+# polluted. A retry being NEEDED between terminal and dispatch again would
+# be a GH #48 regression — the attempt-count line below makes it visible.
 dispatch_run() {
   local want="$1" attempt json total
   for attempt in $(seq 1 8); do
@@ -380,6 +401,12 @@ require_tools
 port_free "$PORT" || die "port $PORT is already in use — stop whatever is on it, or set CLAVESA_VERIFY_ADDR=:<port> for a parallel run"
 
 WORK="$(mktemp -d /tmp/clavesa-verify-readme.XXXX)"
+# Snapshot the binary into the workdir and run THAT copy: anything rewriting
+# bin/clavesa mid-walkthrough (e.g. the parallel test-cli gate under
+# `make release-gates` running build-bin) must not yank the binary out from
+# under a multi-minute run already in flight.
+cp "$BIN" "$WORK/clavesa"
+BIN="$WORK/clavesa"
 # Sandbox the active-workspace pointer (~/.config/clavesa/current-workspace)
 # — see the deviation list in the header.
 export XDG_CONFIG_HOME="$WORK/xdg-config"
@@ -545,16 +572,9 @@ while [[ "$n" -le "$RUNS_WANTED" ]]; do
   fi
   banner "README browser step 5: run pipeline ($n of $RUNS_WANTED, timeout ${timeout}s)"
   CURRENT_PAGE="/pipelines/dashboard?dir=$PIPELINE (run $n)"
-  if [[ "$n" -gt 1 ]]; then
-    # GH #48: the previous run's in-flight lock outlives every observable
-    # signal (terminal runs-API status, Delta rollup rows) by seconds to
-    # 30s+ of runner-container teardown; a click inside that window is
-    # rejected with "a run is already in progress". The pause models the
-    # README's own pacing ("back to the dashboard, Run pipeline") and
-    # dispatch_run re-clicks if the lock is still held after it.
-    # Remove the settle once #48 is fixed.
-    sleep 20
-  fi
+  # GH #48 is fixed: the run lock releases the moment the run is terminal,
+  # so a Run click right after the previous run completes dispatches
+  # immediately — no settle needed between runs.
   dispatch_run "$n"
   wait_runs_terminal "$n" "$timeout"
   pass "run $n SUCCEEDED"
@@ -617,6 +637,10 @@ check_text "\bpayment_type\b" 15 "schema lists payment_type"
 # Sample rows land via the auto-run query pane ("N rows" footer; the
 # column-profile top-K lines also say "rows" but always as "x / y rows").
 check_text "[0-9][0-9,]* rows" 300 "sample rows render (query pane returned data)" 5
+# ADR-024: the sample-rows card header carries the engine badge. Presence
+# by testid, not text — the copy (engine/warehouse qualifiers) is not part
+# of the contract.
+check_testid "engine-badge-sample-rows" 30 "sample-rows card carries the engine badge"
 check_text "Commit timeline" 30 "commit timeline renders"
 check_absent "Commit history unavailable" "commit history is populated"
 check_text "\bLineage\b" 30 "lineage panel renders"

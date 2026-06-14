@@ -579,8 +579,9 @@ func bundleEnv(extra map[string]string) map[string]string {
 	return env
 }
 
-// bundleResult is the aggregated pipeline_handler result — the LAST stdout line
-// (the only line with no top-level "_event" key).
+// bundleResult is the aggregated pipeline_handler result — the JSON object on
+// stdout carrying a top-level "status" key (the only structured stdout line
+// now that per-node progress goes to the warehouse `_progress` tree).
 type bundleResult struct {
 	Status     string `json:"status"`
 	FailedNode string `json:"failed_node"`
@@ -590,8 +591,11 @@ type bundleResult struct {
 	} `json:"transforms"`
 }
 
-// parseBundle scans the runner stdout for the per-node _event lines and the
-// final aggregate result line. Returns the succeeded node set and the result.
+// parseBundle scans the runner stdout for the final aggregate result line.
+// The runner no longer emits per-node `_event` progress lines (progress now
+// goes to the warehouse `_progress/<run>/<node>.json` tree, not stdout), so
+// the per-node succeeded set is derived from the aggregate's transforms[]
+// (status == "ok"). Returns the succeeded node set and the result.
 func parseBundle(t *testing.T, stdout string) (succeeded map[string]bool, res bundleResult) {
 	t.Helper()
 	succeeded = map[string]bool{}
@@ -605,15 +609,7 @@ func parseBundle(t *testing.T, stdout string) (succeeded map[string]bool, res bu
 		if json.Unmarshal([]byte(line), &probe) != nil {
 			continue
 		}
-		if ev, ok := probe["_event"]; ok {
-			if ev == "succeeded" {
-				if node, _ := probe["node"].(string); node != "" {
-					succeeded[node] = true
-				}
-			}
-			continue
-		}
-		// No _event key + has a "status" key => the aggregate result line.
+		// The aggregate result line is the JSON object carrying a "status" key.
 		if _, ok := probe["status"]; ok {
 			resultLine = line
 		}
@@ -623,6 +619,11 @@ func parseBundle(t *testing.T, stdout string) (succeeded map[string]bool, res bu
 	}
 	if err := json.Unmarshal([]byte(resultLine), &res); err != nil {
 		t.Fatalf("parse aggregate result: %v\nline: %s", err, resultLine)
+	}
+	for _, tr := range res.Transforms {
+		if tr.Status == "ok" {
+			succeeded[tr.Node] = true
+		}
 	}
 	return succeeded, res
 }
@@ -650,10 +651,10 @@ func TestPipelineBundle_HealsDeadSession(t *testing.T) {
 
 	succeeded, res := parseBundle(t, stdout)
 	if !succeeded["a"] {
-		t.Errorf("node a should have emitted succeeded; stdout:\n%s", stdout)
+		t.Errorf("node a should have reported ok; stdout:\n%s", stdout)
 	}
 	if !succeeded["b"] {
-		t.Errorf("node b should have emitted succeeded after the session was killed (self-heal failed); stdout:\n%s", stdout)
+		t.Errorf("node b should have reported ok after the session was killed (self-heal failed); stdout:\n%s", stdout)
 	}
 	if res.Status != "ok" {
 		t.Errorf("bundle status: want ok, got %q (failed_node=%q)", res.Status, res.FailedNode)

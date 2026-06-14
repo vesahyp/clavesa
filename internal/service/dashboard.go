@@ -406,7 +406,7 @@ type DashboardRender struct {
 }
 
 // servingTemplate returns the dialect-appropriate SQL template for the
-// workspace environment mode: on a cloud workspace the cached Trino
+// workspace warehouse: on a cloud workspace the cached Trino
 // transpilation of the Spark template (populated at save), on a local
 // workspace the Spark template unchanged (local serving runs Spark). A
 // nil/local resolver means local. Errors only on a cloud transpile failure
@@ -516,9 +516,9 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string, params map[s
 }
 
 // dashboardProvider returns the cloud-or-local provider for the
-// workspace's environment mode. Used only by RenderDashboard, the widget
-// SQL execution path, which stays env-dispatched (ADR-014). Definition
-// CRUD no longer touches a Provider.
+// workspace's warehouse. Used only by RenderDashboard, the widget
+// SQL execution path, which stays warehouse-dispatched (ADR-014).
+// Definition CRUD no longer touches a Provider.
 func (s *Service) dashboardProvider() (observability.Provider, error) {
 	if s.dashResolver == nil {
 		return nil, fmt.Errorf("dashboards: observability resolver not configured")

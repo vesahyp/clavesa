@@ -74,14 +74,14 @@ payment_type  n
 3             19597
 ```
 
-Add `--json` when you want to pipe the result into `jq`, a script, or a test assertion. The JSON carries the column types alongside the rows:
+Add `--json` when you want to pipe the result into `jq`, a script, or a test assertion. The JSON carries the column types alongside the rows — the same shape the UI's `/query` page consumes ([ADR-015](../decisions/015-cli-ui-parity.md)):
 
 ```bash
 bin/clavesa query "SELECT payment_type, COUNT(*) AS n FROM clavesa_cookbook__demo.trips GROUP BY payment_type ORDER BY n DESC" --json --workspace $WS
 ```
 
 ```json
-{"columns":["payment_type","n"],"column_types":["bigint","bigint"],"rows":[[1,2319046],[2,439191],[0,140162],[4,46628],[3,19597]]}
+{"columns":[{"name":"payment_type","type":"bigint"},{"name":"n","type":"bigint"}],"rows":[["1","2319046"],["2","439191"],["0","140162"],["4","46628"],["3","19597"]],"row_count":5,"truncated":false}
 ```
 
 You can also pipe SQL in on stdin — handy for longer queries kept in a file:
@@ -152,10 +152,10 @@ It's a good pre-commit / CI gate for transform SQL: `find . -name '*.sql' -exec 
 
 ## What to expect — and the limits
 
-- **Local engine is Spark SQL.** `clavesa query` runs through the warm Spark container against your workspace's local Hadoop catalog. It speaks the full SparkSQL/Databricks dialect — `MERGE`, Delta time-travel (`SELECT … VERSION AS OF 3`), `read_files`, the lot.
-- **In the cloud, serving SQL is Athena (Trino dialect).** A deployed pipeline's tables are queried from Athena, which is Trino, not Spark. Most ANSI SQL is identical, but Spark-only constructs (some functions, `MERGE` as a query, Delta-specific syntax) won't port. Keep dashboard/serving SQL Trino-portable; use Spark-only features in transforms, where the engine is always Spark. `clavesa query` itself is **local-only** — there's no `--env cloud`; for cloud ad-hoc SQL, use Athena directly or the dashboards path.
+- **The engine follows the workspace warehouse** ([ADR-024](../decisions/024-warehouse-compute-split.md)). On a local warehouse (the default), `clavesa query` runs through the warm Spark container against your workspace's local Hadoop catalog — the full SparkSQL/Databricks dialect: `MERGE`, Delta time-travel (`SELECT … VERSION AS OF 3`), `read_files`, the lot. On a cloud warehouse, the same command queries the deployed tables through Athena — exactly what the UI's `/query` page does. Pass `--warehouse local|cloud` to override for one invocation.
+- **You author SparkSQL either way.** Athena speaks Trino, not Spark, but you don't hand-maintain a second dialect: on a cloud warehouse your SparkSQL is transpiled to the Trino serving dialect automatically ([ADR-023](../decisions/023-single-serving-dialect-spark-transpile.md)). A construct with no Trino mapping fails with a clear dialect error (pointing at the offending spot) instead of an Athena syntax error — keep truly Spark-only operations like `MERGE` in transforms, where the engine is always Spark.
 - **No automatic row cap.** Results stream back in full — your SQL supplies the `LIMIT`. `SELECT * FROM clavesa_cookbook__demo.trips` will try to print 3 million rows. Add `LIMIT`.
-- **First query pays a warm-up.** The Spark container spins up on the first query in a session (tens of seconds); every query after that is sub-second until the workspace's `clavesa ui`/query worker is torn down.
+- **First local query pays a warm-up.** On a local warehouse the Spark container spins up on the first query in a session (tens of seconds); every query after that is sub-second until the workspace's `clavesa ui`/query worker is torn down. Cloud queries have no Spark warm-up — Athena charges per query instead.
 - **Errors lead with the Spark message and exit non-zero** (see below) — so `clavesa query` is safe to use as a check in a script.
 
 ## Verify
@@ -167,7 +167,7 @@ bin/clavesa query "SHOW TABLES IN clavesa_cookbook__demo" --json --workspace $WS
 
 # Aggregate returns the five payment types, bigint counts, no scientific notation.
 bin/clavesa query "SELECT COUNT(*) AS c FROM clavesa_cookbook__demo.trips" --json --workspace $WS
-# Expect: {"columns":["c"],"column_types":["bigint"],"rows":[[2964624]]}
+# Expect: {"columns":[{"name":"c","type":"bigint"}],"rows":[["2964624"]],"row_count":1,"truncated":false}
 
 # Good SQL lints clean and silent.
 printf 'SELECT 1\n' > /tmp/ok.sql
@@ -181,7 +181,7 @@ bin/clavesa sql lint /tmp/bad.sql --workspace $WS ; echo "exit=$?"    # exit=1
 bin/clavesa query "SELECT * FROM clavesa_cookbook__demo.nope LIMIT 1" --workspace $WS ; echo "exit=$?"  # exit=1
 ```
 
-Assertable signals an agent or CI can rely on: `sql lint` exits 0 on parse-clean SQL and 1 otherwise; `query` exits non-zero on any execution error; `--json` output is stable `{columns, column_types, rows}`. The exact row counts above are deterministic for `yellow_tripdata_2024-01.parquet` (2,964,624 rows); a different month will differ.
+Assertable signals an agent or CI can rely on: `sql lint` exits 0 on parse-clean SQL and 1 otherwise; `query` exits non-zero on any execution error; `--json` output is stable `{columns: [{name, type}], rows, row_count, truncated}` — the same shape from both warehouses and from the UI's `/query` endpoint. Row values are strings (`jq` tip: `.rows[0][0] | tonumber`). The exact row counts above are deterministic for `yellow_tripdata_2024-01.parquet` (2,964,624 rows); a different month will differ.
 
 ## Troubleshooting
 
@@ -191,7 +191,7 @@ Assertable signals an agent or CI can rely on: `sql lint` exits 0 on parse-clean
 
 **`SELECT *` floods the terminal.** No implicit row cap — add `LIMIT`.
 
-**A function works in `clavesa query` but fails on a deployed pipeline's Athena query.** Spark (local) and Trino (Athena, cloud) are different dialects. Keep serving/dashboard SQL Trino-portable; reserve Spark-only features for transforms.
+**A query works on the local warehouse but fails with a dialect error on cloud.** The transpiler maps most SparkSQL to Trino automatically ([ADR-023](../decisions/023-single-serving-dialect-spark-transpile.md)); a dialect error means that construct has no Trino equivalent on Athena. Reserve those (e.g. `MERGE`, Delta time-travel) for transforms — the transform engine is always Spark — or run the query with `--warehouse local`.
 
 ## Next
 

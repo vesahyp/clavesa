@@ -199,13 +199,19 @@ type DialectError struct {
 
 func (e *DialectError) Error() string { return e.Message }
 
+// DialectRejection marks the error for HTTP layers that cannot import
+// internal/service (internal/dataquery — service imports it, so the
+// reverse import would cycle). Those layers match it structurally via an
+// errors.As interface target and map the rejection to a 400.
+func (e *DialectError) DialectRejection() {}
+
 // Service provides direct access to pipeline operations without HTTP.
 type Service struct {
-	workspace string
-	fo        *fileops.FileOps
-	s3Client  dataquery.S3Client
-	s3Once    sync.Once
-	s3Err     error
+	workspace  string
+	fo         *fileops.FileOps
+	s3Client   dataquery.S3Client
+	s3Once     sync.Once
+	s3Err      error
 	evictor    WarehouseEvictor
 	sqlParser  SQLParser
 	transpiler Transpiler
@@ -242,6 +248,19 @@ type Service struct {
 	// Docker. CLI and UI wire the real ensurer via WithMetastoreEnsurer;
 	// empty results mean the containers fall back to embedded Derby.
 	metastoreEnsure func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string)
+
+	// recordRun appends the end-of-run rollup row (one more runner
+	// container after the run is terminal). Defaults to recordLocalRun in
+	// New; tests stub it to pin the GH #48 ordering — the run lock and
+	// in-flight flag release at the terminal `_run.json` write, BEFORE this
+	// rollup runs — without touching Docker.
+	recordRun func(ctx context.Context, image, pipelineDir string, outcome *runOutcome, cascadeSkipped []string, ensureMetastore func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string))
+
+	// cloudLocalDispatch is the "cloud warehouse, local compute" docker
+	// dispatcher (ADR-024) — defaults to the real runCloudLocalEvent in
+	// New, stubbed by tests so the backfill-stage --compute local routing
+	// can be exercised without Docker. See cloudlocal.go.
+	cloudLocalDispatch func(ctx context.Context, env, perNodeEnv map[string]string, event any, onEvent func(map[string]any)) (*cloudLocalResult, error)
 }
 
 // Ref wraps a bare HCL expression (e.g. file("path"), var.x) as a reference
@@ -252,7 +271,7 @@ func Ref(expr string) fileops.ModuleReference {
 
 // New creates a new Service rooted at workspace.
 func New(workspace string) *Service {
-	return &Service{
+	s := &Service{
 		workspace:    workspace,
 		fo:           fileops.New(),
 		runsInFlight: make(map[string]bool),
@@ -260,7 +279,10 @@ func New(workspace string) *Service {
 		// touches Docker. Production wires the real one via
 		// WithMetastoreEnsurer; empty results mean embedded fallback.
 		metastoreEnsure: func(context.Context, string, string) (string, string) { return "", "" },
+		recordRun:       recordLocalRun,
 	}
+	s.cloudLocalDispatch = s.runCloudLocalEvent
+	return s
 }
 
 // WithEvictor registers a warm-worker evictor so `pipeline run` can

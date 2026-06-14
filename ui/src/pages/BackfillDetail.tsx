@@ -34,6 +34,7 @@ import {
   useBackfillDedupCheck,
   useBackfillDiff,
   useBackfills,
+  useWarehouse,
 } from "@/lib/queries";
 
 // Pick a sensible default dedup column from the staging schema. We
@@ -75,6 +76,15 @@ export function BackfillDetail() {
   const [promoting, setPromoting] = useState(false);
   const [discarding, setDiscarding] = useState(false);
 
+  // Local compute is a cloud-warehouse-only capability: on a local
+  // warehouse promote/discard already run on this machine, so the toggle
+  // is hidden rather than disabled. One piece of state drives both the
+  // promote and discard mutations (ADR-024: per-action compute placement).
+  const [computeLocal, setComputeLocal] = useState(false);
+  const warehouse = useWarehouse();
+  const cloudWarehouse = warehouse.data?.warehouse === "cloud";
+  const computeArg = cloudWarehouse && computeLocal ? "local" : undefined;
+
   const stagingColumns = diff.data?.staging_columns ?? [];
 
   // Pre-pick a default dedup column once the schema lands. Without
@@ -104,6 +114,7 @@ export function BackfillDetail() {
         dir,
         force_dedup: appendAnyway ? undefined : forceDedup || undefined,
         allow_duplicates: appendAnyway || undefined,
+        compute: computeArg,
       });
       if (result.columns_added.length > 0) {
         toast.success(
@@ -136,7 +147,7 @@ export function BackfillDetail() {
     if (!window.confirm("Drop staging table without promoting?")) return;
     setDiscarding(true);
     try {
-      await discardBackfill(runID, { dir });
+      await discardBackfill(runID, { dir, compute: computeArg });
       toast.success("Discarded.");
       // See handlePromote: navigate away so the diff / dedup-check
       // observers unmount; don't removeQueries (it would refetch
@@ -196,6 +207,15 @@ export function BackfillDetail() {
             backfill
           </Badge>
           <h1 className="font-mono text-lg tracking-tight">{runID}</h1>
+          {run?.compute === "local" && (
+            <Badge
+              variant="outline"
+              data-testid="backfill-compute-chip"
+              className="font-mono text-[10px] uppercase"
+            >
+              computed locally
+            </Badge>
+          )}
         </div>
 
         {run && (
@@ -402,6 +422,25 @@ export function BackfillDetail() {
                   </p>
                 </div>
               </div>
+            )}
+
+            {cloudWarehouse && (
+              <label className="flex items-start gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  data-testid="backfill-detail-compute-local"
+                  checked={computeLocal}
+                  onChange={(e) => setComputeLocal(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Run compute locally (docker on this machine)
+                  <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                    Runs the MERGE / cleanup on this machine against the cloud
+                    warehouse.
+                  </span>
+                </span>
+              </label>
             )}
 
             <div className="flex justify-end gap-2 pt-2">

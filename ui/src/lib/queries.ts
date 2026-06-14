@@ -27,6 +27,20 @@ function isQueryableIdentifier(database: string, table: string): boolean {
 // Schemas (boundary-of-trust for API responses)
 // ---------------------------------------------------------------------------
 
+// ADR-024: engine identity is per-response metadata. Every SQL-running
+// endpoint may stamp `served` describing which engine answered and against
+// which warehouse. Optional — absent on old servers and on endpoints that
+// haven't adopted it yet; the EngineBadge renders nothing in that case.
+// `engine`/`warehouse` stay open strings so a new engine value degrades to
+// a badge with an unfamiliar label instead of failing the whole response
+// parse.
+export const ServedInfo = z.object({
+  engine: z.string(),
+  warehouse: z.string(),
+  transpiled: z.boolean().optional(),
+});
+export type ServedInfo = z.infer<typeof ServedInfo>;
+
 const CatalogColumn = z.object({
   name: z.string(),
   type: z.string(),
@@ -73,6 +87,7 @@ const TableQueryResult = z.object({
   rows: z.array(z.array(z.string())),
   row_count: z.number(),
   truncated: z.boolean(),
+  served: ServedInfo.optional(),
 });
 export type TableQueryResult = z.infer<typeof TableQueryResult>;
 
@@ -1012,6 +1027,9 @@ const DashboardQueryResult = z.object({
   rows: z.array(z.array(z.string())).default([]),
   row_count: z.number(),
   truncated: z.boolean(),
+  // The /dashboards/query handler writes the provider QueryResult through
+  // verbatim, so the ADR-024 stamp rides along here too.
+  served: ServedInfo.optional(),
 });
 export type DashboardQueryResult = z.infer<typeof DashboardQueryResult>;
 
@@ -1289,6 +1307,9 @@ const BackfillRun = z.object({
   status: z.string().optional().default(""),
   rows_written: z.number().nullish(),
   error_msg: z.string().optional().default(""),
+  // Which machine ran the staging compute. Absent on old servers →
+  // the Lambda path (the only one that existed before ADR-024 slice 6).
+  compute: z.enum(["lambda", "local"]).optional(),
 });
 export type BackfillRun = z.infer<typeof BackfillRun>;
 
@@ -1401,6 +1422,9 @@ export async function stageBackfill(body: {
   from: string[];
   to: string[];
   direct?: boolean;
+  /** Omit for the default Lambda path; "local" runs the heavy Spark
+   * work in a local docker container against the cloud warehouse. */
+  compute?: "local";
 }): Promise<BackfillRun> {
   const res = await fetch(`${BASE_URL}/backfills/stage`, {
     method: "POST",
@@ -1442,7 +1466,14 @@ export type BackfillPromoteResult = z.infer<typeof BackfillPromoteResult>;
  */
 export async function promoteBackfill(
   runID: string,
-  body: { dir: string; force_dedup?: string; allow_duplicates?: boolean },
+  body: {
+    dir: string;
+    force_dedup?: string;
+    allow_duplicates?: boolean;
+    /** Omit for the default Lambda path; "local" runs the MERGE in a
+     * local docker container against the cloud warehouse. */
+    compute?: "local";
+  },
 ): Promise<BackfillPromoteResult> {
   const res = await fetch(
     `${BASE_URL}/backfills/${encodeURIComponent(runID)}/promote`,
@@ -1462,7 +1493,12 @@ export async function promoteBackfill(
 /** POST /api/backfills/{run_id}/discard. */
 export async function discardBackfill(
   runID: string,
-  body: { dir: string },
+  body: {
+    dir: string;
+    /** Omit for the default Lambda path; "local" runs the staging
+     * cleanup in a local docker container against the cloud warehouse. */
+    compute?: "local";
+  },
 ): Promise<void> {
   const res = await fetch(
     `${BASE_URL}/backfills/${encodeURIComponent(runID)}/discard`,
@@ -1746,37 +1782,45 @@ export async function deleteDashboard(slug: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace environment mode
+// Workspace warehouse (local | cloud)
 // ---------------------------------------------------------------------------
 
-const EnvironmentMode = z.object({
-  mode: z.enum(["local", "cloud"]),
-});
-export type EnvironmentMode = z.infer<typeof EnvironmentMode>;
+// The wire shape carries `warehouse` plus a deprecated `mode` alias with
+// the same value; older servers send only `mode`. Prefer `warehouse`,
+// fall back to `mode`, default "local" (absent → local).
+const Warehouse = z
+  .object({
+    warehouse: z.enum(["local", "cloud"]).optional(),
+    mode: z.enum(["local", "cloud"]).optional(),
+  })
+  .transform(({ warehouse, mode }) => ({
+    warehouse: warehouse ?? mode ?? ("local" as const),
+  }));
+export type Warehouse = z.infer<typeof Warehouse>;
 
 /**
- * GET /api/workspace/environment — the workspace environment mode that
- * drives local-vs-cloud dispatch. Absent → "local".
+ * GET /api/workspace/environment — the workspace warehouse that drives
+ * local-vs-cloud dispatch for what every page reads and writes.
  */
-export function useEnvironmentMode() {
+export function useWarehouse() {
   return useQuery({
-    queryKey: ["environment"],
+    queryKey: ["warehouse"],
     queryFn: async () =>
-      EnvironmentMode.parse(await request("/workspace/environment")),
+      Warehouse.parse(await request("/workspace/environment")),
   });
 }
 
 /**
- * PUT /api/workspace/environment — persist the workspace environment
- * mode. The CLI twin is `clavesa workspace use --env` (ADR-015).
+ * PUT /api/workspace/environment — persist the workspace warehouse.
+ * The CLI twin is `clavesa workspace use` (ADR-015).
  */
-export async function setEnvironmentMode(
-  mode: "local" | "cloud",
-): Promise<EnvironmentMode> {
-  return EnvironmentMode.parse(
+export async function setWarehouse(
+  warehouse: "local" | "cloud",
+): Promise<Warehouse> {
+  return Warehouse.parse(
     await request("/workspace/environment", {
       method: "PUT",
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ warehouse }),
     }),
   );
 }
@@ -1994,12 +2038,16 @@ const CellResult = z.object({
   stderr: z.string(),
   display: CellDisplay.optional(),
   error: CellError.optional(),
+  served: ServedInfo.optional(),
 });
 export type CellResult = z.infer<typeof CellResult>;
 
 const CellRunResult = z.object({
   cell: NotebookCell,
   result: CellResult,
+  // ADR-024 engine identity. The backend stamps `served` next to `result`;
+  // CellResult.served above tolerates the sibling-of-status placement too.
+  served: ServedInfo.optional(),
 });
 export type CellRunResult = z.infer<typeof CellRunResult>;
 
@@ -2127,6 +2175,7 @@ const AdhocQueryResult = z.object({
   rows: z.array(z.array(z.string())),
   row_count: z.number().optional(),
   truncated: z.boolean().optional(),
+  served: ServedInfo.optional(),
 });
 export type AdhocQueryResult = z.infer<typeof AdhocQueryResult>;
 

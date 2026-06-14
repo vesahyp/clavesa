@@ -250,17 +250,32 @@ func (p *persistentDockerQueryRunner) Run(ctx context.Context, warehouse, sql st
 // internal/api can `errors.As(&service.ParseError{})` without
 // reaching into the observability package.
 func (p *persistentDockerQueryRunner) SQLParserFor(warehouse string) *boundSQLParser {
-	return &boundSQLParser{runner: p, warehouse: warehouse}
+	return &boundSQLParser{runner: p, resolve: func() (string, error) { return warehouse, nil }}
+}
+
+// SQLParserForWorkspace returns a SQL parser bound to the workspace's
+// *active* warehouse (ADR-024), resolved lazily on every Parse call via
+// workspace.WarehouseURI. Lazy resolution means a `workspace use
+// --warehouse` flip takes effect without rebuilding the parser (the
+// worker map is keyed by warehouse string, so local and cloud workers
+// coexist), and a cloud warehouse on an undeployed workspace surfaces
+// WarehouseURI's actionable error at the moment a parse is requested —
+// never a silent fallback to local.
+func (p *persistentDockerQueryRunner) SQLParserForWorkspace() *boundSQLParser {
+	return &boundSQLParser{runner: p, resolve: func() (string, error) {
+		return workspace.WarehouseURI(p.workspaceRoot)
+	}}
 }
 
 // boundSQLParser binds a persistentDockerQueryRunner to one warehouse
-// so it satisfies the service-layer SQLParser shape (no warehouse
-// parameter). The translation to *service.ParseError happens at the
-// caller (cli/api) by detecting the *observability.ParseError this
-// returns — keeps the observability package free of an import cycle.
+// resolver so it satisfies the service-layer SQLParser shape (no
+// warehouse parameter). The translation to *service.ParseError happens
+// at the caller (cli/api) by detecting the *observability.ParseError
+// this returns — keeps the observability package free of an import
+// cycle.
 type boundSQLParser struct {
-	runner    *persistentDockerQueryRunner
-	warehouse string
+	runner  *persistentDockerQueryRunner
+	resolve func() (string, error)
 }
 
 // Parse satisfies service.SQLParser (and is the parse seam Slice 3
@@ -271,7 +286,11 @@ type boundSQLParser struct {
 // service-layer type. service.ValidateSQL's wrapping turns it into a
 // *service.ParseError at the api / cli boundary.
 func (b *boundSQLParser) Parse(ctx context.Context, sql string) error {
-	err := b.runner.Parse(ctx, b.warehouse, sql)
+	warehouse, err := b.resolve()
+	if err != nil {
+		return err
+	}
+	err = b.runner.Parse(ctx, warehouse, sql)
 	if err == nil {
 		return nil
 	}
@@ -407,41 +426,16 @@ func (p *persistentDockerQueryRunner) Workers() []WorkerStatus {
 }
 
 func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse string) (string, int, error) {
-	if err := os.MkdirAll(warehouse, 0o755); err != nil {
-		return "", 0, fmt.Errorf("create warehouse dir: %w", err)
+	isS3 := strings.HasPrefix(warehouse, "s3://")
+	if !isS3 {
+		if err := os.MkdirAll(warehouse, 0o755); err != nil {
+			return "", 0, fmt.Errorf("create warehouse dir: %w", err)
+		}
 	}
-	args := []string{
-		"run", "-d", "--rm",
-		"--label", p.labelKV,
-		// Bind only to loopback (the Go side always dials 127.0.0.1, and the
-		// warm Spark worker has no business being reachable from the LAN) and
-		// request an ephemeral host port via the empty-host-port form
-		// `127.0.0.1::CONTAINER`. This is the canonical "give me a random
-		// port" spelling; the literal `0:CONTAINER` form we used before is
-		// what Docker Desktop occasionally fails to forward (see the spawn
-		// retry below).
-		"-p", "127.0.0.1::8765/tcp",
-		// Spark Connect gRPC binding. Exposed so future Slice-1 notebook
-		// REPL subprocesses (which connect via gRPC) and host-side debug
-		// tools (`grpcurl`) can reach the in-container Connect server.
-		// Slice 0's /query path goes through a Connect client inside the
-		// same container, so this port isn't strictly required today —
-		// but exposing it is free and avoids a respawn churn when Slice 1
-		// lands.
-		"-p", "127.0.0.1::15002/tcp",
-		"-e", "CLAVESA_QUERY_SERVER=1",
-		"-e", "CLAVESA_QUERY_SERVER_PORT=8765",
-		"-e", "CLAVESA_CONNECT_PORT=15002",
-		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
-	}
-	// ADR-019 Slice 4: register the V2 multi-catalog so warm reads of
-	// three-level addresses ``<catalog>.<schema>.<table>`` resolve. The
-	// runner falls back to spark_catalog for legacy two-segment reads
-	// (pre-Slice-4 tables under the Hive metastore), so this is purely
-	// additive.
+	var catalog, systemCatalog string
 	if m, _ := workspace.Load(p.workspaceRoot); m != nil {
-		args = append(args, "-e", "CLAVESA_CATALOG="+m.CatalogIdentifier())
-		args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+m.SystemCatalogIdentifier())
+		catalog = m.CatalogIdentifier()
+		systemCatalog = m.SystemCatalogIdentifier()
 	}
 	// Shared local Derby metastore (the local analog of cloud's shared
 	// Glue). EnsureMetastore brings up (or reuses) the per-workspace Derby
@@ -452,19 +446,22 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 	// `pipeline run` container is writing to the same warehouse, without
 	// either side colliding on the embedded Derby lock. Best-effort: on any
 	// failure we log and fall back to embedded Derby (safe precisely
-	// because no server is then serving the DB).
-	if addr, err := EnsureMetastore(ctx, p.workspaceRoot, p.metastoreWorkspaceName()); err != nil {
-		fmt.Fprintf(os.Stderr, "clavesa: warm worker falling back to embedded metastore (shared metastore unavailable): %v\n", err)
-	} else {
-		args = append(args, "--network", metastoreNetworkName(p.workspaceRoot))
-		args = append(args, "-e", "CLAVESA_METASTORE_ADDR="+addr)
+	// because no server is then serving the DB). A cloud (s3://) warehouse
+	// uses Glue federation instead — no Derby, no metastore network.
+	var metastoreNetwork, metastoreAddr string
+	if !isS3 {
+		if addr, err := EnsureMetastore(ctx, p.workspaceRoot, p.metastoreWorkspaceName()); err != nil {
+			fmt.Fprintf(os.Stderr, "clavesa: warm worker falling back to embedded metastore (shared metastore unavailable): %v\n", err)
+		} else {
+			metastoreNetwork = metastoreNetworkName(p.workspaceRoot)
+			metastoreAddr = addr
+		}
 	}
-	// No explicit `--memory` / Spark driver heap is set here: the warm
-	// worker serves small interactive result sets, and now that the shared
-	// metastore lets it coexist with a `pipeline run` container we rely on
-	// the Docker Desktop memory budget rather than a per-container cap.
-	// Adding a cap would be a new knob with no current symptom to fix.
-	args = append(args, "-v", warehouse+":"+warehouse, p.resolveImage())
+	var awsArgs []string
+	if isS3 {
+		awsArgs = runner.AWSEnvDockerArgs(ctx)
+	}
+	args := warmWorkerRunArgs(p.labelKV, warehouse, p.resolveImage(), catalog, systemCatalog, metastoreNetwork, metastoreAddr, awsArgs)
 
 	// Docker Desktop intermittently accepts a `-p` publish request but never
 	// wires up the host-side forwarding: the container runs fine, Spark boots,
@@ -511,6 +508,71 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		return containerID, port, nil
 	}
 	return "", 0, fmt.Errorf("warm worker: docker never published a host port across %d attempts: %w", spawnAttempts, lastErr)
+}
+
+// warmWorkerRunArgs assembles the `docker run` argument list for one warm
+// worker. Kept free of docker / filesystem calls so the local-vs-cloud
+// branch shapes are unit-testable; spawn() gathers the inputs (metastore
+// addr, catalog identifiers, image) and passes them in.
+//
+// Local warehouse: bind-mount the warehouse dir, join the per-workspace
+// Derby metastore network when one is up (empty network/addr → embedded
+// Derby fallback).
+//
+// Cloud (s3://) warehouse (ADR-024): CLAVESA_WAREHOUSE is passed verbatim
+// — runner/spark_conf.py keys Glue Hive federation + S3SingleDriverLogStore
+// on the s3:// prefix — with no local mount and no Derby metastore (Glue is
+// the metastore); awsArgs carries the host-resolved AWS credential
+// env/mounts (runner.AWSEnvDockerArgs — resolved by spawn() so this
+// function stays pure).
+func warmWorkerRunArgs(labelKV, warehouse, image, catalog, systemCatalog, metastoreNetwork, metastoreAddr string, awsArgs []string) []string {
+	args := []string{
+		"run", "-d", "--rm",
+		"--label", labelKV,
+		// Bind only to loopback (the Go side always dials 127.0.0.1, and the
+		// warm Spark worker has no business being reachable from the LAN) and
+		// request an ephemeral host port via the empty-host-port form
+		// `127.0.0.1::CONTAINER`. This is the canonical "give me a random
+		// port" spelling; the literal `0:CONTAINER` form we used before is
+		// what Docker Desktop occasionally fails to forward (see the spawn
+		// retry in spawn()).
+		"-p", "127.0.0.1::8765/tcp",
+		// Spark Connect gRPC binding. Exposed so notebook REPL subprocesses
+		// (which connect via gRPC) and host-side debug tools (`grpcurl`) can
+		// reach the in-container Connect server.
+		"-p", "127.0.0.1::15002/tcp",
+		"-e", "CLAVESA_QUERY_SERVER=1",
+		"-e", "CLAVESA_QUERY_SERVER_PORT=8765",
+		"-e", "CLAVESA_CONNECT_PORT=15002",
+		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
+	}
+	// ADR-019 Slice 4: register the V2 multi-catalog so warm reads of
+	// three-level addresses ``<catalog>.<schema>.<table>`` resolve. The
+	// runner falls back to spark_catalog for legacy two-segment reads
+	// (pre-Slice-4 tables under the Hive metastore), so this is purely
+	// additive.
+	if catalog != "" {
+		args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
+	}
+	if systemCatalog != "" {
+		args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
+	}
+	if strings.HasPrefix(warehouse, "s3://") {
+		args = append(args, awsArgs...)
+		args = append(args, image)
+		return args
+	}
+	if metastoreNetwork != "" && metastoreAddr != "" {
+		args = append(args, "--network", metastoreNetwork)
+		args = append(args, "-e", "CLAVESA_METASTORE_ADDR="+metastoreAddr)
+	}
+	// No explicit `--memory` / Spark driver heap is set here: the warm
+	// worker serves small interactive result sets, and now that the shared
+	// metastore lets it coexist with a `pipeline run` container we rely on
+	// the Docker Desktop memory budget rather than a per-container cap.
+	// Adding a cap would be a new knob with no current symptom to fix.
+	args = append(args, "-v", warehouse+":"+warehouse, image)
+	return args
 }
 
 // dockerContainerState returns a short "running exit=N" summary for a

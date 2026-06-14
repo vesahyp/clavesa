@@ -6,7 +6,8 @@ import (
 )
 
 // TestPrepareRun — the synchronous half of an async run produces a
-// meaningful run id and a started progress channel before any DAG work.
+// meaningful run id, a run-level outcome, and a progress store (the
+// `_run.json` sink) before any DAG work.
 func TestPrepareRun(t *testing.T) {
 	svc, dir, id := initComputeTestWorkspace(t)
 	if _, err := svc.UpdateNode(dir, id, map[string]interface{}{"sql": "SELECT 1"}); err != nil {
@@ -20,8 +21,11 @@ func TestPrepareRun(t *testing.T) {
 	if prep.runID == "" {
 		t.Error("prepareRun returned an empty run id")
 	}
-	if prep.channel == nil {
-		t.Error("prepareRun returned a nil progress channel")
+	if prep.outcome == nil {
+		t.Error("prepareRun returned a nil run outcome")
+	}
+	if prep.store == nil {
+		t.Error("prepareRun returned a nil progress store")
 	}
 	found := false
 	for _, n := range prep.order {

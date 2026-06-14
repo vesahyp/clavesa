@@ -1,7 +1,9 @@
 /**
  * BackfillStageDialog — stage a new backfill window from the pipeline
  * dashboard. Mirrors the CLI's `clavesa pipeline backfill stage`
- * surface field-for-field (ADR-015): node + from + to + direct.
+ * surface field-for-field (ADR-015): node + from + to + direct, plus
+ * the cloud-warehouse-only "run compute locally" toggle (`--compute
+ * local`, ADR-024).
  *
  * The Lambda invoke blocks the dialog for the full transform run (a Spark
  * cold start plus however long the window takes to process); the Loader
@@ -25,7 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { stageBackfill, type BackfillRun } from "@/lib/queries";
+import { stageBackfill, useWarehouse, type BackfillRun } from "@/lib/queries";
 
 export interface BackfillStageDialogProps {
   open: boolean;
@@ -48,7 +50,16 @@ export function BackfillStageDialog({
   const [fromCursor, setFromCursor] = useState("");
   const [toCursor, setToCursor] = useState("");
   const [direct, setDirect] = useState(false);
+  const [computeLocal, setComputeLocal] = useState(false);
   const [running, setRunning] = useState(false);
+
+  // Local compute is a cloud-warehouse-only capability: on a local
+  // warehouse everything already runs on this machine, so the toggle
+  // is hidden entirely rather than disabled (the choice genuinely
+  // doesn't exist there). ADR-024: compute is a per-action choice that
+  // only diverges from the warehouse in the (cloud, local) combination.
+  const warehouse = useWarehouse();
+  const cloudWarehouse = warehouse.data?.warehouse === "cloud";
 
   // The parent dashboard always mounts this dialog (just toggles its
   // `open` prop). At mount time the pipeline graph fetch hasn't
@@ -69,6 +80,7 @@ export function BackfillStageDialog({
     setFromCursor("");
     setToCursor("");
     setDirect(false);
+    setComputeLocal(false);
   }
 
   async function handleStage() {
@@ -84,6 +96,7 @@ export function BackfillStageDialog({
         from: fromCursor.split("/").map((s) => s.trim()).filter(Boolean),
         to: toCursor.split("/").map((s) => s.trim()).filter(Boolean),
         direct: direct || undefined,
+        compute: cloudWarehouse && computeLocal ? "local" : undefined,
       });
       toast.success(
         direct
@@ -183,6 +196,26 @@ export function BackfillStageDialog({
               merge-keyed outputs.
             </span>
           </label>
+
+          {cloudWarehouse && (
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                data-testid="backfill-compute-local"
+                checked={computeLocal}
+                onChange={(e) => setComputeLocal(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                Run compute locally (docker on this machine, against cloud
+                data)
+                <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                  Heavy windows that hit Lambda's 15-minute cap run fine
+                  locally; data still lands in the cloud warehouse.
+                </span>
+              </span>
+            </label>
+          )}
         </div>
 
         <DialogFooter>

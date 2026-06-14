@@ -214,14 +214,14 @@ output "system_catalog" {
 	// file:-backed credential payloads live next to the registry as
 	// plaintext and must never be committed (the credential JSON spec
 	// itself is fine to commit; only the .secret payload is ignored).
-	// (2) the per-developer environment-mode file. (3) the
+	// (2) the per-developer warehouse file (environment.json). (3) the
 	// per-developer AWS-profile selection.
 	// Each line is appended only if absent, so re-running init — or
 	// running it on a workspace created by an older clavesa — stays
 	// idempotent and never duplicates a line.
 	gitignoreEntries := []struct{ marker, snippet string }{
 		{".clavesa/credentials/*.secret", "# clavesa: never commit file:-backend credential payloads\n.clavesa/credentials/*.secret\n"},
-		{".clavesa/environment.json", "# clavesa: per-developer environment mode (local/cloud lens)\n.clavesa/environment.json\n"},
+		{".clavesa/environment.json", "# clavesa: per-developer warehouse selection (local/cloud)\n.clavesa/environment.json\n"},
 		{".clavesa/aws-profile.json", "# clavesa: per-developer AWS profile selection\n.clavesa/aws-profile.json\n"},
 	}
 	gitignorePath := filepath.Join(root, ".gitignore")
@@ -269,6 +269,15 @@ output "system_catalog" {
 	// references locally — `terraform init` makes no network call.
 	if err := modules.Extract(root, moduleVersion); err != nil {
 		return fmt.Errorf("extract modules: %w", err)
+	}
+
+	// Scaffold the opt-in `_maintenance` pipeline (GH #53) — a scheduled
+	// transform that OPTIMIZE/VACUUMs the workspace system tables so their
+	// Delta `_delta_log` stays bounded. Written to disk, not deployed; the
+	// user opts in by deploying it (or deletes the directory). Needs the
+	// extracted modules above for its `source` reference to resolve.
+	if err := scaffoldMaintenancePipeline(root, catalog, systemCatalog, moduleVersion); err != nil {
+		return fmt.Errorf("scaffold maintenance pipeline: %w", err)
 	}
 
 	// Build the local Docker image so the workspace has the image its first

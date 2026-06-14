@@ -1,4 +1,4 @@
-.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme release-check release-public validate-examples
+.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme release-gates release-check release-public validate-examples
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -7,7 +7,7 @@ dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
 
 sync-runner: ## Copy runner/ → internal/runner/files/ so the embedded copy used by `clavesa workspace init` stays in sync
-	cp runner/Dockerfile runner/runner.py runner/spark_conf.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/spark_conf.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
 
 sync-modules: ## Copy modules/ → internal/modules/files/ (tracked .tf/.py/.md/.hcl files only) so `terraform init` resolves embedded modules locally
 	@rm -rf internal/modules/files
@@ -46,13 +46,21 @@ build-ui: ui/node_modules ## Build the React frontend → internal/ui/dist/
 build: build-ui sync-modules sync-runner ## Build everything → bin/clavesa (UI + modules + runner files embedded)
 	go build -o bin/clavesa ./cmd/clavesa
 
+# SKIP_BUILD is INTERNAL to release-gates, which runs `make build` once and
+# then launches the gates with SKIP_BUILD=1 so three concurrent sub-makes
+# don't race each other rewriting bin/clavesa. NEVER set it manually — the
+# build dep is what keeps every gate off a stale binary.
 test: test-go test-runner-py test-cli test-runner ## Run all tests (incl. docker-gated runner suite — GH #27)
+	@./scripts/green-stamp.sh write test
 
 test-go: ## Go unit tests (fast, no binary)
 	go test -v ./...
 
-test-cli: build-bin ## Build binary + CLI pipeline cycle (Go-driven)
-	go test -v -tags integration ./tests/cli/...
+# -count=1 on the integration suites: they exercise bin/clavesa and the
+# runner image — external artifacts Go's test cache can't see — so a
+# cached PASS can predate the binary it claims to verify.
+test-cli: $(if $(SKIP_BUILD),,build-bin) ## Build binary + CLI pipeline cycle (Go-driven)
+	go test -v -count=1 -tags integration ./tests/cli/...
 
 test-runner: ## Docker-gated runner integration tests (preview + handler)
 	@docker info >/dev/null 2>&1 || { \
@@ -60,7 +68,7 @@ test-runner: ## Docker-gated runner integration tests (preview + handler)
 	  echo "  start Docker or run the individual suites (test-go / test-runner-py / test-cli)."; \
 	  exit 1; \
 	}
-	go test -v -tags integration ./tests/runner/...
+	go test -v -count=1 -tags integration ./tests/runner/...
 
 test-runner-py: ## Pure-Python runner unit tests (stdlib only, no docker, no Spark)
 	@for f in tests/runner/test_*.py; do \
@@ -81,7 +89,7 @@ validate-examples: ## terraform validate every modules/*/aws/examples/* (catches
 	 done; \
 	 exit $$status
 
-release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, cloud-smoke stamp, examples validate, tag not yet created
+release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, cloud-smoke stamp, tree-exact test/verify-readme stamps, examples validate, tag not yet created
 	@VERSION=$$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1); \
 	 echo "→ ModuleVersion: $$VERSION"; \
 	 grep -qE "^## \[$$VERSION\]" CHANGELOG.md || { \
@@ -114,6 +122,20 @@ release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, clou
 	   fi; \
 	   echo "✓ cloud smoke stamp matches $$VERSION ($$(grep -oE '"timestamp"[^,}]*' .cloud-smoke-green.json))"; \
 	 fi; \
+	 if [ "$$CLAVESA_SKIP_LOCAL_GATES" = "1" ]; then \
+	   echo "##############################################################"; \
+	   echo "## WARNING: CLAVESA_SKIP_LOCAL_GATES=1 — local gates BYPASSED."; \
+	   echo "## $$VERSION ships without tree-exact test / verify-readme"; \
+	   echo "## verification. Document why in the release commit message."; \
+	   echo "##############################################################"; \
+	 else \
+	   for g in test verify-readme; do \
+	     ./scripts/green-stamp.sh check $$g || { \
+	       echo "  run 'make release-gates' (or CLAVESA_SKIP_LOCAL_GATES=1 to bypass — document why in the release commit)"; \
+	       exit 1; \
+	     }; \
+	   done; \
+	 fi; \
 	 if git tag --list | grep -qx "$$VERSION"; then \
 	   echo "✗ git tag $$VERSION already exists locally — bump ModuleVersion or delete the stale tag."; \
 	   exit 1; \
@@ -124,11 +146,42 @@ release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, clou
 release-public: release-check ## Snapshot the dev tree into the public clavesa repo, commit + tag, then prompt before push
 	@./scripts/release-public.sh
 
-smoke-cloud: build ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
+smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
 	@./scripts/cloud-smoke.sh run
 
-verify-readme: build ## Walk the README quick-start literally (UI via playwright-cli) and assert the mandatory pages (CLAVESA_VERIFY_ADDR to override the :8080 UI port)
+verify-readme: $(if $(SKIP_BUILD),,build) ## Walk the README quick-start literally (UI via playwright-cli) and assert the mandatory pages (CLAVESA_VERIFY_ADDR to override the :8080 UI port)
 	@./scripts/verify-readme.sh
+	@./scripts/green-stamp.sh write verify-readme
+
+release-gates: build ## Run the three release gates (test, smoke-cloud, verify-readme) concurrently; per-gate logs in .gates/, green stamps enforced by release-check
+	@mkdir -p .gates; \
+	 rm -f .gates/test.log .gates/smoke-cloud.log .gates/verify-readme.log; \
+	 echo "→ release gates running concurrently (logs: .gates/<gate>.log)"; \
+	 echo "  verify-readme UI port: $${CLAVESA_VERIFY_ADDR:-:8089} (cloud-smoke picks a random free port; nothing on :8080 is touched)"; \
+	 SKIP_BUILD=1 $(MAKE) test            >.gates/test.log 2>&1 & p_test=$$!; \
+	 SKIP_BUILD=1 $(MAKE) smoke-cloud     >.gates/smoke-cloud.log 2>&1 & p_smoke=$$!; \
+	 SKIP_BUILD=1 CLAVESA_VERIFY_ADDR="$${CLAVESA_VERIFY_ADDR:-:8089}" $(MAKE) verify-readme >.gates/verify-readme.log 2>&1 & p_verify=$$!; \
+	 st_test=0;   wait $$p_test   || st_test=$$?; \
+	 st_smoke=0;  wait $$p_smoke  || st_smoke=$$?; \
+	 st_verify=0; wait $$p_verify || st_verify=$$?; \
+	 rc=0; \
+	 for g in test smoke-cloud verify-readme; do \
+	   case $$g in \
+	     test)          s=$$st_test;; \
+	     smoke-cloud)   s=$$st_smoke;; \
+	     verify-readme) s=$$st_verify;; \
+	   esac; \
+	   if [ "$$s" = "0" ]; then \
+	     echo "✓ $$g  (.gates/$$g.log)"; \
+	   else \
+	     echo "✗ $$g failed with exit $$s  (.gates/$$g.log)"; \
+	     rc=1; \
+	   fi; \
+	 done; \
+	 if [ "$$rc" = "0" ]; then \
+	   echo "all three release gates green — stamps written (.test-green.json, .verify-readme-green.json, .cloud-smoke-green.json)"; \
+	 fi; \
+	 exit $$rc
 
 smoke-cloud-setup: build ## One-time: create + deploy the persistent cloud smoke workspace (SMOKE_WS / SMOKE_PROFILE env-overridable)
 	@./scripts/cloud-smoke.sh setup

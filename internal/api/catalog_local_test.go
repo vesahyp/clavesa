@@ -35,18 +35,20 @@ func (f *fakeGlueClient) GetTables(_ context.Context, in *glue.GetTablesInput, _
 	return &glue.GetTablesOutput{TableList: f.tables[aws.ToString(in.DatabaseName)]}, nil
 }
 
-// writeEnvMode declares the workspace environment mode the catalog reads.
-// The catalog lists the cloud (Glue) half in cloud mode and the local
-// (warehouse) half in local mode, per the EnvModeToggle contract — so a
-// test that wants the cloud half must say so.
-func writeEnvMode(t *testing.T, workspace, mode string) {
+// writeEnvMode declares the workspace warehouse the catalog reads.
+// The catalog lists the cloud (Glue) half on a cloud warehouse and the
+// local (on-disk) half on a local warehouse, per the EnvModeToggle
+// contract — so a test that wants the cloud half must say so. Writes
+// the legacy `mode` key deliberately, so the pre-ADR-024 fallback read
+// path stays covered.
+func writeEnvMode(t *testing.T, workspace, warehouse string) {
 	t.Helper()
 	dir := filepath.Join(workspace, ".clavesa")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir .clavesa: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "environment.json"),
-		[]byte(`{"mode":"`+mode+`"}`+"\n"), 0o644); err != nil {
+		[]byte(`{"mode":"`+warehouse+`"}`+"\n"), 0o644); err != nil {
 		t.Fatalf("write environment.json: %v", err)
 	}
 }
@@ -237,9 +239,9 @@ func TestCatalogStampsCloudPipelineMeta(t *testing.T) {
 		[]byte(`{"name":"test","cloud":"aws","version":1,"catalog":"clavesa_test"}`+"\n"), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
-	// The catalog reads the workspace env mode (the EnvModeToggle contract):
-	// cloud mode lists Glue, local mode lists the on-disk warehouse. This
-	// test exercises the cloud half, so declare cloud mode.
+	// The catalog reads the workspace warehouse (the EnvModeToggle
+	// contract): cloud lists Glue, local lists the on-disk tables. This
+	// test exercises the cloud half, so declare a cloud warehouse.
 	writeEnvMode(t, workspace, "cloud")
 	// Convention: pipeline directory name == var.pipeline_name. The walker
 	// uses the dir basename for Glue DB matching, so they must agree.

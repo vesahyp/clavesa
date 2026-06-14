@@ -2,7 +2,10 @@
 // source data items and executing SQL transforms locally via DuckDB.
 package preview
 
-import "github.com/vesahyp/clavesa/internal/graph"
+import (
+	"github.com/vesahyp/clavesa/internal/graph"
+	"github.com/vesahyp/clavesa/internal/observability"
+)
 
 // PreviewResult holds a pageable set of data items returned by the preview endpoints.
 type PreviewResult struct {
@@ -10,6 +13,9 @@ type PreviewResult struct {
 	Schema    []graph.Column           `json:"schema"`
 	Total     int                      `json:"total"` // -1 if unknown
 	Truncated bool                     `json:"truncated"`
+	// Served identifies the engine + warehouse this preview executed
+	// against (ADR-024). Stamped by the HTTP handler at execution time.
+	Served *observability.Served `json:"served,omitempty"`
 }
 
 // TransformPair holds one input row and the output rows it produced.
@@ -22,4 +28,6 @@ type TransformPair struct {
 type TransformPreviewResult struct {
 	Pairs []TransformPair `json:"pairs"`
 	SQL   string          `json:"sql"`
+	// Served — see PreviewResult.Served.
+	Served *observability.Served `json:"served,omitempty"`
 }

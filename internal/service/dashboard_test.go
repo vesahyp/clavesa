@@ -832,14 +832,14 @@ func TestSaveDashboardTranspileCacheWritesFile(t *testing.T) {
 
 // renderService builds a Service rooted at a temp workspace with distinct
 // cloud and local providers, so a render test can assert which provider
-// received the SQL. The env mode (local or cloud) decides which one the
+// received the SQL. The warehouse (local or cloud) decides which one the
 // resolver dispatches to. A wired transpiler (or nil) controls whether the
 // cloud path transpiles.
-func renderService(t *testing.T, cloud, local *fakeProvider, mode workspace.Mode, tp *fakeTranspiler) *Service {
+func renderService(t *testing.T, cloud, local *fakeProvider, mode workspace.Warehouse, tp *fakeTranspiler) *Service {
 	t.Helper()
 	ws := t.TempDir()
-	if err := workspace.WriteEnvironmentMode(ws, mode); err != nil {
-		t.Fatalf("WriteEnvironmentMode(%s): %v", mode, err)
+	if err := workspace.WriteWarehouse(ws, mode); err != nil {
+		t.Fatalf("WriteWarehouse(%s): %v", mode, err)
 	}
 	resolver := observability.NewResolver(ws, cloud, local)
 	s := New(ws).WithResolver(resolver)
@@ -873,7 +873,7 @@ func TestRenderDashboardLocalRunsSpark(t *testing.T) {
 	tp := &fakeTranspiler{toServing: func(_ context.Context, sql string) (string, error) {
 		return "TRANSPILED(" + sql + ")", nil
 	}}
-	s := renderService(t, cloud, local, workspace.ModeLocal, tp)
+	s := renderService(t, cloud, local, workspace.WarehouseLocal, tp)
 	saveRenderDashboard(t, s)
 
 	got, err := s.RenderDashboard(context.Background(), "demo", nil)
@@ -909,7 +909,7 @@ func TestRenderDashboardCloudTranspiles(t *testing.T) {
 		// raw Spark — uppercasing is enough to detect transpilation.
 		return strings.ToUpper(sql), nil
 	}}
-	s := renderService(t, cloud, local, workspace.ModeCloud, tp)
+	s := renderService(t, cloud, local, workspace.WarehouseCloud, tp)
 	saveRenderDashboard(t, s)
 
 	got, err := s.RenderDashboard(context.Background(), "demo", nil)

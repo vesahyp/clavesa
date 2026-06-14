@@ -83,7 +83,9 @@ func newDashboardService(cmd *cobra.Command) (*service.Service, string, error) {
 	// dataset's SQL before persisting, so users see all bad datasets in
 	// one shot instead of after a Spark cold start at first render.
 	warm := observability.NewPersistentQueryRunner(workspace)
-	parser := warm.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
+	// Parser resolves the active warehouse (ADR-024) lazily on first
+	// Parse; cloud + undeployed surfaces an actionable error there.
+	parser := warm.SQLParserForWorkspace()
 	registerCloseable(warm.Close)
 	sidecar := observability.NewTranspileSidecar(workspace)
 	registerCloseable(sidecar.Close)

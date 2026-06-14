@@ -1,6 +1,7 @@
 package preview
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/dataquery"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/httputil"
+	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -109,6 +111,8 @@ func handleSourcePreview(
 
 	result := Convert(qr)
 	result.Items = paginate(result.Items, offset, limit)
+	// No Served stamp: this is a raw S3 read in Go — no Spark executed,
+	// and a badge claiming an engine that didn't run would lie (ADR-024).
 	httputil.WriteJSON(w, http.StatusOK, result)
 }
 
@@ -200,7 +204,7 @@ func handleTransformPreview(
 
 	allRows, err := ResolveInputData(r.Context(), s3c, g, dir, nodeID, rowCount)
 	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		httputil.WriteError(w, previewErrorStatus(err), err.Error())
 		return
 	}
 
@@ -231,7 +235,7 @@ func handleTransformPreview(
 
 	outputsByKey, err := RunPreview(r.Context(), localImageForDir(dir), image, allRows, runSQL, runPy)
 	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		httputil.WriteError(w, previewErrorStatus(err), err.Error())
 		return
 	}
 
@@ -258,8 +262,9 @@ func handleTransformPreview(
 		displaySQL = "(Python transform)"
 	}
 	httputil.WriteJSON(w, http.StatusOK, &TransformPreviewResult{
-		Pairs: pairs,
-		SQL:   displaySQL,
+		Pairs:  pairs,
+		SQL:    displaySQL,
+		Served: servedForDir(dir),
 	})
 }
 
@@ -335,6 +340,7 @@ func handleDestinationPreview(
 		}
 		result := Convert(qr)
 		result.Items = paginate(result.Items, 0, rowCount)
+		// No Served stamp — raw S3 read, no Spark executed (ADR-024).
 		httputil.WriteJSON(w, http.StatusOK, result)
 		return
 	}
@@ -342,18 +348,41 @@ func handleDestinationPreview(
 	// Transform upstream: execute the full chain and return output rows.
 	items, err := executeTransformChain(r.Context(), s3c, g, dir, upstream, rowCount)
 	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		httputil.WriteError(w, previewErrorStatus(err), err.Error())
 		return
 	}
 	if len(items) > rowCount {
 		items = items[:rowCount]
 	}
-	httputil.WriteJSON(w, http.StatusOK, &PreviewResult{Items: items, Total: len(items)})
+	httputil.WriteJSON(w, http.StatusOK, &PreviewResult{Items: items, Total: len(items), Served: servedForDir(dir)})
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// servedForDir stamps the engine metadata for a preview response
+// (ADR-024). Previews execute through runner Spark; the warehouse label
+// follows the workspace warehouse loaded at execution time — the same
+// resolution ResolveInputData uses for its catalog reads — so the badge
+// reflects what this request actually ran against, not a separately
+// fetched workspace state that could flip between requests. `dir` is the
+// resolved absolute pipeline dir; its parent is the workspace root.
+func servedForDir(dir string) *observability.Served {
+	wh := workspace.LoadWarehouse(filepath.Dir(dir))
+	return &observability.Served{Engine: "spark", Warehouse: string(wh)}
+}
+
+// previewErrorStatus maps an input-resolution / execution error to an HTTP
+// status. A cloud warehouse on an undeployed workspace (ADR-024) is a
+// user-actionable 409 — the request was fine, the workspace state can't
+// satisfy it; everything else stays a 500.
+func previewErrorStatus(err error) int {
+	if errors.Is(err, workspace.ErrWarehouseUndeployed) {
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
+}
 
 // extractS3Config pulls bucket, prefix, format, json_path from a node's Config map.
 func extractS3Config(node *graph.Node) (bucket, prefix, format, jsonPath string, ok bool) {

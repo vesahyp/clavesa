@@ -139,6 +139,13 @@ func TestHandleSourcePreview_ReturnsItems(t *testing.T) {
 	if result.Items[0]["order_id"] != "ORD-001" {
 		t.Errorf("expected order_id=ORD-001, got %v", result.Items[0]["order_id"])
 	}
+	// ADR-024 engine badge: the source preview is a raw S3 read in Go —
+	// no Spark executes, so the response must NOT claim an engine. (The
+	// transform preview, which does run Spark, is asserted to carry the
+	// stamp in its own test.)
+	if result.Served != nil {
+		t.Errorf("Served = %+v, want nil on a raw S3 source preview", result.Served)
+	}
 }
 
 func TestHandleSourcePreview_OffsetLimit(t *testing.T) {
@@ -268,6 +275,10 @@ func TestHandleTransformPreview_ExecutesSQL(t *testing.T) {
 	}
 	if !strings.Contains(result.SQL, "WHERE status = 'pending'") {
 		t.Errorf("expected SQL to be forwarded to result, got %q", result.SQL)
+	}
+	// ADR-024 engine badge on the transform preview response.
+	if result.Served == nil || result.Served.Engine != "spark" || result.Served.Warehouse != "local" {
+		t.Errorf("Served = %+v, want {spark local}", result.Served)
 	}
 }
 

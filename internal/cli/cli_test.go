@@ -644,7 +644,7 @@ func TestPipelineUpgradeNoClavesaSources(t *testing.T) {
 	}
 }
 
-func TestWorkspaceUseSetsEnvMode(t *testing.T) {
+func TestWorkspaceUseSetsWarehouse(t *testing.T) {
 	t.Parallel()
 	ws := t.TempDir()
 	manifest := `{"name":"use-ws","cloud":"aws","version":1,"catalog":"clavesa_use_ws"}` + "\n"
@@ -653,25 +653,41 @@ func TestWorkspaceUseSetsEnvMode(t *testing.T) {
 	}
 
 	// Default — no environment.json yet — resolves to local.
-	if got := workspace.LoadEnvironmentMode(ws); got != workspace.ModeLocal {
-		t.Fatalf("default env mode = %q, want local", got)
+	if got := workspace.LoadWarehouse(ws); got != workspace.WarehouseLocal {
+		t.Fatalf("default warehouse = %q, want local", got)
 	}
 
+	if err := Run([]string{"workspace", "use", "--warehouse", "cloud", "--workspace", ws}); err != nil {
+		t.Fatalf("workspace use --warehouse cloud: %v", err)
+	}
+	if got := workspace.LoadWarehouse(ws); got != workspace.WarehouseCloud {
+		t.Errorf("warehouse = %q, want cloud", got)
+	}
+
+	if err := Run([]string{"workspace", "use", "--warehouse", "local", "--workspace", ws}); err != nil {
+		t.Fatalf("workspace use --warehouse local: %v", err)
+	}
+	if got := workspace.LoadWarehouse(ws); got != workspace.WarehouseLocal {
+		t.Errorf("warehouse = %q, want local", got)
+	}
+
+	if err := Run([]string{"workspace", "use", "--warehouse", "banana", "--workspace", ws}); err == nil {
+		t.Error("workspace use --warehouse banana: expected an error for an unknown warehouse")
+	}
+
+	// The deprecated --env alias still works (ADR-024 wire/flag compat).
 	if err := Run([]string{"workspace", "use", "--env", "cloud", "--workspace", ws}); err != nil {
-		t.Fatalf("workspace use --env cloud: %v", err)
+		t.Fatalf("workspace use --env cloud (deprecated alias): %v", err)
 	}
-	if got := workspace.LoadEnvironmentMode(ws); got != workspace.ModeCloud {
-		t.Errorf("env mode = %q, want cloud", got)
-	}
-
-	if err := Run([]string{"workspace", "use", "--env", "local", "--workspace", ws}); err != nil {
-		t.Fatalf("workspace use --env local: %v", err)
-	}
-	if got := workspace.LoadEnvironmentMode(ws); got != workspace.ModeLocal {
-		t.Errorf("env mode = %q, want local", got)
+	if got := workspace.LoadWarehouse(ws); got != workspace.WarehouseCloud {
+		t.Errorf("warehouse via --env alias = %q, want cloud", got)
 	}
 
-	if err := Run([]string{"workspace", "use", "--env", "banana", "--workspace", ws}); err == nil {
-		t.Error("workspace use --env banana: expected an error for an unknown mode")
+	// When both flags are set, --warehouse wins.
+	if err := Run([]string{"workspace", "use", "--warehouse", "local", "--env", "cloud", "--workspace", ws}); err != nil {
+		t.Fatalf("workspace use --warehouse local --env cloud: %v", err)
+	}
+	if got := workspace.LoadWarehouse(ws); got != workspace.WarehouseLocal {
+		t.Errorf("warehouse with both flags = %q, want local (--warehouse wins)", got)
 	}
 }

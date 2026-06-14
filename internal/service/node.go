@@ -80,7 +80,7 @@ func (s *Service) AddNode(dir, nodeType, name string) (PipelineGraph, error) {
 		// No `compute` attribute — it defaults to the module's "lambda"
 		// (compute is purely the cloud deploy target). A fresh transform
 		// still runs on the laptop without `terraform
-		// apply`: the workspace environment mode (default "local")
+		// apply`: the workspace warehouse (default "local")
 		// drives local-vs-cloud dispatch, not this attribute. Users
 		// pick "fargate" / "emr-serverless" here only when the cloud
 		// workload outgrows Lambda.
@@ -133,7 +133,7 @@ func (s *Service) AddNode(dir, nodeType, name string) (PipelineGraph, error) {
 // UpdateNode merges attrs into the given node's module block.
 func (s *Service) UpdateNode(dir, nodeID string, attrs map[string]interface{}) (PipelineGraph, error) {
 	// compute is strictly a cloud deploy target. "local" is no longer a
-	// value — local execution is the workspace environment mode, not a
+	// value — local execution is the workspace warehouse, not a
 	// per-node attribute.
 	if c, ok := attrs["compute"].(string); ok {
 		switch c {

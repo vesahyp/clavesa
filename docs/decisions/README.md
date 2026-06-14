@@ -36,3 +36,6 @@ Each ADR follows this structure:
 | [019](019-three-level-namespace-native.md) | Native three-level namespace | Superseded before shipping (see 020) |
 | [020](020-three-level-display-normalization.md) | Three-level display normalization | Accepted (co-exists with 016) |
 | [021](021-dashboards-as-iac.md) | Dashboards as IaC (workspace dashboard registry) | Accepted |
+| [022](022-interactive-read-engine.md) | Interactive read engine and serving-vs-authoring SQL | Accepted (partially superseded by 023) |
+| [023](023-single-serving-dialect-spark-transpile.md) | Author serving SQL in Spark, transpile to Trino | Accepted |
+| [024](024-warehouse-compute-split.md) | Split environment mode into warehouse and compute | Accepted |

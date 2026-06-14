@@ -29,11 +29,12 @@ import (
 // [from, to] (inclusive) and writes to a parallel staging table that the
 // user inspects + promotes separately (production target untouched).
 type BackfillStageRequest struct {
-	Dir    string   // pipeline dir, relative to workspace
-	Node   string   // transform node id
-	From   []string // partition cursor tuple, inclusive
-	To     []string // partition cursor tuple, inclusive
-	Direct bool     // skip staging — write straight to canonical target (escape hatch)
+	Dir     string   // pipeline dir, relative to workspace
+	Node    string   // transform node id
+	From    []string // partition cursor tuple, inclusive
+	To      []string // partition cursor tuple, inclusive
+	Direct  bool     // skip staging — write straight to canonical target (escape hatch)
+	Compute string   // "" | "local" — local routes the heavy Spark work to the local docker runner against the cloud warehouse (ADR-024)
 }
 
 // BackfillRun is the metadata recorded for one staged backfill. The
@@ -54,6 +55,11 @@ type BackfillRun struct {
 	Status         string    `json:"status"` // ok | failed | running
 	RowsWritten    int64     `json:"rows_written,omitempty"`
 	ErrorMsg       string    `json:"error_msg,omitempty"`
+	// Compute records which machine ran the staging compute: "lambda"
+	// (the deployed pipeline Lambda) or "local" (the local docker runner
+	// against the cloud warehouse, ADR-024). Persisted as a Glue tag and
+	// reconstructed by List() (absent → "lambda").
+	Compute string `json:"compute,omitempty"`
 }
 
 // BackfillColumnInfo names one column on a staging table. The UI uses
@@ -109,6 +115,7 @@ type BackfillDedupCheckResult struct {
 type BackfillPromoteOpts struct {
 	ForceDedup      string // append: column to MERGE on (must be unique in staging)
 	AllowDuplicates bool   // append: accept dupes, plain INSERT INTO
+	Compute         string // "" | "local" — local runs the MERGE in a local docker container against the cloud warehouse (ADR-024)
 }
 
 // BackfillPromoteResult is the per-promote summary the runner returns —
@@ -126,13 +133,14 @@ const stagingSuffix = "__backfill__"
 // Glue tag keys identifying staging tables. The Catalog page picks these
 // up and tags the table as "staging — pending promote/discard".
 const (
-	glueTagBackfill       = "clavesa:backfill"
-	glueTagBackfillRunID  = "clavesa:backfill-run-id"
-	glueTagBackfillFrom   = "clavesa:backfill-from"
-	glueTagBackfillTo     = "clavesa:backfill-to"
-	glueTagBackfillNode   = "clavesa:backfill-node"
-	glueTagBackfillCanon  = "clavesa:backfill-canonical-table"
-	glueTagBackfillOutput = "clavesa:backfill-output-key"
+	glueTagBackfill        = "clavesa:backfill"
+	glueTagBackfillRunID   = "clavesa:backfill-run-id"
+	glueTagBackfillFrom    = "clavesa:backfill-from"
+	glueTagBackfillTo      = "clavesa:backfill-to"
+	glueTagBackfillNode    = "clavesa:backfill-node"
+	glueTagBackfillCanon   = "clavesa:backfill-canonical-table"
+	glueTagBackfillOutput  = "clavesa:backfill-output-key"
+	glueTagBackfillCompute = "clavesa:backfill-compute"
 )
 
 // BackfillStage invokes the target transform Lambda directly with a
@@ -170,7 +178,12 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
 	runID := newBackfillRunID()
 
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	warehouse := workspace.LoadWarehouse(s.workspace)
+	if err := validateCompute(warehouse, req.Compute); err != nil {
+		return nil, err
+	}
+
+	if warehouse == workspace.WarehouseLocal {
 		return s.backfillStageLocal(ctx, req, &g, node, abs, pipelineName, runID)
 	}
 
@@ -182,10 +195,16 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	// Resolve canonical target from the deployed Lambda's env vars
 	// rather than the pipeline .tf — the .tf carries unresolved
 	// terraform references (e.g. var.schema) that we can't statically
-	// resolve without re-running Terraform's evaluator.
+	// resolve without re-running Terraform's evaluator. Fetch the whole
+	// env map once: it serves both canonical resolution and (when
+	// --compute local) the docker dispatcher's env mirroring.
 	functionName := pipelineRunnerLambdaName(pipelineName)
 	lc := lambda.NewFromConfig(cfg)
-	canonicalTable, glueDB, outputKey, err := canonicalFromLambdaEnv(ctx, lc, functionName, node)
+	lambdaEnv, err := lambdaRunnerEnv(ctx, lc, functionName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve canonical target: %w", err)
+	}
+	canonicalTable, glueDB, outputKey, err := canonicalFromEnv(lambdaEnv, functionName, node)
 	if err != nil {
 		return nil, fmt.Errorf("resolve canonical target: %w", err)
 	}
@@ -228,12 +247,10 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
 
-	started := time.Now()
-	out, err := lc.Invoke(ctx, &lambda.InvokeInput{
-		FunctionName: aws.String(functionName),
-		Payload:      body,
-	})
-	stopped := time.Now()
+	compute := "lambda"
+	if req.Compute == "local" {
+		compute = "local"
+	}
 	run := &BackfillRun{
 		RunID:          runID,
 		Pipeline:       pipelineName,
@@ -244,28 +261,53 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 		Direct:         req.Direct,
 		TargetTable:    targetTable,
 		CanonicalTable: canonicalTable,
-		StartedAt:      started,
-		StoppedAt:      stopped,
+		Compute:        compute,
 		Status:         "ok",
 	}
-	if err != nil {
-		run.Status = "failed"
-		run.ErrorMsg = err.Error()
-		return run, fmt.Errorf("invoke Lambda %q: %w", functionName, err)
-	}
-	if out.FunctionError != nil && *out.FunctionError != "" {
-		run.Status = "failed"
-		// Lambda response body carries the error JSON.
-		run.ErrorMsg = string(out.Payload)
-		return run, fmt.Errorf("Lambda %q returned error: %s", functionName, *out.FunctionError)
+
+	// respPayload is the runner's terminal response envelope, regardless of
+	// which compute produced it — the same runnerResponse* checks then run
+	// against it so a skipped/empty window fails stage on both paths (the
+	// c8f55f2 regression class).
+	var respPayload []byte
+
+	if compute == "local" {
+		// Cloud warehouse, local compute (ADR-024): docker-run the
+		// workspace runner image with the deployed Lambda env mirrored. No
+		// run lock — staging tables are private single-node events, which
+		// don't acquire the warehouse run lease (slice 5).
+		payloadBytes, derr := s.stageLocalDispatch(ctx, run, lambdaEnv, req.Node, language, logicPath, payload)
+		if derr != nil {
+			return run, derr
+		}
+		respPayload = payloadBytes
+	} else {
+		run.StartedAt = time.Now()
+		out, ierr := lc.Invoke(ctx, &lambda.InvokeInput{
+			FunctionName: aws.String(functionName),
+			Payload:      body,
+		})
+		run.StoppedAt = time.Now()
+		if ierr != nil {
+			run.Status = "failed"
+			run.ErrorMsg = ierr.Error()
+			return run, fmt.Errorf("invoke Lambda %q: %w", functionName, ierr)
+		}
+		if out.FunctionError != nil && *out.FunctionError != "" {
+			run.Status = "failed"
+			// Lambda response body carries the error JSON.
+			run.ErrorMsg = string(out.Payload)
+			return run, fmt.Errorf("Lambda %q returned error: %s", functionName, *out.FunctionError)
+		}
+		respPayload = out.Payload
 	}
 
 	// Inspect the runner's response envelope. A successful single-node
 	// handler run returns a richer envelope; a present non-ok "status"
 	// (e.g. "skipped" — no new partitions in the window — or "failed")
 	// is fatal. Absent "status" is treated as ok for safety.
-	if status := runnerResponseStatus(out.Payload); status != "" && status != "ok" {
-		msg := runnerResponseMessage(out.Payload)
+	if status := runnerResponseStatus(respPayload); status != "" && status != "ok" {
+		msg := runnerResponseMessage(respPayload)
 		run.Status = status
 		run.ErrorMsg = msg
 		return run, fmt.Errorf("backfill staging did not run: %s", msg)
@@ -323,7 +365,7 @@ func runnerResponseMessage(payload []byte) string {
 // under the pipeline's database. The Glue tags carry the originating
 // run_id, window, node — no separate registry needed.
 func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, error) {
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		return s.backfillListLocal(dir)
 	}
 	abs := s.resolveDir(dir)
@@ -356,17 +398,9 @@ func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, 
 		if params[glueTagBackfill] != "true" {
 			continue
 		}
-		run := BackfillRun{
-			RunID:          params[glueTagBackfillRunID],
-			Pipeline:       pipelineName,
-			Node:           params[glueTagBackfillNode],
-			OutputKey:      params[glueTagBackfillOutput],
-			From:           splitCursor(params[glueTagBackfillFrom]),
-			To:             splitCursor(params[glueTagBackfillTo]),
-			TargetTable:    fmt.Sprintf("%s.%s", glueDB, name),
-			CanonicalTable: params[glueTagBackfillCanon],
-			Status:         "ok",
-		}
+		run := backfillRunFromGlueParams(params)
+		run.Pipeline = pipelineName
+		run.TargetTable = fmt.Sprintf("%s.%s", glueDB, name)
 		runs = append(runs, run)
 	}
 	return runs, nil
@@ -376,7 +410,7 @@ func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, 
 // row count, schema, and (when merge_keys are declared) per-key match count.
 // Athena queries; no spark.
 func (s *Service) BackfillDiff(ctx context.Context, dir, runID string) (*BackfillDiff, error) {
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		return s.backfillDiffLocal(ctx, dir, runID)
 	}
 	runs, err := s.BackfillList(ctx, dir)
@@ -481,6 +515,14 @@ func (s *Service) BackfillDiff(ctx context.Context, dir, runID string) (*Backfil
 // On success drops the staging table. On error leaves it in place so the
 // user can fix the underlying issue and re-promote.
 func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts BackfillPromoteOpts) (*BackfillPromoteResult, error) {
+	// Validate the compute/warehouse combo before any lookup so an
+	// impossible request (e.g. --compute cloud on a local warehouse, or an
+	// unknown value) reports the real problem rather than a downstream
+	// "run not found" — matches BackfillStage / BackfillDiscard ordering.
+	if err := validateCompute(workspace.LoadWarehouse(s.workspace), opts.Compute); err != nil {
+		return nil, err
+	}
+
 	runs, err := s.BackfillList(ctx, dir)
 	if err != nil {
 		return nil, err
@@ -529,7 +571,7 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 		"allow_duplicates": opts.AllowDuplicates,
 	}
 
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		resp, err := s.runOperation(ctx, payload)
 		if err != nil {
 			return nil, err
@@ -545,9 +587,9 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 		return &BackfillPromoteResult{ColumnsAdded: parseColumnsAdded(resp)}, nil
 	}
 
-	// Spark-side MERGE via the runner Lambda. Same engine + IAM scope
-	// that wrote the staging table — SparkSQL's MERGE INTO accepts
-	// `UPDATE SET *` and `INSERT *`, no column enumeration needed.
+	// Spark-side MERGE. Same engine + IAM scope that wrote the staging
+	// table — SparkSQL's MERGE INTO accepts `UPDATE SET *` and `INSERT *`,
+	// no column enumeration needed.
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -555,23 +597,39 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
 	functionName := pipelineRunnerLambdaName(pipelineName)
-	body, _ := json.Marshal(payload)
-	out2, err := lc.Invoke(ctx, &lambda.InvokeInput{
-		FunctionName: aws.String(functionName),
-		Payload:      body,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("invoke %q: %w", functionName, err)
+
+	// respPayload is the runner's terminal response envelope, regardless of
+	// which compute produced it — the same runnerResponse* checks run
+	// against it so a failed MERGE fails promote on both paths.
+	var respPayload []byte
+
+	if opts.Compute == "local" {
+		out, derr := s.operationLocalDispatch(ctx, lc, functionName, payload)
+		if derr != nil {
+			return nil, fmt.Errorf("local backfill promote: %w", derr)
+		}
+		respPayload = out
+	} else {
+		body, _ := json.Marshal(payload)
+		out2, err := lc.Invoke(ctx, &lambda.InvokeInput{
+			FunctionName: aws.String(functionName),
+			Payload:      body,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("invoke %q: %w", functionName, err)
+		}
+		if out2.FunctionError != nil && *out2.FunctionError != "" {
+			return nil, fmt.Errorf("Lambda %q returned error: %s", functionName, string(out2.Payload))
+		}
+		respPayload = out2.Payload
 	}
-	if out2.FunctionError != nil && *out2.FunctionError != "" {
-		return nil, fmt.Errorf("Lambda %q returned error: %s", functionName, string(out2.Payload))
-	}
-	if status := runnerResponseStatus(out2.Payload); status != "" && status != "ok" {
-		return nil, fmt.Errorf("backfill promote did not run: %s", runnerResponseMessage(out2.Payload))
+
+	if status := runnerResponseStatus(respPayload); status != "" && status != "ok" {
+		return nil, fmt.Errorf("backfill promote did not run: %s", runnerResponseMessage(respPayload))
 	}
 	var resp map[string]any
-	if len(out2.Payload) > 0 {
-		_ = json.Unmarshal(out2.Payload, &resp)
+	if len(respPayload) > 0 {
+		_ = json.Unmarshal(respPayload, &resp)
 	}
 	return &BackfillPromoteResult{ColumnsAdded: parseColumnsAdded(resp)}, nil
 }
@@ -618,7 +676,7 @@ func (s *Service) BackfillDedupCheck(ctx context.Context, dir, runID, col string
 	if run == nil {
 		return nil, fmt.Errorf("backfill: run_id %q not found", runID)
 	}
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		return s.backfillDedupCheckLocal(ctx, dir, run, col)
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
@@ -672,9 +730,14 @@ func (s *Service) BackfillDedupCheck(ctx context.Context, dir, runID, col string
 }
 
 // BackfillDiscard drops the staging table without promoting. Routed
-// through the runner Lambda for engine consistency with promote — same
-// Spark/Iceberg path that created the staging table tears it down.
-func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error {
+// through the runner (Lambda, or a local docker container against the
+// cloud warehouse when compute=="local") for engine consistency with
+// promote — same Spark/Delta path that created the staging table tears it
+// down.
+func (s *Service) BackfillDiscard(ctx context.Context, dir, runID, compute string) error {
+	if err := validateCompute(workspace.LoadWarehouse(s.workspace), compute); err != nil {
+		return err
+	}
 	runs, err := s.BackfillList(ctx, dir)
 	if err != nil {
 		return err
@@ -695,7 +758,7 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error 
 	}
 	abs := s.resolveDir(dir)
 
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		if _, err := s.runOperation(ctx, payload); err != nil {
 			return err
 		}
@@ -717,19 +780,35 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID string) error 
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
 	functionName := pipelineRunnerLambdaName(pipelineName)
-	body, _ := json.Marshal(payload)
-	out, err := lc.Invoke(ctx, &lambda.InvokeInput{
-		FunctionName: aws.String(functionName),
-		Payload:      body,
-	})
-	if err != nil {
-		return fmt.Errorf("invoke %q: %w", functionName, err)
+
+	// respPayload is the runner's terminal response envelope, regardless of
+	// which compute produced it — the same runnerResponse* checks run
+	// against it so a failed DROP fails discard on both paths.
+	var respPayload []byte
+
+	if compute == "local" {
+		out, derr := s.operationLocalDispatch(ctx, lc, functionName, payload)
+		if derr != nil {
+			return fmt.Errorf("local backfill discard: %w", derr)
+		}
+		respPayload = out
+	} else {
+		body, _ := json.Marshal(payload)
+		out, err := lc.Invoke(ctx, &lambda.InvokeInput{
+			FunctionName: aws.String(functionName),
+			Payload:      body,
+		})
+		if err != nil {
+			return fmt.Errorf("invoke %q: %w", functionName, err)
+		}
+		if out.FunctionError != nil && *out.FunctionError != "" {
+			return fmt.Errorf("Lambda %q returned error: %s", functionName, string(out.Payload))
+		}
+		respPayload = out.Payload
 	}
-	if out.FunctionError != nil && *out.FunctionError != "" {
-		return fmt.Errorf("Lambda %q returned error: %s", functionName, string(out.Payload))
-	}
-	if status := runnerResponseStatus(out.Payload); status != "" && status != "ok" {
-		return fmt.Errorf("backfill discard did not run: %s", runnerResponseMessage(out.Payload))
+
+	if status := runnerResponseStatus(respPayload); status != "" && status != "ok" {
+		return fmt.Errorf("backfill discard did not run: %s", runnerResponseMessage(respPayload))
 	}
 	return nil
 }
@@ -819,16 +898,18 @@ func filepathBase(p string) string {
 // variable-resolution dance and stays correct even when the pipeline .tf
 // carries unresolved references.
 func canonicalFromLambdaEnv(ctx context.Context, lc *lambda.Client, functionName string, node *graph.Node) (string, string, string, error) {
-	cfg, err := lc.GetFunctionConfiguration(ctx, &lambda.GetFunctionConfigurationInput{
-		FunctionName: aws.String(functionName),
-	})
+	env, err := lambdaRunnerEnv(ctx, lc, functionName)
 	if err != nil {
-		return "", "", "", fmt.Errorf("GetFunctionConfiguration %q: %w", functionName, err)
+		return "", "", "", err
 	}
-	if cfg.Environment == nil || cfg.Environment.Variables == nil {
-		return "", "", "", fmt.Errorf("Lambda %q has no environment variables", functionName)
-	}
-	env := cfg.Environment.Variables
+	return canonicalFromEnv(env, functionName, node)
+}
+
+// canonicalFromEnv applies the canonical-table rule to an already-fetched
+// Lambda env map. Split out from canonicalFromLambdaEnv so the stage path
+// can fetch the env once (lambdaRunnerEnv) and reuse it for both canonical
+// resolution and the docker dispatcher's env mirroring.
+func canonicalFromEnv(env map[string]string, functionName string, node *graph.Node) (string, string, string, error) {
 	catalog := env["CLAVESA_CATALOG"]
 	schema := env["CLAVESA_SCHEMA"]
 	if catalog == "" || schema == "" {
@@ -1039,6 +1120,116 @@ func nodeIOFromDefinition(def, nodeID string) (any, any, string, string, error) 
 	return payload["inputs"], payload["outputs"], language, logicPath, nil
 }
 
+// allTransformsFromDefinition extracts the full ordered transform list from a
+// deployed SFN definition JSON — the same transforms[] array nodeIOFromDefinition
+// matches a single node against, but returned whole so a cloud-local pipeline
+// run can replay the entire bundle. Pure (no AWS) so it's unit-testable.
+//
+// Only the v2.2.0+ single-Task shape carries a transforms[] array; the pre-
+// v2.2.0 per-node ASL has no bundle to extract, so an empty result there is a
+// clear "redeploy with a current binary" signal rather than a silent no-op.
+func allTransformsFromDefinition(def string) ([]map[string]any, error) {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(def), &parsed); err != nil {
+		return nil, fmt.Errorf("parse SFN definition: %w", err)
+	}
+	states, _ := parsed["States"].(map[string]any)
+	for _, s := range states {
+		st, _ := s.(map[string]any)
+		params, _ := st["Parameters"].(map[string]any)
+		payload, _ := params["Payload"].(map[string]any)
+		transforms, _ := payload["transforms"].([]any)
+		if len(transforms) == 0 {
+			continue
+		}
+		out := make([]map[string]any, 0, len(transforms))
+		for _, e := range transforms {
+			t, _ := e.(map[string]any)
+			if t == nil {
+				continue
+			}
+			out = append(out, t)
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("no transforms[] array in SFN definition — redeploy with a current clavesa binary (pre-v2.2.0 per-node ASL is unsupported for cloud-local runs)")
+}
+
+// loadPipelineTransforms pulls the full ordered transform list from the
+// deployed SFN state machine's definition — the post-apply resolved values
+// (S3 paths, table ids) the runner needs, which can't be rebuilt from the .tf
+// alone (module-output references resolve at apply time). Mirrors loadNodeIO's
+// state-machine lookup, returning every transform instead of one.
+func loadPipelineTransforms(ctx context.Context, client *sfn.Client, pipelineName string) ([]map[string]any, error) {
+	smName := "clavesa-" + pipelineName
+	var nextToken *string
+	var arn string
+	for {
+		out, err := client.ListStateMachines(ctx, &sfn.ListStateMachinesInput{MaxResults: 1000, NextToken: nextToken})
+		if err != nil {
+			return nil, err
+		}
+		for _, sm := range out.StateMachines {
+			if aws.ToString(sm.Name) == smName {
+				arn = aws.ToString(sm.StateMachineArn)
+				break
+			}
+		}
+		if arn != "" || out.NextToken == nil {
+			break
+		}
+		nextToken = out.NextToken
+	}
+	if arn == "" {
+		return nil, fmt.Errorf("state machine %q not found — is the pipeline deployed?", smName)
+	}
+	desc, err := client.DescribeStateMachine(ctx, &sfn.DescribeStateMachineInput{StateMachineArn: aws.String(arn)})
+	if err != nil {
+		return nil, err
+	}
+	return allTransformsFromDefinition(aws.ToString(desc.Definition))
+}
+
+// setBackfillGlueParams writes the clavesa:backfill-* identity tags onto a
+// Glue table parameter map. Pure (mutates the map in place) so the
+// tag-write rule is unit-testable without a Glue client. The compute tag
+// is only written when set, so a "lambda" run from before the tag existed
+// stays absent and reconstructs as "lambda" (see backfillRunFromGlueParams).
+func setBackfillGlueParams(params map[string]string, run *BackfillRun) {
+	params[glueTagBackfill] = "true"
+	params[glueTagBackfillRunID] = run.RunID
+	params[glueTagBackfillFrom] = joinCursor(run.From)
+	params[glueTagBackfillTo] = joinCursor(run.To)
+	params[glueTagBackfillNode] = run.Node
+	params[glueTagBackfillCanon] = run.CanonicalTable
+	params[glueTagBackfillOutput] = run.OutputKey
+	if run.Compute != "" {
+		params[glueTagBackfillCompute] = run.Compute
+	}
+}
+
+// backfillRunFromGlueParams reconstructs a BackfillRun from a Glue table's
+// parameter map (the inverse of setBackfillGlueParams). An absent compute
+// tag → "lambda" — tables staged before the local-compute path existed
+// were all Lambda runs. Caller fills Pipeline + TargetTable (db-qualified
+// name) which aren't carried in the tags.
+func backfillRunFromGlueParams(params map[string]string) BackfillRun {
+	compute := params[glueTagBackfillCompute]
+	if compute == "" {
+		compute = "lambda"
+	}
+	return BackfillRun{
+		RunID:          params[glueTagBackfillRunID],
+		Node:           params[glueTagBackfillNode],
+		OutputKey:      params[glueTagBackfillOutput],
+		From:           splitCursor(params[glueTagBackfillFrom]),
+		To:             splitCursor(params[glueTagBackfillTo]),
+		CanonicalTable: params[glueTagBackfillCanon],
+		Compute:        compute,
+		Status:         "ok",
+	}
+}
+
 // tagStagingTable writes the clavesa:backfill-* parameters onto the
 // Glue table so List() can find it and the Catalog page can render the
 // staging chip without an out-of-band registry.
@@ -1057,13 +1248,7 @@ func tagStagingTable(ctx context.Context, gc *glue.Client, glueDB, tableName str
 	if t.Parameters == nil {
 		t.Parameters = map[string]string{}
 	}
-	t.Parameters[glueTagBackfill] = "true"
-	t.Parameters[glueTagBackfillRunID] = run.RunID
-	t.Parameters[glueTagBackfillFrom] = joinCursor(run.From)
-	t.Parameters[glueTagBackfillTo] = joinCursor(run.To)
-	t.Parameters[glueTagBackfillNode] = run.Node
-	t.Parameters[glueTagBackfillCanon] = run.CanonicalTable
-	t.Parameters[glueTagBackfillOutput] = run.OutputKey
+	setBackfillGlueParams(t.Parameters, run)
 
 	_, err = gc.UpdateTable(ctx, &glue.UpdateTableInput{
 		DatabaseName: aws.String(glueDB),

@@ -16,7 +16,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { ArrowUp, ChevronRight, FileWarning, History, Loader2, Play, Settings, Zap } from "lucide-react";
+import { ArrowUp, ChevronRight, FileWarning, History, Laptop, Loader2, Play, Settings, Zap } from "lucide-react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -57,7 +57,7 @@ import type { Column, Node } from "@/types/pipeline";
 import {
   useBackfills,
   useCatalogTables,
-  useEnvironmentMode,
+  useWarehouse,
   useExecutionStates,
   useLineage,
   useNodeRuns,
@@ -168,7 +168,6 @@ export function PipelineDashboard() {
       { replace: true },
     );
   };
-
   // Resolve pipeline name from dir via the workspace pipeline list.
   const pipelines = usePipelines();
   const pipelineMeta = useMemo(
@@ -263,14 +262,14 @@ export function PipelineDashboard() {
   // channel (ADR-014). Cloud pipelines keep the legacy ARN path so the SFN
   // history continues to back the polling.
   const isLocal = pipelineMeta?.compute === "local";
-  // Workspace env mode is the right gate for "is this user running cloud
-  // stuff right now?" decisions (Recent executions, Backfills). `isLocal`
-  // above is per-pipeline and tells us which runner channel to poll —
-  // distinct concept; don't conflate the two. A workspace in local env
-  // shouldn't nag about cloud deployments even for pipelines that haven't
-  // declared `compute = "local"`.
-  const envMode = useEnvironmentMode();
-  const isLocalEnv = envMode.data?.mode === "local";
+  // The workspace warehouse is the right gate for "is this user running
+  // cloud stuff right now?" decisions (Recent executions, Backfills).
+  // `isLocal` above is per-pipeline and tells us which runner channel to
+  // poll — distinct concept; don't conflate the two. A workspace on the
+  // local warehouse shouldn't nag about cloud deployments even for
+  // pipelines that haven't declared `compute = "local"`.
+  const wh = useWarehouse();
+  const isLocalWarehouse = wh.data?.warehouse === "local";
   // A pipeline with zero nodes has no compute target, no warehouse, no
   // runs anywhere — querying observability surfaces produces backend
   // errors (cloud Athena 400, local runner spin-up) that surface as
@@ -281,12 +280,12 @@ export function PipelineDashboard() {
   const queryDir = hasNodes ? dir : "";
   const status = usePipelineStatus(queryDir);
   const trackedExecutionArn = useMemo(() => {
-    if (isLocalEnv) return "";
+    if (isLocalWarehouse) return "";
     const execs = status.data?.executions ?? [];
     const running = execs.find((e) => e.status === "RUNNING");
     if (running) return running.execution_arn;
     return execs[0]?.execution_arn ?? "";
-  }, [status.data, isLocalEnv]);
+  }, [status.data, isLocalWarehouse]);
   // Live-states dispatch follows the workspace env mode, not the per-
   // pipeline `compute` attr. The local channel (state.json) is written
   // by `clavesa pipeline run` regardless of whether the pipeline
@@ -296,7 +295,7 @@ export function PipelineDashboard() {
   // doesn't declare compute silently falls into the cloud path and
   // never sees its live state.
   const states = useExecutionStates(
-    isLocalEnv ? { dir: queryDir } : { arn: trackedExecutionArn },
+    isLocalWarehouse ? { dir: queryDir } : { arn: trackedExecutionArn },
   );
   const nodeStatuses = useMemo(() => {
     const m = new Map<string, "running" | "succeeded" | "failed">();
@@ -344,13 +343,13 @@ export function PipelineDashboard() {
   const gridRuns = useMemo<Run[]>(() => {
     const rows = runs.data?.rows ?? [];
     const live = states.data;
-    if (!live || live.status !== "RUNNING" || !live.run_id) return rows;
+    if (!live || !live.run_id || live.status !== "RUNNING") return rows;
     if (rows.some((r) => r.run_id === live.run_id)) return rows;
     const synthetic: Run = {
       run_id: live.run_id,
       pipeline: pipelineName,
       sf_execution_arn: live.run_id,
-      status: "RUNNING",
+      status: live.status,
       trigger: "manual",
       started_at: live.started_at || new Date().toISOString(),
       ended_at: "",
@@ -580,12 +579,23 @@ export function PipelineDashboard() {
       <RunPipelineButton
         dir={dir}
         disabled={!hasNodes}
-        onRunSucceeded={() => {
-          // Stay on the dashboard — toast + grid refresh are enough
-          // confirmation. The new run column appears via the synthetic
-          // in-flight row while running and lands as a real column when
-          // the query invalidation refetches. Users open the Sheet
-          // explicitly by clicking the column header.
+        cloudWarehouse={wh.data?.warehouse === "cloud"}
+        onRunSucceeded={(result) => {
+          // A cloud-local run (run_id "local-<uuid>", no SFN execution) isn't
+          // surfaced on the dashboard grid by the SFN-keyed tracker, so open
+          // the run-detail sheet on dispatch — the sheet polls execution-states
+          // by run id (the same warehouse-routed path every run uses) so the
+          // run is visible right away with per-node status. Local-warehouse and
+          // cloud-SFN runs surface on the grid directly; auto-opening the sheet
+          // for them would overlay the Run button and block the next dispatch
+          // (verify-readme runs the pipeline 3×), so gate strictly on the
+          // cloud-local run-id prefix.
+          if (result.run_id?.startsWith("local-")) {
+            openRunDetail(result.run_id);
+          }
+          // The new run column appears via the synthetic in-flight row while
+          // running and lands as a real column when the query invalidation
+          // refetches.
           void qc.invalidateQueries({ queryKey: ["runs"] });
           void qc.invalidateQueries({ queryKey: ["node-runs"] });
           void qc.invalidateQueries({ queryKey: ["catalog"] });
@@ -903,7 +913,7 @@ export function PipelineDashboard() {
             </Card>
 
             {/* Recent executions — cloud-only (SFN), workspace-env gated. */}
-            {!isLocalEnv && (
+            {!isLocalWarehouse && (
               <Card>
                 <CardHeader className="pb-3">
                   <CardTitle>Recent executions</CardTitle>
@@ -979,7 +989,7 @@ export function PipelineDashboard() {
                 )}
                 {Boolean(backfills.error) && (
                   <div className="p-6 text-xs text-muted-foreground">
-                    {isLocalEnv
+                    {isLocalWarehouse
                       ? "Couldn't list backfills for this local pipeline. Run the pipeline at least once so the warehouse has a canonical target."
                       : "Backfills require a deployed pipeline (Lambda + Glue). Apply the pipeline first, then stage a backfill here."}
                   </div>
@@ -1388,6 +1398,14 @@ function ExecutionListItem({ e }: { e: ExecutionInfo }) {
 interface RunPipelineButtonProps {
   dir: string;
   disabled?: boolean;
+  /** True when the workspace warehouse is cloud. Compute placement is a
+   * choice only here, so it gets two explicit buttons — "Run on cloud"
+   * (Step Functions + Lambda) and "Run locally" (docker on this machine
+   * against the cloud warehouse, ADR-024). On a local warehouse there is
+   * nothing to choose (the warehouse already runs locally), so it stays a
+   * single "Run pipeline" button. Placement is never hidden behind the
+   * options popover — you can see where a run will execute before clicking. */
+  cloudWarehouse?: boolean;
   onRunSucceeded: (result: import("@/api/pipeline").RunPipelineResult) => void;
 }
 
@@ -1405,12 +1423,15 @@ interface RunPipelineButtonProps {
  * .clavesa/runs/<id>/ is already there — wire to the same polling
  * surface the cloud-side already uses.
  */
-function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonProps) {
-  const [running, setRunning] = useState(false);
+function RunPipelineButton({ dir, disabled, cloudWarehouse, onRunSucceeded }: RunPipelineButtonProps) {
+  // runningKind is which placement is mid-flight (null = idle), so the
+  // spinner lands on the button that was actually clicked.
+  const [runningKind, setRunningKind] = useState<null | "cloud" | "local">(null);
   const [force, setForce] = useState(false);
   const [forceNodesInput, setForceNodesInput] = useState("");
   const [popoverOpen, setPopoverOpen] = useState(false);
   const popoverRef = useRef<HTMLDivElement | null>(null);
+  const running = runningKind !== null;
 
   // Outside-click closes the popover. The native trigger button's click
   // is excluded by the ref check (it's inside the wrapper).
@@ -1426,8 +1447,13 @@ function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonP
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [popoverOpen]);
 
-  async function handleClick() {
-    setRunning(true);
+  // compute === "local" routes to the local docker runner against the cloud
+  // warehouse (ADR-024); undefined runs the deployed pipeline (local DAG
+  // walk on a local warehouse, Step Functions on a cloud one). Force /
+  // force-nodes from the popover apply to either placement.
+  async function handleRun(compute?: "local") {
+    setRunningKind(compute === "local" ? "local" : "cloud");
+    setPopoverOpen(false);
     try {
       // Parse comma-separated node IDs; trim + drop empty entries so
       // " a , b , " resolves to ["a","b"]. Explicit force-nodes implies
@@ -1439,8 +1465,12 @@ function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonP
       const effectiveForce = force || forceNodes.length > 0;
       const result = await runPipeline(
         dir,
-        effectiveForce
-          ? { force: true, forceNodes: forceNodes.length > 0 ? forceNodes : undefined }
+        effectiveForce || compute
+          ? {
+              force: effectiveForce || undefined,
+              forceNodes: forceNodes.length > 0 ? forceNodes : undefined,
+              compute,
+            }
           : undefined,
       );
       // Dispatch is async — the run is starting, not finished.
@@ -1451,27 +1481,62 @@ function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonP
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
-      setRunning(false);
+      setRunningKind(null);
     }
   }
 
   const forceActive = force || forceNodesInput.trim().length > 0;
+  const forcePrefix = forceActive ? "Force " : "";
 
   return (
     <div className="relative inline-flex items-center gap-1" ref={popoverRef}>
+      {/* Primary run button. On a cloud warehouse it is explicitly "Run on
+          cloud" (the deployed pipeline); on a local warehouse there is only
+          one place to run, so it stays "Run pipeline". Either way the label
+          says where the run will execute before you click — placement is
+          never hidden in the options popover. */}
       <Button
-        onClick={handleClick}
+        onClick={() => handleRun(undefined)}
         disabled={disabled || running}
         size="sm"
+        title={
+          cloudWarehouse
+            ? "Run on the deployed pipeline (Step Functions + Lambda)"
+            : "Run the pipeline locally"
+        }
         data-testid="run-pipeline"
       >
-        {running ? (
+        {runningKind === "cloud" ? (
           <Loader2 className="h-4 w-4 animate-spin" />
         ) : (
           <Play className="h-4 w-4" />
         )}
-        {running ? "Running…" : forceActive ? "Force run" : "Run pipeline"}
+        {runningKind === "cloud"
+          ? "Running…"
+          : cloudWarehouse
+            ? `${forcePrefix}Run on cloud`
+            : `${forcePrefix}Run pipeline`}
       </Button>
+      {/* The local-compute placement is a first-class button on a cloud
+          warehouse, not a buried toggle (ADR-024): run the whole pipeline
+          in a local docker container against the cloud warehouse. */}
+      {cloudWarehouse && (
+        <Button
+          onClick={() => handleRun("local")}
+          disabled={disabled || running}
+          size="sm"
+          variant="outline"
+          title="Run the whole pipeline in a local docker container on this machine against the cloud warehouse. It still drains the live source queue and advances watermarks, exactly like a deployed run."
+          data-testid="run-pipeline-local"
+        >
+          {runningKind === "local" ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Laptop className="h-4 w-4" />
+          )}
+          {runningKind === "local" ? "Running…" : `${forcePrefix}Run locally`}
+        </Button>
+      )}
       <Button
         type="button"
         size="sm"
@@ -1479,7 +1544,7 @@ function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonP
         onClick={() => setPopoverOpen((v) => !v)}
         disabled={disabled || running}
         aria-label="Run options"
-        title="Run options"
+        title="Run options (force, force-nodes)"
         data-testid="run-pipeline-options"
       >
         <Zap className="h-4 w-4" />
@@ -1492,7 +1557,7 @@ function RunPipelineButton({ dir, disabled, onRunSucceeded }: RunPipelineButtonP
           <p className="mb-2 text-xs text-muted-foreground">
             Bypasses incremental-skip checks for this run. Watermarks
             still advance on success. Append-without-merge_keys outputs
-            may write duplicates.
+            may write duplicates. Applies to whichever Run button you click.
           </p>
           <div className="mb-3 flex items-center gap-2">
             <input

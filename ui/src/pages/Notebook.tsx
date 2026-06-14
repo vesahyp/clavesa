@@ -35,6 +35,7 @@ import {
   useNotebook,
   type Notebook as NbType,
   type NotebookCell,
+  type ServedInfo,
 } from "@/lib/queries";
 
 const AUTOSAVE_DEBOUNCE_MS = 600;
@@ -52,6 +53,12 @@ export function Notebook() {
   const runningCellRef = useRef<Map<string, string>>(new Map());
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set());
   const [runningAll, setRunningAll] = useState(false);
+  // ADR-024 engine identity per cell, from that cell's last run response in
+  // THIS session — intentionally not persisted into the .ipynb (the badge
+  // describes who served the run you just made, not historic state).
+  const [servedByCell, setServedByCell] = useState<Map<string, ServedInfo>>(
+    new Map(),
+  );
   const [graduatingCell, setGraduatingCell] = useState<NotebookCell | null>(null);
   const pipelines = usePipelines();
 
@@ -147,6 +154,16 @@ export function Notebook() {
         // Patch our local draft with the freshly persisted cell (outputs +
         // metadata.clavesa.*). Other cells unchanged.
         setCells((cells) => cells.map((c) => (c.id === cell.id ? res.cell : c)));
+        // Engine identity: the backend stamps `served` next to `result`;
+        // tolerate the inside-result placement too (wire contract allows
+        // either while the backend slice lands).
+        const served = res.served ?? res.result.served;
+        setServedByCell((m) => {
+          const next = new Map(m);
+          if (served) next.set(cell.id, served);
+          else next.delete(cell.id);
+          return next;
+        });
         // Toast non-OK statuses so the user notices even if they scrolled away.
         if (res.result.status === "error") {
           toast.error(`Cell errored: ${res.result.error?.ename ?? "error"}`);
@@ -338,6 +355,7 @@ export function Notebook() {
             key={c.id}
             cell={c}
             busy={runningIds.has(c.id)}
+            served={servedByCell.get(c.id)}
             onEditorReady={(view) => editorViewsRef.current.set(c.id, view)}
             onFocus={() => setActiveCellId(c.id)}
             onChange={(source) =>

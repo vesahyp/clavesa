@@ -274,14 +274,90 @@ func TestCloudUndeployedReturnsEmpty(t *testing.T) {
 	}
 }
 
-// TestCloudExecutionStatesNonARNRef — a ref that isn't a real SFN
-// execution ARN (a bare `dir` from the dashboard's dir-mode poll on an
-// undeployed workspace) returns empty states with nil error, not a 500.
+// TestCloudExecutionStatesNonARNRef — a ref that isn't a real SFN execution
+// ARN (an undeployed workspace with no S3 store) returns empty states + a
+// RUNNING overall status with nil error, not a 500. Post-ADR-024 the old
+// "empty bail on non-ARN ref" is gone (it broke cloud-local); without a run
+// marker the overall reads as RUNNING (freshly-dispatched semantics).
 func TestCloudExecutionStatesNonARNRef(t *testing.T) {
 	c := NewCloudProvider(nil, "", nil, nil)
 	r, err := c.ExecutionStates(context.Background(), ExecutionStatesQuery{ExecutionRef: "bronze"})
-	if err != nil || r == nil || len(r.States) != 0 || r.Status != "" {
-		t.Errorf("ExecutionStates(bare dir) = (%v, %v), want empty result, nil err", r, err)
+	if err != nil || r == nil || len(r.States) != 0 || r.Status != "RUNNING" {
+		t.Errorf("ExecutionStates(no store) = (%v, %v), want empty states + RUNNING, nil err", r, err)
+	}
+}
+
+// TestCloudExecutionStatesCloudLocalRunMarker proves a cloud-local run id
+// (no SFN execution) derives its overall status from the `_run.json` run
+// marker in the S3 warehouse, and its per-node states from the progress
+// markers — the path the deleted non-ARN bail used to break.
+func TestCloudExecutionStatesCloudLocalRunMarker(t *testing.T) {
+	const run = "local-1746612000-abcd"
+	const bucket = "demo-bucket"
+	now := time.UnixMilli(1700000000000)
+	s3stub := &stubS3Snap{
+		objects: map[string][]byte{
+			bucket + "/_progress/" + run + "/a.json":       terminalProgressJSON("succeeded", now.UnixMilli()),
+			bucket + "/_progress/" + run + "/_run.json":     []byte(`{"status":"SUCCEEDED","pipeline":"demo","started_ms":1700000000000}`),
+		},
+	}
+	c := NewCloudProvider(nil, bucket, nil, nil).WithS3(s3stub)
+	c.clock = func() time.Time { return now }
+
+	res, err := c.ExecutionStates(context.Background(), ExecutionStatesQuery{ExecutionRef: run})
+	if err != nil {
+		t.Fatalf("ExecutionStates: %v", err)
+	}
+	if res.Status != "SUCCEEDED" {
+		t.Errorf("overall Status = %q, want SUCCEEDED (from run marker)", res.Status)
+	}
+	if got := res.States["a"].Status; got != "SUCCEEDED" {
+		t.Errorf("node a Status = %q, want SUCCEEDED", got)
+	}
+}
+
+// TestCloudExecutionStatesCloudLocalCompositeRef is the regression guard for
+// the bug where the cloud-local progress channel read empty. The HTTP handler
+// encodes a non-ARN run id as the "dir:runID" composite (FormatExecRef), but
+// the warehouse `_progress` tree is keyed by the run id ALONE. ExecutionStates
+// must split the composite and read `_progress/<runID>/…`, not
+// `_progress/<dir:runID>/…`. Drives the EXACT ref shape the handler produces.
+func TestCloudExecutionStatesCloudLocalCompositeRef(t *testing.T) {
+	const run = "local-1746612000-abcd"
+	const dir = "/Users/x/clavesa-workspaces/smoke/taxi"
+	const bucket = "demo-bucket"
+	now := time.UnixMilli(1700000000000)
+	s3stub := &stubS3Snap{
+		objects: map[string][]byte{
+			bucket + "/_progress/" + run + "/a.json":   terminalProgressJSON("succeeded", now.UnixMilli()),
+			bucket + "/_progress/" + run + "/b.json":   terminalProgressJSON("succeeded", now.UnixMilli()),
+			bucket + "/_progress/" + run + "/_run.json": []byte(`{"status":"SUCCEEDED","pipeline":"taxi","started_ms":1700000000000}`),
+		},
+	}
+	c := NewCloudProvider(nil, bucket, nil, nil).WithS3(s3stub)
+	c.clock = func() time.Time { return now }
+
+	// FormatExecRef yields "dir:runID" for a non-ARN run id — the composite the
+	// handler passes for a cloud-local run.
+	ref := FormatExecRef(dir, run)
+	if ref == run {
+		t.Fatalf("test precondition: FormatExecRef should compose dir:runID, got bare %q", ref)
+	}
+	res, err := c.ExecutionStates(context.Background(), ExecutionStatesQuery{ExecutionRef: ref})
+	if err != nil {
+		t.Fatalf("ExecutionStates(composite ref): %v", err)
+	}
+	if res.Status != "SUCCEEDED" {
+		t.Errorf("overall Status = %q, want SUCCEEDED (composite ref must split to the bare run id)", res.Status)
+	}
+	if res.RunID != run {
+		t.Errorf("RunID = %q, want bare %q", res.RunID, run)
+	}
+	if got := res.States["a"].Status; got != "SUCCEEDED" {
+		t.Errorf("node a Status = %q, want SUCCEEDED (states empty ⇒ composite not split)", got)
+	}
+	if got := res.States["b"].Status; got != "SUCCEEDED" {
+		t.Errorf("node b Status = %q, want SUCCEEDED", got)
 	}
 }
 

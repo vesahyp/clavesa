@@ -319,7 +319,14 @@ func (s *Service) resolveInputData(ctx context.Context, g *graph.PipelineGraph, 
 				}
 				localTag = ensured
 			}
-			warehouse := workspace.LocalWarehouseDir(s.workspace)
+			// Cross-pipeline reads sample the workspace's *active*
+			// warehouse (ADR-024): local Hadoop dir or the cloud Glue/S3
+			// warehouse. Cloud + undeployed is a hard error surfaced to
+			// the caller — never a silent local fallback.
+			warehouse, err := workspace.WarehouseURI(s.workspace)
+			if err != nil {
+				return nil, err
+			}
 			image, _ := target.Config["runner_image"].(string)
 			for alias, raw := range extInputs {
 				if _, already := allRows[alias]; already {

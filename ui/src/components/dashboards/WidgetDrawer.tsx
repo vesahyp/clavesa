@@ -54,6 +54,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { CodeEditor } from "@/components/CodeEditor";
+import { EngineBadge } from "@/components/EngineBadge";
 import type { DatasetColumns } from "@/hooks/useDatasetColumns";
 import type {
   DashboardControl,
@@ -441,6 +442,20 @@ function DrawerBody({
           </p>
         )}
         <RowsPreview columns={columns} />
+        {/* ADR-024: where this widget's query runs. Predicted from the
+            warehouse before the first run; confirmed from the response's own
+            `served` stamp after (the /dashboards/query handler writes the
+            provider QueryResult through), never derived from workspace
+            state at render time. */}
+        {!columns?.error && (
+          <div className="flex justify-end">
+            <EngineBadge
+              served={columns?.served}
+              surface="serving"
+              testid="engine-badge-widget-editor"
+            />
+          </div>
+        )}
       </section>
 
       {/* Field mapping — type-specific column pickers. */}

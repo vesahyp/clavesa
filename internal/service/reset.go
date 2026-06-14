@@ -76,7 +76,7 @@ type resetNodePlan struct {
 // executor needs (mode, bucket) so execute doesn't re-derive them.
 type resetPlan struct {
 	pipeline string
-	mode     workspace.Mode
+	mode     workspace.Warehouse
 	bucket   string // cloud only
 	nodes    []resetNodePlan
 }
@@ -113,7 +113,7 @@ func (s *Service) PipelineReset(ctx context.Context, req PipelineResetRequest) (
 	if err != nil {
 		return nil, err
 	}
-	if plan.mode == workspace.ModeLocal {
+	if plan.mode == workspace.WarehouseLocal {
 		return s.executeResetLocal(plan)
 	}
 	return s.executeResetCloud(ctx, plan)
@@ -140,7 +140,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 		nodeByID[g.Nodes[i].ID] = &g.Nodes[i]
 	}
 
-	mode := workspace.LoadEnvironmentMode(s.workspace)
+	mode := workspace.LoadWarehouse(s.workspace)
 	plan := &resetPlan{pipeline: pipelineName, mode: mode}
 
 	// Cloud: the Glue DB comes from the deployed Lambda's env vars
@@ -149,7 +149,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 	// references. The env is function-level (one runner Lambda per
 	// pipeline since v2.2.0), so one resolution covers every node.
 	cloudDB := ""
-	if mode == workspace.ModeCloud {
+	if mode == workspace.WarehouseCloud {
 		plan.bucket = workspace.PipelineBucket(s.workspace)
 		if plan.bucket == "" {
 			return nil, fmt.Errorf("reset: pipeline bucket not found — is the workspace deployed?")
@@ -188,7 +188,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 		matched = true
 
 		glueDB := cloudDB
-		if mode == workspace.ModeLocal {
+		if mode == workspace.WarehouseLocal {
 			_, db, _, err := s.canonicalTargetFor(n, abs, pipelineName)
 			if err != nil {
 				return nil, fmt.Errorf("resolve canonical target for %q: %w", n.ID, err)
@@ -204,7 +204,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 		for _, key := range outputKeyList(*n) {
 			seg := canonicalTableSegment(n.ID, defs, key)
 			loc := ""
-			if mode == workspace.ModeLocal {
+			if mode == workspace.WarehouseLocal {
 				// Local writes land in the ADR-019 V2 layout
 				// `<warehouse>/<catalog>/<schema>/<table>` (runner.py
 				// _v2_layout_path pins it via the DB LOCATION clause);
@@ -241,7 +241,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 				// the orchestration emitter's `id + "__" + alias`.
 				name := n.ID + "__" + alias + ".json"
 				path := ""
-				if mode == workspace.ModeLocal {
+				if mode == workspace.WarehouseLocal {
 					path = filepath.Join(abs, ".clavesa", "watermarks", name)
 				} else {
 					path = fmt.Sprintf("s3://%s/%s/_watermarks/%s", plan.bucket, pipelineName, name)

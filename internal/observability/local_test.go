@@ -11,30 +11,14 @@ import (
 	"github.com/vesahyp/clavesa/internal/observability"
 )
 
-// writeRunFixture lays out a minimal run directory at <dir>/.clavesa/runs/<runID>/
-// with a state.json + log files for two nodes. Returns the resolved runID.
+// writeRunFixture lays out the per-node log file at
+// <dir>/.clavesa/runs/<runID>/logs/ that ExecutionLogs reads. Per-run state
+// no longer lives in a state.json (ADR-024 moved overall run status to the
+// warehouse `_progress/<run>/_run.json` marker); only logs stay in the
+// per-pipeline runs dir, so the fixture writes just the log.
 func writeRunFixture(t *testing.T, dir, runID, status string) {
 	t.Helper()
-	state := &observability.RunStateFile{
-		RunID:     runID,
-		Pipeline:  "demo",
-		Status:    status,
-		StartedAt: time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
-		States: map[string]observability.NodeRunState{
-			"load_orders": {
-				Status:    "SUCCEEDED",
-				EnteredAt: "2026-05-07T10:00:00Z",
-				ExitedAt:  "2026-05-07T10:00:02Z",
-			},
-			"filter_complete": {
-				Status:    "RUNNING",
-				EnteredAt: "2026-05-07T10:00:03Z",
-			},
-		},
-	}
-	if err := observability.WriteRunState(dir, state); err != nil {
-		t.Fatalf("WriteRunState: %v", err)
-	}
+	_ = status // retained for call-site readability; status now lives in _run.json
 	logPath := observability.RunLogPath(dir, runID, "filter_complete")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatalf("mkdir log dir: %v", err)
@@ -44,12 +28,49 @@ func writeRunFixture(t *testing.T, dir, runID, status string) {
 	}
 }
 
-func TestLocalProviderExecutionStatesByRunID(t *testing.T) {
-	dir := t.TempDir()
-	writeRunFixture(t, dir, "run-abc", "RUNNING")
+// warehouseFor mirrors workspace.LocalWarehouseDir without importing the
+// workspace package into the test: the warehouse is <root>/.clavesa/warehouse.
+func warehouseFor(root string) string {
+	return filepath.Join(root, ".clavesa", "warehouse")
+}
 
-	p := observability.NewLocalProvider(filepath.Dir(dir))
-	ref := observability.FormatExecRef(filepath.Base(dir), "run-abc")
+// writeProgressMarker writes one per-node `_progress/<run>/<node>.json`
+// marker under the workspace warehouse (ADR-024 cloud-local read tree).
+// updatedMs controls freshness for still-"running" markers; nowFresh marks it
+// at the current epoch so the freshness window passes.
+func writeProgressMarker(t *testing.T, root, run, node, status string, nowFresh bool, extra string) {
+	t.Helper()
+	dir := filepath.Join(warehouseFor(root), "_progress", run)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir progress dir: %v", err)
+	}
+	updated := int64(1)
+	if nowFresh {
+		updated = time.Now().UnixMilli()
+	}
+	body := fmt.Sprintf(`{"status":%q,"updated_ms":%d%s}`, status, updated, extra)
+	if err := os.WriteFile(filepath.Join(dir, node+".json"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write progress marker: %v", err)
+	}
+}
+
+// writeRunMarkerFixture writes the run-level `_progress/<run>/_run.json`.
+func writeRunMarkerFixture(t *testing.T, root, run string, m observability.RunMarker) {
+	t.Helper()
+	store := observability.NewFileProgressStore(warehouseFor(root))
+	if err := observability.WriteRunMarker(context.Background(), store, run, m); err != nil {
+		t.Fatalf("WriteRunMarker: %v", err)
+	}
+}
+
+func TestLocalProviderExecutionStatesByRunID(t *testing.T) {
+	root := t.TempDir()
+	writeProgressMarker(t, root, "run-abc", "load_orders", "succeeded", false, `,"started_ms":1,"ended_ms":3`)
+	writeProgressMarker(t, root, "run-abc", "filter_complete", "running", true, "")
+	writeRunMarkerFixture(t, root, "run-abc", observability.RunMarker{Status: "RUNNING", Pipeline: "demo"})
+
+	p := observability.NewLocalProvider(root)
+	ref := observability.FormatExecRef("demo", "run-abc")
 
 	res, err := p.ExecutionStates(context.Background(), observability.ExecutionStatesQuery{
 		ExecutionRef: ref,
@@ -60,26 +81,26 @@ func TestLocalProviderExecutionStatesByRunID(t *testing.T) {
 	if res.Status != "RUNNING" {
 		t.Errorf("Status = %q, want RUNNING", res.Status)
 	}
+	// Terminal markers are authoritative regardless of freshness.
 	if got := res.States["load_orders"].Status; got != "SUCCEEDED" {
 		t.Errorf("load_orders status = %q, want SUCCEEDED", got)
 	}
 	if got := res.States["filter_complete"].Status; got != "RUNNING" {
 		t.Errorf("filter_complete status = %q, want RUNNING", got)
 	}
-	if got := res.States["load_orders"].EnteredAt; got == "" {
-		t.Error("EnteredAt should be propagated to the result")
-	}
 }
 
 func TestLocalProviderExecutionStatesLatestWhenRunIDOmitted(t *testing.T) {
-	dir := t.TempDir()
-	writeRunFixture(t, dir, "older-run", "SUCCEEDED")
-	// Sleep so mtimes differ (filesystem resolution can be 1s).
+	root := t.TempDir()
+	writeProgressMarker(t, root, "older-run", "n", "succeeded", false, "")
+	writeRunMarkerFixture(t, root, "older-run", observability.RunMarker{Status: "SUCCEEDED", Pipeline: "demo"})
+	// Sleep so the _run.json mtimes differ (filesystem resolution can be 1s).
 	time.Sleep(20 * time.Millisecond)
-	writeRunFixture(t, dir, "newer-run", "RUNNING")
+	writeProgressMarker(t, root, "newer-run", "n", "running", true, "")
+	writeRunMarkerFixture(t, root, "newer-run", observability.RunMarker{Status: "RUNNING", Pipeline: "demo"})
 
-	p := observability.NewLocalProvider(filepath.Dir(dir))
-	ref := observability.FormatExecRef(filepath.Base(dir), "")
+	p := observability.NewLocalProvider(root)
+	ref := observability.FormatExecRef("demo", "")
 
 	res, err := p.ExecutionStates(context.Background(), observability.ExecutionStatesQuery{
 		ExecutionRef: ref,
@@ -301,46 +322,25 @@ func TestLocalProviderNodeRunsViaQuery(t *testing.T) {
 	}
 }
 
-// TestLocalProviderNodeRunsFromState covers the dashboard fast path —
-// no SfExecutionARN means the provider projects per-(run,node) rows
-// from state.json directly, bypassing Spark entirely.
-func TestLocalProviderNodeRunsFromState(t *testing.T) {
-	workspace := t.TempDir()
-	pipelineDir := filepath.Join(workspace, "demo")
-	if err := os.MkdirAll(pipelineDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	dur := int64(1234)
-	st := &observability.RunStateFile{
-		RunID:     "r1",
-		Pipeline:  "demo",
-		Status:    "SUCCEEDED",
-		StartedAt: "2026-05-07T10:00:00Z",
-		EndedAt:   "2026-05-07T10:00:02Z",
-		Trigger:   "manual",
-		States: map[string]observability.NodeRunState{
-			"transform_a": {
-				Status:     "SUCCEEDED",
-				EnteredAt:  "2026-05-07T10:00:00.100Z",
-				ExitedAt:   "2026-05-07T10:00:01.334Z",
-				DurationMs: &dur,
-			},
-			"transform_b": {
-				Status:     "SKIPPED",
-				ErrorMsg:   "all upstreams skipped",
-				DurationMs: nil,
-			},
-		},
-	}
-	if err := observability.WriteRunState(pipelineDir, st); err != nil {
-		t.Fatal(err)
-	}
+// TestLocalProviderNodeRunsFromProgress covers the dashboard fast path —
+// no SfExecutionARN means the provider projects per-(run,node) rows from the
+// warehouse `_progress/<run>/<node>.json` markers directly (ADR-024),
+// bypassing Spark entirely.
+func TestLocalProviderNodeRunsFromProgress(t *testing.T) {
+	root := t.TempDir()
+	// transform_a: terminal succeeded with started/ended → duration 1234, output_rows.
+	writeProgressMarker(t, root, "r1", "transform_a", "succeeded", false,
+		`,"started_ms":1746612000100,"ended_ms":1746612001334,"output_rows":42`)
+	// transform_b: terminal skipped, no timing.
+	writeProgressMarker(t, root, "r1", "transform_b", "skipped", false, "")
+	writeRunMarkerFixture(t, root, "r1", observability.RunMarker{
+		Status: "SUCCEEDED", Pipeline: "demo", Trigger: "manual",
+	})
 
 	// Use a stub that would explode if the Spark path got hit — the fast
 	// path must not invoke it.
 	stub := &stubQueryRunner{err: fmt.Errorf("query runner must not be called for bulk dashboard fetch")}
-	p := observability.NewLocalProvider(workspace).WithQueryRunner(stub)
+	p := observability.NewLocalProvider(root).WithQueryRunner(stub)
 
 	res, err := p.NodeRuns(context.Background(), observability.NodeRunsQuery{
 		PipelineName: "demo",
@@ -364,7 +364,7 @@ func TestLocalProviderNodeRunsFromState(t *testing.T) {
 	if a, ok := byNode["transform_a"]; !ok {
 		t.Errorf("transform_a row missing")
 	} else {
-		// Maps state.json's SUCCEEDED → "ok" to match the runner's
+		// Maps the progress marker's succeeded → "ok" to match the runner's
 		// node_runs convention; the grid checks `=== "ok"` literally.
 		if a.Status != "ok" {
 			t.Errorf("transform_a status = %q, want %q", a.Status, "ok")
@@ -372,8 +372,14 @@ func TestLocalProviderNodeRunsFromState(t *testing.T) {
 		if a.DurationMs == nil || *a.DurationMs != 1234 {
 			t.Errorf("transform_a duration = %v, want 1234", a.DurationMs)
 		}
+		if a.OutputRows == nil || *a.OutputRows != 42 {
+			t.Errorf("transform_a output_rows = %v, want 42", a.OutputRows)
+		}
 		if a.SfExecutionARN != "r1" {
 			t.Errorf("transform_a sf_execution_arn = %q, want r1", a.SfExecutionARN)
+		}
+		if a.Pipeline != "demo" {
+			t.Errorf("transform_a pipeline = %q, want demo", a.Pipeline)
 		}
 	}
 	if b, ok := byNode["transform_b"]; !ok {
@@ -442,6 +448,11 @@ func TestLocalProviderSampleTableViaQuery(t *testing.T) {
 	if !contains(stub.gotSQL, "clavesa_demo.orders__default") {
 		t.Errorf("SQL did not target the right table:\n%s", stub.gotSQL)
 	}
+	// ADR-024: the local provider executed the read — runner Spark over
+	// the local warehouse — and stamps the result accordingly.
+	if res.Served == nil || res.Served.Engine != "spark" || res.Served.Warehouse != "local" {
+		t.Errorf("Served = %+v, want {spark local}", res.Served)
+	}
 }
 
 // TestLocalProviderQueryArbitrary exercises the free-form Query path
@@ -478,6 +489,10 @@ func TestLocalProviderQueryArbitrary(t *testing.T) {
 	}
 	if !contains(stub.gotSQL, "SELECT status, COUNT(*)") {
 		t.Errorf("SQL didn't pass through verbatim: %s", stub.gotSQL)
+	}
+	// ADR-024 engine-metadata stamp from the executing provider.
+	if res.Served == nil || res.Served.Engine != "spark" || res.Served.Warehouse != "local" || res.Served.Transpiled {
+		t.Errorf("Served = %+v, want {spark local false}", res.Served)
 	}
 }
 

@@ -254,7 +254,11 @@ in the same workspace reuse the running container.`,
 			warm := observability.NewPersistentQueryRunner(wsRoot)
 			defer warm.Close()
 			ctx := cmd.Context()
-			warm.Warmup(ctx, defaultWarehouseDir(wsRoot))
+			warehouseURI, err := activeWarehouseURI(wsRoot)
+			if err != nil {
+				return err
+			}
+			warm.Warmup(ctx, warehouseURI)
 
 			nbRunner := observability.NewNotebookSessionRunner(warm)
 			defer nbRunner.Close()
@@ -374,9 +378,11 @@ func detectLanguageDisplay(source string) string {
 	return "python"
 }
 
-// defaultWarehouseDir is the path the warm worker uses for the workspace's
-// Iceberg warehouse — wraps workspace.LocalWarehouseDir for the CLI's
-// `notebook run` so it can prime the warmup at the right path.
-func defaultWarehouseDir(wsRoot string) string {
-	return workspace.LocalWarehouseDir(wsRoot)
+// activeWarehouseURI resolves the warehouse the warm worker should
+// target for the CLI's `notebook run` — the workspace's *active*
+// warehouse (ADR-024), local dir or cloud s3:// URI. Errors (cloud
+// warehouse, undeployed shell) are returned to the command so the user
+// gets the actionable message before any container spawns.
+func activeWarehouseURI(wsRoot string) (string, error) {
+	return workspace.WarehouseURI(wsRoot)
 }

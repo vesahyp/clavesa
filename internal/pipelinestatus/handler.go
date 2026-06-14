@@ -59,6 +59,16 @@ type CloudPipelineRunner interface {
 	RunPipelineCloud(ctx context.Context, dir string, opts RunOpts) (string, error)
 }
 
+// CloudLocalPipelineRunner is the "cloud warehouse, local compute" path
+// (ADR-024): the whole pipeline bundle runs in the workspace-local docker
+// runner against the cloud warehouse instead of an SFN execution. Returns a
+// `local-<uuid>` run id the UI routes to the filesystem progress channel.
+// Implemented by service.Service; the interface lives here so
+// internal/pipelinestatus stays free of an internal/service import.
+type CloudLocalPipelineRunner interface {
+	StartRunCloudLocal(ctx context.Context, dir string, opts RunOpts) (string, error)
+}
+
 // ErrRunInFlight is re-exported from internal/errs so callers comparing
 // with errors.Is continue to work; the underlying sentinel is shared with
 // service.ErrRunInFlight, eliminating the cli/ui.go bridge (C10,
@@ -106,6 +116,12 @@ type Handler struct {
 	// SFN client lazily and dispatches inline without execution input
 	// (legacy behaviour; preserves pre-Slice-C tests).
 	cloudRunner CloudPipelineRunner
+
+	// cloudLocalRunner, when set, lets POST /pipeline/run dispatch a cloud
+	// warehouse run through the local docker runner when the request body
+	// carries compute="local" (ADR-024). Without it, compute="local" on a
+	// cloud warehouse falls back to the SFN path.
+	cloudLocalRunner CloudLocalPipelineRunner
 }
 
 // NewHandler returns a new Handler rooted at the given workspace directory.
@@ -144,6 +160,15 @@ func (h *Handler) WithLocalRunner(r LocalPipelineRunner) *Handler {
 // StartExecution dispatch (legacy behaviour, no force payload).
 func (h *Handler) WithCloudRunner(r CloudPipelineRunner) *Handler {
 	h.cloudRunner = r
+	return h
+}
+
+// WithCloudLocalRunner enables POST /pipeline/run to dispatch a cloud-warehouse
+// run through the local docker runner when the request body carries
+// compute="local" (ADR-024). Tests can leave this unset; compute="local" then
+// falls back to the SFN path.
+func (h *Handler) WithCloudLocalRunner(r CloudLocalPipelineRunner) *Handler {
+	h.cloudLocalRunner = r
 	return h
 }
 
@@ -399,21 +424,35 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Local-mode dispatch: arn is `local:<dir>#<runID>` synthesised by
-	// GetStatus above. ReadRunState already populates failed_step +
-	// error_class + error_msg (B P1-2 from 2026-05-24).
+	// GetStatus above. The failure context comes from the warehouse
+	// `_run.json` run marker (ADR-024), read via the provider's RunDetail.
 	if dir, runID, ok := splitLocalExecRef(arn); ok {
-		st, err := observability.ReadRunState(dir, runID)
+		if h.resolver == nil {
+			httputil.WriteError(w, http.StatusInternalServerError, "no observability resolver configured")
+			return
+		}
+		prov, err := h.providerForRun(dir, runID)
 		if err != nil {
-			httputil.WriteError(w, http.StatusNotFound, "read run state: "+err.Error())
+			httputil.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		rd, ok := prov.(runDetailer)
+		if !ok {
+			httputil.WriteError(w, http.StatusInternalServerError, "provider does not support run detail")
+			return
+		}
+		detail, err := rd.RunDetail(r.Context(), runID)
+		if err != nil {
+			httputil.WriteError(w, http.StatusNotFound, "read run detail: "+err.Error())
 			return
 		}
 		httputil.WriteJSON(w, http.StatusOK, executionDetail{
-			Status:     st.Status,
-			Error:      st.ErrorClass,
-			Cause:      st.ErrorMsg,
-			FailedStep: st.FailedStep,
-			StepError:  st.ErrorClass,
-			StepCause:  st.ErrorMsg,
+			Status:     detail.Status,
+			Error:      detail.ErrorClass,
+			Cause:      detail.ErrorMsg,
+			FailedStep: detail.FailedStep,
+			StepError:  detail.ErrorClass,
+			StepCause:  detail.ErrorMsg,
 		})
 		return
 	}
@@ -464,12 +503,13 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 //   - arn=<arn>: legacy cloud-only path; preserved while UI clients migrate.
 func (h *Handler) GetExecutionStates(w http.ResponseWriter, r *http.Request) {
 	if dir := r.URL.Query().Get("dir"); dir != "" && h.resolver != nil {
-		p, err := h.resolver.For(dir)
+		run := r.URL.Query().Get("run")
+		p, err := h.providerForRun(dir, run)
 		if err != nil {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		ref := observability.FormatExecRef(dir, r.URL.Query().Get("run"))
+		ref := observability.FormatExecRef(dir, run)
 		res, err := p.ExecutionStates(r.Context(), observability.ExecutionStatesQuery{
 			ExecutionRef: ref,
 		})
@@ -520,12 +560,13 @@ func (h *Handler) GetExecutionLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if dir := r.URL.Query().Get("dir"); dir != "" && h.resolver != nil {
-		p, err := h.resolver.For(dir)
+		run := r.URL.Query().Get("run")
+		p, err := h.providerForRun(dir, run)
 		if err != nil {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		ref := observability.FormatExecRef(dir, r.URL.Query().Get("run"))
+		ref := observability.FormatExecRef(dir, run)
 		res, err := p.ExecutionLogs(r.Context(), observability.ExecutionLogsQuery{
 			ExecutionRef: ref,
 			Step:         step,
@@ -585,6 +626,11 @@ type runRequest struct {
 	// without payload duplication.
 	Force      bool     `json:"force,omitempty"`
 	ForceNodes []string `json:"force_nodes,omitempty"`
+	// Compute is the per-action execution placement (ADR-024). "" defaults to
+	// the warehouse; "local" on a cloud warehouse runs the bundle in the local
+	// docker runner against the cloud warehouse (response carries run_id with
+	// the `local-` prefix). Ignored on a local warehouse (already local).
+	Compute string `json:"compute,omitempty"`
 }
 
 type runResponse struct {
@@ -636,6 +682,30 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cloud warehouse, local compute (ADR-024): run the whole pipeline bundle
+	// in the local docker runner against the cloud warehouse. Returns a
+	// `local-<uuid>` run id the UI routes to the filesystem progress channel.
+	if req.Compute == "local" && h.cloudLocalRunner != nil {
+		runID, err := h.cloudLocalRunner.StartRunCloudLocal(r.Context(), abs, opts)
+		if err != nil {
+			if errors.Is(err, ErrRunInFlight) {
+				httputil.WriteError(w, http.StatusConflict, err.Error())
+				return
+			}
+			// A non-nil run id with an error means the bundle started and
+			// failed mid-run — surface the id so the UI can open the run
+			// detail; still report the failure status.
+			if runID != "" {
+				httputil.WriteJSON(w, http.StatusOK, runResponse{RunID: runID})
+				return
+			}
+			httputil.WriteError(w, http.StatusInternalServerError, "cloud-local run: "+err.Error())
+			return
+		}
+		httputil.WriteJSON(w, http.StatusOK, runResponse{RunID: runID})
+		return
+	}
+
 	// Cloud dispatch. Prefer the wired CloudPipelineRunner (production
 	// path) — it lifts the SFN client construction + execution-input
 	// payload into the service so CLI and UI share one code path and
@@ -677,7 +747,7 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 
 // isLocalCompute consults the observability resolver to decide whether the
 // workspace operates locally. The resolver encapsulates the local/cloud
-// routing rule (the workspace environment mode); reusing it here keeps
+// routing rule (the workspace warehouse); reusing it here keeps
 // that rule in one place. Without a resolver wired (test mode), the
 // handler defaults to cloud — preserves the legacy behavior.
 func (h *Handler) isLocalCompute(_ string) bool {
@@ -685,6 +755,25 @@ func (h *Handler) isLocalCompute(_ string) bool {
 		return false
 	}
 	return h.resolver.IsLocal()
+}
+
+// providerForRun picks the observability provider for a states/logs request.
+// Routing is purely by warehouse via the resolver (ADR-024): a cloud-local
+// run (cloud warehouse, local compute) is read by the cloud provider off the
+// S3 `_progress` tree the runner wrote there, exactly like a fully-cloud run
+// — the provider seam reads the warehouse, not SFN, for per-node state, so
+// the old `local-`-prefix special-case (which forced the local provider) is
+// no longer needed. The run id no longer steers dispatch.
+func (h *Handler) providerForRun(dir, run string) (observability.Provider, error) {
+	return h.resolver.For(dir)
+}
+
+// runDetailer is the narrow capability the local execution-detail path needs:
+// reading the warehouse `_run.json` run marker for failure context. Both the
+// cloud and local providers satisfy it; asserted (not part of the Provider
+// interface) so the seam stays minimal.
+type runDetailer interface {
+	RunDetail(ctx context.Context, run string) (observability.RunDetail, error)
 }
 
 func boolPtr(b bool) *bool { return &b }

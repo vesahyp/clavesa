@@ -231,25 +231,27 @@ func resolveWorkspaceForInit(cmd *cobra.Command, name string) (string, error) {
 }
 
 func newWorkspaceUseCmd() *cobra.Command {
+	var warehouseFlag string
 	var env string
 	var profile string
 	profileSet := false
 	cmd := &cobra.Command{
 		Use:   "use [path]",
-		Short: "Switch the current workspace, or set its environment mode / AWS profile",
+		Short: "Switch the current workspace, or set its warehouse / AWS profile",
 		Long: `With <path>, record it as the current workspace — subsequent commands
 without --workspace and without $CLAVESA_WORKSPACE resolve to it. The
 selection is stored in $XDG_CONFIG_HOME/clavesa/current-workspace
 (default: ~/.config/clavesa/current-workspace).
 
-With --env, set the workspace environment mode:
+With --warehouse, set where all workspace state lives:
 
   - local: author and run against the local runner + Hadoop catalog.
   - cloud: operate the deployed pipeline (Step Functions, Glue, Athena).
 
-The mode is stored per-workspace in .clavesa/environment.json
+The warehouse is stored per-workspace in .clavesa/environment.json
 (gitignored) and defaults to "local". It drives local-vs-cloud dispatch
-for pipeline runs and the observability surfaces.
+for pipeline runs and the observability surfaces. (--env is the
+deprecated alias.)
 
 With --profile, set the AWS profile the workspace operates as — the
 profile ` + "`clavesa ui`" + ` resolves AWS credentials from, and forwards
@@ -260,7 +262,7 @@ AWS_PROFILE / default credential chain. The profile must exist in
 ~/.aws; a running ` + "`clavesa ui`" + ` server picks the change up on its
 next start.
 
-Run with no arguments to print the current workspace, mode, and AWS profile.`,
+Run with no arguments to print the current workspace, warehouse, and AWS profile.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var root string
@@ -286,13 +288,19 @@ Run with no arguments to print the current workspace, mode, and AWS profile.`,
 				}
 				root = r
 			}
-			if env != "" {
-				mode, ok := workspace.ParseMode(env)
+			// --warehouse wins when both it and the deprecated --env
+			// alias are set.
+			raw := warehouseFlag
+			if raw == "" {
+				raw = env
+			}
+			if raw != "" {
+				wh, ok := workspace.ParseWarehouse(raw)
 				if !ok {
-					return fmt.Errorf(`--env must be "local" or "cloud", got %q`, env)
+					return fmt.Errorf(`--warehouse must be "local" or "cloud", got %q`, raw)
 				}
-				if err := workspace.WriteEnvironmentMode(root, mode); err != nil {
-					return fmt.Errorf("write environment mode: %w", err)
+				if err := workspace.WriteWarehouse(root, wh); err != nil {
+					return fmt.Errorf("write warehouse: %w", err)
 				}
 			}
 			if profileSet {
@@ -308,7 +316,7 @@ Run with no arguments to print the current workspace, mode, and AWS profile.`,
 				}
 			}
 			fmt.Printf("Current workspace: %s\n", root)
-			fmt.Printf("Environment mode:  %s\n", workspace.LoadEnvironmentMode(root))
+			fmt.Printf("Warehouse:         %s\n", workspace.LoadWarehouse(root))
 			if p := workspace.LoadAWSProfile(root); p != "" {
 				fmt.Printf("AWS profile:       %s\n", p)
 			} else {
@@ -317,7 +325,10 @@ Run with no arguments to print the current workspace, mode, and AWS profile.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&env, "env", "", `set the environment mode: "local" or "cloud"`)
+	cmd.Flags().StringVar(&warehouseFlag, "warehouse", "", `set the workspace warehouse: "local" or "cloud"`)
+	cmd.Flags().StringVar(&env, "env", "", `deprecated alias for --warehouse`)
+	cmd.Flags().MarkHidden("env")
+	cmd.Flags().MarkDeprecated("env", "use --warehouse")
 	cmd.Flags().StringVar(&profile, "profile", "", `set the AWS profile (must exist in ~/.aws); "" clears the override`)
 	cmd.PreRun = func(cmd *cobra.Command, _ []string) {
 		profileSet = cmd.Flags().Changed("profile")

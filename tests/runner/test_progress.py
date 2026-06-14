@@ -158,29 +158,66 @@ class ProgressSnapshotTests(unittest.TestCase):
         self.assertEqual(seen, {7})
 
 
-class ProgressS3TargetTests(unittest.TestCase):
+class ProgressTargetTests(unittest.TestCase):
     def setUp(self):
         self.runner = _load_runner()
 
-    def test_resolves_bucket_and_key(self):
+    # --- s3 branch (deployed run: CLAVESA_SYSTEM_WAREHOUSE is s3://) -------
+
+    def test_s3_resolves_bucket_and_key(self):
         env = {"CLAVESA_SYSTEM_WAREHOUSE": "s3://my-bucket/_system/pipelines/"}
-        target = self.runner._progress_s3_target(env, "arn:aws:states:exec/abc", "trips")
-        self.assertEqual(target, ("my-bucket", "_progress/arn:aws:states:exec/abc/trips.json"))
+        target = self.runner._progress_target(env, "arn:aws:states:exec/abc", "trips")
+        self.assertEqual(
+            target,
+            ("s3", "my-bucket", "_progress/arn:aws:states:exec/abc/trips.json"),
+        )
 
-    def test_none_without_warehouse(self):
-        self.assertIsNone(self.runner._progress_s3_target({}, "arn", "node"))
+    def test_s3_precedence_over_file_warehouse(self):
+        # A deployed run can have both set; s3 system warehouse wins.
+        env = {
+            "CLAVESA_SYSTEM_WAREHOUSE": "s3://sys-bucket/_system/pipelines/",
+            "CLAVESA_WAREHOUSE": "s3://pipeline-bucket/p/_warehouse/",
+        }
+        target = self.runner._progress_target(env, "run1", "trips")
+        self.assertEqual(target, ("s3", "sys-bucket", "_progress/run1/trips.json"))
 
-    def test_none_for_non_s3_warehouse(self):
-        env = {"CLAVESA_SYSTEM_WAREHOUSE": "/local/warehouse"}
-        self.assertIsNone(self.runner._progress_s3_target(env, "arn", "node"))
+    # --- file branch (local / cloud-local against a disk warehouse) -------
 
-    def test_none_without_arn(self):
+    def test_file_resolves_local_path(self):
+        env = {"CLAVESA_WAREHOUSE": "/abs/.clavesa/warehouse"}
+        target = self.runner._progress_target(env, "run1", "trips")
+        self.assertEqual(
+            target,
+            ("file", "/abs/.clavesa/warehouse/_progress/run1/trips.json"),
+        )
+
+    def test_file_branch_when_system_warehouse_absent(self):
+        # Local runs never get CLAVESA_SYSTEM_WAREHOUSE — only CLAVESA_WAREHOUSE
+        # (a filesystem path) — so the file branch must fire.
+        env = {"CLAVESA_WAREHOUSE": "/tmp/ws/.clavesa/warehouse"}
+        target = self.runner._progress_target(env, "abc", "revenue")
+        self.assertEqual(target[0], "file")
+        self.assertTrue(target[1].endswith("/_progress/abc/revenue.json"))
+
+    # --- None cases -------------------------------------------------------
+
+    def test_none_without_any_warehouse(self):
+        self.assertIsNone(self.runner._progress_target({}, "arn", "node"))
+
+    def test_none_when_warehouse_is_s3_but_system_absent(self):
+        # CLAVESA_WAREHOUSE on s3 with no system warehouse: the file branch
+        # rejects an s3 path, so there's no resolvable file sink and we
+        # return None rather than mis-routing.
+        env = {"CLAVESA_WAREHOUSE": "s3://b/p/_warehouse/"}
+        self.assertIsNone(self.runner._progress_target(env, "arn", "node"))
+
+    def test_none_without_run(self):
         env = {"CLAVESA_SYSTEM_WAREHOUSE": "s3://b/_system/pipelines/"}
-        self.assertIsNone(self.runner._progress_s3_target(env, "", "node"))
+        self.assertIsNone(self.runner._progress_target(env, "", "node"))
 
     def test_none_without_node(self):
         env = {"CLAVESA_SYSTEM_WAREHOUSE": "s3://b/_system/pipelines/"}
-        self.assertIsNone(self.runner._progress_s3_target(env, "arn", ""))
+        self.assertIsNone(self.runner._progress_target(env, "arn", ""))
 
 
 if __name__ == "__main__":

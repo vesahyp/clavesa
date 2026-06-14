@@ -289,6 +289,28 @@ type SampleTableQuery struct {
 	Limit       int
 }
 
+// Served identifies which engine and warehouse actually executed one SQL
+// request (ADR-024). It is stamped by the code that ran the request — the
+// provider, the service seam, or the runner dispatch — never derived from
+// workspace state after the fact, so a UI badge fed from it cannot lie
+// across a warehouse toggle flip.
+type Served struct {
+	// Engine that executed the SQL: "spark" | "athena".
+	Engine string `json:"engine"`
+	// Warehouse the SQL ran against: "local" | "cloud".
+	Warehouse string `json:"warehouse"`
+	// Transpiled is true when the authored SparkSQL was transpiled to the
+	// Trino/Athena serving dialect before dispatch (ADR-023). Set by the
+	// service seam — the provider only sees the post-transpile SQL.
+	Transpiled bool `json:"transpiled,omitempty"`
+}
+
+// servedAthenaCloud / servedSparkLocal build the Served stamp for results
+// the cloud and local providers execute. A fresh value per result —
+// callers may mutate it (the service seam sets Transpiled).
+func servedAthenaCloud() *Served { return &Served{Engine: "athena", Warehouse: "cloud"} }
+func servedSparkLocal() *Served  { return &Served{Engine: "spark", Warehouse: "local"} }
+
 // SampleTableColumn is one column in a SampleTableResult.
 type SampleTableColumn struct {
 	Name string `json:"name"`
@@ -304,6 +326,10 @@ type SampleTableResult struct {
 	Rows      [][]string          `json:"rows"`
 	RowCount  int                 `json:"row_count"`
 	Truncated bool                `json:"truncated"`
+	// Served is stamped by the provider that executed the sample read
+	// (ADR-024): {athena, cloud} from CloudProvider, {spark, local} from
+	// LocalProvider.
+	Served *Served `json:"served,omitempty"`
 }
 
 // QueryQuery is the request for an arbitrary SQL query against the
@@ -327,6 +353,11 @@ type QueryResult struct {
 	Rows      [][]string          `json:"rows"`
 	RowCount  int                 `json:"row_count"`
 	Truncated bool                `json:"truncated"`
+	// Served is stamped by the provider that executed the SQL (ADR-024):
+	// {athena, cloud} from CloudProvider, {spark, local} from
+	// LocalProvider. The service seam flips Transpiled on after a cloud
+	// transpile — the provider only sees the post-transpile SQL.
+	Served *Served `json:"served,omitempty"`
 }
 
 // ExecQuery is a write — DDL or DML — against the pipeline's warehouse.
@@ -456,3 +487,16 @@ const (
 	LogSourceCloudWatch = "cloudwatch"
 	LogSourceLocal      = "local"
 )
+
+// RunDetail is the run-level failure context for one execution, projected
+// from the warehouse `_run.json` run marker (ADR-024). Backs the
+// GET /pipeline/execution detail endpoint for non-SFN (local-compute) runs,
+// where SFN DescribeExecution / history aren't available. Found reports
+// whether a marker existed.
+type RunDetail struct {
+	Status     string
+	FailedStep string
+	ErrorClass string
+	ErrorMsg   string
+	Found      bool
+}

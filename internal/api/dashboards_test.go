@@ -292,8 +292,8 @@ func TestDashboardsQueryCloudTranspiles(t *testing.T) {
 		},
 	}
 	ws := t.TempDir()
-	if err := workspace.WriteEnvironmentMode(ws, workspace.ModeCloud); err != nil {
-		t.Fatalf("WriteEnvironmentMode(cloud): %v", err)
+	if err := workspace.WriteWarehouse(ws, workspace.WarehouseCloud); err != nil {
+		t.Fatalf("WriteWarehouse(cloud): %v", err)
 	}
 	resolver := observability.NewResolver(ws, prov, prov)
 	var hookCalls int

@@ -237,7 +237,7 @@ type discoveredPipeline struct {
 	// pipeline name (matching what the runner's _glue_db() does).
 	schema string
 	// isLocal flags that this pipeline dispatches local — the workspace
-	// environment mode is local, or (transitional fallback) a transform
+	// warehouse is local, or (transitional fallback) a transform
 	// still carries compute = "local". Cloud pipelines still get scanned:
 	// their freshness/dir metadata stamps onto Glue-sourced tables for
 	// ADR-014 parity.
@@ -256,10 +256,10 @@ type discoveredPipeline struct {
 // filter by `isLocal` when they want only one side.
 func scanWorkspacePipelines(root string) []discoveredPipeline {
 	var out []discoveredPipeline
-	// The workspace environment mode is the sole local-vs-cloud key
+	// The workspace warehouse is the sole local-vs-cloud key
 	// (TODO bucket 16) — every pipeline in the workspace dispatches the
 	// same way.
-	isLocal := workspace.LoadEnvironmentMode(root) == workspace.ModeLocal
+	isLocal := workspace.LoadWarehouse(root) == workspace.WarehouseLocal
 	candidates := candidateDirs(root)
 	for _, dir := range candidates {
 		g, err := hclparser.Parse(dir)

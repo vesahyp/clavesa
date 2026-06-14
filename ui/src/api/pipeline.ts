@@ -201,16 +201,23 @@ export interface RunPipelineResult {
  * run. Explicit forceNodes scope the bypass down to the listed nodes
  * (matches `--force-node`'s CLI semantics); an empty/missing list with
  * `force=true` applies to every node in the dispatch.
+ *
+ * `opts.compute = "local"` (ADR-024) requests per-invocation local compute:
+ * the whole pipeline runs in a local docker container against the cloud
+ * warehouse. Only meaningful on a cloud warehouse; omit the field otherwise
+ * (the warehouse already runs locally). A cloud-local run's id is prefixed
+ * `local-`, but the caller navigates by the returned id either way.
  */
 export async function runPipeline(
   dir: string,
-  opts?: { force?: boolean; forceNodes?: string[] },
+  opts?: { force?: boolean; forceNodes?: string[]; compute?: "local" },
 ): Promise<RunPipelineResult> {
   const body: Record<string, unknown> = { dir };
   if (opts?.force) body.force = true;
   if (opts?.forceNodes && opts.forceNodes.length > 0) {
     body.force_nodes = opts.forceNodes;
   }
+  if (opts?.compute === "local") body.compute = "local";
   const res = await fetch(`${BASE_URL}/pipeline/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

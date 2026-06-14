@@ -20,6 +20,7 @@ import {
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
 import { AdhocQuery } from "@/components/AdhocQuery";
+import { EngineBadge } from "@/components/EngineBadge";
 import { CopyButton } from "@/components/CopyButton";
 import { LineagePanel } from "@/components/LineagePanel";
 import { Badge } from "@/components/ui/badge";
@@ -42,6 +43,7 @@ import {
   type ColumnStat,
   type ColumnStatsResult,
   type Dashboard,
+  type ServedInfo,
   type SnapshotInfo,
   type SnapshotsResult,
 } from "@/lib/queries";
@@ -721,6 +723,9 @@ function TableQueryPane({
   autoRun?: boolean;
 }) {
   const [open, setOpen] = useState(!!defaultOpen);
+  // ADR-024 engine identity for the last sample/query result, lifted out
+  // of the embedded AdhocQuery so the badge sits in the card header.
+  const [served, setServed] = useState<ServedInfo | undefined>(undefined);
   return (
     <Card data-testid="table-sample-rows">
       <CardHeader className="flex-row items-center justify-between pb-2">
@@ -734,14 +739,27 @@ function TableQueryPane({
           <CardTitle className="text-base">Query this table</CardTitle>
         </button>
         {open && (
-          <Button asChild size="sm" variant="ghost">
-            <a href={`/query?sql=${encodeURIComponent(sql)}`}>Open in /query</a>
-          </Button>
+          <div className="flex items-center gap-2">
+            <EngineBadge
+              served={served}
+              surface="serving"
+              testid="engine-badge-sample-rows"
+            />
+            <Button asChild size="sm" variant="ghost">
+              <a href={`/query?sql=${encodeURIComponent(sql)}`}>Open in /query</a>
+            </Button>
+          </div>
         )}
       </CardHeader>
       {open && (
         <CardContent className="pt-0">
-          <AdhocQuery initialSql={sql} bare autoRun={autoRun} />
+          <AdhocQuery
+            initialSql={sql}
+            bare
+            autoRun={autoRun}
+            badgeTestid={null}
+            onServed={setServed}
+          />
         </CardContent>
       )}
     </Card>

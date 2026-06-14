@@ -53,47 +53,75 @@ func NewLocalProvider(workspaceRoot string) *LocalProvider {
 // run for the inspected pipeline — matches how CloudProvider treats the
 // "latest in-flight execution" case via the SFN ListExecutions path.
 func (p *LocalProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQuery) (*ExecutionStatesResult, error) {
-	dir, err := p.pipelineDirForQuery(q.ExecutionRef)
-	if err != nil {
-		return nil, err
-	}
-	runID, err := p.resolveRunID(dir, q.ExecutionRef)
-	if err != nil {
-		// Fresh pipeline that hasn't been run yet — the run directory
-		// doesn't exist. Returning empty matches the cloud provider's
-		// "no executions yet" path, so the dashboard renders a clean
-		// empty state instead of flashing a 500.
-		if errors.Is(err, os.ErrNotExist) {
+	store := p.progressStore()
+	_, runID := splitExecRef(q.ExecutionRef)
+	if runID == "" {
+		// No explicit run id: inspect the newest run in the warehouse
+		// `_progress` tree. Empty when nothing has run yet — the cloud
+		// provider's "no executions" parity (clean empty state, not a 500).
+		ids, err := ListProgressRunIDs(p.warehouseDir())
+		if err != nil {
+			return nil, fmt.Errorf("list local runs: %w", err)
+		}
+		if len(ids) == 0 {
 			return &ExecutionStatesResult{States: map[string]StateStatus{}}, nil
 		}
-		return nil, err
-	}
-	st, err := ReadRunState(dir, runID)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &ExecutionStatesResult{States: map[string]StateStatus{}}, nil
-		}
-		return nil, err
+		runID = ids[0]
 	}
 
+	// Per-node states from the warehouse progress markers — the same shared
+	// helper the cloud provider uses (ADR-014 parity).
+	states := progressStates(ctx, store, runID, time.Now().UnixMilli())
+
 	out := &ExecutionStatesResult{
-		Status:    st.Status,
-		States:    make(map[string]StateStatus, len(st.States)),
-		RunID:     st.RunID,
-		StartedAt: st.StartedAt,
+		Status: "RUNNING",
+		States: states,
+		RunID:  runID,
 	}
-	for nodeID, s := range st.States {
-		out.States[nodeID] = StateStatus{
-			Status:          s.Status,
-			EnteredAt:       s.EnteredAt,
-			StagesTotal:     s.StagesTotal,
-			StagesCompleted: s.StagesCompleted,
-			TasksTotal:      s.TasksTotal,
-			TasksCompleted:  s.TasksCompleted,
-			TasksFailed:     s.TasksFailed,
+	// Overall status + start time come from the run marker. Absent marker on
+	// a freshly dispatched run reads as RUNNING so the dashboard renders an
+	// in-flight column rather than flashing empty.
+	if m, ok, _ := readRunMarker(ctx, store, runID); ok && m != nil {
+		if m.Status != "" {
+			out.Status = m.Status
+		}
+		if m.StartedMs != nil {
+			out.StartedAt = formatMillis(*m.StartedMs)
 		}
 	}
 	return out, nil
+}
+
+// RunDetail reads one run's `_run.json` run marker and projects its
+// failure context. Found=false when no marker exists (a fresh / pre-marker
+// run). Backs the GET /pipeline/execution detail endpoint for local runs.
+func (p *LocalProvider) RunDetail(ctx context.Context, run string) (RunDetail, error) {
+	m, ok, err := readRunMarker(ctx, p.progressStore(), run)
+	if err != nil {
+		return RunDetail{}, err
+	}
+	if !ok || m == nil {
+		return RunDetail{}, nil
+	}
+	return RunDetail{
+		Status:     m.Status,
+		FailedStep: m.FailedStep,
+		ErrorClass: m.ErrorClass,
+		ErrorMsg:   m.ErrorMsg,
+		Found:      true,
+	}, nil
+}
+
+// warehouseDir is the workspace-shared local warehouse the runner + dispatch
+// layer write the `_progress` tree under (ADR-024).
+func (p *LocalProvider) warehouseDir() string {
+	return workspace.LocalWarehouseDir(p.workspaceRoot)
+}
+
+// progressStore builds a filesystem ProgressStore rooted at the local
+// warehouse — the read path for ExecutionStates / Runs / nodeRunsFromProgress.
+func (p *LocalProvider) progressStore() ProgressStore {
+	return NewFileProgressStore(p.warehouseDir())
 }
 
 // ---------------------------------------------------------------------------
@@ -201,15 +229,15 @@ func (p *LocalProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
 	}
 
 	// Fast path: the dashboard's grid hits this endpoint with no
-	// `arn` filter and just needs per-cell status + duration. state.json
-	// already has both — sourcing them direct from the filesystem avoids
-	// the 1.5s-warm / 30s-cold Spark roundtrip that was making the grid
-	// look like it lost its data on every refresh. The Sheet's drill-
-	// down (arn-filtered) still goes through Spark below to pick up the
-	// richer columns (image digest, module version, output rows) that
-	// state.json doesn't carry.
+	// `arn` filter and just needs per-cell status + duration. The warehouse
+	// `_progress/<run>/<node>.json` markers carry both — sourcing them direct
+	// from the filesystem avoids the 1.5s-warm / 30s-cold Spark roundtrip that
+	// was making the grid look like it lost its data on every refresh. The
+	// Sheet's drill-down (arn-filtered) still goes through Spark below to pick
+	// up the richer columns (image digest, module version, the per-invocation
+	// Spark metrics) the progress markers don't carry.
 	if q.SfExecutionARN == "" && !q.IncludeMetrics {
-		return p.nodeRunsFromState(q)
+		return p.nodeRunsFromProgress(ctx, q)
 	}
 
 	dbName := q.Database
@@ -350,16 +378,14 @@ func (p *LocalProvider) Runs(ctx context.Context, q RunsQuery) (*RunsResult, err
 	if !validPipelineName(q.PipelineName) {
 		return nil, fmt.Errorf("invalid pipeline name: %q", q.PipelineName)
 	}
-	pipelineRef := q.PipelineDir
-	if pipelineRef == "" {
-		pipelineRef = q.PipelineName
-	}
-	dir := pipelineRef
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(p.workspaceRoot, dir)
-	}
+	store := p.progressStore()
 
-	runIDs, err := ListRunIDs(dir)
+	// The warehouse `_progress` tree is workspace-wide — every pipeline's
+	// runs land there, distinguished by the run marker's `pipeline` field.
+	// Filter to the queried pipeline so the Runs surface stays per-pipeline.
+	wantPipeline := p.pipelineNameForQuery(q.PipelineName, q.PipelineDir)
+
+	runIDs, err := ListProgressRunIDs(p.warehouseDir())
 	if err != nil {
 		return nil, fmt.Errorf("list local runs: %w", err)
 	}
@@ -368,34 +394,71 @@ func (p *LocalProvider) Runs(ctx context.Context, q RunsQuery) (*RunsResult, err
 	if limit <= 0 {
 		limit = 50
 	}
-	truncated := len(runIDs) > limit
-	if truncated {
-		runIDs = runIDs[:limit]
-	}
 
 	out := make([]Run, 0, len(runIDs))
+	truncated := false
 	for _, rid := range runIDs {
-		st, err := ReadRunState(dir, rid)
-		if err != nil {
-			// Skip unreadable runs (in-flight, corrupt) rather than failing
-			// the whole listing.
+		m, ok, _ := readRunMarker(ctx, store, rid)
+		if !ok || m == nil {
+			// Skip unreadable / absent markers (in-flight, corrupt) rather
+			// than failing the whole listing.
 			continue
 		}
+		if wantPipeline != "" && m.Pipeline != wantPipeline {
+			continue
+		}
+		if len(out) >= limit {
+			truncated = true
+			break
+		}
 		out = append(out, Run{
-			RunID:          st.RunID,
-			Pipeline:       st.Pipeline,
-			SfExecutionARN: st.RunID,
-			Status:         st.Status,
-			Trigger:        st.Trigger,
-			StartedAt:      st.StartedAt,
-			EndedAt:        st.EndedAt,
-			DurationMs:     st.DurationMs,
-			FailedStep:     st.FailedStep,
-			ErrorClass:     st.ErrorClass,
-			ErrorMsg:       st.ErrorMsg,
+			RunID:          rid,
+			Pipeline:       m.Pipeline,
+			SfExecutionARN: rid,
+			Status:         m.Status,
+			Trigger:        m.Trigger,
+			StartedAt:      millisToISO(m.StartedMs),
+			EndedAt:        millisToISO(m.EndedMs),
+			DurationMs:     durationMs(m.StartedMs, m.EndedMs),
+			FailedStep:     m.FailedStep,
+			ErrorClass:     m.ErrorClass,
+			ErrorMsg:       m.ErrorMsg,
 		})
 	}
 	return &RunsResult{Rows: out, Truncated: truncated}, nil
+}
+
+// pipelineNameForQuery derives the pipeline identifier used to filter the
+// shared `_progress` tree's run markers down to one pipeline. Prefers the
+// explicit PipelineName; falls back to the basename of the pipeline dir
+// (the convention Resolver.PipelineName uses).
+func (p *LocalProvider) pipelineNameForQuery(name, dir string) string {
+	if name != "" {
+		return name
+	}
+	if dir == "" {
+		return ""
+	}
+	return filepath.Base(pathutil.ResolveDir(p.workspaceRoot, dir))
+}
+
+// millisToISO renders epoch milliseconds as ISO-8601 UTC (the wire shape the
+// runs/node-runs rows carry), or "" when nil.
+func millisToISO(ms *int64) string {
+	if ms == nil {
+		return ""
+	}
+	return formatMillis(*ms)
+}
+
+// durationMs computes ended-started in milliseconds, or nil when either
+// bound is unknown.
+func durationMs(startedMs, endedMs *int64) *int64 {
+	if startedMs == nil || endedMs == nil {
+		return nil
+	}
+	d := *endedMs - *startedMs
+	return &d
 }
 
 // tablesFromMetadata walks the warehouse directly: one subdirectory
@@ -655,46 +718,20 @@ func readDeltaCurrentSnapshot(tableDir string) (TableInfo, bool) {
 	return info, true
 }
 
-// nodeStatusFromState normalises the channel's UPPERCASE state enum
-// (PENDING/RUNNING/SUCCEEDED/FAILED/SKIPPED) to the lowercase strings
-// the runner stamps onto node_runs Iceberg rows and the dashboard cell
-// renderer expects. SUCCEEDED → "ok" is the only non-obvious mapping;
-// it predates this codepath (the runner emits "ok" because Iceberg
-// rows are written from runner.py).
-func nodeStatusFromState(state string) string {
-	switch state {
-	case "SUCCEEDED":
-		return "ok"
-	case "FAILED":
-		return "failed"
-	case "RUNNING":
-		return "running"
-	case "SKIPPED":
-		return "skipped"
-	default:
-		return strings.ToLower(state)
-	}
-}
+// nodeRunsFromProgress fans out one row per (run, node) by reading the
+// warehouse `_progress/<run>/<node>.json` markers — the dashboard grid's
+// bulk-fetch fast path. Skips the Spark roundtrip the Delta-backed node_runs
+// path needs (1.5s warm, 15-30s cold). Doesn't carry the richer columns the
+// runner stamps onto the node_runs row (runner_image_digest, module_version,
+// cold_start, memory_mb, lambda_request_id, the Spark metrics) — the Sheet's
+// drill-down, which passes an arn filter, falls back through the Spark path
+// above to pick those up. It does carry output_rows, which the terminal
+// marker stamps.
+func (p *LocalProvider) nodeRunsFromProgress(ctx context.Context, q NodeRunsQuery) (*NodeRunsResult, error) {
+	store := p.progressStore()
+	wantPipeline := p.pipelineNameForQuery(q.PipelineName, q.PipelineDir)
 
-// nodeRunsFromState fans out one row per (run, node) by reading every
-// state.json on disk — the dashboard grid's bulk-fetch fast path. Skips
-// the Spark roundtrip the Iceberg-backed node_runs path needs (1.5s
-// warm, 15-30s cold). Doesn't carry the richer columns the runner
-// stamps onto the Iceberg row (runner_image_digest, module_version,
-// output_rows, cold_start, memory_mb, lambda_request_id) — the Sheet's
-// drill-down, which passes an arn filter, falls back through the Spark
-// path above to pick those up.
-func (p *LocalProvider) nodeRunsFromState(q NodeRunsQuery) (*NodeRunsResult, error) {
-	pipelineRef := q.PipelineDir
-	if pipelineRef == "" {
-		pipelineRef = q.PipelineName
-	}
-	dir := pipelineRef
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(p.workspaceRoot, dir)
-	}
-
-	runIDs, err := ListRunIDs(dir)
+	runIDs, err := ListProgressRunIDs(p.warehouseDir())
 	if err != nil {
 		return nil, fmt.Errorf("list local runs: %w", err)
 	}
@@ -706,45 +743,57 @@ func (p *LocalProvider) nodeRunsFromState(q NodeRunsQuery) (*NodeRunsResult, err
 
 	out := make([]NodeRun, 0, len(runIDs)*4)
 	for _, rid := range runIDs {
-		st, err := ReadRunState(dir, rid)
+		// The run marker carries the owning pipeline; filter the workspace-
+		// wide tree down to the queried pipeline.
+		m, ok, _ := readRunMarker(ctx, store, rid)
+		if ok && m != nil && wantPipeline != "" && m.Pipeline != wantPipeline {
+			continue
+		}
+
+		keys, err := store.ListKeys(ctx, progressPrefix(rid))
 		if err != nil {
 			continue
 		}
-		for nodeID, ns := range st.States {
+		for _, key := range keys {
+			prefix := progressPrefix(rid)
+			if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, ".json") {
+				continue
+			}
+			nodeID := strings.TrimSuffix(key[len(prefix):], ".json")
+			if nodeID == "" || nodeID == "_run" {
+				continue
+			}
 			if q.Node != "" && nodeID != q.Node {
 				continue
 			}
-			// PENDING entries are seeded by the orchestrator before any
-			// node enters — they're not "this happened" records and the
-			// dashboard expects their absence so its in-flight overlay
-			// (liveStates) drives the cell color. Emitting them here
-			// would paint queued cells as if they had finished.
-			if ns.Status == "" || ns.Status == "PENDING" {
+			snap := readProgressSnapshot(ctx, store, key)
+			if snap == nil {
 				continue
 			}
-			started := ns.EnteredAt
-			if started == "" {
-				started = st.StartedAt
+			// A still-"running" marker (or empty status, pre-status runner)
+			// isn't a "this happened" record — the dashboard expects its
+			// absence so the in-flight overlay (liveStates) drives the cell
+			// color. Only emit terminal markers here.
+			status := nodeRunStatusFromProgress(snap.Status)
+			if status == "" || status == "running" {
+				continue
+			}
+			pipeline := ""
+			if m != nil {
+				pipeline = m.Pipeline
 			}
 			out = append(out, NodeRun{
-				RunID:    st.RunID,
-				Pipeline: st.Pipeline,
-				Node:     nodeID,
-				// Map state.json's uppercase enum to the runner's
-				// lowercase convention used by node_runs Iceberg rows
-				// and the dashboard's nodeCellState. Plain lowercasing
-				// would emit "succeeded", which doesn't match the
-				// grid's `=== "ok"` check and would silently render
-				// every success as a skip.
-				Status:         nodeStatusFromState(ns.Status),
-				StartedAt:      started,
-				EndedAt:        ns.ExitedAt,
-				DurationMs:     ns.DurationMs,
+				RunID:          rid,
+				Pipeline:       pipeline,
+				Node:           nodeID,
+				Status:         status,
+				StartedAt:      millisToISO(snap.StartedMs),
+				EndedAt:        millisToISO(snap.EndedMs),
+				DurationMs:     durationMs(snap.StartedMs, snap.EndedMs),
 				ComputeTarget:  "local",
-				ErrorClass:     ns.ErrorClass,
-				ErrorMsg:       ns.ErrorMsg,
-				OutputRows:     ns.OutputRows,
-				SfExecutionARN: st.RunID,
+				ErrorMsg:       snap.Error,
+				OutputRows:     snap.OutputRows,
+				SfExecutionARN: rid,
 			})
 		}
 	}
@@ -755,6 +804,28 @@ func (p *LocalProvider) nodeRunsFromState(q NodeRunsQuery) (*NodeRunsResult, err
 		truncated = true
 	}
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
+}
+
+// nodeRunStatusFromProgress maps the lowercase progress-marker status
+// (running/succeeded/failed/skipped) to the node_runs convention the
+// dashboard's nodeCellState expects: succeeded → "ok" (the runner stamps
+// "ok" onto node_runs rows). An empty status maps to "" so the caller can
+// skip pre-status / in-flight markers.
+func nodeRunStatusFromProgress(status string) string {
+	switch status {
+	case "succeeded":
+		return "ok"
+	case "failed":
+		return "failed"
+	case "running":
+		return "running"
+	case "skipped":
+		return "skipped"
+	case "":
+		return ""
+	default:
+		return status
+	}
 }
 
 // Tables reads current-state-per-table from <pipeline>.tables. The runner
@@ -1049,7 +1120,7 @@ func (p *LocalProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 		// result so the UI shows the "Table is empty" state instead of an
 		// error box. Same treatment Snapshots / NodeRuns already give.
 		if isMissingTableErr(err) {
-			return &SampleTableResult{Columns: []SampleTableColumn{}, Rows: [][]string{}}, nil
+			return &SampleTableResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedSparkLocal()}, nil
 		}
 		return nil, err
 	}
@@ -1075,6 +1146,7 @@ func (p *LocalProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 		Rows:      stringRows,
 		RowCount:  len(stringRows),
 		Truncated: truncated,
+		Served:    servedSparkLocal(),
 	}, nil
 }
 
@@ -1144,7 +1216,7 @@ func (p *LocalProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 		// a fresh table renders as an empty chart instead of a stack
 		// trace.
 		if isMissingTableErr(err) {
-			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}}, nil
+			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedSparkLocal()}, nil
 		}
 		return nil, err
 	}
@@ -1169,6 +1241,7 @@ func (p *LocalProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 		Rows:      stringRows,
 		RowCount:  len(stringRows),
 		Truncated: truncated,
+		Served:    servedSparkLocal(),
 	}, nil
 }
 

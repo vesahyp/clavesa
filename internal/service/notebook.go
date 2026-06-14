@@ -29,6 +29,10 @@ type NotebookSummary = notebooks.Summary
 type CellRunResult struct {
 	Cell   notebooks.Cell           `json:"cell"`
 	Result observability.CellResult `json:"result"`
+	// Served identifies the engine + warehouse this cell ran against
+	// (ADR-024). Response-envelope only — never persisted into the
+	// .ipynb; a saved notebook records outputs, not where they ran.
+	Served *observability.Served `json:"served,omitempty"`
 }
 
 // NotebookRunner is what the service layer needs from the REPL pool. Kept
@@ -158,7 +162,15 @@ func (s *Service) RunCell(ctx context.Context, name, cellID string) (*CellRunRes
 
 	source := strings.Join(cell.Source, "")
 	language := detectCellLanguage(source)
-	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	// The REPL targets the workspace's active warehouse (ADR-024) — local
+	// Hadoop dir or the cloud Glue/S3 warehouse. Sessions are keyed
+	// (notebookID, warehouse), so flipping the warehouse respawns the REPL
+	// against the right catalog. Cloud + undeployed is a hard error the
+	// HTTP layer maps to 409.
+	warehouse, err := workspace.WarehouseURI(s.workspace)
+	if err != nil {
+		return nil, err
+	}
 	cellRunID := newCellRunID()
 
 	res, err := s.notebookRunner.RunCell(ctx, name, warehouse, cellRunID, language, source)
@@ -180,7 +192,15 @@ func (s *Service) RunCell(ctx context.Context, name, cellID string) (*CellRunRes
 	if _, err := s.SaveNotebook(nb); err != nil {
 		return nil, fmt.Errorf("save after run: %w", err)
 	}
-	return &CellRunResult{Cell: *cell, Result: *res}, nil
+	// Stamp the engine metadata from the warehouse this dispatch actually
+	// targeted (ADR-024): the REPL is always Spark; an s3:// warehouse URI
+	// means the cloud Glue/S3 catalog, anything else the local Hadoop dir.
+	// Notebooks are an authoring surface — no transpile, ever (ADR-023).
+	served := &observability.Served{Engine: "spark", Warehouse: string(workspace.WarehouseLocal)}
+	if strings.HasPrefix(warehouse, "s3://") {
+		served.Warehouse = string(workspace.WarehouseCloud)
+	}
+	return &CellRunResult{Cell: *cell, Result: *res, Served: served}, nil
 }
 
 // CancelCell forwards a cancel request to the notebook's REPL. Best-effort;
@@ -190,7 +210,12 @@ func (s *Service) CancelCell(ctx context.Context, name, cellRunID string) error 
 	if s.notebookRunner == nil {
 		return nil
 	}
-	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	// Same active-warehouse resolution as RunCell — the session being
+	// cancelled is keyed by (notebookID, warehouse).
+	warehouse, err := workspace.WarehouseURI(s.workspace)
+	if err != nil {
+		return err
+	}
 	return s.notebookRunner.CancelCell(ctx, name, warehouse, cellRunID)
 }
 

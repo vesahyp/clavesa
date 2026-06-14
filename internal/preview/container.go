@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/version"
 )
 
@@ -106,22 +107,32 @@ func queryWarehouseDocker(ctx context.Context, localTag, image, warehouse, sql s
 		// Override the baked-in version — see runPreviewDocker for rationale.
 		"-e", "CLAVESA_MODULE_VERSION=" + version.Module,
 	}
-	// Shared local Derby metastore. This warehouse query reads the same
-	// hive→Derby warehouse the pipelines write to (it samples a
-	// cross-pipeline `external_inputs` table), so when the per-workspace
-	// Derby Network Server is up it must connect as a client rather than
-	// open the embedded single-writer DB — otherwise it would collide with
-	// a concurrent run / warm worker on the Derby lock. Keyed off the
-	// warehouse path. Best-effort: empty network/addr falls back to
-	// embedded Derby. (Plain CLAVESA_PREVIEW=1 previews work on in-memory
-	// input rows and never touch this warehouse, so they are deliberately
-	// left embedded.)
-	if network, addr := observability.EnsureMetastoreForWarehouse(ctx, warehouse); network != "" && addr != "" {
-		args = append(args, "--network", network, "-e", "CLAVESA_METASTORE_ADDR="+addr)
+	if strings.HasPrefix(warehouse, "s3://") {
+		// Cloud (s3://) warehouse (ADR-024): the runner keys Glue Hive
+		// federation + S3SingleDriverLogStore on the s3:// prefix, so
+		// Glue is the metastore — no Derby network, no local bind-mount.
+		// Forward the host's AWS credential env + a read-only ~/.aws
+		// mount instead (same passthrough as s3-source local runs).
+		args = append(args, runner.AWSEnvDockerArgs(ctx)...)
+		args = append(args, image)
 	} else {
-		fmt.Fprintf(os.Stderr, "clavesa: warehouse query using embedded metastore (shared metastore unavailable)\n")
+		// Shared local Derby metastore. This warehouse query reads the same
+		// hive→Derby warehouse the pipelines write to (it samples a
+		// cross-pipeline `external_inputs` table), so when the per-workspace
+		// Derby Network Server is up it must connect as a client rather than
+		// open the embedded single-writer DB — otherwise it would collide with
+		// a concurrent run / warm worker on the Derby lock. Keyed off the
+		// warehouse path. Best-effort: empty network/addr falls back to
+		// embedded Derby. (Plain CLAVESA_PREVIEW=1 previews work on in-memory
+		// input rows and never touch this warehouse, so they are deliberately
+		// left embedded.)
+		if network, addr := observability.EnsureMetastoreForWarehouse(ctx, warehouse); network != "" && addr != "" {
+			args = append(args, "--network", network, "-e", "CLAVESA_METASTORE_ADDR="+addr)
+		} else {
+			fmt.Fprintf(os.Stderr, "clavesa: warehouse query using embedded metastore (shared metastore unavailable)\n")
+		}
+		args = append(args, "-v", warehouse+":"+warehouse, image)
 	}
-	args = append(args, "-v", warehouse+":"+warehouse, image)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = strings.NewReader(sql)
 	var stderr strings.Builder

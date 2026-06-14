@@ -48,13 +48,22 @@ want to skip the round-trip.`,
 }
 
 func newBackfillStageCmd() *cobra.Command {
-	var nodeID, fromStr, toStr string
+	var nodeID, fromStr, toStr, compute string
 	var direct, jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "stage [pipeline-dir]",
 		Short: "Stage a backfill into a parallel Iceberg table",
-		Long:  "Stage a backfill into a parallel Iceberg table.\n\n" + pipelineDirHelp,
-		Args:  cobra.RangeArgs(0, 1),
+		Long: "Stage a backfill into a parallel Iceberg table.\n\n" + pipelineDirHelp + `
+
+--compute local runs the heavy Spark staging job in a local docker
+container on this machine against the cloud warehouse — the workaround
+for the deployed Lambda's 15-minute cap on large historical windows
+(GH #43). The staging table still lands in the cloud S3 warehouse and
+registers in Glue, so diff / promote / discard are unchanged. Requires
+docker, and the human principal needs source-S3 read + warehouse-S3 RW
++ Glue RW. Honors CLAVESA_JVM_HEAP_MB to raise the Spark driver heap for
+big windows (defaults to ~1 GB).`,
+		Args: cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dir, _, ws, err := resolvePipelineDir(cmd, args, 0)
 			if err != nil {
@@ -65,11 +74,12 @@ func newBackfillStageCmd() *cobra.Command {
 				return err
 			}
 			req := service.BackfillStageRequest{
-				Dir:    dir,
-				Node:   nodeID,
-				From:   splitCursorArg(fromStr),
-				To:     splitCursorArg(toStr),
-				Direct: direct,
+				Dir:     dir,
+				Node:    nodeID,
+				From:    splitCursorArg(fromStr),
+				To:      splitCursorArg(toStr),
+				Direct:  direct,
+				Compute: compute,
 			}
 			run, err := svc.BackfillStage(cmd.Context(), req)
 			// Emit the JSON envelope even on failure so machine consumers
@@ -89,6 +99,9 @@ func newBackfillStageCmd() *cobra.Command {
 			fmt.Printf("  staging table:  %s\n", run.TargetTable)
 			fmt.Printf("  canonical:      %s\n", run.CanonicalTable)
 			fmt.Printf("  window:         [%s, %s]\n", joinCursorArg(run.From), joinCursorArg(run.To))
+			if run.Compute == "local" {
+				fmt.Printf("  compute:        local (docker)\n")
+			}
 			if run.Direct {
 				fmt.Printf("  --direct:       wrote straight to canonical target (no staging)\n")
 				return nil
@@ -105,6 +118,7 @@ func newBackfillStageCmd() *cobra.Command {
 	cmd.Flags().StringVar(&fromStr, "from", "", "partition cursor lower bound, slash-separated (e.g. 2026/04/26/00) (required)")
 	cmd.Flags().StringVar(&toStr, "to", "", "partition cursor upper bound, slash-separated (e.g. 2026/04/27/00) (required)")
 	cmd.Flags().BoolVar(&direct, "direct", false, "skip staging — write straight to the canonical target (escape hatch; non-merge outputs need this carefully)")
+	cmd.Flags().StringVar(&compute, "compute", "", "where to run staging compute: \"local\" runs heavy Spark in a local docker container against the cloud warehouse (GH #43 workaround); default runs on the deployed Lambda")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable output")
 	_ = cmd.MarkFlagRequired("node")
 	_ = cmd.MarkFlagRequired("from")
@@ -199,7 +213,7 @@ func newBackfillDiffCmd() *cobra.Command {
 }
 
 func newBackfillPromoteCmd() *cobra.Command {
-	var forceDedup string
+	var forceDedup, compute string
 	var allowDuplicates bool
 	cmd := &cobra.Command{
 		Use:   "promote [pipeline-dir] <run_id>",
@@ -219,11 +233,15 @@ func newBackfillPromoteCmd() *cobra.Command {
 			res, err := svc.BackfillPromote(cmd.Context(), dir, runID, service.BackfillPromoteOpts{
 				ForceDedup:      forceDedup,
 				AllowDuplicates: allowDuplicates,
+				Compute:         compute,
 			})
 			if err != nil {
 				return err
 			}
 			fmt.Printf("Promoted %s into canonical target. Staging table dropped.\n", runID)
+			if compute == "local" {
+				fmt.Printf("  compute: local (docker)\n")
+			}
 			if res != nil && len(res.ColumnsAdded) > 0 {
 				fmt.Printf("Schema evolved: added %d column(s) to target — %s\n", len(res.ColumnsAdded), strings.Join(res.ColumnsAdded, ", "))
 			}
@@ -232,10 +250,12 @@ func newBackfillPromoteCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&forceDedup, "force-dedup", "", "(append outputs) column to MERGE on so duplicates are dropped; column must uniquely identify a row")
 	cmd.Flags().BoolVar(&allowDuplicates, "allow-duplicates", false, "(append outputs) accept duplicates — plain INSERT INTO without dedup")
+	cmd.Flags().StringVar(&compute, "compute", "", "where to run the MERGE: \"local\" runs it in a local docker container against the cloud warehouse (IAM superset; honors CLAVESA_JVM_HEAP_MB); default runs on the deployed Lambda")
 	return cmd
 }
 
 func newBackfillDiscardCmd() *cobra.Command {
+	var compute string
 	cmd := &cobra.Command{
 		Use:   "discard [pipeline-dir] <run_id>",
 		Short: "Drop a staging table without promoting",
@@ -251,13 +271,17 @@ func newBackfillDiscardCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := svc.BackfillDiscard(cmd.Context(), dir, runID); err != nil {
+			if err := svc.BackfillDiscard(cmd.Context(), dir, runID, compute); err != nil {
 				return err
 			}
 			fmt.Printf("Discarded %s.\n", runID)
+			if compute == "local" {
+				fmt.Printf("  compute: local (docker)\n")
+			}
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&compute, "compute", "", "where to run the staging-table cleanup: \"local\" runs it in a local docker container against the cloud warehouse (IAM superset; honors CLAVESA_JVM_HEAP_MB); default runs on the deployed Lambda")
 	return cmd
 }
 

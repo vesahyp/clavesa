@@ -433,6 +433,14 @@ func TestTableAthenaResult(t *testing.T) {
 	if r.Truncated {
 		t.Error("expected truncated=false")
 	}
+	// ADR-024: the cloud provider executed the sample read, so the
+	// response carries its Served stamp for the UI engine badge.
+	if r.Served == nil {
+		t.Fatal("expected served stamp on the sample-table response")
+	}
+	if r.Served.Engine != "athena" || r.Served.Warehouse != "cloud" || r.Served.Transpiled {
+		t.Errorf("served = %+v, want {athena cloud false}", *r.Served)
+	}
 }
 
 // ---------------------------------------------------------------------------

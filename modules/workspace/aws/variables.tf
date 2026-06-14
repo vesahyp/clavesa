@@ -46,6 +46,22 @@ variable "athena_results_retention_days" {
   default     = 14
 }
 
+variable "noncurrent_version_retention_days" {
+  description = <<-EOT
+    How long to keep noncurrent (superseded) object versions before S3
+    expires them. The bucket has versioning Enabled, and Delta rewrites or
+    deletes objects on every MERGE, OPTIMIZE, VACUUM, and `_delta_log`
+    truncation — each superseded object becomes a noncurrent version that is
+    never freed without this rule, so storage grows without bound (worst on
+    the high-churn `_system/pipelines` `_delta_log` dirs). Default 7 days is a
+    short accidental-delete recovery window while bounding storage. Independent
+    of `athena_results_retention_days`; the cleanup runs even when Athena
+    retention is disabled.
+  EOT
+  type        = number
+  default     = 7
+}
+
 variable "kms_key_id" {
   description = <<-EOT
     Optional KMS key ID/ARN for server-side encryption of bucket objects.

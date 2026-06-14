@@ -107,14 +107,14 @@ func applyWorkspaceAWSProfile(root string) {
 }
 
 // printTargetContext writes a short summary — resolved workspace,
-// environment mode, and effective AWS profile — to stderr before an
-// operating or destructive command (run / deploy / destroy) acts, so
-// which world the command targets is never a mystery. stderr, not
-// stdout, keeps `--json` output clean. An empty mode is omitted
-// (deploy / destroy have no local/cloud axis). workspaceRoot may be
-// empty; if non-empty, the workspace line is printed with the manifest
-// name when readable and the absolute path.
-func printTargetContext(action, workspaceRoot string, mode wspkg.Mode) {
+// warehouse, and effective AWS profile — to stderr before an operating
+// or destructive command (run / deploy / destroy) acts, so which world
+// the command targets is never a mystery. stderr, not stdout, keeps
+// `--json` output clean. An empty warehouse is omitted (deploy /
+// destroy have no local/cloud axis). workspaceRoot may be empty; if
+// non-empty, the workspace line is printed with the manifest name when
+// readable and the absolute path.
+func printTargetContext(action, workspaceRoot string, warehouse wspkg.Warehouse) {
 	if workspaceRoot != "" {
 		name := workspaceRoot
 		if m, err := wspkg.Load(workspaceRoot); err == nil && m != nil && m.Name != "" {
@@ -128,8 +128,8 @@ func printTargetContext(action, workspaceRoot string, mode wspkg.Mode) {
 	if profile == "" {
 		profile = "default credential chain"
 	}
-	if mode != "" {
-		fmt.Fprintf(os.Stderr, "%s · env: %s · aws profile: %s\n", action, mode, profile)
+	if warehouse != "" {
+		fmt.Fprintf(os.Stderr, "%s · warehouse: %s · aws profile: %s\n", action, warehouse, profile)
 	} else {
 		fmt.Fprintf(os.Stderr, "%s · aws profile: %s\n", action, profile)
 	}
@@ -238,7 +238,9 @@ func newService(cmd *cobra.Command) (*service.Service, string, error) {
 	}
 	svc := service.New(workspace)
 	warm := observability.NewPersistentQueryRunner(workspace)
-	parser := warm.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
+	// Parser resolves the active warehouse (ADR-024) lazily on first
+	// Parse; cloud + undeployed surfaces an actionable error there.
+	parser := warm.SQLParserForWorkspace()
 	registerCloseable(warm.Close)
 	sidecar := observability.NewTranspileSidecar(workspace)
 	registerCloseable(sidecar.Close)

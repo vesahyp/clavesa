@@ -224,7 +224,9 @@ func (s *Service) backfillStageLocal(
 		CanonicalTable: canonicalTable,
 		StartedAt:      started,
 		StoppedAt:      stopped,
-		Status:         "ok",
+		// A local-warehouse stage always ran on the local docker runner.
+		Compute: "local",
+		Status:  "ok",
 	}
 	if rerr != nil {
 		run.Status = "failed"
@@ -665,6 +667,7 @@ func (s *Service) backfillListLocal(dir string) ([]BackfillRun, error) {
 			CanonicalTable: e.Sidecar.CanonicalTable,
 			StartedAt:      e.Sidecar.StartedAt,
 			StoppedAt:      e.Sidecar.StoppedAt,
+			Compute:        "local",
 			Status:         "ok",
 		})
 	}

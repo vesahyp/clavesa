@@ -43,8 +43,11 @@ export function Query() {
           Query
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Ad-hoc SparkSQL against the workspace catalog. No persistence — for a
-          multi-cell scratchpad with persistent Python state, use{" "}
+          SparkSQL against the workspace catalog, validated for Trino/Athena
+          portability on every warehouse so what runs here also runs in cloud
+          dashboards. It runs on Athena (transpiled to Trino) on a cloud
+          warehouse and on Spark locally. Single-shot and not saved; for
+          multi-cell Spark exploration with persistent Python state, use{" "}
           <a className="text-primary underline" href="/notebooks">
             Notebooks
           </a>

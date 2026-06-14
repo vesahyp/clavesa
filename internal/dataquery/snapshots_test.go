@@ -96,8 +96,8 @@ func (p *fakeLocalProvider) ExecutionLogs(context.Context, observability.Executi
 // TestSnapshotsDirlessLocalRoutesToWorkspaceProvider — the workspace-wide
 // system tables (runs, node_runs, …) carry no `dir`, so a dir-less request
 // in a local workspace must dispatch to the workspace-level local provider
-// rather than 400ing. t.TempDir has no environment.json → defaults to local
-// mode (ModeLocal).
+// rather than 400ing. t.TempDir has no environment.json → defaults to a
+// local warehouse (WarehouseLocal).
 func TestSnapshotsDirlessLocalRoutesToWorkspaceProvider(t *testing.T) {
 	local := &fakeLocalProvider{}
 	resolver := observability.NewResolver(t.TempDir(), nil, local)

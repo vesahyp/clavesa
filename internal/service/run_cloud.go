@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path/filepath"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
+
+	"github.com/vesahyp/clavesa/internal/runlock"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // RunPipelineCloud starts a Step Functions execution for a deployed
@@ -40,6 +46,18 @@ func (s *Service) RunPipelineCloud(ctx context.Context, dir string, opts RunOpts
 	if err != nil {
 		return "", fmt.Errorf("load AWS config: %w", err)
 	}
+
+	// ADR-024 slice 5: best-effort pre-flight on the warehouse run lock
+	// (s3://<bucket>/<pipeline>/_locks/run.json — the lease the deployed
+	// Lambda's pipeline_handler acquires). If it's held and unexpired,
+	// fail fast with the holder's identity instead of dispatching an
+	// execution the Lambda will FAIL seconds later. The Lambda owns
+	// acquisition — this never writes; any S3/read problem proceeds to
+	// dispatch.
+	if err := preflightRunLock(ctx, cfg, filepath.Dir(abs), pipelineName); err != nil {
+		return "", err
+	}
+
 	client := sfn.NewFromConfig(cfg)
 
 	arn, err := findStateMachineByName(ctx, client, stateMachineName)
@@ -74,6 +92,63 @@ func (s *Service) RunPipelineCloud(ctx context.Context, dir string, opts RunOpts
 		return "", fmt.Errorf("StartExecution: %w", err)
 	}
 	return aws.ToString(startOut.ExecutionArn), nil
+}
+
+// preflightRunLock is a best-effort fast-fail check on the warehouse run
+// lease (internal/runlock's S3 backend object,
+// `s3://<bucket>/<pipeline>/_locks/run.json`). It GETs the lease and returns
+// a HeldError-derived error — wrapped under ErrRunInFlight so the HTTP 409
+// mapping matches the local path in prepareRun — when the lease is held and
+// not expired past the takeover grace. It deliberately does NOT acquire:
+// the deployed Lambda owns acquisition (runner/run_lock.py); this exists
+// purely so `pipeline run` rejects in milliseconds instead of dispatching
+// an execution that fails seconds later.
+//
+// Best-effort means: no deployed bucket recorded, GET failure (no creds,
+// no such key, permissions), unparseable lease — all proceed to dispatch.
+//
+// Version-skew note: a Lambda deployed before this slice never writes a
+// lease, so the pre-flight finds nothing and older deployments behave as
+// before until `workspace upgrade` + deploy rebuilds their image.
+func preflightRunLock(ctx context.Context, cfg aws.Config, workspaceRoot, pipelineName string) error {
+	bucket := workspace.PipelineBucket(workspaceRoot)
+	if bucket == "" {
+		return nil
+	}
+	// Same key derivation as runlock.New's S3 backend (bucket-root prefix):
+	// path.Join("", pipeline, "_locks", "run.json").
+	key := pipelineName + "/_locks/run.json"
+	out, err := s3.NewFromConfig(cfg).GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil // best-effort: absent lease, no perms, etc. — dispatch
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil
+	}
+	// The slice of the lease document the held-check needs (the full shape
+	// lives in internal/runlock/runlock.go leaseDoc).
+	var doc struct {
+		Holder     runlock.Holder `json:"holder"`
+		AcquiredAt time.Time      `json:"acquired_at"`
+		ExpiresAt  time.Time      `json:"expires_at"`
+		State      string         `json:"state"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	if doc.State != "held" {
+		return nil // tombstoned — the Lambda takes over immediately
+	}
+	if time.Now().After(doc.ExpiresAt.Add(runlock.TakeoverGrace)) {
+		return nil // expired past grace — the Lambda takes over
+	}
+	held := &runlock.HeldError{Holder: doc.Holder, AcquiredAt: doc.AcquiredAt, ExpiresAt: doc.ExpiresAt}
+	return fmt.Errorf("%w: %s", ErrRunInFlight, held.Error())
 }
 
 // findStateMachineByName paginates ListStateMachines until it finds an

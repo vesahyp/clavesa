@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,7 +15,6 @@ import (
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
@@ -830,7 +828,7 @@ ORDER BY column_name`, q.Database, safeIdent)
 // work via the LocalProvider implementation (ADR-014 parity).
 func (c *CloudProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*SampleTableResult, error) {
 	if c.undeployed() {
-		return &SampleTableResult{Columns: []SampleTableColumn{}, Rows: [][]string{}}, nil
+		return &SampleTableResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedAthenaCloud()}, nil
 	}
 	if c.athena == nil {
 		return nil, fmt.Errorf("cloud: athena client not configured")
@@ -897,6 +895,7 @@ func (c *CloudProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 		Rows:      rows,
 		RowCount:  len(rows),
 		Truncated: truncated,
+		Served:    servedAthenaCloud(),
 	}, nil
 }
 
@@ -910,7 +909,7 @@ func (c *CloudProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 // IAM: the executing role's grants control what's reachable.
 func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, error) {
 	if c.undeployed() {
-		return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}}, nil
+		return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedAthenaCloud()}, nil
 	}
 	if c.athena == nil {
 		return nil, fmt.Errorf("cloud: athena client not configured")
@@ -926,7 +925,7 @@ func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 			// but never run — system Delta tables don't exist yet.
 			// Surface as an empty result so the widget renders cleanly
 			// instead of 500-ing the whole dashboard.
-			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}}, nil
+			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedAthenaCloud()}, nil
 		}
 		return nil, err
 	}
@@ -965,6 +964,7 @@ func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 		Rows:      rows,
 		RowCount:  len(rows),
 		Truncated: truncated,
+		Served:    servedAthenaCloud(),
 	}, nil
 }
 
@@ -993,47 +993,115 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	if q.ExecutionRef == "" {
 		return nil, fmt.Errorf("execution ref is required")
 	}
-	// A ref that isn't a real SFN execution ARN — a bare `dir` (the
-	// dashboard's dir-mode poll), or anything from a workspace with no
-	// deployed state machine — has no execution to inspect. Empty
-	// result, not a 500: switching an undeployed workspace to cloud
-	// mode is a valid empty state (TODO bucket 16). Checked before the
-	// client guard — a bare dir has no execution regardless of wiring.
-	if StateMachineNameFromExecutionARN(q.ExecutionRef) == "" {
-		return &ExecutionStatesResult{States: map[string]StateStatus{}}, nil
-	}
-	if c.sfn == nil {
-		return nil, fmt.Errorf("cloud: sfn client not configured")
+
+	// The ExecutionRef arrives in one of two on-the-wire shapes (FormatExecRef):
+	// a full SFN execution ARN (real cloud run), or a "dir:runID" composite for
+	// a non-ARN run id — a cloud-local run (ADR-024) carries `dir:local-…`. The
+	// warehouse progress tree is keyed by the run id ALONE (the dir is a local
+	// addressing detail, irrelevant to the cloud bucket), so extract it; an ARN
+	// is self-contained and used as-is.
+	isARN := StateMachineNameFromExecutionARN(q.ExecutionRef) != ""
+	runID := q.ExecutionRef
+	if !isARN {
+		if _, rid := splitExecRef(q.ExecutionRef); rid != "" {
+			runID = rid
+		}
 	}
 
-	desc, err := c.sfn.DescribeExecution(ctx, &sfn.DescribeExecutionInput{
-		ExecutionArn: aws.String(q.ExecutionRef),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("describe execution: %w", err)
+	// Per-node status always comes from the `_progress/<run>/<node>.json`
+	// markers the runner writes into the S3 warehouse: a "running" snapshot
+	// rewritten each poll tick while a node is in flight, then a single
+	// terminal marker ("succeeded"/"failed"/"skipped") once it finishes. We
+	// LIST those and let each marker's own `status` field drive the per-node
+	// StateStatus — authoritative for both live and completed nodes (ADR-014
+	// parity with local). Backend-blind via the shared progressStates helper.
+	store := c.progressStore()
+	states := progressStates(ctx, store, runID, c.nowFn().UnixMilli())
+
+	// Overall status: prefer SFN DescribeExecution when the ref is a real
+	// execution ARN and SFN is wired. A cloud-local run has a `local-…` run id
+	// and no SFN execution; its overall status comes from the `_run.json` run
+	// marker instead. The old "bare dir / undeployed → empty" bail is gone — it
+	// broke cloud-local by returning empty before the progress markers could be
+	// read.
+	if isARN && c.sfn != nil {
+		desc, err := c.sfn.DescribeExecution(ctx, &sfn.DescribeExecutionInput{
+			ExecutionArn: aws.String(q.ExecutionRef),
+		})
+		if err == nil {
+			startedAt := ""
+			if desc.StartDate != nil {
+				startedAt = desc.StartDate.UTC().Format("2006-01-02T15:04:05.000Z")
+			}
+			return &ExecutionStatesResult{
+				Status:    string(desc.Status),
+				States:    states,
+				RunID:     q.ExecutionRef,
+				StartedAt: startedAt,
+			}, nil
+		}
+		// ExecutionDoesNotExist (or any describe failure) falls through to the
+		// run-marker path — a non-SFN run id whose progress lives only in the
+		// warehouse markers.
 	}
+
+	// No SFN execution to inspect: derive overall status from `_run.json`.
+	// Absent marker on a freshly-dispatched run reads as RUNNING so the
+	// dashboard renders an in-flight column instead of flashing empty.
+	overall := "RUNNING"
 	startedAt := ""
-	if desc.StartDate != nil {
-		startedAt = desc.StartDate.UTC().Format("2006-01-02T15:04:05.000Z")
+	if store != nil {
+		if m, ok, _ := readRunMarker(ctx, store, runID); ok && m != nil {
+			if m.Status != "" {
+				overall = m.Status
+			}
+			if m.StartedMs != nil {
+				startedAt = formatMillis(*m.StartedMs)
+			}
+		}
 	}
-	// Since v2.2.0 the cloud machine is a single bundled RunPipeline Task
-	// running the whole DAG in one Lambda, so SFN history only carries that
-	// one synthetic state name, never per-node. Per-node status comes instead
-	// from the `_progress/<execARN>/<node>.json` objects the runner writes:
-	// a "running" snapshot rewritten each poll tick while a node is in flight,
-	// then a single terminal marker ("succeeded"/"failed"/"skipped") once it
-	// finishes. We always LIST those files and let each one's own `status`
-	// field drive the per-node StateStatus — authoritative for both live and
-	// completed nodes (ADR-014 parity with local). The overall Status below
-	// still comes from SFN DescribeExecution; only per-node state comes from
-	// the progress files, so a terminal execution still surfaces every node's
-	// final status rather than an empty map.
-	states := c.liveProgressStates(ctx, q.ExecutionRef, c.nowFn())
 	return &ExecutionStatesResult{
-		Status:    string(desc.Status),
+		Status:    overall,
 		States:    states,
-		RunID:     q.ExecutionRef,
+		RunID:     runID,
 		StartedAt: startedAt,
+	}, nil
+}
+
+// progressStore builds an S3-backed ProgressStore from the provider's S3
+// client + warehouse bucket. Returns nil when neither is wired (a provider
+// constructed without WithS3, or an undeployed workspace) — progressStates
+// and readRunMarker both tolerate a nil store.
+func (c *CloudProvider) progressStore() ProgressStore {
+	if c.s3 == nil || c.athenaOutputBucket == "" {
+		return nil
+	}
+	return NewS3ProgressStore(c.s3, c.athenaOutputBucket)
+}
+
+// RunDetail reads one run's `_run.json` run marker from the S3 warehouse and
+// projects its failure context. Found=false when no marker exists (a
+// fully-cloud SFN run carries its failure context in SFN history, not a run
+// marker; cloud-local runs do write the marker). Backs the
+// GET /pipeline/execution detail endpoint.
+func (c *CloudProvider) RunDetail(ctx context.Context, run string) (RunDetail, error) {
+	store := c.progressStore()
+	if store == nil {
+		return RunDetail{}, nil
+	}
+	m, ok, err := readRunMarker(ctx, store, run)
+	if err != nil {
+		return RunDetail{}, err
+	}
+	if !ok || m == nil {
+		return RunDetail{}, nil
+	}
+	return RunDetail{
+		Status:     m.Status,
+		FailedStep: m.FailedStep,
+		ErrorClass: m.ErrorClass,
+		ErrorMsg:   m.ErrorMsg,
+		Found:      true,
 	}, nil
 }
 
@@ -1052,8 +1120,14 @@ type progressSnapshot struct {
 	Status          string          `json:"status"`
 	StartedMs       *int64          `json:"started_ms"`
 	EndedMs         *int64          `json:"ended_ms"`
-	Error           string          `json:"error"`
-	Metrics         json.RawMessage `json:"metrics"`
+	// OutputRows is the runner-reported added-records sum across this node's
+	// Delta outputs, stamped on the terminal marker. Nil while running and
+	// for path-mode-only / skipped nodes. The local node-runs fast path
+	// (nodeRunsFromProgress) carries it onto the NodeRun row so the dashboard
+	// drawer reads it without a Spark roundtrip.
+	OutputRows *int64          `json:"output_rows"`
+	Error      string          `json:"error"`
+	Metrics    json.RawMessage `json:"metrics"`
 }
 
 // freshnessWindowMs bounds how recent a `_progress/<node>.json` snapshot
@@ -1064,121 +1138,12 @@ type progressSnapshot struct {
 const freshnessWindowMs = 12000
 
 // liveProgressStates LISTs the per-node `_progress/<execARN>/<node>.json`
-// objects the runner writes and returns a StateStatus per node whose status
-// is taken from the file's own `status` field. The runner rewrites a
-// "running" snapshot each poll tick (~1.5s) while a node is in flight, then
-// writes a single terminal marker ("succeeded"/"failed"/"skipped") once the
-// node finishes. This is the per-node progress source for the bundled
-// single-Task cloud machine (v2.2.0+), where SFN history no longer carries
-// per-node states.
-//
-// The freshness check applies ONLY to still-"running" files: a stale running
-// file is a crashed node (or an old runner whose node already finished but
-// never wrote a terminal marker) and is dropped. Terminal markers are
-// authoritative and always included — they never go stale. An empty status
-// (old runner that never wrote the field) is treated as "running" to preserve
-// the prior LIST-fresh-and-mark-RUNNING behavior.
-//
-// Best-effort throughout: a missing S3 client or bucket, a LIST error, or any
-// per-object GET/parse failure yields whatever was accumulated so far (an
-// empty, non-nil map at worst) and never returns an error to the caller.
+// markers via the S3-backed ProgressStore and delegates to the shared
+// progressStates helper — the same read path the local provider uses
+// (ADR-014). Kept as a thin method for the cloud-specific tests that drive
+// it directly; production code goes through ExecutionStates.
 func (c *CloudProvider) liveProgressStates(ctx context.Context, execARN string, now time.Time) map[string]StateStatus {
-	states := map[string]StateStatus{}
-	if c.s3 == nil || c.athenaOutputBucket == "" {
-		return states
-	}
-	prefix := fmt.Sprintf("_progress/%s/", execARN)
-	nowMs := now.UnixMilli()
-
-	var token *string
-	for {
-		resp, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(c.athenaOutputBucket),
-			Prefix:            aws.String(prefix),
-			ContinuationToken: token,
-		})
-		if err != nil {
-			// LIST failed mid-walk; return whatever we already gathered.
-			return states
-		}
-		for _, obj := range resp.Contents {
-			key := aws.ToString(obj.Key)
-			if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, ".json") {
-				continue
-			}
-			node := strings.TrimSuffix(key[len(prefix):], ".json")
-			if node == "" {
-				continue
-			}
-			snap := c.fetchProgress(ctx, execARN, node)
-			if snap == nil {
-				continue
-			}
-			// An empty status means an old runner that never wrote the field;
-			// treat it as "running" to preserve the prior behavior.
-			rawStatus := snap.Status
-			if rawStatus == "" {
-				rawStatus = "running"
-			}
-			if rawStatus == "running" {
-				if nowMs-snap.UpdatedMs >= freshnessWindowMs {
-					// Stale "running" object — a crashed node, or an old
-					// runner whose node already finished. Skip it.
-					continue
-				}
-			}
-			var status string
-			switch rawStatus {
-			case "running":
-				status = "RUNNING"
-			case "succeeded":
-				status = "SUCCEEDED"
-			case "failed":
-				status = "FAILED"
-			case "skipped":
-				status = "SKIPPED"
-			default:
-				status = "RUNNING"
-			}
-			states[node] = StateStatus{
-				Status:          status,
-				StagesTotal:     snap.StagesTotal,
-				StagesCompleted: snap.StagesCompleted,
-				TasksTotal:      snap.TasksTotal,
-				TasksCompleted:  snap.TasksCompleted,
-				TasksFailed:     snap.TasksFailed,
-			}
-		}
-		if resp.IsTruncated == nil || !*resp.IsTruncated || resp.NextContinuationToken == nil {
-			break
-		}
-		token = resp.NextContinuationToken
-	}
-	return states
-}
-
-// fetchProgress reads s3://<bucket>/_progress/<execARN>/<node>.json. Returns
-// nil on a missing object or any error — the counters stay nil and the
-// progress bar simply doesn't render for that node.
-func (c *CloudProvider) fetchProgress(ctx context.Context, execARN, node string) *progressSnapshot {
-	key := fmt.Sprintf("_progress/%s/%s.json", execARN, node)
-	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(c.athenaOutputBucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return nil
-	}
-	defer out.Body.Close()
-	body, err := io.ReadAll(out.Body)
-	if err != nil {
-		return nil
-	}
-	var snap progressSnapshot
-	if err := json.Unmarshal(body, &snap); err != nil {
-		return nil
-	}
-	return &snap
+	return progressStates(ctx, c.progressStore(), execARN, now.UnixMilli())
 }
 
 // StateStatusesFromHistory walks SFN history events in order and computes the

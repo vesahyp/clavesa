@@ -23,9 +23,15 @@ import { toast } from "sonner";
 
 import { CatalogBrowser } from "@/components/CatalogBrowser";
 import { CodeEditor } from "@/components/CodeEditor";
+import { EngineBadge } from "@/components/EngineBadge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { runAdhocQuery, usePipelines, type AdhocQueryResult } from "@/lib/queries";
+import {
+  runAdhocQuery,
+  usePipelines,
+  type AdhocQueryResult,
+  type ServedInfo,
+} from "@/lib/queries";
 
 export interface AdhocQueryProps {
   /** Initial SQL to show. Subsequent edits are local-only. */
@@ -40,6 +46,14 @@ export interface AdhocQueryProps {
    * the TableDetail "Query this table" pane so the user sees the LIMIT 100
    * result without an extra click. */
   autoRun?: boolean;
+  /** data-testid for the inline ADR-024 engine badge in the results header.
+   * Defaults to the /query page's contract id; pass `null` when the host
+   * surface lifts the badge into its own chrome via `onServed` (the
+   * TableDetail sample-rows card) so the result isn't double-badged. */
+  badgeTestid?: string | null;
+  /** Fired with the `served` metadata when a result lands; with undefined
+   * when the result is cleared (initialSql swap) or a run fails. */
+  onServed?: (served: ServedInfo | undefined) => void;
 }
 
 export function AdhocQuery({
@@ -48,6 +62,8 @@ export function AdhocQuery({
   bare,
   showCatalog,
   autoRun,
+  badgeTestid = "engine-badge-query",
+  onServed,
 }: AdhocQueryProps) {
   const [sql, setSql] = useState(initialSql);
   const [result, setResult] = useState<AdhocQueryResult | null>(null);
@@ -59,12 +75,19 @@ export function AdhocQuery({
   // editor).
   const viewRef = useRef<EditorView | null>(null);
 
+  // Ref-stabilised onServed so the reset effect below doesn't need the
+  // callback in its dependency list (callers may pass a fresh closure
+  // every render).
+  const onServedRef = useRef(onServed);
+  onServedRef.current = onServed;
+
   // If the caller swaps initialSql (e.g. user navigates to a different
   // table page), reset the editor + clear any stale result.
   useEffect(() => {
     setSql(initialSql);
     setResult(null);
     setError(null);
+    onServedRef.current?.(undefined);
   }, [initialSql]);
 
   const firstDir = pipelines.data?.[0]?.dir ?? "";
@@ -89,10 +112,12 @@ export function AdhocQuery({
     try {
       const res = await runAdhocQuery(sql, firstDir);
       setResult(res);
+      onServedRef.current?.(res.served);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
       toast.error(msg);
+      onServedRef.current?.(undefined);
     } finally {
       setBusy(false);
     }
@@ -168,6 +193,13 @@ export function AdhocQuery({
             {result.rows.length} row{result.rows.length === 1 ? "" : "s"}
             {result.truncated && <> · truncated</>}
           </span>
+        )}
+        {!error && badgeTestid !== null && (
+          <EngineBadge
+            served={result?.served}
+            surface="serving"
+            testid={badgeTestid}
+          />
         )}
       </div>
 

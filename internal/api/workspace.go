@@ -114,40 +114,50 @@ func (wh *WorkspaceHandler) GetWorkspace(w http.ResponseWriter, _ *http.Request)
 // GET / PUT /workspace/environment
 // ---------------------------------------------------------------------------
 
-// environmentResponse carries the workspace environment mode (TODO
-// bucket 16) — "local" or "cloud". Same shape for the GET response and
-// the PUT request/response body so the UI toggle reads and writes one
-// type.
+// environmentResponse carries the workspace warehouse (ADR-024) —
+// "local" or "cloud". Warehouse is the current key; Mode is the
+// pre-ADR-024 deprecated alias, kept on the wire so older consumers of
+// this endpoint keep working. Both keys carry the same value in
+// responses. Same shape for the GET response and the PUT request/
+// response body so the UI toggle reads and writes one type; on PUT,
+// `warehouse` wins when both keys are set.
 type environmentResponse struct {
-	Mode string `json:"mode"`
+	Warehouse string `json:"warehouse,omitempty"`
+	// Mode is the deprecated alias for Warehouse.
+	Mode string `json:"mode,omitempty"`
 }
 
-// GetEnvironment returns the workspace environment mode. Absent file
-// resolves to "local" — see workspace.LoadEnvironmentMode.
+// GetEnvironment returns the workspace warehouse. Absent file resolves
+// to "local" — see workspace.LoadWarehouse.
 func (wh *WorkspaceHandler) GetEnvironment(w http.ResponseWriter, _ *http.Request) {
-	httputil.WriteJSON(w, http.StatusOK, environmentResponse{
-		Mode: string(workspace.LoadEnvironmentMode(wh.root)),
-	})
+	v := string(workspace.LoadWarehouse(wh.root))
+	httputil.WriteJSON(w, http.StatusOK, environmentResponse{Warehouse: v, Mode: v})
 }
 
-// SetEnvironment persists the workspace environment mode. The CLI twin
-// is `clavesa workspace use --env` (ADR-015 parity); both write
-// .clavesa/environment.json via workspace.WriteEnvironmentMode.
+// SetEnvironment persists the workspace warehouse. The CLI twin is
+// `clavesa workspace use --warehouse` (ADR-015 parity); both write
+// .clavesa/environment.json via workspace.WriteWarehouse. Accepts the
+// legacy `mode` key when `warehouse` is absent.
 func (wh *WorkspaceHandler) SetEnvironment(w http.ResponseWriter, r *http.Request) {
 	req, ok := httputil.DecodeJSON[environmentResponse](w, r)
 	if !ok {
 		return
 	}
-	mode, ok := workspace.ParseMode(req.Mode)
+	raw := req.Warehouse
+	if raw == "" {
+		raw = req.Mode
+	}
+	warehouse, ok := workspace.ParseWarehouse(raw)
 	if !ok {
-		httputil.WriteError(w, http.StatusBadRequest, `mode must be "local" or "cloud"`)
+		httputil.WriteError(w, http.StatusBadRequest, `warehouse must be "local" or "cloud"`)
 		return
 	}
-	if err := workspace.WriteEnvironmentMode(wh.root, mode); err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, "write environment mode: "+err.Error())
+	if err := workspace.WriteWarehouse(wh.root, warehouse); err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, "write warehouse: "+err.Error())
 		return
 	}
-	httputil.WriteJSON(w, http.StatusOK, environmentResponse{Mode: string(mode)})
+	v := string(warehouse)
+	httputil.WriteJSON(w, http.StatusOK, environmentResponse{Warehouse: v, Mode: v})
 }
 
 // ---------------------------------------------------------------------------

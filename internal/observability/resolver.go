@@ -12,12 +12,12 @@ import (
 )
 
 // Resolver picks a Provider per request from the workspace's
-// environment mode: mode = local routes every pipeline to the local
-// provider, mode = cloud routes to the cloud provider. The mode is the
-// sole switch — the per-node `compute` attr is a deploy target and no
-// longer influences dispatch (TODO bucket 16; the old
-// `compute = "local"` fallback is gone). The host's AWS availability is
-// irrelevant either way (ADR-014).
+// warehouse setting (ADR-024): warehouse = local routes every pipeline
+// to the local provider, warehouse = cloud routes to the cloud
+// provider. The warehouse is the sole switch — the per-node `compute`
+// attr is a deploy target and no longer influences dispatch (TODO
+// bucket 16; the old `compute = "local"` fallback is gone). The host's
+// AWS availability is irrelevant either way (ADR-014).
 type Resolver struct {
 	workspace string
 	cloud     Provider
@@ -32,34 +32,33 @@ func NewResolver(workspace string, cloud, local Provider) *Resolver {
 	return &Resolver{workspace: workspace, cloud: cloud, local: local}
 }
 
-// For returns the Provider matching the workspace environment mode.
-// dir must be non-empty (the observability surfaces always inspect a
-// named pipeline) but is not otherwise consulted — dispatch is purely
-// the workspace mode.
+// For returns the Provider matching the workspace warehouse. dir must
+// be non-empty (the observability surfaces always inspect a named
+// pipeline) but is not otherwise consulted — dispatch is purely the
+// workspace warehouse.
 func (r *Resolver) For(dir string) (Provider, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("observability: dir is required to dispatch provider")
 	}
-	if r.IsLocal() {
-		if r.local == nil {
-			return nil, fmt.Errorf("observability: local provider not configured")
-		}
-		return r.local, nil
-	}
-	if r.cloud == nil {
-		return nil, fmt.Errorf("observability: cloud provider unavailable (no AWS credentials)")
-	}
-	return r.cloud, nil
+	return r.Workspace()
 }
 
 // Workspace returns the workspace-level Provider for dir-less queries —
 // the workspace-wide system observability tables (runs, node_runs,
 // column_stats, tables) have no owning pipeline, so the catalog stamps
 // no `dir` on them. Selection is the same as For (purely the workspace
-// mode), minus the dir guard: local mode reads the workspace warehouse
-// directly, so a missing dir costs the local provider nothing.
+// warehouse), minus the dir guard: a local warehouse is read directly
+// from disk, so a missing dir costs the local provider nothing.
 func (r *Resolver) Workspace() (Provider, error) {
-	if r.IsLocal() {
+	return r.ForWarehouse(workspace.LoadWarehouse(r.workspace))
+}
+
+// ForWarehouse returns the Provider for an explicit warehouse value —
+// the seam per-invocation `--warehouse local|cloud` overrides dispatch
+// through (ADR-024). For and Workspace delegate here after resolving the
+// workspace's persisted warehouse, so the three paths can't drift.
+func (r *Resolver) ForWarehouse(w workspace.Warehouse) (Provider, error) {
+	if w == workspace.WarehouseLocal {
 		if r.local == nil {
 			return nil, fmt.Errorf("observability: local provider not configured")
 		}
@@ -72,12 +71,12 @@ func (r *Resolver) Workspace() (Provider, error) {
 }
 
 // IsLocal reports whether the workspace dispatches to the local
-// provider — true iff the environment mode is local. Used by surfaces
-// that need a local-vs-cloud decision without instantiating a provider
-// — e.g. POST /pipeline/run, which routes to service.RunPipeline
+// provider — true iff the warehouse is local. Used by surfaces that
+// need a local-vs-cloud decision without instantiating a provider —
+// e.g. POST /pipeline/run, which routes to service.RunPipeline
 // locally vs SFN StartExecution on cloud.
 func (r *Resolver) IsLocal() bool {
-	return workspace.LoadEnvironmentMode(r.workspace) == workspace.ModeLocal
+	return workspace.LoadWarehouse(r.workspace) == workspace.WarehouseLocal
 }
 
 // PipelineName returns the conventional pipeline name (the directory's

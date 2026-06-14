@@ -281,6 +281,7 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 	// here (it is expanded above), so transpile the expanded form directly;
 	// no sentinel scheme is needed.
 	sqlToRun := expanded
+	transpiled := false
 	if h.resolver != nil && !h.resolver.IsLocal() && h.transpile != nil {
 		t, terr := h.transpile(r.Context(), expanded)
 		if terr != nil {
@@ -291,6 +292,7 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sqlToRun = t
+		transpiled = true
 	}
 
 	res, err := provider.Query(r.Context(), observability.QueryQuery{
@@ -302,6 +304,12 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The provider stamps engine + warehouse; only this handler knows the
+	// SQL was dialect-translated first (ADR-024: served metadata is set by
+	// the code that did the work, never derived from workspace state).
+	if transpiled && res.Served != nil {
+		res.Served.Transpiled = true
+	}
 	httputil.WriteJSON(w, http.StatusOK, res)
 }
 
@@ -312,7 +320,7 @@ func expandDashboardPlaceholders(sql string, params map[string]string) (string, 
 }
 
 // providerFor dispatches the query through the resolver (cloud or local
-// per the workspace environment mode); falls back to the cloud-only
+// per the workspace warehouse); falls back to the cloud-only
 // provider when no resolver is wired.
 func (h *DashboardsHandler) providerFor(dir string) observability.Provider {
 	if h.resolver != nil && dir != "" {

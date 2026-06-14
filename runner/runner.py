@@ -638,25 +638,75 @@ def _s3_client():
     return _S3_CLIENT
 
 
-def _progress_s3_target(env, arn, node):
-    """Resolve the (bucket, key) the cloud progress sink writes to, or None.
+def _progress_target(env, run, node):
+    """Resolve where the per-node progress sink writes, backend-neutral, or None.
 
-    The bucket is derived from CLAVESA_SYSTEM_WAREHOUSE (an
-    ``s3://<bucket>/_system/pipelines/`` URI); the key is
-    ``_progress/<arn>/<node>.json`` at the bucket root — the same bucket
-    the Go CloudProvider reads back via its workspace S3 client. Returns
-    None when any of the inputs is missing or the warehouse URI isn't S3,
-    so the caller can skip the sink without a live cloud channel.
+    Returns a small descriptor the writer (``_write_progress``) dispatches on:
+
+      - ``("s3", bucket, "_progress/<run>/<node>.json")`` when
+        CLAVESA_SYSTEM_WAREHOUSE is an ``s3://`` URI. The bucket is the
+        workspace pipeline bucket the Go CloudProvider lists back via its
+        workspace S3 client; the key is ``_progress/<run>/<node>.json`` at
+        the bucket root. Derived from the SYSTEM warehouse (not
+        CLAVESA_WAREHOUSE) because that's the bucket the reader watches and
+        real cloud already works this way.
+      - ``("file", "<CLAVESA_WAREHOUSE>/_progress/<run>/<node>.json")`` when
+        the warehouse is a non-empty, non-s3 filesystem path (local mode /
+        cloud-local against a disk warehouse). The container mounts that
+        path at the same location, so the Go side reads the same tree.
+      - ``None`` when neither warehouse resolves or ``run``/``node`` is empty,
+        so the caller skips the sink without a live progress channel.
+
+    The system-warehouse s3 branch takes precedence: a deployed run always
+    has CLAVESA_SYSTEM_WAREHOUSE set to ``s3://…`` and we want the s3 sink.
 
     Pure (no boto3, no env reads of its own) so it's unit-testable.
     """
-    warehouse = (env or {}).get("CLAVESA_SYSTEM_WAREHOUSE", "")
-    if not warehouse or not _is_s3(warehouse) or not arn or not node:
+    env = env or {}
+    if not run or not node:
         return None
-    bucket, _ = _split_s3(warehouse)
-    if not bucket:
+    system_warehouse = env.get("CLAVESA_SYSTEM_WAREHOUSE", "") or ""
+    if system_warehouse and _is_s3(system_warehouse):
+        bucket, _ = _split_s3(system_warehouse)
+        if bucket:
+            return ("s3", bucket, f"_progress/{run}/{node}.json")
         return None
-    return bucket, f"_progress/{arn}/{node}.json"
+    warehouse = env.get("CLAVESA_WAREHOUSE", "") or ""
+    if warehouse and not _is_s3(warehouse):
+        path = os.path.join(warehouse, "_progress", run, f"{node}.json")
+        return ("file", path)
+    return None
+
+
+def _write_progress(target, payload):
+    """Write a progress JSON payload to the resolved target, best-effort.
+
+    ``target`` is a descriptor from ``_progress_target``. Never raises and
+    never blocks the transform: a PUT / file-write failure is swallowed and
+    logged to stderr only. The ``file`` backend writes atomically (temp file
+    in the same directory + os.replace) so a concurrent reader never sees a
+    half-written JSON document.
+    """
+    if not target:
+        return
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        kind = target[0]
+        if kind == "s3":
+            _, bucket, key = target
+            _s3_client().put_object(Bucket=bucket, Key=key, Body=body)
+        elif kind == "file":
+            _, path = target
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001 — sink is enrichment-only
+        print(
+            f"[clavesa] progress write failed for {target!r}: {exc!r}",
+            file=sys.stderr,
+        )
 
 
 def _looks_like_path(s: str) -> bool:
@@ -806,8 +856,15 @@ def _drain_source_queue(queue_url: str, max_keys: int, region: str | None = None
     poison message rather than this run silently swallowing it. Only handles for
     messages we successfully turned into a key are returned for deletion.
 
-    Long-polls (``WaitTimeSeconds``) so a near-empty queue doesn't spin; stops at
-    the first empty receive OR once ``max_keys`` keys are collected.
+    Drains to empty: loops ``ReceiveMessage`` until a genuinely empty receive
+    OR ``max_keys`` keys are collected, never on a partial (<10) batch. SQS
+    routinely returns fewer than ``MaxNumberOfMessages`` even when the queue
+    holds thousands more, so a short read is a sampling artifact, not a drained
+    queue (GH #52: treating <10 as "drained" capped ingestion at one batch per
+    trigger regardless of arrival rate). The 20s long poll makes the
+    terminating empty read authoritative rather than a near-empty short-poll
+    miss, and a backlog larger than ``max_keys`` finishes draining on the next
+    poller tick (the per-pipeline run lock serializes those executions).
     """
     import boto3  # noqa: PLC0415
     import urllib.parse  # noqa: PLC0415
@@ -822,7 +879,7 @@ def _drain_source_queue(queue_url: str, max_keys: int, region: str | None = None
         resp = sqs.receive_message(
             QueueUrl=queue_url,
             MaxNumberOfMessages=10,
-            WaitTimeSeconds=5,
+            WaitTimeSeconds=20,
         )
         messages = resp.get("Messages") or []
         if not messages:
@@ -854,10 +911,6 @@ def _drain_source_queue(queue_url: str, max_keys: int, region: str | None = None
             if uri not in seen:
                 seen.add(uri)
                 keys.append(uri)
-        if len(messages) < 10:
-            # Partial batch ⇒ queue is (near) drained; one more empty poll
-            # would just burn the long-poll wait. Stop here.
-            break
     if skipped:
         print(
             f"[clavesa] drain {queue_url!r}: skipped {skipped} un-parseable message(s)",
@@ -2572,6 +2625,33 @@ def _node_runs_schema():
     ])
 
 
+_SYSTEM_TABLE_PROPERTIES = {
+    "delta.logRetentionDuration": "interval 24 hours",
+    "delta.deletedFileRetentionDuration": "interval 24 hours",
+    "delta.checkpointInterval": "10",
+}
+
+
+def _set_system_table_properties(spark, table_id: str) -> None:
+    """Bound the _delta_log growth of the workspace bookkeeping tables.
+    Called once, right after a system table is first created. These tables
+    are append-mostly operational logs written once per node per run, so a
+    short log/tombstone retention (hours, not Delta's 30-day default) lets
+    the periodic checkpoint truncate stale commit files instead of letting
+    them accumulate into thousands of LIST-expensive entries (GH #53). The
+    active compaction/VACUUM is a separate scheduled maintenance pipeline;
+    this only keeps the log bounded between those runs. Best-effort: a
+    failure logs to stderr and is swallowed, same posture as the recorders."""
+    props = ", ".join(f"'{k}' = '{v}'" for k, v in _SYSTEM_TABLE_PROPERTIES.items())
+    try:
+        spark.sql(f"ALTER TABLE {table_id} SET TBLPROPERTIES ({props})")
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[clavesa] could not set system-table properties on {table_id}: {exc!r}",
+            file=sys.stderr,
+        )
+
+
 def _record_node_run(row: dict[str, Any]) -> None:
     """Append one row to the pipeline's node_runs Iceberg table.
 
@@ -2587,14 +2667,16 @@ def _record_node_run(row: dict[str, Any]) -> None:
 
     df = spark.createDataFrame([row], schema=_node_runs_schema())
     location = _system_table_location("node_runs")
+    created = not spark.catalog.tableExists(table_id)
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
-    if not spark.catalog.tableExists(table_id):
-        if location:
-            # Delta's external-location pin: .option("path", …) at first write
-            # registers the table at the workspace-shared system prefix instead
-            # of letting the metastore default it under the invoking pipeline.
-            writer = writer.option("path", location)
+    if created and location:
+        # Delta's external-location pin: .option("path", …) at first write
+        # registers the table at the workspace-shared system prefix instead
+        # of letting the metastore default it under the invoking pipeline.
+        writer = writer.option("path", location)
     writer.saveAsTable(table_id)
+    if created:
+        _set_system_table_properties(spark, table_id)
     _sync_glue_table_schema(table_id, df.schema, location=location)
 
 
@@ -2655,7 +2737,10 @@ def _record_run(row: dict[str, Any]) -> None:
     _ensure_database(spark, db_part)
 
     df = spark.createDataFrame([row], schema=_runs_schema())
+    created = not spark.catalog.tableExists(table_id)
     df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
+    if created:
+        _set_system_table_properties(spark, table_id)
     _sync_glue_table_schema(table_id, df.schema)
 
 
@@ -2797,11 +2882,13 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
 
     df = spark.createDataFrame([row], schema=_tables_schema())
     location = _system_table_location("tables")
+    created = not spark.catalog.tableExists(tables_id)
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
-    if not spark.catalog.tableExists(tables_id):
-        if location:
-            writer = writer.option("path", location)
+    if created and location:
+        writer = writer.option("path", location)
     writer.saveAsTable(tables_id)
+    if created:
+        _set_system_table_properties(spark, tables_id)
     _sync_glue_table_schema(tables_id, df.schema, location=location)
 
     # Net rows this commit contributed.
@@ -3079,11 +3166,13 @@ def _record_column_stats(rows):
 
     df = spark.createDataFrame(rows, schema=_column_stats_schema())
     location = _system_table_location("column_stats")
+    created = not spark.catalog.tableExists(table_id)
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
-    if not spark.catalog.tableExists(table_id):
-        if location:
-            writer = writer.option("path", location)
+    if created and location:
+        writer = writer.option("path", location)
     writer.saveAsTable(table_id)
+    if created:
+        _set_system_table_properties(spark, table_id)
     _sync_glue_table_schema(table_id, df.schema, location=location)
 
 
@@ -3386,45 +3475,34 @@ def handler(event, context):
     # from "no Iceberg outputs").
     output_rows_total: int | None = None
 
-    # Cloud live in-flight progress: each node is its own Lambda invocation
-    # under Step Functions, so stdout is NOT a live channel (that path is
-    # the local bundle's pipeline_handler). Instead, a per-node poller pushes
-    # Spark stage/task snapshots to s3://<bucket>/_progress/<arn>/<node>.json,
-    # which the Go CloudProvider reads back for RUNNING nodes. Gated on the
-    # AWS Lambda runtime env var so the local bundle path (which invokes
-    # handler() WITHOUT AWS_LAMBDA_FUNCTION_NAME set) never double-starts a
-    # poller on top of pipeline_handler's stdout poller.
-    cloud_poller = None
-    is_cloud = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+    # Per-node live in-flight progress: a daemon poller pushes Spark
+    # stage/task snapshots to <warehouse>/_progress/<run>/<node>.json on
+    # whatever backend the warehouse resolves to (S3 for a deployed run,
+    # the local filesystem otherwise — see _progress_target). The Go reader
+    # lists the same tree for RUNNING nodes. Written for ANY runtime: there
+    # is no longer an is_cloud gate or a stdout progress channel — the bundle
+    # path (pipeline_handler) drives every node through handler(), so this
+    # one poller per node is the single progress source for both per-node
+    # Lambdas and local/cloud-local bundle runs.
+    progress_poller = None
     node = os.environ.get("CLAVESA_NODE", "")
-    progress_target = (
-        _progress_s3_target(os.environ, sf_execution_arn, node) if is_cloud else None
-    )
+    progress_target = _progress_target(os.environ, sf_execution_arn, node)
     if progress_target is not None:
-        prog_bucket, prog_key = progress_target
-
-        def _emit_progress_s3(payload, _bucket=prog_bucket, _key=prog_key):
-            # Best-effort: a PUT failure must never affect the transform.
+        def _emit_progress(payload, _target=progress_target):
             # "status": "running" tags this as a live in-flight tick so the
             # backend can tell it apart from the terminal marker written in
-            # the finally block below.
-            try:
-                _s3_client().put_object(
-                    Bucket=_bucket,
-                    Key=_key,
-                    Body=json.dumps(
-                        {
-                            **payload,
-                            "status": "running",
-                            "updated_ms": int(time.time() * 1000),
-                        }
-                    ).encode("utf-8"),
-                )
-            except Exception:  # noqa: BLE001 — sink is enrichment-only
-                pass
+            # the finally block below. Best-effort via _write_progress.
+            _write_progress(
+                _target,
+                {
+                    **payload,
+                    "status": "running",
+                    "updated_ms": int(time.time() * 1000),
+                },
+            )
 
-        cloud_poller = _ProgressPoller(node, _emit_progress_s3)
-        cloud_poller.start()
+        progress_poller = _ProgressPoller(node, _emit_progress)
+        progress_poller.start()
 
     try:
         response = _run_transform(event, context, run_id=run_id)
@@ -3475,20 +3553,21 @@ def handler(event, context):
         error_msg = str(exc) or repr(exc)
         raise
     finally:
-        if cloud_poller is not None:
-            cloud_poller.stop()
+        if progress_poller is not None:
+            progress_poller.stop()
         ended_ms = int(time.time() * 1000)
         # Terminal marker: overwrite the last running tick with a final
         # snapshot so the progress file is AUTHORITATIVE for completed nodes.
         # The backend no longer has to infer "done" from a stale-but-running
         # file — a terminal "status" (succeeded/failed/skipped) is written
-        # explicitly. No stage/task counters here on purpose; the progress
-        # bar only shows for in-flight nodes. "metrics" is reserved for future
-        # executor/shuffle telemetry (e.g. Spark task metrics) and ships empty
-        # for now. Best-effort: a PUT failure must never affect or mask the
+        # explicitly. Carries output_rows (the per-node added-rows count, the
+        # same value stamped on the response) so the Go node-runs fast path
+        # can read it without re-querying. No stage/task counters here on
+        # purpose; the progress bar only shows for in-flight nodes. "metrics"
+        # is reserved for future executor/shuffle telemetry and ships empty
+        # for now. Best-effort: a write failure must never affect or mask the
         # transform outcome.
         if progress_target is not None:
-            prog_bucket, prog_key = progress_target
             terminal = (
                 "failed"
                 if status == "failed"
@@ -3496,25 +3575,20 @@ def handler(event, context):
                 if status == "skipped"
                 else "succeeded"
             )
-            try:
-                _s3_client().put_object(
-                    Bucket=prog_bucket,
-                    Key=prog_key,
-                    Body=json.dumps(
-                        {
-                            "status": terminal,
-                            "started_ms": started_ms,
-                            "ended_ms": ended_ms,
-                            "error": (error_msg or "")[:500]
-                            if status == "failed"
-                            else "",
-                            "updated_ms": ended_ms,
-                            "metrics": {},
-                        }
-                    ).encode("utf-8"),
-                )
-            except Exception:  # noqa: BLE001 — sink is enrichment-only
-                pass
+            _write_progress(
+                progress_target,
+                {
+                    "status": terminal,
+                    "started_ms": started_ms,
+                    "ended_ms": ended_ms,
+                    "output_rows": output_rows_total,
+                    "error": (error_msg or "")[:500]
+                    if status == "failed"
+                    else "",
+                    "updated_ms": ended_ms,
+                    "metrics": {},
+                },
+            )
         try:
             # Resource + Spark task-metric capture. Both are best-effort and
             # already inside this try, so a failure here logs and is
@@ -3654,11 +3728,14 @@ def pipeline_handler(event, context):
     is skipped without invoking the runner — upstream tables haven't
     changed, so the output wouldn't either.
 
-    Progress streaming: each per-transform state transition is emitted to
-    stdout as a JSON line with a top-level ``_event`` key, flushed
-    immediately so the Go-side caller can update the per-run state.json
-    in real time. The aggregated pipeline result is the LAST line on
-    stdout, identifiable by the absence of an ``_event`` key.
+    Progress reporting: per-node live + terminal progress is written by
+    handler() (invoked per transform below) to
+    ``<warehouse>/_progress/<run>/<node>.json`` — S3 for a deployed run,
+    the local filesystem otherwise — which the Go reader watches. The bundle
+    loop no longer emits per-node ``_event`` progress lines on stdout. The
+    aggregated pipeline result is still the LAST line on stdout (the
+    non-``_event`` dict with overall status / failed_node / per-node
+    statuses) that the Go-side caller parses as the final result.
 
     Stops on first transform failure — downstream transforms would fail
     anyway with missing input tables.
@@ -3702,6 +3779,95 @@ def pipeline_handler(event, context):
             _reset_spark_session()
             raise
 
+    # ADR-024 slice 5: deployed (s3 warehouse) bundle runs serialize on the
+    # same warehouse run lock the Go side acquires (internal/runlock) — a
+    # scheduled Lambda run and any other compute contend on one S3 object at
+    # <pipeline>/_locks/run.json. Acquired before any Spark work; released
+    # in the finally once the run is observably terminal. Non-s3 warehouses
+    # no-op (local docker bundle runs are already locked Go-side via the
+    # file backend). Single-node payloads above never reach here, so they
+    # never take the lock (backfill staging is private; operations are
+    # covered later).
+    # Version skew: an already-deployed Lambda only enforces this after its
+    # image is rebuilt + redeployed (`workspace upgrade` + deploy).
+    lease, held_result = _acquire_run_lease(event)
+    if held_result is not None:
+        return held_result
+    try:
+        return _run_pipeline_bundle(event, context)
+    finally:
+        if lease is not None:
+            lease.release()
+
+
+def _run_lock_holder(event):
+    """Identity stamped into the run-lock lease (mirrors runlock.Holder).
+
+    run_id: cloud SFN payloads carry the execution ARN as _sf_execution_arn
+    ($$.Execution.Id, tfgen.go emitStateMachine) and no run_id; local bundle
+    events carry run_id. Prefer run_id, fall back to the execution ARN.
+    """
+    import socket  # noqa: PLC0415
+
+    run_id = str(event.get("run_id") or event.get("_sf_execution_arn") or "") or "unknown"
+    fn = os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+    host = fn or socket.gethostname()
+    # Same keying as _record_node_run's compute_target: a local docker
+    # container driving an s3 warehouse (ADR-024 cloud-local compute) is
+    # compute=local even though it takes the same S3 lock.
+    compute = "lambda" if fn else "local"
+    return {"run_id": run_id, "compute": compute, "host": host, "pid": os.getpid()}
+
+
+def _acquire_run_lease(event):
+    """Acquire the warehouse run lock for a pipeline-bundle run.
+
+    Returns (lease, None) on success with the heartbeat already running,
+    (None, None) when the warehouse is not s3:// (no lock taken), and —
+    when the lock is held by another run — either raises RuntimeError (on
+    Lambda, so the SFN execution FAILS with the holder in a readable cause)
+    or returns (None, failed_result) for the local CLAVESA_RUN path,
+    mirroring pipeline_handler's standard failure shape.
+    """
+    warehouse = os.environ.get("CLAVESA_WAREHOUSE", "")
+    if not warehouse.startswith("s3://"):
+        return None, None
+    import run_lock  # noqa: PLC0415 — sibling module, COPY'd next to runner.py
+
+    try:
+        lease = run_lock.acquire_for_warehouse(warehouse, _run_lock_holder(event))
+    except run_lock.HeldError as exc:
+        msg = str(exc)
+        print(
+            json.dumps({
+                "_event": "failed",
+                "node": "",
+                "error_class": "RunLockHeld",
+                "error_msg": msg,
+            }),
+            flush=True,
+        )
+        if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+            # GH #2 mirror: a returned dict would make Step Functions mark
+            # the execution SUCCEEDED — raise so it FAILS with the holder
+            # identity in the cause.
+            raise RuntimeError("clavesa runner: " + msg) from None
+        return None, {
+            "status": "failed",
+            "transforms": [],
+            "failed_node": None,
+            "error_class": "RunLockHeld",
+            "error_msg": msg,
+        }
+    if lease is not None:
+        lease.start_heartbeat()
+    return lease, None
+
+
+def _run_pipeline_bundle(event, context):
+    """The bundle loop body of ``pipeline_handler`` — runs every transform
+    sequentially in one Spark session. Split out of pipeline_handler so the
+    run-lock wrapper there can release the lease in a finally."""
     transforms = event.get("transforms", []) or []
     # Defensive: the emitter SHOULD already topo-order this list, but a
     # mis-ordered payload (GH #6) would otherwise run a consumer before its
@@ -3752,9 +3918,21 @@ def pipeline_handler(event, context):
         ps = parents_by_node.get(node, [])
         if ps and all(p in skipped_set for p in ps):
             note = "all upstreams skipped"
-            print(
-                json.dumps({"_event": "skipped", "node": node, "note": note}),
-                flush=True,
+            # handler() is NOT invoked for a cascade-skip, so write the
+            # terminal progress marker here (every other node's marker is
+            # written by handler() itself via _progress_target/_write_progress).
+            _now = int(time.time() * 1000)
+            _write_progress(
+                _progress_target(os.environ, sf_execution_arn, node),
+                {
+                    "status": "skipped",
+                    "started_ms": _now,
+                    "ended_ms": _now,
+                    "output_rows": None,
+                    "error": "",
+                    "updated_ms": _now,
+                    "metrics": {},
+                },
             )
             skipped_set.add(node)
             results.append({"node": node, "status": "skipped", "note": note})
@@ -3795,36 +3973,21 @@ def pipeline_handler(event, context):
             )
             _reset_spark_session()
 
-        print(json.dumps({"_event": "entered", "node": node}), flush=True)
-
-        # Live in-flight progress: a per-node daemon poller reads the Spark
-        # statusTracker and emits {"_event": "progress", ...} lines on the
-        # same stdout channel the Go scanner already reads for
-        # entered/succeeded. Fresh poller + fresh seen set per node.
-        def _emit_progress(payload, _node=node):
-            print(
-                json.dumps({"_event": "progress", **payload}),
-                flush=True,
-            )
-
-        poller = _ProgressPoller(node, _emit_progress)
-        poller.start()
+        # Per-node progress is now written by handler() itself: it resolves
+        # _progress_target from the warehouse and drives its own poller +
+        # terminal marker to <warehouse>/_progress/<run>/<node>.json. The
+        # bundle loop no longer starts a poller or emits stdout _event lines
+        # — those were the old stdout progress channel, replaced by the
+        # progress-file tree the Go reader watches for both cloud and
+        # cloud-local runs.
         try:
             resp = handler(sub_event, context)
         except Exception as exc:  # noqa: BLE001
-            # handler() already wrote a failed node_runs row in its finally
-            # block; emit the progress event and stop the pipeline run.
+            # handler() already wrote a failed node_runs row AND the failed
+            # terminal progress marker in its finally block; just record the
+            # failure and stop the pipeline run.
             err_class = type(exc).__name__
             err_msg = str(exc) or repr(exc)
-            print(
-                json.dumps({
-                    "_event": "failed",
-                    "node": node,
-                    "error_class": err_class,
-                    "error_msg": err_msg,
-                }),
-                flush=True,
-            )
             results.append({
                 "node": node,
                 "status": "failed",
@@ -3839,8 +4002,6 @@ def pipeline_handler(event, context):
             # hooks, which delete blockmgr and spill dirs under /tmp.
             _reset_spark_session()
             break
-        finally:
-            poller.stop()
 
         node_status = (
             resp.get("status") if isinstance(resp, dict) else None
@@ -3848,21 +4009,9 @@ def pipeline_handler(event, context):
         output_rows = resp.get("output_rows") if isinstance(resp, dict) else None
         if node_status == "skipped":
             note = resp.get("reason", "") if isinstance(resp, dict) else ""
-            print(
-                json.dumps({"_event": "skipped", "node": node, "note": note}),
-                flush=True,
-            )
             skipped_set.add(node)
             results.append({"node": node, "status": "skipped", "note": note})
         else:
-            print(
-                json.dumps({
-                    "_event": "succeeded",
-                    "node": node,
-                    "output_rows": output_rows,
-                }),
-                flush=True,
-            )
             results.append({
                 "node": node,
                 "status": "ok",

@@ -10,6 +10,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/notebooks"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // NotebookRegistry is the service-layer interface internal/api depends on
@@ -40,6 +41,9 @@ type NotebookRegistry interface {
 type CellRunResult struct {
 	Cell   notebooks.Cell           `json:"cell"`
 	Result observability.CellResult `json:"result"`
+	// Served — engine + warehouse the cell ran against (ADR-024).
+	// Response-envelope only, never persisted into the .ipynb.
+	Served *observability.Served `json:"served,omitempty"`
 }
 
 // NotebooksHandler serves /notebooks* endpoints.
@@ -200,6 +204,13 @@ func (h *NotebooksHandler) runCell(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusNotFound, "notebook not found: "+name)
 			return
 		}
+		// Cloud warehouse on an undeployed workspace (ADR-024): the
+		// request is well-formed but the workspace state can't satisfy
+		// it — a user-actionable 409, not a server fault.
+		if errors.Is(err, workspace.ErrWarehouseUndeployed) {
+			httputil.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -210,6 +221,10 @@ func (h *NotebooksHandler) cancelCell(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	cellRunID := r.PathValue("cellRunID")
 	if err := h.svc.CancelCell(r.Context(), name, cellRunID); err != nil {
+		if errors.Is(err, workspace.ErrWarehouseUndeployed) {
+			httputil.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

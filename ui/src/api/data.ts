@@ -3,6 +3,7 @@
  */
 
 import type { Column } from "../types/pipeline";
+import type { ServedInfo } from "@/lib/queries";
 import { request } from "./client";
 
 // ---------------------------------------------------------------------------
@@ -14,6 +15,8 @@ export interface PreviewResult {
   schema: Column[];
   total: number;
   truncated: boolean;
+  /** ADR-024 engine identity — absent on old servers. */
+  served?: ServedInfo;
 }
 
 export interface TransformPair {
@@ -24,6 +27,8 @@ export interface TransformPair {
 export interface TransformPreviewResult {
   pairs: TransformPair[];
   sql: string;
+  /** ADR-024 engine identity — absent on old servers. */
+  served?: ServedInfo;
 }
 
 // ---------------------------------------------------------------------------

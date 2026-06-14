@@ -17,3 +17,5 @@ var FS embed.FS
 func LocalImageName(workspaceName string) string {
 	return "clavesa/" + workspaceName + "/transform-runner"
 }
+
+// AWSEnvDockerArgs lives in awsenv.go.

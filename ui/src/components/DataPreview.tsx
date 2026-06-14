@@ -22,6 +22,7 @@ import {
 } from "../api/data";
 import type { PreviewResult, TransformPreviewResult } from "../api/data";
 import type { Column } from "../types/pipeline";
+import { EngineBadge } from "@/components/EngineBadge";
 import {
   Dialog,
   DialogContent,
@@ -250,6 +251,18 @@ export function DataPreview({
           <DialogTitle className="text-sm font-semibold text-muted-foreground">
             Preview: <span className="font-mono text-foreground">{nodeId}</span>
           </DialogTitle>
+          {!loading && !error && (
+            <EngineBadge
+              served={
+                isTransform ? transformResult?.served : sourceResult?.served
+              }
+              // Transform preview runs Spark (authoring) → predictable. A
+              // source preview is a raw S3 read with no engine (slice 3), so
+              // no surface → no prediction, and it stays badge-less.
+              surface={isTransform ? "authoring" : undefined}
+              testid="engine-badge-preview"
+            />
+          )}
           {isTransform && (
             <div className="ml-auto">
               <Select value={String(rows)} onValueChange={(v) => setRows(Number(v))}>

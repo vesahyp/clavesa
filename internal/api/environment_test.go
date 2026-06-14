@@ -17,7 +17,10 @@ func newWorkspaceMux(t *testing.T, root string) *http.ServeMux {
 	return mux
 }
 
-func envMode(t *testing.T, mux *http.ServeMux, method, body string) (int, string) {
+// envWarehouse drives GET/PUT /workspace/environment and returns the
+// status plus both response keys: warehouse (current) and mode (the
+// deprecated alias).
+func envWarehouse(t *testing.T, mux *http.ServeMux, method, body string) (int, string, string) {
 	t.Helper()
 	var r *http.Request
 	if body != "" {
@@ -28,52 +31,67 @@ func envMode(t *testing.T, mux *http.ServeMux, method, body string) (int, string
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, r)
 	if rr.Code != http.StatusOK {
-		return rr.Code, ""
+		return rr.Code, "", ""
 	}
 	var resp struct {
-		Mode string `json:"mode"`
+		Warehouse string `json:"warehouse"`
+		Mode      string `json:"mode"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode %s response: %v", method, err)
 	}
-	return rr.Code, resp.Mode
+	return rr.Code, resp.Warehouse, resp.Mode
 }
 
-// TestEnvironmentModeDefaultsLocal — a fresh workspace with no
-// environment.json reports "local".
-func TestEnvironmentModeDefaultsLocal(t *testing.T) {
+// TestEnvironmentWarehouseDefaultsLocal — a fresh workspace with no
+// environment.json reports "local" under both keys.
+func TestEnvironmentWarehouseDefaultsLocal(t *testing.T) {
 	mux := newWorkspaceMux(t, t.TempDir())
-	code, mode := envMode(t, mux, http.MethodGet, "")
-	if code != http.StatusOK || mode != "local" {
-		t.Fatalf("GET = (%d, %q), want (200, local)", code, mode)
-	}
-}
-
-// TestEnvironmentModeSetAndGet — PUT persists the mode; a subsequent GET
-// reflects it.
-func TestEnvironmentModeSetAndGet(t *testing.T) {
-	mux := newWorkspaceMux(t, t.TempDir())
-
-	if code, mode := envMode(t, mux, http.MethodPut, `{"mode":"cloud"}`); code != http.StatusOK || mode != "cloud" {
-		t.Fatalf("PUT cloud = (%d, %q), want (200, cloud)", code, mode)
-	}
-	if code, mode := envMode(t, mux, http.MethodGet, ""); code != http.StatusOK || mode != "cloud" {
-		t.Fatalf("GET after PUT = (%d, %q), want (200, cloud)", code, mode)
-	}
-	if code, mode := envMode(t, mux, http.MethodPut, `{"mode":"local"}`); code != http.StatusOK || mode != "local" {
-		t.Fatalf("PUT local = (%d, %q), want (200, local)", code, mode)
+	code, warehouse, mode := envWarehouse(t, mux, http.MethodGet, "")
+	if code != http.StatusOK || warehouse != "local" || mode != "local" {
+		t.Fatalf("GET = (%d, %q, %q), want (200, local, local)", code, warehouse, mode)
 	}
 }
 
-// TestEnvironmentModeRejectsBadInput — an unknown mode and malformed
-// JSON both 400.
-func TestEnvironmentModeRejectsBadInput(t *testing.T) {
+// TestEnvironmentWarehouseSetAndGet — PUT persists the warehouse; a
+// subsequent GET reflects it under both keys.
+func TestEnvironmentWarehouseSetAndGet(t *testing.T) {
 	mux := newWorkspaceMux(t, t.TempDir())
 
-	if code, _ := envMode(t, mux, http.MethodPut, `{"mode":"banana"}`); code != http.StatusBadRequest {
+	if code, warehouse, mode := envWarehouse(t, mux, http.MethodPut, `{"warehouse":"cloud"}`); code != http.StatusOK || warehouse != "cloud" || mode != "cloud" {
+		t.Fatalf("PUT cloud = (%d, %q, %q), want (200, cloud, cloud)", code, warehouse, mode)
+	}
+	if code, warehouse, mode := envWarehouse(t, mux, http.MethodGet, ""); code != http.StatusOK || warehouse != "cloud" || mode != "cloud" {
+		t.Fatalf("GET after PUT = (%d, %q, %q), want (200, cloud, cloud)", code, warehouse, mode)
+	}
+	if code, warehouse, mode := envWarehouse(t, mux, http.MethodPut, `{"warehouse":"local"}`); code != http.StatusOK || warehouse != "local" || mode != "local" {
+		t.Fatalf("PUT local = (%d, %q, %q), want (200, local, local)", code, warehouse, mode)
+	}
+}
+
+// TestEnvironmentWarehouseLegacyModeKey — a PUT carrying only the
+// deprecated `mode` key still works; when both keys are present,
+// `warehouse` wins.
+func TestEnvironmentWarehouseLegacyModeKey(t *testing.T) {
+	mux := newWorkspaceMux(t, t.TempDir())
+
+	if code, warehouse, mode := envWarehouse(t, mux, http.MethodPut, `{"mode":"cloud"}`); code != http.StatusOK || warehouse != "cloud" || mode != "cloud" {
+		t.Fatalf("PUT legacy mode=cloud = (%d, %q, %q), want (200, cloud, cloud)", code, warehouse, mode)
+	}
+	if code, warehouse, mode := envWarehouse(t, mux, http.MethodPut, `{"warehouse":"local","mode":"cloud"}`); code != http.StatusOK || warehouse != "local" || mode != "local" {
+		t.Fatalf("PUT both keys = (%d, %q, %q), want (200, local, local) — warehouse wins", code, warehouse, mode)
+	}
+}
+
+// TestEnvironmentWarehouseRejectsBadInput — an unknown warehouse and
+// malformed JSON both 400.
+func TestEnvironmentWarehouseRejectsBadInput(t *testing.T) {
+	mux := newWorkspaceMux(t, t.TempDir())
+
+	if code, _, _ := envWarehouse(t, mux, http.MethodPut, `{"warehouse":"banana"}`); code != http.StatusBadRequest {
 		t.Errorf("PUT banana: status = %d, want 400", code)
 	}
-	if code, _ := envMode(t, mux, http.MethodPut, `not json`); code != http.StatusBadRequest {
+	if code, _, _ := envWarehouse(t, mux, http.MethodPut, `not json`); code != http.StatusBadRequest {
 		t.Errorf("PUT malformed: status = %d, want 400", code)
 	}
 }

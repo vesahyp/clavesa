@@ -24,7 +24,11 @@
 import { useRef } from "react";
 import { useQueries } from "@tanstack/react-query";
 
-import { runDashboardQuery, type DashboardDataset } from "@/lib/queries";
+import {
+  runDashboardQuery,
+  type DashboardDataset,
+  type ServedInfo,
+} from "@/lib/queries";
 
 export interface DatasetColumn {
   name: string;
@@ -37,6 +41,8 @@ export interface DatasetColumns {
   rows: string[][];
   rowCount: number;
   truncated: boolean;
+  /** ADR-024 engine identity from the last result — absent on old servers. */
+  served?: ServedInfo;
   /** True once a result has arrived at least once for this dataset. */
   hasData: boolean;
   isLoading: boolean;
@@ -84,6 +90,7 @@ export function useDatasetColumns(
       rows: r?.data?.rows ?? [],
       rowCount: r?.data?.row_count ?? 0,
       truncated: r?.data?.truncated ?? false,
+      served: r?.data?.served,
       hasData: r?.data != null,
       isLoading: r?.isLoading ?? false,
       error: r?.error ?? null,

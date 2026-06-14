@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/runlock"
 	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/sources"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -60,7 +62,15 @@ type runPrep struct {
 	systemCatalog string
 	schema        string
 	runID         string
-	channel       *runChannel
+	// store is the warehouse-rooted progress sink the run-level `_run.json`
+	// marker is written through (ADR-024). For a local-warehouse run it's a
+	// file store at the workspace LocalWarehouseDir; the runner writes the
+	// per-node `<node>.json` markers into the same `_progress/<run>/` tree.
+	store observability.ProgressStore
+	// outcome accumulates the run-level status the `_run.json` marker + the
+	// runs-row rollup are built from. The runner is the source of per-node
+	// state now; Go only tracks the overall RUNNING→SUCCEEDED/FAILED arc.
+	outcome *runOutcome
 	// metastoreNetwork / metastoreAddr carry the shared local Derby
 	// metastore wiring resolved once per run in prepareRun. When non-empty
 	// the per-node bundle / transform / record-run containers join
@@ -77,6 +87,37 @@ type runPrep struct {
 	// force=true with forceNodes empty == every node in this dispatch.
 	force      bool
 	forceNodes []string
+	// lease is the per-pipeline run lock acquired in prepareRun (ADR-024:
+	// runs are serialized by a lease in the warehouse — here the file
+	// backend on the workspace's local warehouse dir). Released by
+	// releaseTerminal the moment the run is observably terminal.
+	lease *runlock.Lease
+	// onTerminal is extra in-process cleanup hooked by StartRunWithOpts
+	// (clearing runsInFlight). Runs inside releaseTerminal, after the
+	// lease release.
+	onTerminal   func()
+	terminalOnce sync.Once
+}
+
+// releaseTerminal frees the run's concurrency guards — the warehouse lease
+// lock and the in-process runsInFlight flag — at the moment the run is
+// observably terminal (the terminal `_run.json` marker has been written).
+// GH #48: this must happen BEFORE the recordLocalRun rollup, which spins one
+// more container after terminal; holding the guards through that container
+// made a Run clicked right after visible completion 409 for ~20s+.
+// Idempotent — every exit path of executeRun calls it, plus the caller's
+// belt-and-suspenders defer.
+func (p *runPrep) releaseTerminal() {
+	p.terminalOnce.Do(func() {
+		if p.lease != nil {
+			if err := p.lease.Release(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "[clavesa] release run lock: %v\n", err)
+			}
+		}
+		if p.onTerminal != nil {
+			p.onTerminal()
+		}
+	})
 }
 
 // ErrRunInFlight is returned by StartRun when the pipeline already has a
@@ -133,6 +174,10 @@ func (s *Service) RunPipelineWithOpts(ctx context.Context, dir string, opts RunO
 	// defend in depth.
 	prep.force = opts.Force || len(opts.ForceNodes) > 0
 	prep.forceNodes = append([]string(nil), opts.ForceNodes...)
+	// Belt-and-suspenders: executeRun releases the run lock at the terminal
+	// moment on every exit path; this defer only covers the impossible
+	// in-between. Idempotent.
+	defer prep.releaseTerminal()
 	return s.executeRun(ctx, prep)
 }
 
@@ -175,8 +220,14 @@ func (s *Service) StartRunWithOpts(dir string, opts RunOpts) (string, error) {
 	// ForceNodes implies Force (mirrors RunPipelineWithOpts).
 	prep.force = opts.Force || len(opts.ForceNodes) > 0
 	prep.forceNodes = append([]string(nil), opts.ForceNodes...)
+	// Clear the in-flight flag together with the run lock at the moment the
+	// run is observably terminal (the terminal `_run.json` write) — NOT when
+	// executeRun returns, one recordLocalRun rollup container later (GH #48).
+	prep.onTerminal = clear
 	go func() {
-		defer clear()
+		// Belt-and-suspenders: executeRun's exit paths all release; this
+		// defer is idempotent and only covers the impossible in-between.
+		defer prep.releaseTerminal()
 		// context.Background(): the run outlives the HTTP request that
 		// dispatched it (and any browser tab that closes).
 		_, _ = s.executeRun(context.Background(), prep)
@@ -210,6 +261,45 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 		return nil, err
 	}
 
+	// Per-pipeline run lock (ADR-024, GH #48). Acquired before any of the
+	// expensive setup below so a second dispatcher — another process, the
+	// CLI racing the UI, a second laptop on a shared warehouse — is
+	// rejected with the holder's identity instead of corrupting the
+	// single-driver Delta log. The run id is generated here (rather than
+	// just before the channel) because it identifies the lock holder.
+	pipelineName := filepath.Base(abs)
+	workspaceRoot := filepath.Dir(abs)
+	runID := newRunID()
+	hostname, _ := os.Hostname()
+	locker, err := runlock.New(workspace.LocalWarehouseDir(workspaceRoot), pipelineName)
+	if err != nil {
+		return nil, fmt.Errorf("run lock: %w", err)
+	}
+	lease, err := locker.Acquire(context.Background(), runlock.Holder{
+		RunID:   runID,
+		Compute: "local",
+		Host:    hostname,
+		PID:     os.Getpid(),
+	})
+	if err != nil {
+		var held *runlock.HeldError
+		if errors.As(err, &held) {
+			// Keep the sentinel (the HTTP layer maps errors.Is(…,
+			// ErrRunInFlight) to 409) and carry the holder detail.
+			return nil, fmt.Errorf("%w: %s", ErrRunInFlight, held.Error())
+		}
+		return nil, fmt.Errorf("acquire run lock: %w", err)
+	}
+	// Renew every 30s so the 120s TTL survives long runs; a setup failure
+	// below must release so the next dispatch isn't locked out for a TTL.
+	lease.StartHeartbeat()
+	failPrep := func(err error) (*runPrep, error) {
+		if rerr := lease.Release(context.Background()); rerr != nil {
+			fmt.Fprintf(os.Stderr, "[clavesa] release run lock after failed prepare: %v\n", rerr)
+		}
+		return nil, err
+	}
+
 	// Shared local Derby metastore (the local analog of cloud's shared
 	// Glue Data Catalog). Bring up (or reuse) the per-workspace Derby
 	// Network Server once per run, then thread the network + addr onto
@@ -228,7 +318,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 
 	workdir, err := os.MkdirTemp("", "clavesa-run-")
 	if err != nil {
-		return nil, fmt.Errorf("create workdir: %w", err)
+		return failPrep(fmt.Errorf("create workdir: %w", err))
 	}
 
 	// Resolve the workspace-scoped runner image name and the ADR-016
@@ -240,17 +330,15 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	// encoded as the Glue DB name `_glue_db()` writes to — keeps local
 	// runs writing to the same backend names as their cloud twin.
 	image := runner.LocalImageName("") + ":latest"
-	pipelineName := filepath.Base(abs)
 	catalog := ""
 	systemCatalog := ""
-	workspaceRoot := filepath.Dir(abs)
 	if m, _ := workspace.Load(workspaceRoot); m != nil {
 		// Auto-refresh the workspace runner image if a CLI upgrade
 		// shipped new runner code — bypasses the silent-stale-image
 		// trap users would otherwise hit after `brew upgrade`.
 		ensured, err := workspace.EnsureLocalRunnerImage(workspaceRoot)
 		if err != nil {
-			return nil, fmt.Errorf("ensure runner image: %w", err)
+			return failPrep(fmt.Errorf("ensure runner image: %w", err))
 		}
 		image = ensured
 		catalog = m.CatalogIdentifier()
@@ -258,17 +346,21 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	}
 	schema := resolvePipelineSchema(abs, pipelineName)
 
-	runID := newRunID()
-	channel := newRunChannel(abs, runID, pipelineName)
-	if err := channel.start(order, &g); err != nil {
-		return nil, fmt.Errorf("init run channel: %w", err)
-	}
+	// Run-level progress marker (`_progress/<run>/_run.json`) lives under the
+	// workspace local warehouse — the same tree the runner writes the per-node
+	// `<node>.json` markers into. Write the RUNNING marker now so the dashboard
+	// renders an in-flight column the instant StartRun returns, before the
+	// bundle container has produced any per-node marker.
+	store := observability.NewFileProgressStore(workspace.LocalWarehouseDir(workspaceRoot))
+	outcome := newRunOutcome(runID, pipelineName, "manual")
+	writeRunMarker(context.Background(), store, outcome)
 
 	return &runPrep{
 		abs: abs, graph: g, order: order, workdir: workdir,
 		image: image, catalog: catalog, systemCatalog: systemCatalog,
-		schema: schema, runID: runID, channel: channel,
+		schema: schema, runID: runID, store: store, outcome: outcome,
 		metastoreNetwork: metastoreNetwork, metastoreAddr: metastoreAddr,
+		lease: lease,
 	}, nil
 }
 
@@ -283,24 +375,26 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	systemCatalog := prep.systemCatalog
 	schema := prep.schema
 	runID := prep.runID
-	channel := prep.channel
+	store := prep.store
+	outcome := prep.outcome
 
 	// Belt-and-suspenders: every reachable exit from executeRun runs the
-	// `done:` block (channel.finish + recordLocalRun), but a panic inside
-	// the bundle walker or any other unexpected early return would skip
-	// it — leaving the run's state.json frozen at RUNNING and no terminal
-	// row in the `runs` Iceberg table. The dashboard then paints a
-	// phantom Running row with `—` duration until the OrphanThreshold
-	// timer (60s) downgrades it to FAILED on the next read. The defer
-	// closes that gap by force-finishing the channel and writing the
-	// terminal row on panic. channel.finish is idempotent on endedMs
-	// (the explicit `done:` call still wins when it ran first).
+	// `done:` block (outcome.finish + the `_run.json` write + recordLocalRun),
+	// but a panic inside the bundle walker or any other unexpected early
+	// return would skip it — leaving the run's `_run.json` frozen at RUNNING
+	// and no terminal row in the `runs` Delta table. The dashboard then paints
+	// a phantom Running row with `—` duration. The defer closes that gap by
+	// force-finishing the outcome and writing the terminal marker + row on
+	// panic. outcome.finish is idempotent on endedMs (the explicit `done:`
+	// call still wins when it ran first).
 	var terminalFired bool
 	defer func() {
 		if r := recover(); r != nil {
 			if !terminalFired {
-				channel.finish(fmt.Errorf("pipeline runner panicked: %v", r))
-				recordLocalRun(ctx, image, abs, channel, nil, s.metastoreEnsure)
+				outcome.finish(fmt.Errorf("pipeline runner panicked: %v", r))
+				writeRunMarker(ctx, store, outcome)
+				prep.releaseTerminal()
+				s.recordRun(ctx, image, abs, outcome, nil, s.metastoreEnsure)
 			}
 			panic(r) // re-raise so the caller / Go runtime sees it
 		}
@@ -308,10 +402,11 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			// Reached only when an unexpected return path bypasses
 			// `done:`. Synthesise a SUCCEEDED terminal row to match
 			// the cloud runs_writer Lambda's shape (ADR-014 parity);
-			// channel.state.Status stays "RUNNING" until finish() is
-			// called.
-			channel.finish(nil)
-			recordLocalRun(ctx, image, abs, channel, nil, s.metastoreEnsure)
+			// outcome.Status stays "RUNNING" until finish() is called.
+			outcome.finish(nil)
+			writeRunMarker(ctx, store, outcome)
+			prep.releaseTerminal()
+			s.recordRun(ctx, image, abs, outcome, nil, s.metastoreEnsure)
 		}
 	}()
 
@@ -347,10 +442,9 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	//      transform's outputPath/format from autoDeltaTableID, collect
 	//      the per-transform bundle configs.
 	//   2. Issue one `docker run` with the pipeline event.
-	//   3. The runner's pipeline_handler emits per-transform progress
-	//      events to stdout; runPipelineBundle scans them, fires
-	//      channel events in real time so the UI state.json updates
-	//      live (no UX regression vs the per-transform loop).
+	//   3. The runner writes the per-node `_progress/<run>/<node>.json`
+	//      markers itself for live UI state (ADR-024); runPipelineBundle
+	//      reads only the final aggregate response for the per-node statuses.
 	//   4. Destinations afterward (always leaves in v1).
 	var bundle []bundleTransformConfig
 	transformResults := map[string]NodeRunStatus{}
@@ -368,14 +462,13 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			path, perr := localSourcePath(node)
 			if perr != nil {
 				status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: perr.Error()}
-				channel.nodeFailed(nodeID, "source_error", perr.Error())
+				outcome.markFailed(nodeID, "source_error", perr.Error())
 				result.Nodes = append(result.Nodes, status)
 				finalErr = fmt.Errorf("source %s: %w", nodeID, perr)
 				goto done
 			}
 			outputPath[nodeID] = path
 			outputFormat[nodeID] = sourceFormat(node)
-			channel.nodeSucceeded(nodeID, nil)
 			result.Nodes = append(result.Nodes, NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "ok", Output: path})
 
 		case "transform":
@@ -403,7 +496,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 		inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
 		if ierr != nil {
 			status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: ierr.Error()}
-			channel.nodeFailed(nodeID, "input_error", ierr.Error())
+			outcome.markFailed(nodeID, "input_error", ierr.Error())
 			result.Nodes = append(result.Nodes, status)
 			finalErr = fmt.Errorf("transform %s inputs: %w", nodeID, ierr)
 			goto done
@@ -415,7 +508,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 		logic, lerr := readNodeLogic(node, language, abs)
 		if lerr != nil {
 			status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: lerr.Error()}
-			channel.nodeFailed(nodeID, "logic_error", lerr.Error())
+			outcome.markFailed(nodeID, "logic_error", lerr.Error())
 			result.Nodes = append(result.Nodes, status)
 			finalErr = fmt.Errorf("transform %s logic: %w", nodeID, lerr)
 			goto done
@@ -458,7 +551,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	// in real time. Returns the per-transform terminal statuses for
 	// the destination-pass loop below.
 	if len(bundle) > 0 {
-		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, channel, prep.force, prep.forceNodes, prep.metastoreNetwork, prep.metastoreAddr)
+		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, prep.force, prep.forceNodes, prep.metastoreNetwork, prep.metastoreAddr)
 		// Even on bundle error, walk whatever per-node results we got
 		// before the failure so result.Nodes carries the partial picture
 		// (the UI uses this for the per-node breakdown).
@@ -492,18 +585,31 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 		}
 		upstream := upstreamOutput(&g, nodeID, outputPath)
 		status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "skipped", Output: upstream, Note: "destinations not executed in v1; data left at upstream output path"}
-		channel.nodeSkipped(nodeID, status.Note)
 		result.Nodes = append(result.Nodes, status)
 	}
 
 done:
-	channel.finish(finalErr)
+	outcome.finish(finalErr)
+	// Run-level terminal marker (`_progress/<run>/_run.json`). The runner has
+	// already written the per-node `<node>.json` markers into the same tree;
+	// this is the overall RUNNING→SUCCEEDED/FAILED arc the dashboard's Runs
+	// grid + RunDetail read.
+	writeRunMarker(ctx, store, outcome)
+	// The run is observably terminal now (the `_run.json` marker carries the
+	// terminal status) — release the run lock and the in-flight flag BEFORE
+	// the rollup container below, so a Run dispatched the moment the dashboard
+	// shows completion isn't 409-rejected for the rollup's ~20s (GH #48).
+	// The next run's containers racing the rollup's Delta append is safe on
+	// the local warehouse: the FS log store serializes commits on the
+	// node_runs/runs tables via atomic rename, and the rollup never touches
+	// the transform output tables the next run writes.
+	prep.releaseTerminal()
 	// Append the run-level rollup row to <pipeline>.runs so the dashboard's
 	// "Run history" panel works for local pipelines (cloud uses an EventBridge
 	// → runs-writer Lambda that does the same write through Athena). Best-effort:
 	// a failure here logs to stderr but doesn't change the run's outcome — the
 	// data the user cares about already landed via runTransform.
-	recordLocalRun(ctx, image, abs, channel, cascadeSkipped, s.metastoreEnsure)
+	s.recordRun(ctx, image, abs, outcome, cascadeSkipped, s.metastoreEnsure)
 	terminalFired = true
 	if finalErr != nil {
 		return result, finalErr
@@ -950,9 +1056,9 @@ func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string
 //     output, runner error message, unexpected status value).
 //
 // outputRows is non-nil when the runner wrote at least one Iceberg-mode
-// output and reported the added-records sum across them; the caller
-// stamps it onto state.json so the dashboard's node-detail drawer can
-// show "Rows written" without a Spark roundtrip.
+// output and reported the added-records sum across them; the caller surfaces
+// it (the runner also stamps it onto the per-node progress marker so the
+// dashboard's node-detail drawer reads it without a Spark roundtrip).
 //
 // extraEvent, when non-nil, gets shallow-merged into the runner event after
 // the standard inputs/outputs/_sf_execution_arn/_trigger keys are set. This
@@ -1076,27 +1182,10 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	// pipelines work against same-account S3 sources without extra
 	// configuration. No-op for transforms with no s3 inputs.
 	if hasS3Input(inputs) {
-		for _, name := range []string{
-			"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-			"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE",
-			// Test-infra: lets users point S3A at moto/MinIO without
-			// rebuilding the runner image.
-			"CLAVESA_S3_ENDPOINT",
-		} {
-			if v, ok := os.LookupEnv(name); ok {
-				args = append(args, "-e", name+"="+v)
-			}
-		}
-		// Mount ~/.aws read-only so AWS_PROFILE-driven credentials
-		// (the common dev shape — `aws configure sso`, named
-		// profiles in ~/.aws/config) resolve inside the container.
-		// boto3 / hadoop-aws's profile chain needs the actual file.
-		if home, err := os.UserHomeDir(); err == nil {
-			awsDir := filepath.Join(home, ".aws")
-			if st, err := os.Stat(awsDir); err == nil && st.IsDir() {
-				args = append(args, "-v", awsDir+":/root/.aws:ro")
-			}
-		}
+		// Shared passthrough + host-resolved explicit credentials —
+		// same args every host-spawned AWS-reaching container gets,
+		// see runner.AWSEnvDockerArgs.
+		args = append(args, runner.AWSEnvDockerArgs(ctx)...)
 	}
 	// Triage-column env: which exact image and module version produced this
 	// row. The digest comes from `docker image inspect` and changes every
@@ -1259,21 +1348,19 @@ type bundleTransformConfig struct {
 // runner shares one Spark session across every transform in the bundle,
 // paying the ~3-5s JVM cold-start once instead of once per node.
 //
-// Progress streaming: pipeline_handler emits one JSON line per
-// per-transform state transition to stdout, prefixed with `_event`.
-// runPipelineBundle scans those lines as they arrive and fires channel
-// events in real time so the UI's per-run state.json reflects progress
-// without waiting for the whole pipeline to finish. Non-event stdout
-// lines (Spark log noise, anything that fails to JSON-parse) get teed
-// to the per-run log file under the pipeline's first node. The final
-// aggregate response is the last line on stdout with no `_event` key.
+// Progress (ADR-024): pipeline_handler writes the per-node
+// `_progress/<run>/<node>.json` markers into the warehouse tree directly —
+// the UI/CLI read live state from there, not from a stdout `_event` stream.
+// The only JSON the runner emits on stdout is the final aggregate response
+// (overall status, failed_node, per-transform statuses); everything else
+// (Spark log noise) is teed to the per-bundle log file for debugging.
 //
-// Returns one NodeRunStatus per transform that ran (or skipped) — in
-// the order events arrived — plus an error when the bundle itself
-// failed (docker exit non-zero, unparseable response, transform
-// failure). On a transform failure the bundle stops; statuses for
-// downstream transforms are not returned (they never ran).
-func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, channel *runChannel, force bool, forceNodes []string, metastoreNetwork, metastoreAddr string) ([]NodeRunStatus, error) {
+// Returns one NodeRunStatus per transform the runner reported in that
+// aggregate response — in topo (bundle) order — plus an error when the
+// bundle itself failed (docker exit non-zero, unparseable response,
+// transform failure). On a transform failure the runner stops; statuses for
+// downstream transforms are absent (they never ran).
+func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, force bool, forceNodes []string, metastoreNetwork, metastoreAddr string) ([]NodeRunStatus, error) {
 	pipelineName := filepath.Base(pipelineDir)
 	warehouse := workspace.LocalWarehouseDir(s.workspace)
 	if err := os.MkdirAll(warehouse, 0o755); err != nil {
@@ -1412,12 +1499,13 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	// Per-run log file under the pipeline's run dir — channel events stream
-	// to the per-node log via logPathFor, but the bundle has no single
-	// owning node for "everything else stdout"; route non-event stdout AND
-	// all stderr into a pipeline-level log so Spark output (and the real
-	// stack trace when the session dies) is recoverable for debugging.
-	// Created before cmd.Stderr so stderr can be teed into it.
+	// Per-run log file under the pipeline's run dir. The runner no longer
+	// emits per-node `_event` progress lines (it writes per-node `<node>.json`
+	// markers into the warehouse `_progress` tree directly); the only stdout
+	// JSON is the final aggregate response. Route all other stdout AND all
+	// stderr into a pipeline-level log so Spark output (and the real stack
+	// trace when the session dies) is recoverable for debugging. Created
+	// before cmd.Stderr so stderr can be teed into it.
 	var bundleLog *os.File
 	bundleLogPath := filepath.Join(pipelineDir, ".clavesa", "runs", runID, "_bundle.log")
 	if err := os.MkdirAll(filepath.Dir(bundleLogPath), 0o755); err == nil {
@@ -1440,13 +1528,6 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		return nil, fmt.Errorf("docker start: %w", err)
 	}
 
-	statuses := make([]NodeRunStatus, 0, len(bundle))
-	statusByNode := map[string]NodeRunStatus{}
-	nodeTypeByID := map[string]string{}
-	for _, bt := range bundle {
-		nodeTypeByID[bt.NodeID] = "transform"
-	}
-
 	var finalResp map[string]any
 	scanner := bufio.NewScanner(stdoutPipe)
 	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
@@ -1460,63 +1541,21 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 			}
 			continue
 		}
-		evRaw, isEvent := msg["_event"]
-		if !isEvent {
-			// Last JSON object without _event key = the aggregate
-			// pipeline result. Overwrite on each occurrence so we keep
-			// the last one (defensive against future shape changes).
-			finalResp = msg
-			continue
-		}
-		ev, _ := evRaw.(string)
-		node, _ := msg["node"].(string)
-		switch ev {
-		case "entered":
-			channel.nodeEntered(node)
-		case "succeeded":
-			var outputRows *int64
-			if v, ok := msg["output_rows"]; ok && v != nil {
-				if f, ok := v.(float64); ok {
-					n := int64(f)
-					outputRows = &n
-				}
-			}
-			channel.nodeSucceeded(node, outputRows)
-			st := NodeRunStatus{NodeID: node, Type: "transform", Status: "ok"}
-			if t, ok := statusByNode[node]; ok {
-				st = t
-			}
-			st.Status = "ok"
-			statusByNode[node] = st
-		case "progress":
-			channel.nodeProgress(node, NodeProgress{
-				StagesTotal:     msgInt64(msg, "stages_total"),
-				StagesCompleted: msgInt64(msg, "stages_completed"),
-				TasksTotal:      msgInt64(msg, "tasks_total"),
-				TasksCompleted:  msgInt64(msg, "tasks_completed"),
-				TasksFailed:     msgInt64(msg, "tasks_failed"),
-			})
-		case "skipped":
-			note, _ := msg["note"].(string)
-			channel.nodeSkipped(node, note)
-			statusByNode[node] = NodeRunStatus{NodeID: node, Type: "transform", Status: "skipped", Note: note}
-		case "failed":
-			errMsg, _ := msg["error_msg"].(string)
-			errClass, _ := msg["error_class"].(string)
-			if errClass == "" {
-				errClass = "runner_error"
-			}
-			channel.nodeFailed(node, errClass, errMsg)
-			statusByNode[node] = NodeRunStatus{NodeID: node, Type: "transform", Status: "failed", Note: errMsg}
-		}
+		// The runner emits exactly one JSON object on stdout now — the
+		// aggregate pipeline result. Overwrite on each occurrence so the
+		// last one wins (defensive against a future shape change that adds
+		// more stdout JSON).
+		finalResp = msg
 	}
 	waitErr := cmd.Wait()
 
-	// Materialize statuses in topo (bundle) order.
+	// Per-transform statuses come from the runner's aggregate `transforms`
+	// array (the runner is the source of per-node truth now). Materialize in
+	// topo (bundle) order, defaulting to the resolved table id for Output.
+	statusByNode := bundleStatusesFromResponse(finalResp)
+	statuses := make([]NodeRunStatus, 0, len(bundle))
 	for _, bt := range bundle {
 		if st, ok := statusByNode[bt.NodeID]; ok {
-			// Wire the table id onto the status's Output so the UI's
-			// per-node breakdown shows the produced table.
 			if st.Output == "" {
 				st.Output = bt.TableID
 			}
@@ -1582,21 +1621,47 @@ func boundedStderrTail(s string) string {
 	return s
 }
 
-// msgInt64 reads an integer field out of a decoded runner event. JSON
-// numbers decode as float64 into map[string]any; this mirrors the
-// output_rows conversion above. Returns nil when the key is absent, null,
-// or not a number so a partial event decodes cleanly.
-func msgInt64(msg map[string]any, key string) *int64 {
-	v, ok := msg[key]
-	if !ok || v == nil {
-		return nil
+// bundleStatusesFromResponse projects the runner's aggregate pipeline result
+// into a per-node NodeRunStatus map. The runner is the source of per-node
+// truth now: it writes the per-node `<node>.json` progress markers itself and
+// returns one entry per transform in the response's `transforms` array (shape:
+// {"node":…,"status":"ok"|"skipped"|"failed","note":…,"error_msg":…}). The Go
+// side no longer reconstructs per-node state from a `_event` stream. Returns an
+// empty map when the response is nil or carries no transforms (a docker crash
+// before any result) so the caller still materializes a clean — if empty —
+// status slice. Shared by the local-warehouse and cloud-warehouse local-compute
+// dispatch paths so both project the runner's result identically (ADR-014).
+func bundleStatusesFromResponse(resp map[string]any) map[string]NodeRunStatus {
+	out := map[string]NodeRunStatus{}
+	if resp == nil {
+		return out
 	}
-	f, ok := v.(float64)
-	if !ok {
-		return nil
+	transforms, _ := resp["transforms"].([]any)
+	for _, raw := range transforms {
+		t, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		node, _ := t["node"].(string)
+		if node == "" {
+			continue
+		}
+		status, _ := t["status"].(string)
+		// The runner stamps "ok"/"skipped"/"failed"; the UI breakdown reads
+		// these verbatim. Normalize an empty status to "ok" (a transform that
+		// ran without an explicit status) for back-compat.
+		if status == "" {
+			status = "ok"
+		}
+		note, _ := t["note"].(string)
+		if note == "" {
+			// On a failure the runner carries the message under error_msg, not
+			// note; surface it so the per-node breakdown shows the cause.
+			note, _ = t["error_msg"].(string)
+		}
+		out[node] = NodeRunStatus{NodeID: node, Type: "transform", Status: status, Note: note}
 	}
-	n := int64(f)
-	return &n
+	return out
 }
 
 // recordLocalRun invokes the runner image once with CLAVESA_RECORD_RUN=1
@@ -1609,7 +1674,7 @@ func msgInt64(msg map[string]any, key string) *int64 {
 // logs to stderr and returns nil. The run already finished and its data is
 // already on disk; failing here would punish the user for an observability
 // concern they didn't ask for.
-func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *runChannel, cascadeSkipped []string, ensureMetastore func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string)) {
+func recordLocalRun(ctx context.Context, image, pipelineDir string, outcome *runOutcome, cascadeSkipped []string, ensureMetastore func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string)) {
 	pipelineName := filepath.Base(pipelineDir)
 	// Resolve ADR-016 (catalog, schema) the same way RunPipeline does so
 	// the runs row lands in the same Glue DB as the node_runs row this
@@ -1628,46 +1693,9 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *run
 		return
 	}
 
-	channel.mu.Lock()
-	payload := map[string]any{
-		"run_id":   channel.state.RunID,
-		"pipeline": channel.state.Pipeline,
-		// Same value lives on every node_runs row this run produced (via
-		// the runner's `_sf_execution_arn` thread-through). The join key
-		// is `runs.sf_execution_arn = node_runs.sf_execution_arn`,
-		// uniform across local and cloud.
-		"sf_execution_arn": channel.state.RunID,
-		"status":           channel.state.Status,
-		"trigger":          channel.state.Trigger,
-		"started_at_ms":    channel.startMs,
-		"ended_at_ms":      channel.endedMs,
-		"failed_step":      channel.state.FailedStep,
-		"error_class":      channel.state.ErrorClass,
-		"error_msg":        channel.state.ErrorMsg,
-	}
-	if channel.state.DurationMs != nil {
-		payload["duration_ms"] = *channel.state.DurationMs
-	} else {
-		payload["duration_ms"] = channel.endedMs - channel.startMs
-	}
-	// Backfill node_runs rows for cascade-skipped nodes — the cascade path
-	// bypassed the runner entirely so they wouldn't otherwise appear in the
-	// Runs grid. One row per node, all sharing the run's sf_execution_arn so
-	// the dashboard joins them to this execution.
-	if len(cascadeSkipped) > 0 {
-		nowMs := channel.endedMs
-		skipped := make([]map[string]any, 0, len(cascadeSkipped))
-		for _, nodeID := range cascadeSkipped {
-			skipped = append(skipped, map[string]any{
-				"node":          nodeID,
-				"reason":        "all upstreams skipped",
-				"started_at_ms": nowMs,
-				"ended_at_ms":   nowMs,
-			})
-		}
-		payload["cascade_skipped_nodes"] = skipped
-	}
-	channel.mu.Unlock()
+	// Same `sf_execution_arn = run_id` join key, cascade-skip backfill rows,
+	// and timing fields as the cloud-local path — shared via recordRunPayload.
+	payload := recordRunPayload(outcome, cascadeSkipped)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1704,6 +1732,52 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, channel *run
 	args = append(args, "-v", warehouse+":"+warehouse)
 	args = append(args, image)
 
+	execRecordRunContainer(ctx, args, body)
+}
+
+// recordRunPayload assembles the CLAVESA_RECORD_RUN=1 stdin JSON from a
+// finished run outcome + cascade-skipped node list. Shared by the local and
+// cloud-local runs-row writers so both produce an identical row shape; only
+// the warehouse env around it differs (recordLocalRun targets the local
+// Hadoop catalog, the cloud-local path the deployed Lambda's s3:// system
+// warehouse). outcome.mu is taken internally.
+func recordRunPayload(outcome *runOutcome, cascadeSkipped []string) map[string]any {
+	outcome.mu.Lock()
+	defer outcome.mu.Unlock()
+	payload := map[string]any{
+		"run_id":           outcome.runID,
+		"pipeline":         outcome.pipeline,
+		"sf_execution_arn": outcome.runID,
+		"status":           outcome.status,
+		"trigger":          outcome.trigger,
+		"started_at_ms":    outcome.startMs,
+		"ended_at_ms":      outcome.endedMs,
+		"failed_step":      outcome.failedStep,
+		"error_class":      outcome.errorClass,
+		"error_msg":        outcome.errorMsg,
+		"duration_ms":      outcome.endedMs - outcome.startMs,
+	}
+	if len(cascadeSkipped) > 0 {
+		nowMs := outcome.endedMs
+		skipped := make([]map[string]any, 0, len(cascadeSkipped))
+		for _, nodeID := range cascadeSkipped {
+			skipped = append(skipped, map[string]any{
+				"node":          nodeID,
+				"reason":        "all upstreams skipped",
+				"started_at_ms": nowMs,
+				"ended_at_ms":   nowMs,
+			})
+		}
+		payload["cascade_skipped_nodes"] = skipped
+	}
+	return payload
+}
+
+// execRecordRunContainer docker-runs the assembled CLAVESA_RECORD_RUN=1 arg
+// vector, feeding the payload on stdin. Best-effort: a failure logs to stderr
+// and returns — the run already finished and its data is on disk; failing the
+// runs-row write punishes the user for an observability concern.
+func execRecordRunContainer(ctx context.Context, args []string, body []byte) {
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(body)
 	var stdout, stderr bytes.Buffer
@@ -1852,179 +1926,117 @@ func mountRoot(path string) string {
 // Local progress channel
 // ---------------------------------------------------------------------------
 
-// runChannel writes the on-disk progress state observability.LocalProvider
-// reads from. One per pipeline run; methods are safe to call from a single
-// goroutine (RunPipeline is sequential).
-type runChannel struct {
-	pipelineDir string
-	state       *observability.RunStateFile
-	startMs     int64
-	endedMs     int64            // set in finish() — drives the runs row's ended_at_ms
-	nodeStarts  map[string]int64 // nodeID → entered_at unix-millis (for duration calc)
-	mu          sync.Mutex       // guards state writes against concurrent reads
+// runOutcome accumulates the run-level status that the `_progress/<run>/_run.json`
+// marker and the `runs`-table rollup row are built from. Since ADR-024 the
+// runner owns per-node truth (it writes the per-node `<node>.json` progress
+// markers and returns the per-transform statuses in its aggregate response);
+// the Go dispatch side only tracks the overall RUNNING→SUCCEEDED/FAILED arc and
+// the failure context. mu guards the fields against the (rare) concurrent read
+// from recordRunPayload off a different goroutine.
+type runOutcome struct {
+	runID    string
+	pipeline string
+	trigger  string
+	status   string // RUNNING | SUCCEEDED | FAILED
+	startMs  int64
+	endedMs  int64 // set in finish() — drives the runs row's ended_at_ms
+
+	failedStep string
+	errorClass string
+	errorMsg   string
+
+	mu sync.Mutex
 }
 
-func newRunChannel(pipelineDir, runID, pipelineName string) *runChannel {
-	now := time.Now().UTC()
-	return &runChannel{
-		pipelineDir: pipelineDir,
-		startMs:     now.UnixMilli(),
-		state: &observability.RunStateFile{
-			RunID:     runID,
-			Pipeline:  pipelineName,
-			Status:    "RUNNING",
-			StartedAt: now.Format(time.RFC3339Nano),
-			Trigger:   "manual",
-			States:    map[string]observability.NodeRunState{},
-		},
-		nodeStarts: map[string]int64{},
+// newRunOutcome builds a RUNNING outcome stamped at the current wall clock.
+func newRunOutcome(runID, pipeline, trigger string) *runOutcome {
+	return &runOutcome{
+		runID:    runID,
+		pipeline: pipeline,
+		trigger:  trigger,
+		status:   "RUNNING",
+		startMs:  time.Now().UTC().UnixMilli(),
 	}
 }
 
-// start writes the initial state.json with one map entry per ordered node.
-// Sources/destinations get marked SUCCEEDED/SKIPPED inline below; this just
-// surfaces the topology before execution begins.
-func (c *runChannel) start(order []string, _ *graph.PipelineGraph) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, id := range order {
-		c.state.States[id] = observability.NodeRunState{Status: "PENDING"}
+// markFailed records the first node failure's context (failed step + error
+// class/message) so the terminal `_run.json` marker and the runs row carry it.
+// First-failure-wins, mirroring the old channel's `FailedStep == ""` guard.
+// Used for the Go-side pre-bundle failures (source resolution, input/logic
+// build); transform failures inside the bundle are surfaced via finish() from
+// the aggregate response's failed_node.
+func (o *runOutcome) markFailed(nodeID, errClass, errMsg string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.failedStep == "" {
+		o.failedStep = nodeID
 	}
-	return observability.WriteRunState(c.pipelineDir, c.state)
-}
-
-func (c *runChannel) logPathFor(nodeID string) string {
-	return observability.RunLogPath(c.pipelineDir, c.state.RunID, nodeID)
-}
-
-func (c *runChannel) nodeEntered(nodeID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now().UTC()
-	c.nodeStarts[nodeID] = now.UnixMilli()
-	c.state.States[nodeID] = observability.NodeRunState{
-		Status:    "RUNNING",
-		EnteredAt: now.Format(time.RFC3339Nano),
+	if o.errorClass == "" {
+		o.errorClass = errClass
 	}
-	_ = observability.WriteRunState(c.pipelineDir, c.state)
+	if o.errorMsg == "" {
+		o.errorMsg = truncate(errMsg, 4096)
+	}
 }
 
-// NodeProgress carries the in-flight Spark counters the runner emits on a
-// `progress` event. All fields nullable so a partial event (or a future
-// runner that drops a field) decodes cleanly.
-type NodeProgress struct {
-	StagesTotal     *int64
-	StagesCompleted *int64
-	TasksTotal      *int64
-	TasksCompleted  *int64
-	TasksFailed     *int64
-}
-
-// nodeProgress folds an in-flight progress tick onto the node's RUNNING
-// state and rewrites state.json. Defensive: only applies when the node
-// entry exists and is still RUNNING, so a late tick arriving after
-// succeeded/failed (or before entered) is dropped rather than resurrecting
-// a terminal node.
-func (c *runChannel) nodeProgress(nodeID string, p NodeProgress) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	prev, ok := c.state.States[nodeID]
-	if !ok || prev.Status != "RUNNING" {
+// finish stamps the terminal status + end time. finalErr nil → SUCCEEDED;
+// non-nil → FAILED with a PipelineFailed fallback class/message when an
+// earlier markFailed didn't already record one. Idempotent on endedMs: the
+// first call wins, so the executeRun defer's belt-and-suspenders re-finish
+// doesn't overwrite the real outcome.
+func (o *runOutcome) finish(finalErr error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.endedMs != 0 {
 		return
 	}
-	prev.StagesTotal = p.StagesTotal
-	prev.StagesCompleted = p.StagesCompleted
-	prev.TasksTotal = p.TasksTotal
-	prev.TasksCompleted = p.TasksCompleted
-	prev.TasksFailed = p.TasksFailed
-	c.state.States[nodeID] = prev
-	_ = observability.WriteRunState(c.pipelineDir, c.state)
-}
-
-func (c *runChannel) nodeSucceeded(nodeID string, outputRows *int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	prev := c.state.States[nodeID]
-	now := time.Now().UTC()
-	if prev.EnteredAt == "" {
-		prev.EnteredAt = now.Format(time.RFC3339Nano)
-	}
-	dur := c.durationFor(nodeID, now)
-	c.state.States[nodeID] = observability.NodeRunState{
-		Status:     "SUCCEEDED",
-		EnteredAt:  prev.EnteredAt,
-		ExitedAt:   now.Format(time.RFC3339Nano),
-		DurationMs: dur,
-		OutputRows: outputRows,
-	}
-	_ = observability.WriteRunState(c.pipelineDir, c.state)
-}
-
-func (c *runChannel) nodeFailed(nodeID, errClass, errMsg string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	prev := c.state.States[nodeID]
-	now := time.Now().UTC()
-	if prev.EnteredAt == "" {
-		prev.EnteredAt = now.Format(time.RFC3339Nano)
-	}
-	dur := c.durationFor(nodeID, now)
-	c.state.States[nodeID] = observability.NodeRunState{
-		Status:     "FAILED",
-		EnteredAt:  prev.EnteredAt,
-		ExitedAt:   now.Format(time.RFC3339Nano),
-		DurationMs: dur,
-		ErrorClass: errClass,
-		ErrorMsg:   truncate(errMsg, 4096),
-	}
-	if c.state.FailedStep == "" {
-		c.state.FailedStep = nodeID
-	}
-	_ = observability.WriteRunState(c.pipelineDir, c.state)
-}
-
-func (c *runChannel) nodeSkipped(nodeID, note string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.state.States[nodeID] = observability.NodeRunState{
-		Status:   "SKIPPED",
-		ErrorMsg: note,
-	}
-	_ = observability.WriteRunState(c.pipelineDir, c.state)
-}
-
-func (c *runChannel) finish(finalErr error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now().UTC()
-	c.endedMs = now.UnixMilli()
-	c.state.EndedAt = now.Format(time.RFC3339Nano)
-	dur := c.endedMs - c.startMs
-	c.state.DurationMs = &dur
+	o.endedMs = time.Now().UTC().UnixMilli()
 	if finalErr != nil {
-		c.state.Status = "FAILED"
-		if c.state.ErrorClass == "" {
-			c.state.ErrorClass = "PipelineFailed"
+		o.status = "FAILED"
+		if o.errorClass == "" {
+			o.errorClass = "PipelineFailed"
 		}
-		if c.state.ErrorMsg == "" {
-			c.state.ErrorMsg = truncate(finalErr.Error(), 4096)
+		if o.errorMsg == "" {
+			o.errorMsg = truncate(finalErr.Error(), 4096)
 		}
 	} else {
-		c.state.Status = "SUCCEEDED"
+		o.status = "SUCCEEDED"
 	}
-	_ = observability.WriteRunState(c.pipelineDir, c.state)
 }
 
-// durationFor returns the millisecond duration since the node entered, or
-// nil when no entered_at was recorded (source/destination shortcuts).
-func (c *runChannel) durationFor(nodeID string, now time.Time) *int64 {
-	startedMs, ok := c.nodeStarts[nodeID]
-	if !ok {
-		return nil
+// writeRunMarker projects a runOutcome into the run-level `_run.json` marker
+// and persists it via the warehouse progress store (ADR-024). Best-effort:
+// the store write failure logs to stderr but never masks the run outcome —
+// the per-node markers + the runs row carry the durable record. Shared by the
+// local-warehouse (file store) and cloud-warehouse local-compute (s3 store)
+// dispatch paths. outcome.mu is taken internally.
+func writeRunMarker(ctx context.Context, store observability.ProgressStore, outcome *runOutcome) {
+	if store == nil {
+		return
 	}
-	d := now.UnixMilli() - startedMs
-	return &d
+	outcome.mu.Lock()
+	m := observability.RunMarker{
+		Status:     outcome.status,
+		Trigger:    outcome.trigger,
+		Pipeline:   outcome.pipeline,
+		StartedMs:  int64Ptr(outcome.startMs),
+		FailedStep: outcome.failedStep,
+		ErrorClass: outcome.errorClass,
+		ErrorMsg:   outcome.errorMsg,
+	}
+	if outcome.endedMs != 0 {
+		m.EndedMs = int64Ptr(outcome.endedMs)
+	}
+	runID := outcome.runID
+	outcome.mu.Unlock()
+	if err := observability.WriteRunMarker(ctx, store, runID, m); err != nil {
+		fmt.Fprintf(os.Stderr, "[clavesa] write run marker %s: %v\n", runID, err)
+	}
 }
+
+// int64Ptr returns &v — a small helper so the marker's optional epoch-millis
+// fields can be set inline without a temporary.
+func int64Ptr(v int64) *int64 { return &v }
 
 // truncate caps a string to maxLen, appending an ellipsis to signal cut.
 // Matches the runner's 4 KB error-message cap so cloud and local errors

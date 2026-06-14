@@ -81,21 +81,21 @@ func TestResolverDispatchByMode(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		mode    workspace.Mode // "" = no environment.json → defaults to local
+		mode    workspace.Warehouse // "" = no environment.json → defaults to local
 		compute string
 		want    string
 	}{
 		{"default mode (absent file) → local", "", "lambda", "local"},
-		{"mode local → local", workspace.ModeLocal, "lambda", "local"},
-		{"mode cloud → cloud", workspace.ModeCloud, "lambda", "cloud"},
-		{"mode cloud, compute attr ignored → cloud", workspace.ModeCloud, "local", "cloud"},
+		{"mode local → local", workspace.WarehouseLocal, "lambda", "local"},
+		{"mode cloud → cloud", workspace.WarehouseCloud, "lambda", "cloud"},
+		{"mode cloud, compute attr ignored → cloud", workspace.WarehouseCloud, "local", "cloud"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := writePipeline(t, tt.compute)
 			if tt.mode != "" {
-				if err := workspace.WriteEnvironmentMode(dir, tt.mode); err != nil {
+				if err := workspace.WriteWarehouse(dir, tt.mode); err != nil {
 					t.Fatalf("write mode: %v", err)
 				}
 			}
@@ -122,7 +122,7 @@ func TestResolverEmptyDir(t *testing.T) {
 
 func TestResolverMissingCloud(t *testing.T) {
 	dir := writePipeline(t, "lambda")
-	if err := workspace.WriteEnvironmentMode(dir, workspace.ModeCloud); err != nil {
+	if err := workspace.WriteWarehouse(dir, workspace.WarehouseCloud); err != nil {
 		t.Fatalf("write mode: %v", err)
 	}
 	r := observability.NewResolver(dir, nil, &stubProvider{})
@@ -145,19 +145,19 @@ func TestResolverWorkspace(t *testing.T) {
 
 	tests := []struct {
 		name string
-		mode workspace.Mode // "" = no environment.json → defaults to local
+		mode workspace.Warehouse // "" = no environment.json → defaults to local
 		want string
 	}{
 		{"default mode (absent file) → local", "", "local"},
-		{"mode local → local", workspace.ModeLocal, "local"},
-		{"mode cloud → cloud", workspace.ModeCloud, "cloud"},
+		{"mode local → local", workspace.WarehouseLocal, "local"},
+		{"mode cloud → cloud", workspace.WarehouseCloud, "cloud"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if tt.mode != "" {
-				if err := workspace.WriteEnvironmentMode(dir, tt.mode); err != nil {
+				if err := workspace.WriteWarehouse(dir, tt.mode); err != nil {
 					t.Fatalf("write mode: %v", err)
 				}
 			}
@@ -184,7 +184,7 @@ func TestResolverWorkspaceMissingProvider(t *testing.T) {
 
 	// Cloud mode with no cloud provider → typed "unavailable" error.
 	cloudDir := t.TempDir()
-	if err := workspace.WriteEnvironmentMode(cloudDir, workspace.ModeCloud); err != nil {
+	if err := workspace.WriteWarehouse(cloudDir, workspace.WarehouseCloud); err != nil {
 		t.Fatalf("write mode: %v", err)
 	}
 	rCloud := observability.NewResolver(cloudDir, nil, &stubProvider{})
@@ -196,18 +196,18 @@ func TestResolverWorkspaceMissingProvider(t *testing.T) {
 func TestResolverIsLocal(t *testing.T) {
 	tests := []struct {
 		name string
-		mode workspace.Mode
+		mode workspace.Warehouse
 		want bool
 	}{
 		{"default mode → local", "", true},
-		{"mode local → local", workspace.ModeLocal, true},
-		{"mode cloud → cloud", workspace.ModeCloud, false},
+		{"mode local → local", workspace.WarehouseLocal, true},
+		{"mode cloud → cloud", workspace.WarehouseCloud, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if tt.mode != "" {
-				if err := workspace.WriteEnvironmentMode(dir, tt.mode); err != nil {
+				if err := workspace.WriteWarehouse(dir, tt.mode); err != nil {
 					t.Fatalf("write mode: %v", err)
 				}
 			}

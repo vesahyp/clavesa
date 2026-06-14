@@ -30,6 +30,7 @@ COPY spark-class ${SPARK_HOME}/bin/spark-class
 RUN chmod +x ${SPARK_HOME}/bin/spark-class
 
 COPY runner.py ${LAMBDA_TASK_ROOT}/
+COPY run_lock.py ${LAMBDA_TASK_ROOT}/
 COPY spark_conf.py ${LAMBDA_TASK_ROOT}/
 COPY notebook_supervisor.py ${LAMBDA_TASK_ROOT}/
 COPY notebook_repl.py ${LAMBDA_TASK_ROOT}/

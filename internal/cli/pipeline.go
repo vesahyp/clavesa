@@ -519,7 +519,7 @@ catalog entries, and the S3 watermark objects.
 				return nil
 			}
 			if !jsonOut {
-				printTargetContext("reset "+filepath.Base(dir), ws, workspace.Mode(plan.Mode))
+				printTargetContext("reset "+filepath.Base(dir), ws, workspace.Warehouse(plan.Mode))
 				fmt.Printf("\nWill drop %d output table(s):\n", len(plan.TablesDropped))
 				for _, t := range plan.TablesDropped {
 					fmt.Printf("  - %s  (%s)\n", t.Table, t.Location)
@@ -612,24 +612,34 @@ func newPipelineTerraformCmd(tfSubcmd, short string) *cobra.Command {
 func newPipelineRunCmd() *cobra.Command {
 	var jsonOut bool
 	var wait bool
+	var warehouseOverride string
 	var envOverride string
+	var compute string
 	var force bool
 	var forceNodes []string
 	cmd := &cobra.Command{
 		Use:   "run <pipeline-dir>",
 		Short: "Execute the pipeline (local: runner container; cloud: SFN StartExecution)",
-		Long: `Dispatches by the workspace environment mode:
+		Long: `Dispatches by the workspace warehouse:
 
-  - mode = local  →  walks the DAG and invokes the runner container for
-                     each transform; outputs land in a fresh temp
-                     workdir.
-  - mode = cloud  →  finds the deployed Step Functions state machine
-                     (clavesa-<pipeline_name>) and calls
-                     StartExecution. Pass --wait to block until the
-                     execution terminates.
+  - warehouse = local  →  walks the DAG and invokes the runner container
+                          for each transform; outputs land in a fresh
+                          temp workdir.
+  - warehouse = cloud  →  finds the deployed Step Functions state machine
+                          (clavesa-<pipeline_name>) and calls
+                          StartExecution. Pass --wait to block until the
+                          execution terminates.
 
-The mode defaults to "local" and is set with ` + "`clavesa workspace use --env`" + `.
-Pass --env local|cloud to override it for this run only.
+The warehouse defaults to "local" and is set with ` + "`clavesa workspace use --warehouse`" + `.
+Pass --warehouse local|cloud to override it for this run only.
+
+--compute local runs the whole pipeline in a local docker container against
+the cloud warehouse — same data, watermarks, and SQS cursors as a deployed
+run (it DRAINS them), the cost-per-billion win of laptop compute. It needs
+source-S3 read + warehouse-S3 read/write + Glue read/write + SQS consume on
+the human principal, and honors CLAVESA_JVM_HEAP_MB. On a local warehouse
+--compute local is a no-op (compute already equals the warehouse); --compute
+cloud against a local warehouse is rejected.
 
 Local filesystem sources only on the local path — S3 sources need cloud
 dispatch.
@@ -646,13 +656,19 @@ dispatch.
 				return fmt.Errorf("parse pipeline at %s: %w", displayDir(ws, dir), err)
 			}
 
-			mode := workspace.LoadEnvironmentMode(ws)
-			if envOverride != "" {
-				m, ok := workspace.ParseMode(envOverride)
+			warehouse := workspace.LoadWarehouse(ws)
+			// --warehouse wins when both it and the deprecated --env
+			// alias are set.
+			override := warehouseOverride
+			if override == "" {
+				override = envOverride
+			}
+			if override != "" {
+				w, ok := workspace.ParseWarehouse(override)
 				if !ok {
-					return fmt.Errorf(`--env must be "local" or "cloud", got %q`, envOverride)
+					return fmt.Errorf(`--warehouse must be "local" or "cloud", got %q`, override)
 				}
-				mode = m
+				warehouse = w
 			}
 
 			// --force-node implies a scoped --force; defend in depth.
@@ -661,18 +677,38 @@ dispatch.
 				warnForceAppendWithoutMergeKeys(&g, forceNodes)
 			}
 
-			if !jsonOut {
-				printTargetContext("run "+filepath.Base(dir), ws, mode)
+			// ADR-024: compute is a per-action execution-placement choice on
+			// top of the warehouse. validateCompute rejects the impossible
+			// (cloud compute against a local warehouse); local compute on a
+			// local warehouse is a harmless no-op.
+			if err := service.ValidateCompute(warehouse, compute); err != nil {
+				return err
 			}
-			if mode == workspace.ModeLocal {
+
+			if !jsonOut {
+				printTargetContext("run "+filepath.Base(dir), ws, warehouse)
+			}
+			if warehouse == workspace.WarehouseLocal {
+				// compute local == no-op (already local); compute cloud was
+				// rejected above. Either way the local DAG walk runs.
 				return runLocalPipeline(cmd, dir, jsonOut, effectiveForce, forceNodes)
+			}
+			// Cloud warehouse. compute local → run the whole bundle in the
+			// local docker runner against the cloud warehouse; compute "" /
+			// cloud → SFN StartExecution.
+			if compute == "local" {
+				return runCloudLocalPipeline(cmd, dir, jsonOut, wait, effectiveForce, forceNodes)
 			}
 			return runCloudPipeline(cmd, dir, jsonOut, wait, effectiveForce, forceNodes)
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable output")
-	cmd.Flags().StringVar(&envOverride, "env", "", "override the workspace environment mode for this run: local | cloud")
-	cmd.Flags().BoolVar(&wait, "wait", false, "(cloud only) block until the SFN execution terminates")
+	cmd.Flags().StringVar(&warehouseOverride, "warehouse", "", "override the workspace warehouse for this run: local | cloud")
+	cmd.Flags().StringVar(&envOverride, "env", "", "deprecated alias for --warehouse")
+	cmd.Flags().MarkHidden("env")
+	cmd.Flags().MarkDeprecated("env", "use --warehouse")
+	cmd.Flags().StringVar(&compute, "compute", "", "execution placement for this run: local (docker runner against the cloud warehouse) | cloud (SFN, the default on a cloud warehouse)")
+	cmd.Flags().BoolVar(&wait, "wait", false, "block until the run terminates (cloud: SFN execution; cloud + --compute local: the local docker bundle)")
 	cmd.Flags().BoolVar(&force, "force", false, "Bypass incremental-skip checks for this run; the runner reads the full source range. Watermarks still advance on success.")
 	cmd.Flags().StringSliceVar(&forceNodes, "force-node", nil, "Bypass incremental-skip for the named node only. Repeatable. Implies --force scoped to that node.")
 	return cmd
@@ -830,6 +866,45 @@ func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait, force bool,
 		}
 		return fmt.Errorf("execution did not succeed")
 	}
+	return nil
+}
+
+// runCloudLocalPipeline is the CLI shell for `pipeline run --compute local` on
+// a cloud warehouse (ADR-024): the whole pipeline bundle runs in the
+// workspace-local docker runner against the cloud warehouse. StartRunCloudLocal
+// blocks until the bundle terminates (the docker run is synchronous), so the
+// run id it returns is already terminal — --wait is implicit here. The run
+// drains the same SQS cursors and advances the same _watermarks a deployed run
+// would; output + node_runs land in the cloud warehouse.
+func runCloudLocalPipeline(cmd *cobra.Command, abs string, jsonOut, _ bool, force bool, forceNodes []string) error {
+	ctx := cmd.Context()
+	svc, _, err := newService(cmd)
+	if err != nil {
+		return err
+	}
+	runID, runErr := svc.StartRunCloudLocal(ctx, abs, service.RunOpts{
+		Force:      force,
+		ForceNodes: forceNodes,
+	})
+	if jsonOut {
+		out := map[string]string{"run_id": runID, "compute": "local"}
+		if runErr != nil {
+			out["status"] = "FAILED"
+			out["error"] = runErr.Error()
+		} else {
+			out["status"] = "SUCCEEDED"
+		}
+		_ = printJSON(os.Stdout, out)
+		return runErr
+	}
+	if runID != "" {
+		fmt.Printf("Run: %s\n", runID)
+		fmt.Printf("compute: local (docker)\n")
+	}
+	if runErr != nil {
+		return runErr
+	}
+	fmt.Printf("Status: SUCCEEDED\n")
 	return nil
 }
 

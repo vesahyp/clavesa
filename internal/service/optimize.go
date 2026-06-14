@@ -140,7 +140,7 @@ func (s *Service) OptimizeTable(ctx context.Context, req OptimizeRequest) ([]Opt
 
 	// One dispatcher closure per mode keeps the per-table loop identical.
 	var dispatch func(ctx context.Context, op map[string]any) error
-	if workspace.LoadEnvironmentMode(s.workspace) == workspace.ModeLocal {
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		dispatch = func(ctx context.Context, op map[string]any) error {
 			_, err := s.runOperation(ctx, op)
 			return err

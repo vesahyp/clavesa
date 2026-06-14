@@ -1,6 +1,7 @@
 package dataquery
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -32,7 +33,18 @@ type Handler struct {
 	mux      *http.ServeMux
 	cloud    observability.Provider
 	resolver *observability.Resolver
+	queryFn  QueryFunc
 }
+
+// QueryFunc runs one workspace-level ad-hoc SQL statement through the
+// shared service seam (service.Service.Query): provider dispatch by the
+// workspace warehouse plus the SparkSQL→Trino transpile on a cloud
+// warehouse (ADR-023). The seam is a func, not a service value, because
+// internal/service imports this package (for S3Client) — dataquery
+// importing it back would cycle. Wired via WithQueryService from
+// cli/ui.go; the CLI's `clavesa query` calls the same service method
+// (ADR-015).
+type QueryFunc func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error)
 
 // NewHandler returns a Handler that serves:
 //
@@ -120,12 +132,20 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 
 	// POST /data/query — workspace-level ad-hoc SQL editor. Body shape:
 	//   { "sql": "SELECT …", "dir": "<pipeline-dir>" }
-	// `dir` scopes the provider dispatch (local-warehouse vs Athena);
-	// any pipeline dir in the workspace will route to the same local
-	// Hadoop catalog so the UI just picks the first pipeline it knows
-	// about. The /query page and the per-table SQL pane on
-	// /tables/:db/:table both call this endpoint.
+	// Dispatch follows the workspace warehouse; on a cloud warehouse the
+	// authored SparkSQL is transpiled to the Trino/Athena serving dialect
+	// (ADR-023) — both via the service seam injected through
+	// WithQueryService. `dir` only scopes the provider's pipeline
+	// reference (the warehouse is workspace-shared, so any dir resolves
+	// the same catalog). The /query page and the per-table SQL pane on
+	// /tables/:db/:table both call this endpoint. Without a wired
+	// QueryFunc (tests, pre-wiring callers), falls back to direct
+	// provider dispatch with no transpile — the pre-seam behavior.
 	mux.HandleFunc("POST /data/query", func(w http.ResponseWriter, r *http.Request) {
+		if h.queryFn != nil {
+			handleAdhocQueryService(w, r, h.queryFn)
+			return
+		}
 		p, ok := h.providerFor(w, r)
 		if !ok {
 			return
@@ -153,6 +173,16 @@ func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 	return h
 }
 
+// WithQueryService routes POST /data/query through the shared ad-hoc
+// query seam (service.Service.Query) so the HTTP surface and the CLI's
+// `clavesa query` share dispatch and transpile behavior exactly
+// (ADR-015). The response shape is unchanged — only where the SQL runs
+// (and, on cloud, its dialect) is decided by the seam.
+func (h *Handler) WithQueryService(fn QueryFunc) *Handler {
+	h.queryFn = fn
+	return h
+}
+
 // providerFor picks the provider for one request. Returns (provider, true)
 // when routing succeeded; on failure writes a 400 to w and returns
 // (nil, false) so the caller can early-out.
@@ -170,15 +200,19 @@ func (h *Handler) providerFor(w http.ResponseWriter, r *http.Request) (observabi
 	}
 	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
 	if dir == "" {
-		if h.resolver.IsLocal() {
-			p, err := h.resolver.Workspace()
-			if err != nil {
-				httputil.WriteError(w, http.StatusInternalServerError, err.Error())
-				return nil, false
-			}
-			return p, true
+		// Dir-less query — the workspace-wide system tables (runs, node_runs,
+		// column_stats, tables) have no owning pipeline dir. Route to the
+		// workspace-level provider, the SAME fully-wired (Glue + S3) provider
+		// For(dir) returns. The bare h.cloud is Athena-only (NewHandler builds
+		// it without Glue/S3), so it can't read Delta `_delta_log` — that left
+		// the catalog's Rows/Commits columns blank for every system table while
+		// pipeline-owned tables (which carry a dir) showed real counts.
+		p, err := h.resolver.Workspace()
+		if err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+			return nil, false
 		}
-		return h.cloud, true
+		return p, true
 	}
 	p, err := h.resolver.For(dir)
 	if err != nil {
@@ -319,6 +353,7 @@ func handleTable(w http.ResponseWriter, r *http.Request, p observability.Provide
 		Rows:      res.Rows,
 		RowCount:  res.RowCount,
 		Truncated: res.Truncated,
+		Served:    res.Served,
 	}
 	for _, c := range res.Columns {
 		result.Columns = append(result.Columns, graph.Column{
@@ -330,46 +365,39 @@ func handleTable(w http.ResponseWriter, r *http.Request, p observability.Provide
 	httputil.WriteJSON(w, http.StatusOK, result)
 }
 
-// handleAdhocQuery serves POST /data/query?dir=<pipeline-dir> with body
-// {"sql": "..."}. Executes free-form SparkSQL through the resolved provider
-// (local Hadoop catalog or Athena) and returns the legacy QueryResult shape
-// so the UI's existing data-grid renderer parses without changes.
-//
-// `dir` selects the provider (compute=local vs cloud); the SQL itself is
-// against the workspace catalog. Any pipeline dir in the workspace routes
-// to the same local warehouse, so the UI sends whichever pipeline dir it
-// can see — the /query page picks the first one it knows about.
-func handleAdhocQuery(w http.ResponseWriter, r *http.Request, p observability.Provider) {
+// adhocQueryMaxRows caps how many rows POST /data/query returns to the UI
+// even when the user's SQL has no LIMIT.
+const adhocQueryMaxRows = 1000
+
+// decodeAdhocSQL reads the {"sql": "..."} body shared by both adhoc-query
+// paths. On failure writes the 400 and returns ok=false.
+func decodeAdhocSQL(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var body struct {
 		SQL string `json:"sql"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		httputil.WriteError(w, http.StatusBadRequest, "invalid body: "+err.Error())
-		return
+		return "", false
 	}
 	sql := strings.TrimSpace(body.SQL)
 	if sql == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "sql is required")
-		return
+		return "", false
 	}
+	return sql, true
+}
 
-	res, err := p.Query(r.Context(), observability.QueryQuery{
-		SQL:         sql,
-		PipelineDir: r.URL.Query().Get("dir"),
-		MaxRows:     1000,
-	})
-	if err != nil {
-		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// Same legacy QueryResult shape /data/table returns — the UI grid
-	// parses both with the same hook.
+// writeAdhocResult converts the provider-shape result into the legacy
+// QueryResult shape — the same shape /data/table returns, so the UI grid
+// parses both with the same hook — and writes it. Shared by both adhoc
+// paths so the service seam cannot drift the wire shape (ADR-014).
+func writeAdhocResult(w http.ResponseWriter, res *observability.QueryResult) {
 	out := &QueryResult{
 		Columns:   make([]graph.Column, 0, len(res.Columns)),
 		Rows:      res.Rows,
 		RowCount:  res.RowCount,
 		Truncated: res.Truncated,
+		Served:    res.Served,
 	}
 	for _, c := range res.Columns {
 		out.Columns = append(out.Columns, graph.Column{
@@ -379,6 +407,63 @@ func handleAdhocQuery(w http.ResponseWriter, r *http.Request, p observability.Pr
 		})
 	}
 	httputil.WriteJSON(w, http.StatusOK, out)
+}
+
+// handleAdhocQueryService serves POST /data/query?dir=<pipeline-dir>
+// through the shared service seam: warehouse-dispatched provider plus the
+// SparkSQL→Trino transpile on a cloud warehouse (ADR-023) — identical
+// behavior to the CLI's `clavesa query` (ADR-015). `dir` only scopes the
+// provider's pipeline reference; empty falls back to the workspace root
+// inside the seam.
+func handleAdhocQueryService(w http.ResponseWriter, r *http.Request, fn QueryFunc) {
+	sql, ok := decodeAdhocSQL(w, r)
+	if !ok {
+		return
+	}
+	res, err := fn(r.Context(), sql, r.URL.Query().Get("dir"), adhocQueryMaxRows)
+	if err != nil {
+		// A dialect rejection (SparkSQL the ADR-023 transpiler can't map
+		// to Trino/Athena) is the author's problem — 400, mirroring the
+		// dashboards query route, so the editor surfaces it inline
+		// instead of as a server fault.
+		var dr dialectRejection
+		if errors.As(err, &dr) {
+			httputil.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeAdhocResult(w, res)
+}
+
+// dialectRejection is implemented by *service.DialectError via its
+// DialectRejection marker method. Matched structurally with errors.As
+// because this package cannot import internal/service — service imports
+// dataquery (for S3Client), so the direct import would cycle.
+type dialectRejection interface {
+	error
+	DialectRejection()
+}
+
+// handleAdhocQuery is the pre-seam fallback for POST /data/query when no
+// QueryFunc is wired (tests, partial wirings): free-form SQL straight
+// through the resolved provider, no transpile.
+func handleAdhocQuery(w http.ResponseWriter, r *http.Request, p observability.Provider) {
+	sql, ok := decodeAdhocSQL(w, r)
+	if !ok {
+		return
+	}
+	res, err := p.Query(r.Context(), observability.QueryQuery{
+		SQL:         sql,
+		PipelineDir: r.URL.Query().Get("dir"),
+		MaxRows:     adhocQueryMaxRows,
+	})
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeAdhocResult(w, res)
 }
 
 // parseLimit parses the limit query parameter. Returns (defaultLimit, true) if

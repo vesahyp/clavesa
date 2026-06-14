@@ -104,6 +104,28 @@ func (b cloudPipelineRunnerBridge) RunPipelineCloud(ctx context.Context, dir str
 	})
 }
 
+// cloudLocalPipelineRunnerBridge adapts service.Service onto
+// pipelinestatus.CloudLocalPipelineRunner (ADR-024 — cloud warehouse, local
+// compute). Same RunOpts translation as the cloud bridge.
+type cloudLocalPipelineRunnerBridge struct {
+	svc *tuiservice.Service
+}
+
+func (b cloudLocalPipelineRunnerBridge) StartRunCloudLocal(ctx context.Context, dir string, opts pipelinestatus.RunOpts) (string, error) {
+	// Async dispatch: the cloud-local run is a synchronous docker bundle that
+	// takes the full pipeline duration, so the UI must NOT block the HTTP
+	// request on it (the CLI's StartRunCloudLocal does, with --wait implicit).
+	// The async variant prepares synchronously — a held lock still 409s — then
+	// returns the local-<uuid> id immediately and runs the bundle in the
+	// background; the browser polls the progress channel. ctx is unused (the
+	// run is detached onto context.Background inside the async path).
+	_ = ctx
+	return b.svc.StartRunCloudLocalAsync(dir, tuiservice.RunOpts{
+		Force:      opts.Force,
+		ForceNodes: opts.ForceNodes,
+	})
+}
+
 // sourceRegistryBridge adapts service.Service onto api.SourceRegistry —
 // translates SourceSpec / SourceUsage / ErrSourceInUse between the two
 // packages so internal/api stays free of an internal/service import
@@ -409,7 +431,7 @@ func (b notebookRegistryBridge) RunCell(ctx context.Context, name, cellID string
 	if err != nil {
 		return nil, err
 	}
-	return &api.CellRunResult{Cell: res.Cell, Result: res.Result}, nil
+	return &api.CellRunResult{Cell: res.Cell, Result: res.Result, Served: res.Served}, nil
 }
 
 func (b notebookRegistryBridge) CancelCell(ctx context.Context, name, cellRunID string) error {
@@ -434,11 +456,12 @@ type backfillBridge struct {
 
 func (b backfillBridge) BackfillStage(ctx context.Context, req api.BackfillStageRequest) (*api.BackfillRun, error) {
 	run, err := b.svc.BackfillStage(ctx, tuiservice.BackfillStageRequest{
-		Dir:    req.Dir,
-		Node:   req.Node,
-		From:   req.From,
-		To:     req.To,
-		Direct: req.Direct,
+		Dir:     req.Dir,
+		Node:    req.Node,
+		From:    req.From,
+		To:      req.To,
+		Direct:  req.Direct,
+		Compute: req.Compute,
 	})
 	// BackfillStage can return both a partial run AND an error when the
 	// Lambda itself reported an error — surface both verbatim.
@@ -494,6 +517,7 @@ func (b backfillBridge) BackfillPromote(ctx context.Context, dir, runID string, 
 	r, err := b.svc.BackfillPromote(ctx, dir, runID, tuiservice.BackfillPromoteOpts{
 		ForceDedup:      opts.ForceDedup,
 		AllowDuplicates: opts.AllowDuplicates,
+		Compute:         opts.Compute,
 	})
 	if err != nil {
 		return nil, err
@@ -501,8 +525,8 @@ func (b backfillBridge) BackfillPromote(ctx context.Context, dir, runID string, 
 	return &api.BackfillPromoteResult{ColumnsAdded: r.ColumnsAdded}, nil
 }
 
-func (b backfillBridge) BackfillDiscard(ctx context.Context, dir, runID string) error {
-	return b.svc.BackfillDiscard(ctx, dir, runID)
+func (b backfillBridge) BackfillDiscard(ctx context.Context, dir, runID, compute string) error {
+	return b.svc.BackfillDiscard(ctx, dir, runID, compute)
 }
 
 func toAPIBackfillRun(r *tuiservice.BackfillRun) *api.BackfillRun {
@@ -522,6 +546,7 @@ func toAPIBackfillRun(r *tuiservice.BackfillRun) *api.BackfillRun {
 		Status:         r.Status,
 		RowsWritten:    r.RowsWritten,
 		ErrorMsg:       r.ErrorMsg,
+		Compute:        r.Compute,
 	}
 	if !r.StartedAt.IsZero() {
 		out.StartedAt = r.StartedAt.UTC().Format(time.RFC3339)
@@ -785,6 +810,17 @@ Examples:
 							err)
 						return
 					}
+					// Warm the worker for the workspace's *active* warehouse
+					// (ADR-024) — local Hadoop dir or the cloud Glue/S3
+					// warehouse. Warmup is a background optimization, so a
+					// cloud warehouse on an undeployed shell logs the
+					// actionable error and skips; the first real query (or
+					// notebook cell) surfaces the same error in-context.
+					warehouseURI, whErr := wspkg.WarehouseURI(workspace)
+					if whErr != nil {
+						fmt.Fprintf(os.Stderr, "clavesa: skipping Spark warmup: %v\n", whErr)
+						return
+					}
 					// Bring up the shared local Derby metastore before the
 					// first query so the warm worker connects to it as a
 					// client rather than racing to create it. Order matters:
@@ -795,11 +831,14 @@ Examples:
 					// ready before the first query rather than on first spawn.
 					// A failure degrades to embedded Derby (logged inside
 					// EnsureMetastore's callers); don't block warmup on it.
-					if _, err := observability.EnsureMetastore(context.Background(), workspace, wsName); err != nil {
-						fmt.Fprintf(os.Stderr,
-							"clavesa: shared local metastore unavailable (queries fall back to embedded Derby): %v\n", err)
+					// Cloud warehouses use Glue, not Derby — skip entirely.
+					if wspkg.LoadWarehouse(workspace) == wspkg.WarehouseLocal {
+						if _, err := observability.EnsureMetastore(context.Background(), workspace, wsName); err != nil {
+							fmt.Fprintf(os.Stderr,
+								"clavesa: shared local metastore unavailable (queries fall back to embedded Derby): %v\n", err)
+						}
 					}
-					warmQuery.Warmup(context.Background(), wspkg.LocalWarehouseDir(workspace))
+					warmQuery.Warmup(context.Background(), warehouseURI)
 				}()
 			}
 
@@ -816,8 +855,12 @@ Examples:
 			// Slice 3: parse-validate authoring SQL before persistence /
 			// dispatch. The warm worker is the same one /query rides on,
 			// so /parse is a single in-JVM call (~milliseconds) instead
-			// of a fresh container spawn.
-			sqlParser := warmQuery.SQLParserFor(wspkg.LocalWarehouseDir(workspace))
+			// of a fresh container spawn. The parser resolves the active
+			// warehouse (ADR-024) lazily per Parse, so a warehouse flip
+			// mid-session reaches the right worker, and cloud+undeployed
+			// surfaces an actionable error instead of parsing against a
+			// warehouse the workspace isn't using.
+			sqlParser := warmQuery.SQLParserForWorkspace()
 			svc := tuiservice.New(workspace).
 				WithEvictor(nbRunner).
 				WithResolver(resolver).
@@ -856,8 +899,17 @@ Examples:
 				}
 			}
 			workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithRestart(restartFn)
-			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc}).WithCloudRunner(cloudPipelineRunnerBridge{svc: svc}).WithAthenaOutputBucket(athenaOutputBucket)
-			dataHandler := dataquery.NewHandler(s3Client, athenaClient, athenaOutputBucket).(*dataquery.Handler).WithResolver(resolver)
+			statusHandler := pipelinestatus.NewHandler(workspace).WithResolver(resolver).WithLocalRunner(localPipelineRunnerBridge{svc: svc}).WithCloudRunner(cloudPipelineRunnerBridge{svc: svc}).WithCloudLocalRunner(cloudLocalPipelineRunnerBridge{svc: svc}).WithAthenaOutputBucket(athenaOutputBucket)
+			// WithQueryService routes /data/query through the shared
+			// Service.Query seam (provider dispatch + Spark→Trino
+			// transpile on cloud) — the same path `clavesa query`
+			// uses (ADR-015). The handler's direct-provider fallback
+			// only fires if this wiring is absent.
+			dataHandler := dataquery.NewHandler(s3Client, athenaClient, athenaOutputBucket).(*dataquery.Handler).
+				WithResolver(resolver).
+				WithQueryService(func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error) {
+					return svc.Query(ctx, sql, tuiservice.QueryOptions{Dir: dir, MaxRows: maxRows})
+				})
 			// nil-safe: catalog handler renders an empty list in local-only mode.
 			var catalogClient api.GlueClient
 			if glueClient != nil {
@@ -951,7 +1003,7 @@ Examples:
 			// the warm query workers AND the shared Derby metastore. Without
 			// the metastore teardown, the container keeps holding the
 			// workspace's embedded Derby lock after `clavesa ui` exits, and
-			// the next `clavesa pipeline run --env local` dies with
+			// the next `clavesa pipeline run --warehouse local` dies with
 			// "Another instance of Derby may have already booted the
 			// database" (#21). SweepWarmWorkers / SweepMetastores clean both
 			// up on the next UI start, but a local run in between would still

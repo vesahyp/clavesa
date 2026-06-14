@@ -204,19 +204,14 @@ def test_three_transforms_all_succeed():
     assert result["status"] == "ok"
     assert result["failed_node"] is None
     assert [t["node"] for t in result["transforms"]] == ["a", "b", "c"]
+    # output_rows still threads through into the returned aggregate.
+    assert [t.get("output_rows") for t in result["transforms"]] == [10, 20, 30]
 
-    # pipeline_handler emits per-transform events to stdout; the final
-    # aggregated dict is RETURNED (printed by run_local, not the handler
-    # itself). So stdout carries entered + succeeded for each transform.
-    expected = [
-        {"_event": "entered", "node": "a"},
-        {"_event": "succeeded", "node": "a", "output_rows": 10},
-        {"_event": "entered", "node": "b"},
-        {"_event": "succeeded", "node": "b", "output_rows": 20},
-        {"_event": "entered", "node": "c"},
-        {"_event": "succeeded", "node": "c", "output_rows": 30},
-    ]
-    assert events == expected, f"events: {events}"
+    # The bundle no longer streams per-node progress on stdout — per-node
+    # progress is now written to the _progress file tree by handler() (stubbed
+    # out here, so nothing is written). The local warehouse here isn't s3, so
+    # the run-lock path emits nothing either: stdout carries no _event lines.
+    assert events == [], f"expected no stdout _event lines, got: {events}"
 
 
 def test_cascade_skip_when_all_parents_skip():
@@ -258,11 +253,13 @@ def test_failure_stops_pipeline():
     assert len(result["transforms"]) == 2
     assert result["transforms"][1]["status"] == "failed"
     assert "boom" in result["transforms"][1]["error_msg"]
+    assert result["transforms"][1]["error_class"] == "RuntimeError"
 
-    # Final event should be the failure JSON.
-    failed_ev = next(e for e in events if e.get("_event") == "failed")
-    assert failed_ev["node"] == "b"
-    assert failed_ev["error_class"] == "RuntimeError"
+    # The failure is carried in the returned aggregate, not a stdout _event
+    # line (those were removed with the stdout progress channel). handler()
+    # writes the failed terminal marker to the _progress tree; it's stubbed
+    # here, so stdout stays clean.
+    assert events == [], f"expected no stdout _event lines, got: {events}"
 
 
 def test_partial_skip_then_continue():

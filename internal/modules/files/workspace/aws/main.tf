@@ -5,8 +5,10 @@ resource "aws_s3_bucket" "workspace_bucket" {
 }
 
 # Versioning: accidental object deletes (or `aws s3 rm` typos) are
-# recoverable. Iceberg metadata files are tiny; the cost overhead is
-# negligible.
+# recoverable. Delta (v2) rewrites and deletes objects on every MERGE,
+# OPTIMIZE, VACUUM, and `_delta_log` truncation, so each write leaves
+# noncurrent versions behind — the lifecycle rule below expires them and
+# reaps the delete markers so the versioning overhead stays bounded.
 resource "aws_s3_bucket_versioning" "workspace_bucket" {
   bucket = aws_s3_bucket.workspace_bucket.id
   versioning_configuration {
@@ -73,7 +75,6 @@ resource "aws_glue_catalog_database" "system_pipelines" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "workspace_bucket" {
-  count  = var.athena_results_retention_days > 0 ? 1 : 0
   bucket = aws_s3_bucket.workspace_bucket.id
 
   # Athena workgroup writes one result object per query (Catalog page,
@@ -82,16 +83,46 @@ resource "aws_s3_bucket_lifecycle_configuration" "workspace_bucket" {
   # runs_writer Lambda is NOT covered here — S3 lifecycle prefix filters
   # can't match a wildcard segment, and pipeline names aren't known at
   # workspace-module time. Lower-volume than workspace-level Athena.
+  # Conditional on a positive retention window (0 disables it); the
+  # noncurrent-version cleanup below runs regardless.
+  dynamic "rule" {
+    for_each = var.athena_results_retention_days > 0 ? [1] : []
+    content {
+      id     = "expire-athena-results"
+      status = "Enabled"
+
+      filter {
+        prefix = "athena-results/"
+      }
+
+      expiration {
+        days = var.athena_results_retention_days
+      }
+
+      abort_incomplete_multipart_upload {
+        days_after_initiation = 1
+      }
+    }
+  }
+
+  # Noncurrent-version + delete-marker cleanup. Versioning is Enabled and
+  # Delta churns heavily (MERGE / OPTIMIZE / VACUUM / `_delta_log`
+  # truncation), so every superseded object becomes a noncurrent version
+  # and every VACUUM delete leaves a delete marker — none of it reclaimable
+  # without this rule. Always on, decoupled from the athena window above, so
+  # a workspace with athena retention disabled still bounds storage growth.
   rule {
-    id     = "expire-athena-results"
+    id     = "expire-noncurrent-versions"
     status = "Enabled"
 
-    filter {
-      prefix = "athena-results/"
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = var.noncurrent_version_retention_days
     }
 
     expiration {
-      days = var.athena_results_retention_days
+      expired_object_delete_marker = true
     }
 
     abort_incomplete_multipart_upload {

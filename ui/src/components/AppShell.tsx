@@ -16,7 +16,7 @@ import { cn } from "@/lib/utils";
 import { AppSidebar } from "./AppSidebar";
 import { AwsIdentityChip } from "./AwsIdentityChip";
 import { Breadcrumbs } from "./Breadcrumbs";
-import { EnvModeToggle } from "./EnvModeToggle";
+import { WarehouseToggle } from "./WarehouseToggle";
 import { PageChromeProvider, usePageChrome } from "./PageChrome";
 import { RuntimeStatus } from "./RuntimeStatus";
 
@@ -31,7 +31,7 @@ function ShellFrame() {
           <div className="ml-auto flex shrink-0 items-center gap-3">
             <RuntimeStatus />
             <AwsIdentityChip />
-            <EnvModeToggle />
+            <WarehouseToggle />
             {trailing}
           </div>
         </header>

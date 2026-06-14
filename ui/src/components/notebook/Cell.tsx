@@ -20,16 +20,20 @@ import {
 import { EditorView } from "@codemirror/view";
 
 import { CodeEditor } from "@/components/CodeEditor";
+import { EngineBadge } from "@/components/EngineBadge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import type { NotebookCell } from "@/lib/queries";
+import type { NotebookCell, ServedInfo } from "@/lib/queries";
 import { CellOutput } from "./CellOutput";
 import { CellMarkdown } from "./CellMarkdown";
 
 export interface CellProps {
   cell: NotebookCell;
   busy?: boolean;          // a run is in flight for this cell
+  /** ADR-024 engine identity from this cell's last run response in this
+   * session — session state, not persisted into the .ipynb. */
+  served?: ServedInfo;
   onChange: (source: string) => void;
   onChangeType: (cellType: "code" | "markdown") => void;
   onRun: () => void;
@@ -49,6 +53,7 @@ export interface CellProps {
 export function Cell({
   cell,
   busy,
+  served,
   onChange,
   onChangeType,
   onRun,
@@ -111,6 +116,19 @@ export function Cell({
             {cell.outputs.map((o, i) => (
               <CellOutput key={i} output={o} />
             ))}
+          </div>
+        )}
+
+        {/* Footer — where this cell runs (ADR-024). Predicted (always Spark
+            — notebooks are an authoring surface, never Athena) before the
+            cell has run, confirmed from the run's `served` after. */}
+        {cell.cell_type === "code" && (
+          <div className="flex justify-end">
+            <EngineBadge
+              served={served}
+              surface="authoring"
+              testid="engine-badge-notebook"
+            />
           </div>
         )}
       </CardContent>

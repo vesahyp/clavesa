@@ -26,3 +26,8 @@ e2e/.e2e-workspace
 __pycache__/
 # Cloud smoke gate stamp (written by scripts/cloud-smoke.sh, read by release-check)
 .cloud-smoke-green.json
+# Local gate stamps (written by scripts/green-stamp.sh, read by release-check)
+.test-green.json
+.verify-readme-green.json
+# Per-gate logs from make release-gates
+.gates/

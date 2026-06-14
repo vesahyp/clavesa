@@ -55,6 +55,15 @@ func ResolveUpstreamFromSnapshot(
 	// tables written pre-cutover.
 	nodeSafe := identutil.Sanitize(parent.ID)
 
+	// The freshness signal below is mtime comparisons on warehouse
+	// metadata files on local disk — structurally local-only. On a cloud
+	// (s3://) warehouse (ADR-024) there is nothing equivalent to stat, so
+	// rather than half-working, report a miss and let the caller take the
+	// normal re-execute path (which runs through the s3-configured
+	// container and stays correct).
+	if workspace.LoadWarehouse(root) != workspace.WarehouseLocal {
+		return nil, false, nil
+	}
 	warehouse := workspace.LocalWarehouseDir(root)
 	if warehouse == "" {
 		return nil, false, nil

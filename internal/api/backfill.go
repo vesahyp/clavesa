@@ -16,7 +16,7 @@ type Backfiller interface {
 	BackfillDiff(ctx context.Context, dir, runID string) (*BackfillDiff, error)
 	BackfillDedupCheck(ctx context.Context, dir, runID, col string) (*BackfillDedupCheckResult, error)
 	BackfillPromote(ctx context.Context, dir, runID string, opts BackfillPromoteOpts) (*BackfillPromoteResult, error)
-	BackfillDiscard(ctx context.Context, dir, runID string) error
+	BackfillDiscard(ctx context.Context, dir, runID, compute string) error
 }
 
 // BackfillPromoteResult mirrors service.BackfillPromoteResult.
@@ -42,11 +42,12 @@ type BackfillDedupCheckResult struct {
 // boundary. The runner reads only partitions inside [from, to] and writes
 // to a parallel staging table (unless Direct=true).
 type BackfillStageRequest struct {
-	Dir    string   `json:"dir"`
-	Node   string   `json:"node"`
-	From   []string `json:"from"`
-	To     []string `json:"to"`
-	Direct bool     `json:"direct,omitempty"`
+	Dir     string   `json:"dir"`
+	Node    string   `json:"node"`
+	From    []string `json:"from"`
+	To      []string `json:"to"`
+	Direct  bool     `json:"direct,omitempty"`
+	Compute string   `json:"compute,omitempty"` // "" | "local" — route staging compute to the local docker runner (ADR-024)
 }
 
 // BackfillRun mirrors service.BackfillRun. Same field tags so the UI
@@ -66,6 +67,7 @@ type BackfillRun struct {
 	Status         string   `json:"status"`
 	RowsWritten    int64    `json:"rows_written,omitempty"`
 	ErrorMsg       string   `json:"error_msg,omitempty"`
+	Compute        string   `json:"compute,omitempty"` // "lambda" | "local"
 }
 
 // BackfillDiff mirrors service.BackfillDiff.
@@ -88,6 +90,7 @@ type BackfillDiff struct {
 type BackfillPromoteOpts struct {
 	ForceDedup      string `json:"force_dedup,omitempty"`
 	AllowDuplicates bool   `json:"allow_duplicates,omitempty"`
+	Compute         string `json:"compute,omitempty"` // "" | "local" — route the MERGE to the local docker runner (ADR-024)
 }
 
 // BackfillHandler serves the /backfills endpoints.
@@ -208,10 +211,11 @@ type promoteBody struct {
 	Dir             string `json:"dir"`
 	ForceDedup      string `json:"force_dedup,omitempty"`
 	AllowDuplicates bool   `json:"allow_duplicates,omitempty"`
+	Compute         string `json:"compute,omitempty"`
 }
 
 // POST /backfills/{run_id}/promote
-// Body: { dir, force_dedup?, allow_duplicates? }
+// Body: { dir, force_dedup?, allow_duplicates?, compute? }
 func (h *BackfillHandler) promote(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
 	body, ok := httputil.DecodeJSON[promoteBody](w, r)
@@ -224,6 +228,7 @@ func (h *BackfillHandler) promote(w http.ResponseWriter, r *http.Request) {
 	res, err := h.svc.BackfillPromote(r.Context(), body.Dir, runID, BackfillPromoteOpts{
 		ForceDedup:      body.ForceDedup,
 		AllowDuplicates: body.AllowDuplicates,
+		Compute:         body.Compute,
 	})
 	if err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, err.Error())
@@ -239,11 +244,12 @@ func (h *BackfillHandler) promote(w http.ResponseWriter, r *http.Request) {
 }
 
 type discardBody struct {
-	Dir string `json:"dir"`
+	Dir     string `json:"dir"`
+	Compute string `json:"compute,omitempty"`
 }
 
 // POST /backfills/{run_id}/discard
-// Body: { dir }
+// Body: { dir, compute? }
 func (h *BackfillHandler) discard(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
 	body, ok := httputil.DecodeJSON[discardBody](w, r)
@@ -253,7 +259,7 @@ func (h *BackfillHandler) discard(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": body.Dir, "run_id": runID}) {
 		return
 	}
-	if err := h.svc.BackfillDiscard(r.Context(), body.Dir, runID); err != nil {
+	if err := h.svc.BackfillDiscard(r.Context(), body.Dir, runID, body.Compute); err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}

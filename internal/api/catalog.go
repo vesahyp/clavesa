@@ -207,17 +207,18 @@ func (h *CatalogHandler) Tables(ctx context.Context) CatalogResponse {
 		}
 	}
 
-	// The env mode picks which world the catalog reads, the same contract
+	// The warehouse picks which world the catalog reads, the same contract
 	// every other endpoint honours (the EnvModeToggle: "the backend already
-	// dispatches by the mode"). Local mode lists the on-disk Hadoop-catalog
-	// tables; cloud mode lists Glue. Reading both double-listed every table
-	// that is deployed AND run locally (one row per materialization), and
-	// also paid the slow Glue + `_delta_log` enrichment in local mode for
-	// tables the user wasn't looking at. With no workspace root we default
-	// to cloud — the legacy AWS-only catalog.
-	mode := workspace.ModeCloud
+	// dispatches by the warehouse"). A local warehouse lists the on-disk
+	// Hadoop-catalog tables; a cloud warehouse lists Glue. Reading both
+	// double-listed every table that is deployed AND run locally (one row
+	// per materialization), and also paid the slow Glue + `_delta_log`
+	// enrichment on local warehouses for tables the user wasn't looking
+	// at. With no workspace root we default to cloud — the legacy
+	// AWS-only catalog.
+	warehouse := workspace.WarehouseCloud
 	if h.workspaceRoot != "" {
-		mode = workspace.LoadEnvironmentMode(h.workspaceRoot)
+		warehouse = workspace.LoadWarehouse(h.workspaceRoot)
 	}
 
 	// Cloud half. AWS errors degrade gracefully — local-only workspaces
@@ -226,7 +227,7 @@ func (h *CatalogHandler) Tables(ctx context.Context) CatalogResponse {
 	// false; the UI renders the "AWS unavailable" affordance and shows the
 	// local pipelines unaffected.
 	awsAvailable := h.glue != nil
-	if mode == workspace.ModeCloud && h.glue != nil {
+	if warehouse == workspace.WarehouseCloud && h.glue != nil {
 		dbs, err := h.listClavesaDatabases(ctx, workspaceCatalog, systemCatalog)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "catalog: skip cloud half (Glue unreachable): %v\n", err)
@@ -262,7 +263,7 @@ func (h *CatalogHandler) Tables(ctx context.Context) CatalogResponse {
 	// per-pipeline user DB and the workspace-wide system DB (ADR-016
 	// v0.20.0) get scanned; system entries de-dup so runs/node_runs/tables
 	// surface once even in multi-pipeline workspaces.
-	if mode == workspace.ModeLocal && h.workspaceRoot != "" {
+	if warehouse == workspace.WarehouseLocal && h.workspaceRoot != "" {
 		out = append(out, listLocalTables(h.workspaceRoot, workspaceCatalog, systemCatalog, localPipelines)...)
 	}
 
