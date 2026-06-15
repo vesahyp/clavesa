@@ -263,7 +263,7 @@ func metastoreEnsurer() func(ctx context.Context, workspaceRoot, workspaceName s
 			fmt.Fprintf(os.Stderr, "clavesa: falling back to embedded metastore (shared metastore unavailable): %v\n", err)
 			return "", ""
 		}
-		return observability.MetastoreNetwork(workspaceRoot), addr
+		return observability.MetastoreNetwork(), addr
 	}
 }
 

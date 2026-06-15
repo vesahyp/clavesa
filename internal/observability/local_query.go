@@ -97,7 +97,7 @@ func (d *dockerQueryRunner) Run(ctx context.Context, warehouse, sql string) (*Qu
 		if addr, err := EnsureMetastore(ctx, d.workspaceRoot, d.workspaceName); err != nil {
 			fmt.Fprintf(os.Stderr, "clavesa: query falling back to embedded metastore (shared metastore unavailable): %v\n", err)
 		} else {
-			args = append(args, "--network", metastoreNetworkName(d.workspaceRoot))
+			args = append(args, "--network", metastoreNetworkName())
 			args = append(args, "-e", "CLAVESA_METASTORE_ADDR="+addr)
 		}
 	}

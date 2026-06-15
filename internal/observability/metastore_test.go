@@ -3,6 +3,7 @@ package observability
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -16,9 +17,6 @@ var dockerObjectName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 // the workspace path: same path → identical names across calls.
 func TestMetastoreNamesStable(t *testing.T) {
 	const ws = "/Users/vesa/some/workspace"
-	if a, b := metastoreNetworkName(ws), metastoreNetworkName(ws); a != b {
-		t.Fatalf("network name not stable: %q vs %q", a, b)
-	}
 	if a, b := metastoreContainerName(ws), metastoreContainerName(ws); a != b {
 		t.Fatalf("container name not stable: %q vs %q", a, b)
 	}
@@ -27,20 +25,32 @@ func TestMetastoreNamesStable(t *testing.T) {
 	}
 }
 
-// TestMetastoreNamesDistinct checks different workspace paths derive
-// different names, so two workspaces can't collide on the same container
-// or network.
-func TestMetastoreNamesDistinct(t *testing.T) {
+// TestMetastoreNetworkShared checks every workspace lands on the one shared
+// network (GH #42 — per-workspace networks leaked and exhausted the address
+// pool), while the per-workspace *container* name and addr stay distinct so
+// clients on the shared network still dial the right metastore.
+func TestMetastoreNetworkShared(t *testing.T) {
 	a := "/Users/vesa/workspace-a"
 	b := "/Users/vesa/workspace-b"
-	if metastoreNetworkName(a) == metastoreNetworkName(b) {
-		t.Fatalf("distinct paths share a network name: %q", metastoreNetworkName(a))
+	if metastoreNetworkName() != sharedMetastoreNetwork {
+		t.Fatalf("network name = %q, want shared %q", metastoreNetworkName(), sharedMetastoreNetwork)
 	}
 	if metastoreContainerName(a) == metastoreContainerName(b) {
 		t.Fatalf("distinct paths share a container name: %q", metastoreContainerName(a))
 	}
 	if MetastoreAddr(a) == MetastoreAddr(b) {
 		t.Fatalf("distinct paths share an addr: %q", MetastoreAddr(a))
+	}
+}
+
+// TestLegacyNetworkPrefixExcludesShared pins the reaper's safety guard: the
+// shared network must never match the legacy `clavesa-net-<hash>` prefix, or
+// SweepLegacyMetastoreNetworks would delete the live network out from under
+// running containers.
+func TestLegacyNetworkPrefixExcludesShared(t *testing.T) {
+	if strings.HasPrefix(sharedMetastoreNetwork, legacyMetastoreNetworkPrefix) {
+		t.Fatalf("shared network %q matches legacy prefix %q — reaper would delete it",
+			sharedMetastoreNetwork, legacyMetastoreNetworkPrefix)
 	}
 }
 
@@ -55,7 +65,7 @@ func TestMetastoreNamesDockerSafe(t *testing.T) {
 		"/with.dots/and-dashes_under",
 	}
 	for _, p := range paths {
-		for _, name := range []string{metastoreNetworkName(p), metastoreContainerName(p)} {
+		for _, name := range []string{metastoreNetworkName(), metastoreContainerName(p)} {
 			if !dockerObjectName.MatchString(name) {
 				t.Errorf("name %q (from %q) is not docker-safe", name, p)
 			}
@@ -82,10 +92,8 @@ func TestMetastoreAddrShape(t *testing.T) {
 // service / preview packages rely on this to build `--network` args that
 // land the client on the same network EnsureMetastore created.
 func TestMetastoreNetworkMatchesPrivate(t *testing.T) {
-	for _, ws := range []string{"/Users/vesa/workspace", "/tmp/clavesa-x", "relative/path"} {
-		if got, want := MetastoreNetwork(ws), metastoreNetworkName(ws); got != want {
-			t.Fatalf("MetastoreNetwork(%q) = %q, want %q", ws, got, want)
-		}
+	if got, want := MetastoreNetwork(), metastoreNetworkName(); got != want {
+		t.Fatalf("MetastoreNetwork() = %q, want %q", got, want)
 	}
 }
 

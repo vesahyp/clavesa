@@ -1204,6 +1204,10 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	if digest := dockerImageDigest(image); digest != "" {
 		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
 	}
+	// Size the Spark JVM heap from the Docker VM (GH #58) — an uncapped local
+	// container otherwise leaves spark-class on its 1 GB fallback. Reserve for
+	// the co-resident metastore container.
+	args = append(args, localHeapArgs(reserveSharedVMMB)...)
 
 	// Mount the workdir so logic + outputs are accessible.
 	args = append(args, "-v", workdir+":"+workdir)
@@ -1423,6 +1427,10 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	if digest := dockerImageDigest(image); digest != "" {
 		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
 	}
+	// Size the Spark JVM heap from the Docker VM (GH #58) — one container runs
+	// the whole bundle, so the uncapped 1 GB fallback throttles every node.
+	// Reserve for the co-resident metastore container.
+	args = append(args, localHeapArgs(reserveSharedVMMB)...)
 
 	// Credential env passthrough — union across every transform's
 	// inputs, since one container reads them all. Mirrors the per-
@@ -2185,6 +2193,11 @@ func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[stri
 	}
 	// Override the baked-in version — see runTransform for the rationale.
 	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
+	// Size the Spark JVM heap from the Docker VM (GH #58). OPTIMIZE/VACUUM of a
+	// table with many small files is heap-hungry — exactly the _maintenance
+	// path that surfaced the 1 GB throttle. Reserve for the co-resident
+	// metastore container.
+	args = append(args, localHeapArgs(reserveSharedVMMB)...)
 	args = append(args, "-v", warehouse+":"+warehouse)
 	args = append(args, image)
 

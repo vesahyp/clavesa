@@ -69,12 +69,21 @@ func workspaceShortHash(workspaceRoot string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-// metastoreNetworkName returns the per-workspace user-defined docker
-// network name. Deterministic in the workspace path so the metastore and
-// every later client container join the same network without a shared
-// lookup.
-func metastoreNetworkName(workspaceRoot string) string {
-	return "clavesa-net-" + workspaceShortHash(workspaceRoot)
+// sharedMetastoreNetwork is the single user-defined docker network every
+// workspace's metastore and client containers join. It used to be
+// per-workspace (`clavesa-net-<hash>`), but each tempdir workspace leaked one
+// and ~30 fully subnet docker's default address pools — after which
+// `network create` fails, every local run silently falls back to embedded
+// Derby, and the next run deadlocks on the Derby lock (GH #42). One shared
+// network never leaks; per-workspace *container* names (and their in-network
+// DNS) keep clients unambiguous, so nothing else needs to be keyed by network.
+const sharedMetastoreNetwork = "clavesa-net"
+
+// metastoreNetworkName returns the shared metastore network. Kept as a
+// function (not a bare const reference at call sites) so the network's
+// identity stays a single point of definition.
+func metastoreNetworkName() string {
+	return sharedMetastoreNetwork
 }
 
 // metastoreContainerName returns the per-workspace metastore container
@@ -83,16 +92,15 @@ func metastoreContainerName(workspaceRoot string) string {
 	return "clavesa-metastore-" + workspaceShortHash(workspaceRoot)
 }
 
-// MetastoreNetwork returns the per-workspace docker network name a local
-// Spark client container must join (`--network <name>`) to reach the
-// metastore by its in-network DNS address. Pure — computed from the
-// workspace path, no docker call — so the service / preview packages can
-// build a client container's run args without importing the private
-// naming helper. Pair it with MetastoreAddr (the CLAVESA_METASTORE_ADDR
-// value) and an EnsureMetastore call that guarantees something is
-// actually listening on that network.
-func MetastoreNetwork(workspaceRoot string) string {
-	return metastoreNetworkName(workspaceRoot)
+// MetastoreNetwork returns the shared docker network name a local Spark
+// client container must join (`--network <name>`) to reach the metastore by
+// its in-network DNS address. Pure — no docker call — so the service /
+// preview packages can build a client container's run args without importing
+// the private naming helper. Pair it with MetastoreAddr (the
+// CLAVESA_METASTORE_ADDR value, which IS per-workspace) and an EnsureMetastore
+// call that guarantees something is actually listening on that network.
+func MetastoreNetwork() string {
+	return metastoreNetworkName()
 }
 
 // workspaceRootForWarehouse recovers the workspace root from a warehouse
@@ -128,7 +136,7 @@ func EnsureMetastoreForWarehouse(ctx context.Context, warehouse string) (network
 	if err != nil {
 		return "", ""
 	}
-	return MetastoreNetwork(root), a
+	return MetastoreNetwork(), a
 }
 
 // MetastoreAddr returns the in-network DNS address clients put in
@@ -169,7 +177,7 @@ func EnsureMetastore(ctx context.Context, workspaceRoot, workspaceName string) (
 	if strings.TrimSpace(workspaceRoot) == "" {
 		return "", fmt.Errorf("metastore: empty workspaceRoot")
 	}
-	net := metastoreNetworkName(workspaceRoot)
+	net := metastoreNetworkName()
 	name := metastoreContainerName(workspaceRoot)
 
 	if err := ensureMetastoreNetwork(ctx, net); err != nil {
@@ -311,11 +319,11 @@ func metastoreLogReady(logs string) bool {
 // SweepWarmWorkers) so a SIGKILL'd prior session doesn't leave a
 // container holding the Derby db lock and blocking a fresh Ensure.
 //
-// The per-workspace network is intentionally left in place: it is cheap
-// (no running process, no disk), the next EnsureMetastore reuses it, and
-// removing it would race any client container still attached from a
-// half-torn-down prior session. StopMetastore / SweepMetastores own the
-// container's lifecycle; the network outlives them.
+// The shared metastore network (sharedMetastoreNetwork) is intentionally
+// left in place: it is cheap, reused by every workspace, and — being a
+// single network — can never leak the way the old per-workspace networks
+// did (GH #42). Legacy per-workspace networks are reaped separately by
+// SweepLegacyMetastoreNetworks.
 func SweepMetastores(workspaceRoot string) {
 	if strings.TrimSpace(workspaceRoot) == "" {
 		return
@@ -352,4 +360,41 @@ func StopMetastore(workspaceRoot string) {
 		return
 	}
 	_ = exec.Command("docker", "rm", "-f", metastoreContainerName(workspaceRoot)).Run()
+}
+
+// legacyMetastoreNetworkPrefix is the name prefix of the pre-shared-network
+// per-workspace networks (`clavesa-net-<hash>`). The shared network
+// ("clavesa-net") lacks the trailing dash, so a prefix match never reaps it.
+const legacyMetastoreNetworkPrefix = "clavesa-net-"
+
+// SweepLegacyMetastoreNetworks removes orphaned per-workspace metastore
+// networks left by clavesa versions before the shared network (GH #42), so a
+// dev machine that accumulated ~30 of them self-heals instead of hitting "all
+// predefined address pools have been fully subnetted". Best-effort and
+// idempotent: it only touches `clavesa-net-<hash>` names (never the shared
+// network or unrelated networks), and `docker network rm` refuses any network
+// that still has a container attached, so a live older-version session is left
+// alone. Called once at startup, alongside SweepMetastores.
+func SweepLegacyMetastoreNetworks() {
+	out, err := exec.Command("docker", "network", "ls",
+		"--filter", "name="+legacyMetastoreNetworkPrefix, "--format", "{{.Name}}").Output()
+	if err != nil {
+		// Docker not running / not installed — same condition the rest of
+		// the local provider tolerates.
+		return
+	}
+	removed := 0
+	for _, name := range strings.Fields(string(out)) {
+		// `--filter name=` is a substring match; pin to the legacy prefix so
+		// the shared network and any unrelated name can't be caught.
+		if !strings.HasPrefix(name, legacyMetastoreNetworkPrefix) {
+			continue
+		}
+		if exec.Command("docker", "network", "rm", name).Run() == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		fmt.Fprintf(os.Stderr, "clavesa: reaped %d orphaned per-workspace metastore network(s) from a prior clavesa version (GH #42)\n", removed)
+	}
 }

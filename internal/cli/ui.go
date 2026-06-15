@@ -770,6 +770,10 @@ Examples:
 			// itself is in the goroutine so a cold image pull doesn't block
 			// `ui` startup.)
 			observability.SweepMetastores(workspace)
+			// Reap orphaned per-workspace metastore networks left by pre-shared-
+			// network clavesa versions (GH #42), so a machine that accumulated
+			// them self-heals instead of exhausting docker's address pool.
+			observability.SweepLegacyMetastoreNetworks()
 			warmQuery := observability.NewPersistentQueryRunner(workspace)
 			// Slice 4: SparkSQL-to-Trino/Athena transpile sidecar (lazily
 			// spawned, non-Spark sqlglot server) behind an on-disk cache.

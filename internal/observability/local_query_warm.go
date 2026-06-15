@@ -453,7 +453,7 @@ func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse strin
 		if addr, err := EnsureMetastore(ctx, p.workspaceRoot, p.metastoreWorkspaceName()); err != nil {
 			fmt.Fprintf(os.Stderr, "clavesa: warm worker falling back to embedded metastore (shared metastore unavailable): %v\n", err)
 		} else {
-			metastoreNetwork = metastoreNetworkName(p.workspaceRoot)
+			metastoreNetwork = metastoreNetworkName()
 			metastoreAddr = addr
 		}
 	}

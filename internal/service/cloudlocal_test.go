@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -108,10 +107,9 @@ func TestCloudLocalDockerArgs(t *testing.T) {
 		"CLAVESA_LOGIC_S3_PATH": "s3://bucket/demo/logic/trips.sql",
 	}
 	awsArgs := []string{"-e", "AWS_ACCESS_KEY_ID=AKIA", "-v", "/home/u/.aws:/root/.aws:ro"}
+	heapArgs := []string{"-e", "CLAVESA_JVM_HEAP_MB=8192"}
 
-	t.Setenv("CLAVESA_JVM_HEAP_MB", "8192")
-
-	args := cloudLocalDockerArgs("clavesa/ws/transform-runner:latest", env, perNode, awsArgs)
+	args := cloudLocalDockerArgs("clavesa/ws/transform-runner:latest", env, perNode, heapArgs, awsArgs)
 	joined := strings.Join(args, " ")
 
 	// CLAVESA_RUN=1 sentinel present.
@@ -142,7 +140,7 @@ func TestCloudLocalDockerArgs(t *testing.T) {
 			t.Errorf("missing per-node env %q; args=%v", want, args)
 		}
 	}
-	// JVM heap forwarded because it's set in the host env.
+	// JVM heap args threaded through verbatim.
 	if !contains(args, "CLAVESA_JVM_HEAP_MB=8192") {
 		t.Errorf("expected CLAVESA_JVM_HEAP_MB forwarded; args=%v", args)
 	}
@@ -169,21 +167,49 @@ func TestCloudLocalDockerArgs(t *testing.T) {
 	}
 }
 
-func TestCloudLocalDockerArgsHeapAbsentWhenUnset(t *testing.T) {
-	// With the heap env genuinely unset, no override arg is emitted. Use
-	// os.Unsetenv (t.Cleanup restores) since t.Setenv only ever *sets*.
-	prev, had := os.LookupEnv("CLAVESA_JVM_HEAP_MB")
-	_ = os.Unsetenv("CLAVESA_JVM_HEAP_MB")
-	t.Cleanup(func() {
-		if had {
-			_ = os.Setenv("CLAVESA_JVM_HEAP_MB", prev)
-		}
-	})
-	args := cloudLocalDockerArgs("img", map[string]string{}, map[string]string{}, nil)
+func TestCloudLocalDockerArgsHeapAbsentWhenNil(t *testing.T) {
+	// With nil heapArgs the pure assembler emits no heap flag — the caller
+	// passes nil when neither an explicit override nor a Docker-VM size is
+	// available.
+	args := cloudLocalDockerArgs("img", map[string]string{}, map[string]string{}, nil, nil)
 	for _, a := range args {
 		if strings.HasPrefix(a, "CLAVESA_JVM_HEAP_MB=") {
-			t.Errorf("did not expect a heap override arg when env unset; got %q", a)
+			t.Errorf("did not expect a heap arg with nil heapArgs; got %q", a)
 		}
+	}
+}
+
+func TestLocalHeapArgsExplicitOverride(t *testing.T) {
+	// An explicit CLAVESA_JVM_HEAP_MB is forwarded verbatim — it never gets
+	// recomputed from the Docker VM, and the value passes through unparsed.
+	t.Setenv("CLAVESA_JVM_HEAP_MB", "5000")
+	args := localHeapArgs(reserveSharedVMMB)
+	if len(args) != 2 || args[0] != "-e" || args[1] != "CLAVESA_JVM_HEAP_MB=5000" {
+		t.Errorf("expected explicit override forwarded verbatim, got %v", args)
+	}
+}
+
+func TestHeapFromVMTotalMB(t *testing.T) {
+	// 75% of (total - reserve), declining below the 1536 MB worthwhile floor
+	// and for an unknown/over-reserved total.
+	for _, tc := range []struct {
+		name      string
+		totalMB   int
+		reserveMB int
+		wantMB    int
+	}{
+		{name: "unknown total", totalMB: 0, reserveMB: reserveSharedVMMB, wantMB: 0},
+		{name: "reserve exceeds total", totalMB: 2048, reserveMB: reserveSharedVMMB, wantMB: 0},
+		{name: "below worthwhile floor", totalMB: 6000, reserveMB: reserveSharedVMMB, wantMB: 0}, // (6000-4608)*.75=1044 < 1536
+		{name: "7.6GB VM shared", totalMB: 7838, reserveMB: reserveSharedVMMB, wantMB: 2422},     // (7838-4608)*.75
+		{name: "7.6GB VM standalone", totalMB: 7838, reserveMB: reserveStandaloneMB, wantMB: 5302},
+		{name: "64GB host standalone", totalMB: 65536, reserveMB: reserveStandaloneMB, wantMB: 48576},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := heapFromVMTotalMB(tc.totalMB, tc.reserveMB); got != tc.wantMB {
+				t.Errorf("heapFromVMTotalMB(%d, %d) = %d, want %d", tc.totalMB, tc.reserveMB, got, tc.wantMB)
+			}
+		})
 	}
 }
 

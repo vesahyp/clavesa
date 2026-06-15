@@ -12,6 +12,13 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.11.1] — 2026-06-15
+
+### Fixed
+
+- Local runs no longer break once ~30 workspaces have been created (GH #42). The shared local metastore used a per-workspace docker network that was never reaped; each tempdir/throwaway workspace leaked one, and after they fully subnetted docker's address pool, `network create` failed, every local run silently fell back to embedded Derby, and the next run deadlocked on the Derby lock with an inscrutable `XSDB6` stack. All workspaces now share one `clavesa-net` network (per-workspace container names keep clients unambiguous), so nothing leaks. `clavesa ui` also reaps orphaned per-workspace networks from older versions on startup, so an already-affected machine self-heals.
+- Local docker runs (`pipeline run`, `pipeline run --compute local`, backfill stage/promote/discard, and the `_maintenance` OPTIMIZE/VACUUM) no longer throttle Spark to a 1 GB JVM heap on multi-GB hosts (GH #58). The runner's heap auto-sizer only fired for memory-capped or Lambda containers, never for the uncapped local-docker path, so every local run silently used the 1 GB fallback regardless of host RAM. Clavesa now sizes the heap from the Docker VM's available memory, which is exactly the big-backfill / cost-per-billion path where a 1 GB heap hurts most. The `--compute local` dispatcher (no co-resident metastore) gets a generous heap; local-warehouse runs reserve more, since under `clavesa ui` they share the VM with the metastore and a warm query-worker JVM. `CLAVESA_JVM_HEAP_MB` still overrides.
+
 ## [v2.11.0] — 2026-06-14
 
 ### Added

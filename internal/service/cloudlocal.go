@@ -68,7 +68,7 @@ func lambdaRunnerEnv(ctx context.Context, lc lambdaEnvGetter, functionName strin
 // the host-resolved AWS args appended last. There is intentionally NO -v
 // mount, NO metastore arg, NO local warehouse — the container reads the
 // cloud catalog + S3 directly.
-func cloudLocalDockerArgs(image string, env, perNodeEnv map[string]string, awsArgs []string) []string {
+func cloudLocalDockerArgs(image string, env, perNodeEnv map[string]string, heapArgs, awsArgs []string) []string {
 	args := []string{"run", "--rm", "-i"}
 	args = append(args, "-e", "CLAVESA_RUN=1")
 
@@ -107,12 +107,11 @@ func cloudLocalDockerArgs(image string, env, perNodeEnv map[string]string, awsAr
 		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
 	}
 
-	// Heap override: the uncapped local container falls back to a 1 GB
-	// Spark driver heap; big historical windows are the whole point of
-	// running locally, so forward CLAVESA_JVM_HEAP_MB when the user set it.
-	if v, ok := os.LookupEnv("CLAVESA_JVM_HEAP_MB"); ok {
-		args = append(args, "-e", "CLAVESA_JVM_HEAP_MB="+v)
-	}
+	// Heap sizing: the uncapped local container otherwise falls back to a
+	// 1 GB Spark driver heap, and big historical windows are the whole point
+	// of running locally (GH #58). The caller resolves an explicit
+	// CLAVESA_JVM_HEAP_MB or a Docker-VM-derived size into heapArgs.
+	args = append(args, heapArgs...)
 
 	// Host-resolved AWS credentials + ~/.aws mount — the container reads
 	// the cloud catalog and S3 through these.
@@ -168,7 +167,9 @@ func (s *Service) runCloudLocalEvent(ctx context.Context, env, perNodeEnv map[st
 		return nil, fmt.Errorf("marshal event: %w", err)
 	}
 
-	args := cloudLocalDockerArgs(image, env, perNodeEnv, runner.AWSEnvDockerArgs(ctx))
+	// No co-resident metastore on this path — the container reads the cloud
+	// catalog directly — so reserve only OS/daemon slack.
+	args := cloudLocalDockerArgs(image, env, perNodeEnv, localHeapArgs(reserveStandaloneMB), runner.AWSEnvDockerArgs(ctx))
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(body)
 	stdoutPipe, err := cmd.StdoutPipe()
