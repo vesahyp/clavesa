@@ -12,6 +12,16 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.12.0] — 2026-06-30
+
+### Added
+
+- `bound_by` output-definition attribute (`node ... --output-bound-by`): for a merge output whose merge key is uncorrelated with the table's clustering (e.g. a random request-id key on a date-clustered fact), name the clustering column(s) that are functionally determined by the merge keys and the runner bounds the MERGE scan on them too (GH #62). On the web-traffic facts, `bound_by = ["event_date"]` cuts the nightly scan ~68× and holds flat as the fact grows. A per-batch tripwire fails the run if a merge key maps to more than one value of a `bound_by` column.
+
+### Changed
+
+- Merge-mode outputs now bound the MERGE target scan to the batch's key range when a merge key is also a clustering column, so an incremental merge reads only the touched files instead of full-scanning the whole table every run (GH #62). Automatic, no config, and provably semantics-preserving; the win grows with table size. Delta does no dynamic file pruning on the merge join condition itself, so `merge_keys` alone never bounded the scan before.
+
 ## [v2.11.1] — 2026-06-15
 
 ### Fixed

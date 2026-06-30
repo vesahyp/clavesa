@@ -1552,8 +1552,109 @@ def _merge_set_clause(source_cols: list[str], merge_keys: list[str], merge_updat
     return ", ".join(parts)
 
 
+_MERGE_BOUND_IN_THRESHOLD = 200
+
+
+def _sql_lit(v):
+    """Render a Python value as a Spark-SQL literal, or None if the type is
+    one we won't safely render (caller then skips bounding on that column).
+
+    Pure: stdlib + the passed-in value only, no Spark."""
+    import decimal  # noqa: PLC0415
+    import math  # noqa: PLC0415
+
+    if v is None:
+        return None
+    # bool BEFORE int (bool is an int subclass).
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    # datetime BEFORE date (datetime is a date subclass).
+    if isinstance(v, _dt.datetime):
+        return "TIMESTAMP '" + v.isoformat(sep=" ") + "'"
+    if isinstance(v, _dt.date):
+        return "DATE '" + v.isoformat() + "'"
+    if isinstance(v, str):
+        return "'" + v.replace("'", "''") + "'"
+    if isinstance(v, float):
+        return repr(v) if math.isfinite(v) else None
+    if isinstance(v, decimal.Decimal):
+        return str(v)
+    return None
+
+
+def _bound_predicate_sql(col, values, *, threshold=_MERGE_BOUND_IN_THRESHOLD, force_between=False):
+    """Build a static target-only scan-bound predicate for one column from the
+    distinct NON-NULL source values already collected to the driver.
+
+    - Drop any value whose _sql_lit() is None.
+    - If no renderable values remain -> return None (skip; never emit IN ()).
+    - If force_between is False and renderable count <= threshold ->
+      "target.`col` IN (lit, lit, ...)".
+    - Else -> "target.`col` BETWEEN <min-lit> AND <max-lit>" using min()/max()
+      over the RENDERABLE python values (compare values, not strings). If
+      min/max can't be computed (mixed/untypeable) -> None.
+
+    `force_between` lets the caller pass the table-batch's TRUE (min, max) when
+    the collected sample was truncated, so the BETWEEN bound is not derived
+    from a partial sample. Pure: stdlib + values only, no Spark."""
+    lits = []
+    renderable = []
+    for v in values:
+        lit = _sql_lit(v)
+        if lit is None:
+            continue
+        lits.append(lit)
+        renderable.append(v)
+    if not lits:
+        return None
+    quoted = "`" + col + "`"
+    if not force_between and len(lits) <= threshold:
+        return f"target.{quoted} IN (" + ", ".join(lits) + ")"
+    try:
+        mn = min(renderable)
+        mx = max(renderable)
+    except TypeError:
+        return None
+    mn_lit = _sql_lit(mn)
+    mx_lit = _sql_lit(mx)
+    if mn_lit is None or mx_lit is None:
+        return None
+    return f"target.{quoted} BETWEEN {mn_lit} AND {mx_lit}"
+
+
+def _merge_bound_cols(merge_keys, cluster_by, bound_by=None):
+    """Columns to apply the static MERGE scan-bound on.
+
+    Tier 1: merge_keys that are also skipping columns. For a merge output the
+    effective clustering is `cluster_by or merge_keys` (the runner clusters a
+    merge table by its merge_keys when cluster_by is unset — see the write
+    loop's `cluster_cols`).
+
+    Tier 2: every column in `bound_by` is appended unconditionally (even if it
+    isn't in cluster_by) — it's the author's explicit assertion that the column
+    is functionally determined by the merge keys. If it isn't actually a
+    clustering/skipping column it just won't prune (still safe).
+
+    Tier-1 columns come first (in merge_keys order), then the extra bound_by
+    columns (in declared order). De-dup; preserve order. Pure: no Spark."""
+    skipping = set(cluster_by) if cluster_by else set(merge_keys)
+    seen = set()
+    out = []
+    for k in merge_keys:
+        if k in skipping and k not in seen:
+            seen.add(k)
+            out.append(k)
+    for b in bound_by or []:
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
+
+
 def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dict[str, Any]:
-    """Returns {kind: "path"|"delta_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...], merge_update: {...}, cluster_by: [...]}.
+    """Returns {kind: "path"|"delta_table", target: str, mode: "replace"|"append"|"merge", merge_keys: [...], merge_update: {...}, cluster_by: [...], bound_by: [...]}.
 
     String forms map to the existing semantics:
       "" or "<id>" → delta_table, mode=replace
@@ -1589,6 +1690,7 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
         target = _table_id_for(key, all_outputs)
     stats = bool(dest.get("stats"))
     cluster_by = list(dest.get("cluster_by") or [])
+    bound_by = list(dest.get("bound_by") or [])
     merge_update = dict(dest.get("merge_update") or {})
     return {
         "kind": kind,
@@ -1598,6 +1700,7 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
         "merge_update": merge_update,
         "stats": stats,
         "cluster_by": cluster_by,
+        "bound_by": bound_by,
     }
 
 
@@ -2329,6 +2432,71 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                     on_clause = " AND ".join(
                         f"target.`{col}` = source.`{col}`" for col in spec["merge_keys"]
                     )
+                    # Tier 1 scan-bound: for every merge_key that is also a
+                    # skipping/clustering column, inject a static target-only
+                    # literal predicate so Delta data-skipping prunes the MERGE
+                    # target scan. Provably semantics-free: any matching target
+                    # row already satisfies these bounds. (GH #62)
+                    from pyspark.sql import functions as F  # noqa: PLC0415
+
+                    bound_cols = _merge_bound_cols(
+                        spec["merge_keys"], spec.get("cluster_by") or [], spec.get("bound_by")
+                    )
+                    bound_preds = []
+                    for bc in bound_cols:
+                        vals = [
+                            r[0]
+                            for r in df.select(bc)
+                            .where(F.col(bc).isNotNull())
+                            .distinct()
+                            .limit(_MERGE_BOUND_IN_THRESHOLD + 1)
+                            .collect()
+                        ]
+                        if len(vals) > _MERGE_BOUND_IN_THRESHOLD:
+                            # Sample was truncated; the limited min/max is NOT
+                            # the true table-batch min/max. Recompute the true
+                            # bounds for the BETWEEN predicate.
+                            mn, mx = df.agg(F.min(bc), F.max(bc)).first()
+                            p = _bound_predicate_sql(bc, [mn, mx], force_between=True)
+                        else:
+                            p = _bound_predicate_sql(bc, vals)
+                        if p:
+                            bound_preds.append(p)
+                    if bound_preds:
+                        on_clause = "(" + on_clause + ") AND " + " AND ".join(bound_preds)
+                        print(
+                            f"[clavesa] output {key!r}: MERGE scan bounded on {bound_cols}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    # Tier 2 determinism tripwire (GH #62): when the author
+                    # opts into bound_by, verify within THIS staging batch that
+                    # the merge keys functionally determine the bound_by columns.
+                    # A key tuple mapping to >1 distinct bound_by tuple proves
+                    # bound_by is NOT determined by the keys, so the static bound
+                    # could drop a real match and silently duplicate. This is a
+                    # tripwire over the small staging batch, not a proof: it
+                    # cannot catch the insert-only case where each key appears
+                    # exactly once in the batch yet collides with a differently-
+                    # valued historical row in the target.
+                    bb = spec.get("bound_by") or []
+                    if bb:
+                        offenders = (
+                            df.select(*spec["merge_keys"], *bb)
+                            .distinct()
+                            .groupBy(*spec["merge_keys"])
+                            .count()
+                            .where(F.col("count") > 1)
+                            .limit(1)
+                            .count()
+                        )
+                        if offenders:
+                            raise RuntimeError(
+                                f"output {key!r}: bound_by={bb} is not functionally determined by "
+                                f"merge_keys={spec['merge_keys']} in this batch — refusing to bound "
+                                f"the MERGE scan (would risk silent duplicates). Remove bound_by or "
+                                f"fix the merge keys."
+                            )
                     if spec["merge_update"]:
                         set_clause = _merge_set_clause(
                             df.schema.fieldNames(), spec["merge_keys"], spec["merge_update"]

@@ -336,6 +336,30 @@ module "silver" {
 	}
 }
 
+// TestSyncOrchestrationEmitsBoundBy covers the bound_by output attribute:
+// a merge output declaring bound_by must surface it in the emitted
+// outputs map literal (parallel to cluster_by) so the runner reads it
+// from orchestration.tf on cloud runs.
+func TestSyncOrchestrationEmitsBoundBy(t *testing.T) {
+	t.Parallel()
+	ws := xpipeWorkspace(t)
+	writePipelineMain(t, ws, "silver", `module "dim" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "dim"
+  sql    = "SELECT 1 AS customer_id, current_date AS event_date"
+  output_definitions = { default = { mode = "merge", merge_keys = ["customer_id"], bound_by = ["event_date"] } }
+}
+`)
+	svc := New(ws)
+	if err := svc.SyncOrchestration("silver", ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	s := mustRead(t, filepath.Join(ws, "silver", "orchestration.tf"))
+	if !strings.Contains(s, `bound_by = ["event_date"]`) {
+		t.Errorf("orchestration.tf missing bound_by attr:\n%s", s)
+	}
+}
+
 // cdfDescriptor extracts the single delta_table_cdf input descriptor from
 // an emitted orchestration.tf body — everything from `kind =
 // "delta_table_cdf"` up to its closing brace. Lets a test assert on the

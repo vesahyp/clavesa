@@ -217,6 +217,23 @@ variable "output_definitions" {
       surface on the Catalog table-detail page. Default false; cost is
       one extra aggregation pass + a per-low-cardinality-column group-by
       per run, paid only by transforms that opted in.
+    bound_by lists columns the runner uses to bound a merge-mode output's
+      target scan. For each batch the runner derives a static
+      target.<col> IN (...) / BETWEEN predicate from the batch values and
+      injects it into the MERGE condition, so Delta data-skipping prunes the
+      target file scan instead of full-scanning the table every run. Use it
+      when the merge key is uncorrelated with the table's clustering (e.g. a
+      random request-id key on a date-clustered fact): name the clustering
+      column(s) here. Each bound_by column MUST be functionally determined by
+      merge_keys: every re-emission of a given merge key must carry the same
+      value of this column. Otherwise a re-emitted row could be inserted as a
+      duplicate. The runner enforces this with a per-batch tripwire and fails
+      the run if a merge key maps to more than one value of a bound_by column.
+      Effective only on merge-mode outputs, and only prunes when the column is
+      among the table's clustering/skipping columns, so list it in cluster_by
+      too (or rely on a merge output's default clustering). Merge keys are
+      themselves clustering columns and are bounded automatically; bound_by is
+      only needed for the non-key clustered columns.
   EOT
   type = map(object({
     schema = optional(object({

@@ -586,7 +586,7 @@ def test_resolve_output_dict_append():
     os.environ["CLAVESA_SCHEMA"] = "p"
 
     s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "", "mode": "append"})
-    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False, "merge_update": {}, "cluster_by": []}
+    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False, "merge_update": {}, "cluster_by": [], "bound_by": []}
 
     # stats opt-in flows through to the resolved spec — the call site
     # only reads spec["stats"], so propagation is the whole test.

@@ -209,6 +209,7 @@ func newNodeEditCmd() *cobra.Command {
 	var outputMode string
 	var outputMergeKeys []string
 	var outputClusterBy []string
+	var outputBoundBy []string
 	var outputMergeUpdate map[string]string
 	var outputStats bool
 	var addOutputs []string
@@ -264,11 +265,12 @@ Examples:
 			modeChanged := cmd.Flags().Changed("output-mode")
 			keysChanged := cmd.Flags().Changed("output-merge-keys")
 			clusterChanged := cmd.Flags().Changed("output-cluster-by")
+			boundChanged := cmd.Flags().Changed("output-bound-by")
 			mergeUpdateChanged := cmd.Flags().Changed("output-merge-update")
 			statsChanged := cmd.Flags().Changed("output-stats")
 			outputsChanged := len(addOutputs) > 0 || len(removeOutputs) > 0
 			incrementalsChanged := len(addIncrementalInputs) > 0 || len(removeIncrementalInputs) > 0
-			if len(sets) == 0 && !modeChanged && !keysChanged && !clusterChanged && !mergeUpdateChanged && !statsChanged && !outputsChanged && !incrementalsChanged {
+			if len(sets) == 0 && !modeChanged && !keysChanged && !clusterChanged && !boundChanged && !mergeUpdateChanged && !statsChanged && !outputsChanged && !incrementalsChanged {
 				g, err := svc.GetPipeline(dir)
 				if err != nil {
 					return fmt.Errorf("get pipeline: %w", err)
@@ -310,6 +312,13 @@ Examples:
 							}
 							parts = append(parts, "cluster_by="+joinComma(ks))
 						}
+						if bk, ok := def["bound_by"].([]interface{}); ok && len(bk) > 0 {
+							ks := make([]string, len(bk))
+							for i, v := range bk {
+								ks[i] = fmt.Sprint(v)
+							}
+							parts = append(parts, "bound_by="+joinComma(ks))
+						}
 						if mu, ok := def["merge_update"].(map[string]interface{}); ok && len(mu) > 0 {
 							cols := make([]string, 0, len(mu))
 							for col := range mu {
@@ -331,7 +340,7 @@ Examples:
 				return nil
 			}
 			attrs := map[string]interface{}(sets)
-			if modeChanged || keysChanged || clusterChanged || mergeUpdateChanged || statsChanged || outputsChanged {
+			if modeChanged || keysChanged || clusterChanged || boundChanged || mergeUpdateChanged || statsChanged || outputsChanged {
 				g, err := svc.GetPipeline(dir)
 				if err != nil {
 					return fmt.Errorf("get pipeline: %w", err)
@@ -341,7 +350,7 @@ Examples:
 					return fmt.Errorf("node %q not found in %s", nodeID, displayDir(ws, dir))
 				}
 				existing, _ := n.Config["output_definitions"].(map[string]interface{})
-				updated := updateOutputDefault(existing, modeChanged, outputMode, keysChanged, outputMergeKeys, clusterChanged, outputClusterBy, mergeUpdateChanged, outputMergeUpdate)
+				updated := updateOutputDefault(existing, modeChanged, outputMode, keysChanged, outputMergeKeys, clusterChanged, outputClusterBy, boundChanged, outputBoundBy, mergeUpdateChanged, outputMergeUpdate)
 				for _, key := range removeOutputs {
 					if key == "default" {
 						return fmt.Errorf("cannot remove the 'default' output (every transform has one)")
@@ -431,6 +440,7 @@ Examples:
 	cmd.Flags().StringVar(&outputMode, "output-mode", "", `default-output mode: "replace" (default; full overwrite), "append", or "merge"`)
 	cmd.Flags().StringSliceVar(&outputMergeKeys, "output-merge-keys", nil, `comma-separated columns forming the natural key; sets mode=merge implicitly`)
 	cmd.Flags().StringSliceVar(&outputClusterBy, "output-cluster-by", nil, `comma-separated columns to liquid-cluster the output Delta table on (replace/append outputs); does not change mode. Pass with no value to clear`)
+	cmd.Flags().StringSliceVar(&outputBoundBy, "output-bound-by", nil, `comma-separated columns to statically bound a merge output's target scan on (must be functionally determined by merge_keys); pass with no value to clear`)
 	cmd.Flags().StringToStringVar(&outputMergeUpdate, "output-merge-update", nil, `col=spec pairs giving per-column merge expressions for mode=merge outputs (e.g. event_count=additive,last_seen=max). Spec is a keyword (additive, min, max, sketch) or a raw SparkSQL expression. Does not change mode. Pass with no value to clear`)
 	cmd.Flags().BoolVar(&outputStats, "output-stats", false, `opt this transform's outputs into per-column stats (null %, distinct, top-K, percentiles); pass --output-stats=false to turn off`)
 	cmd.Flags().StringSliceVar(&addOutputs, "add-output", nil, "declare an additional output key on a multi-output transform (repeatable). Seeded with mode=replace; tune via direct .tf edit")
@@ -463,12 +473,14 @@ func validateOutputKey(key string) error {
 }
 
 // updateOutputDefault returns a new output_definitions map with the "default"
-// entry's mode + merge_keys + cluster_by + merge_update updated. Other outputs
-// (rare; multi-output transforms) are preserved as-is. Passing an empty
-// mode/keys/cluster/merge_update clears the field. Unlike merge_keys, setting
-// cluster_by or merge_update does not flip mode; cluster_by records the
-// liquid-clustering columns, merge_update records per-column merge expressions.
-func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode string, keysChanged bool, keys []string, clusterChanged bool, clusterKeys []string, mergeUpdateChanged bool, mergeUpdate map[string]string) map[string]interface{} {
+// entry's mode + merge_keys + cluster_by + bound_by + merge_update updated.
+// Other outputs (rare; multi-output transforms) are preserved as-is. Passing
+// an empty mode/keys/cluster/bound/merge_update clears the field. Unlike
+// merge_keys, setting cluster_by, bound_by, or merge_update does not flip
+// mode; cluster_by records the liquid-clustering columns, bound_by records
+// the static merge-scan bound columns, merge_update records per-column merge
+// expressions.
+func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode string, keysChanged bool, keys []string, clusterChanged bool, clusterKeys []string, boundChanged bool, boundKeys []string, mergeUpdateChanged bool, mergeUpdate map[string]string) map[string]interface{} {
 	out := map[string]interface{}{}
 	for k, v := range existing {
 		out[k] = v
@@ -524,6 +536,17 @@ func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode
 				items[i] = k
 			}
 			def["cluster_by"] = items
+		}
+	}
+	if boundChanged {
+		if len(boundKeys) == 0 {
+			delete(def, "bound_by")
+		} else {
+			items := make([]interface{}, len(boundKeys))
+			for i, k := range boundKeys {
+				items[i] = k
+			}
+			def["bound_by"] = items
 		}
 	}
 	if mergeUpdateChanged {

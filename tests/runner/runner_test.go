@@ -864,3 +864,132 @@ print("RESULT_LINE:" + json.dumps({"r1": r1.get("status"), "opt": opt.get("statu
 		t.Errorf("after[B]: want 1, got %v (full: %v)", got, after)
 	}
 }
+
+// TestRunner_MergeBoundBy proves the GH #62 `bound_by` MERGE scan-bound feature
+// on the real Delta MERGE path, covering both sides of the determinism tripwire:
+//
+//   - Happy path: an `bound_by = ["d"]` merge output where the merge_keys
+//     functionally determine `d` within each staging batch. The bound predicate
+//     prunes the target scan, the MERGE applies, and the result is correct with
+//     no duplicates.
+//   - Raise path: a full-snapshot (non-CDF) input where the SAME merge key carries
+//     two distinct `d` values in one staging batch. bound_by is then NOT
+//     functionally determined by the keys, so the static bound could drop a real
+//     match and silently duplicate — the runner's tripwire raises and handler()
+//     re-raises, failing the run with a clear message instead of corrupting data.
+//
+// The raise path deliberately uses a plain bare-string input (`spark.table` full
+// re-read) rather than `delta_table_cdf`: the CDF read dedups to one change row
+// per key, which would make the per-batch tripwire vacuous. `_resolve_input` has
+// no `delta_table` descriptor kind, so the string form is the un-deduped
+// full-snapshot read available to the test.
+func TestRunner_MergeBoundBy(t *testing.T) {
+	script := `
+import json, os, sys, datetime
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_WAREHOUSE"] = "/work/wh"
+os.environ["CLAVESA_WATERMARKS"] = "/work/wm"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_CATALOG"] = "itest_cat"
+os.environ["CLAVESA_SCHEMA"] = "itest"
+os.environ["CLAVESA_PIPELINE"] = "itest"
+os.environ["CLAVESA_NODE"] = "itest"
+os.makedirs("/work/wm", exist_ok=True)
+
+from runner import _spark, handler
+from pyspark.sql.types import StructType, StructField, StringType, DateType, LongType
+
+spark = _spark()
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
+
+d1 = datetime.date(2026, 1, 1)
+d2 = datetime.date(2026, 1, 2)
+
+# Explicit schema so 'd' is a real DateType column (DATE literals in the bound
+# predicate / tripwire) and 'v' a LongType.
+schema = StructType([
+    StructField("k", StringType(), True),
+    StructField("d", DateType(), True),
+    StructField("v", LongType(), True),
+])
+
+# ---------- Happy path: CDF input, bound_by functionally determined ----------
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT k, d, v FROM src")
+
+event = {
+    "inputs": {"src": {"kind": "delta_table_cdf", "table": "itest.src"}},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.fct",
+        "mode": "merge", "merge_keys": ["k"], "cluster_by": ["d"], "bound_by": ["d"]}},
+}
+
+# Batch 1: first incremental run reads the full snapshot and CREATES itest.fct
+# (MERGE has nothing to match against on the create run, so the tripwire is not
+# yet exercised here).
+spark.createDataFrame([("A", d1, 1), ("B", d1, 1)], schema).write.format("delta").mode("append").saveAsTable("itest.src")
+r1 = handler(event, None)
+
+# Batch 2: one new commit (key C, d2). The CDF read returns only the new row;
+# each key maps to exactly one d, so bound_by passes and the MERGE inserts C.
+spark.createDataFrame([("C", d2, 1)], schema).write.format("delta").mode("append").saveAsTable("itest.src")
+r2 = handler(event, None)
+
+cnt = spark.table("itest.fct").count()
+dups = spark.sql("SELECT k FROM itest.fct GROUP BY k HAVING count(*) > 1").count()
+
+# ---------- Raise path: full-snapshot input, bound_by NOT determined ----------
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT k, d, v FROM src2")
+
+# Bare-string input -> spark.table() full re-read each run (no watermark, no
+# CDF dedup), so the staging batch keeps every row for a key.
+ev2 = {
+    "inputs": {"src2": "itest.src2"},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.fct2",
+        "mode": "merge", "merge_keys": ["k"], "cluster_by": ["d"], "bound_by": ["d"]}},
+}
+
+# First run: one clean row per key -> creates itest.fct2, skips MERGE.
+spark.createDataFrame([("A", d1, 1)], schema).write.format("delta").mode("append").saveAsTable("itest.src2")
+handler(ev2, None)
+
+# Now the SAME key A carries two distinct d values in the full snapshot. The
+# second run goes through MERGE; the determinism tripwire fires and handler()
+# re-raises after recording the failure.
+spark.createDataFrame([("A", d2, 2)], schema).write.format("delta").mode("append").saveAsTable("itest.src2")
+try:
+    handler(ev2, None)
+    raised = False
+    msg = ""
+except Exception as e:
+    raised = True
+    msg = str(e)
+
+print("RESULT_LINE:" + json.dumps({
+    "r1": r1.get("status"), "r2": r2.get("status"),
+    "cnt": cnt, "dups": dups,
+    "raised": raised, "msg_ok": ("not functionally determined" in msg),
+}))
+`
+	r := runRawDriver(t, script)
+
+	// Happy path: both runs ok, 3 rows total, no duplicate keys.
+	if r["r1"] != "ok" || r["r2"] != "ok" {
+		t.Fatalf("happy-path handler status: r1=%v r2=%v (want ok/ok)", r["r1"], r["r2"])
+	}
+	if got, _ := r["cnt"].(float64); got != 3 {
+		t.Errorf("itest.fct row count: want 3, got %v", r["cnt"])
+	}
+	if got, _ := r["dups"].(float64); got != 0 {
+		t.Errorf("itest.fct duplicate keys: want 0, got %v", r["dups"])
+	}
+
+	// Raise path: tripwire must fire with the expected message.
+	if raised, _ := r["raised"].(bool); !raised {
+		t.Errorf("raise-path: expected handler to raise on non-determined bound_by, but it did not (raised=%v)", r["raised"])
+	}
+	if msgOK, _ := r["msg_ok"].(bool); !msgOK {
+		t.Errorf("raise-path: tripwire message missing %q substring (msg_ok=%v)", "not functionally determined", r["msg_ok"])
+	}
+}

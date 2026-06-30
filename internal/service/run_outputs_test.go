@@ -65,6 +65,33 @@ func TestBuildLocalOutputsExplicitModeWins(t *testing.T) {
 	}
 }
 
+// TestBuildLocalOutputsBoundBy covers the bound_by passthrough: a
+// merge output declaring bound_by must surface it on the runner-event
+// descriptor (parallel to cluster_by), so the runner can statically
+// bound the merge target scan.
+func TestBuildLocalOutputsBoundBy(t *testing.T) {
+	node := &graph.Node{
+		ID:   "dim_customers",
+		Type: "transform",
+		Config: map[string]interface{}{
+			"output_definitions": map[string]interface{}{
+				"default": map[string]interface{}{
+					"merge_keys": []interface{}{"customer_id"},
+					"bound_by":   []interface{}{"event_date"},
+				},
+			},
+		},
+	}
+	out := buildLocalOutputs(node, "demo.dim_customers__default")
+	def, ok := out["default"].(map[string]any)
+	if !ok {
+		t.Fatalf("default output not a dict: %T", out["default"])
+	}
+	if !reflect.DeepEqual(def["bound_by"], []string{"event_date"}) {
+		t.Errorf("bound_by = %v, want [event_date]", def["bound_by"])
+	}
+}
+
 // TestBuildLocalOutputsBareReplace keeps the legacy fast path: bare
 // "default" entry with no merge_keys + no explicit mode stays as the
 // raw target string the runner reads as auto-Iceberg replace.

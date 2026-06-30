@@ -480,6 +480,7 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		outputMode(nodeByID[id], "default") == "replace" &&
 		len(outputMergeKeys(nodeByID[id], "default")) == 0 &&
 		len(outputClusterBy(nodeByID[id], "default")) == 0 &&
+		len(outputBoundBy(nodeByID[id], "default")) == 0 &&
 		len(outputMergeUpdate(nodeByID[id], "default")) == 0 &&
 		!outputStats(nodeByID[id], "default") {
 		return fmt.Sprintf(`{ default = %s }`, defaultDest)
@@ -493,9 +494,10 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		mode := outputMode(nodeByID[id], key)
 		mergeKeys := outputMergeKeys(nodeByID[id], key)
 		clusterBy := outputClusterBy(nodeByID[id], key)
+		boundBy := outputBoundBy(nodeByID[id], key)
 		mergeUpdate := outputMergeUpdate(nodeByID[id], key)
 		stats := outputStats(nodeByID[id], key)
-		if mode == "replace" && len(mergeKeys) == 0 && len(clusterBy) == 0 && len(mergeUpdate) == 0 && !stats {
+		if mode == "replace" && len(mergeKeys) == 0 && len(clusterBy) == 0 && len(boundBy) == 0 && len(mergeUpdate) == 0 && !stats {
 			entries = append(entries, fmt.Sprintf("%s = %s", key, dest))
 			continue
 		}
@@ -507,13 +509,17 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		if len(clusterBy) > 0 {
 			clusterAttr = fmt.Sprintf(", cluster_by = [%s]", quoteList(clusterBy))
 		}
+		boundAttr := ""
+		if len(boundBy) > 0 {
+			boundAttr = fmt.Sprintf(", bound_by = [%s]", quoteList(boundBy))
+		}
 		mergeUpdateAttr := ""
 		if len(mergeUpdate) > 0 {
 			mergeUpdateAttr = fmt.Sprintf(", merge_update = { %s }", joinMergeUpdate(mergeUpdate))
 		}
 		entries = append(entries, fmt.Sprintf(
-			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s%s%s }`,
-			key, dest, mode, quoteList(mergeKeys), clusterAttr, statsAttr, mergeUpdateAttr))
+			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s%s%s%s }`,
+			key, dest, mode, quoteList(mergeKeys), clusterAttr, boundAttr, statsAttr, mergeUpdateAttr))
 	}
 	return "{ " + strings.Join(entries, ", ") + " }"
 }
@@ -803,6 +809,30 @@ func outputClusterBy(n graph.Node, key string) []string {
 		return nil
 	}
 	raw, ok := def["cluster_by"].([]interface{})
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			keys = append(keys, s)
+		}
+	}
+	return keys
+}
+
+// outputBoundBy returns the bound_by list configured for an output, in
+// declared order. Empty when unset.
+func outputBoundBy(n graph.Node, key string) []string {
+	defs, ok := n.Config["output_definitions"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	def, ok := defs[key].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	raw, ok := def["bound_by"].([]interface{})
 	if !ok {
 		return nil
 	}
