@@ -784,13 +784,14 @@ export type TablesResult = z.infer<typeof TablesResult>;
  */
 export function useTablesState(
   pipeline: string,
-  opts: { dir?: string; limit?: number } = {},
+  opts: { dir?: string; limit?: number; enabled?: boolean } = {},
 ) {
   const limit = opts.limit ?? 50;
   const dir = opts.dir ?? "";
+  const enabled = (opts.enabled ?? true) && Boolean(pipeline);
   return useQuery({
     queryKey: ["tables-state", pipeline, dir, limit],
-    enabled: Boolean(pipeline),
+    enabled,
     retry: false,
     staleTime: 30_000,
     queryFn: async () => {

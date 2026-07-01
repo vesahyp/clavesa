@@ -183,6 +183,153 @@ func ReadCurrent(logFS fs.FS) (*Schema, []Commit, error) {
 	return schema, commits, nil
 }
 
+// FileStats is the live-data-file summary of a Delta table at its latest
+// version — the count of active files and their total byte size. "Active"
+// follows the Delta protocol: a file is live once it has been `add`ed and
+// stays live until a matching `remove` retires it. This is the local
+// fast-path source for the per-table file-count / average-file-size
+// observability the cloud side reads out of the workspace `tables` system
+// table (GH #26), and it closes the local–cloud parity gap where the local
+// reader used to leave those metrics nil (ADR-014).
+type FileStats struct {
+	// FileCount is the number of live data files at the latest version.
+	FileCount int64
+	// TotalBytes is the sum of `add.size` over those live files.
+	TotalBytes int64
+}
+
+// ReadFileStats enumerates the live data files at a Delta table's latest
+// version and returns their count and total byte size. `logFS` must be
+// rooted at the `_delta_log` directory (NOT the table root), the same
+// contract ReadSchema / ReadCurrent honor. Returns ErrNotDelta when the
+// listing holds no commit files and no checkpoint.
+//
+// The live set is computed per the Delta protocol — every `add`ed file
+// minus every `remove`d file, resolved at the latest version:
+//
+//   - When a checkpoint exists at version CV, its parquet snapshots the
+//     live add-set at CV; we seed the live map from the checkpoint's `add`
+//     rows (and apply any `remove` rows it carries), then replay only the
+//     JSON commits with version > CV in ascending order. On a long-lived
+//     table this reads a handful of files instead of every commit back to
+//     version 0 — the same short-cut resolveSchema takes.
+//   - Absent a checkpoint, we replay every JSON commit from version 0
+//     ascending, applying each `add` / `remove` in turn.
+//
+// The map is keyed by the file path string (`add.path` / `remove.path`);
+// `add.size` carries the byte size Delta records for each file. A
+// malformed commit surfaces as an error rather than a silent skip,
+// matching ReadCurrent's contract — a swallowed parse error would let a
+// file-accounting regression ship green.
+func ReadFileStats(logFS fs.FS) (*FileStats, error) {
+	idx, err := listLog(logFS)
+	if err != nil {
+		return nil, err
+	}
+	if len(idx.versions) == 0 && !idx.hasCheckpoint() {
+		return nil, ErrNotDelta
+	}
+
+	// live maps a data-file path to its byte size. A checkpoint seeds it;
+	// post-checkpoint (or all, when there's no checkpoint) JSON commits
+	// mutate it.
+	live := make(map[string]int64)
+	var startAfter int64 = -1 // replay commits strictly greater than this
+	if cv, parts, ok := idx.latestCheckpoint(); ok {
+		if err := applyCheckpointFiles(logFS, parts, live); err != nil {
+			return nil, err
+		}
+		startAfter = cv
+	}
+
+	// idx.versions is ascending; replay every commit past the checkpoint.
+	for _, v := range idx.versions {
+		if v <= startAfter {
+			continue
+		}
+		actions, err := readCommitActions(logFS, idx.versionToFile[v])
+		if err != nil {
+			return nil, fmt.Errorf("read commit %d: %w", v, err)
+		}
+		for _, a := range actions {
+			if a.Add != nil && a.Add.Path != "" {
+				live[a.Add.Path] = a.Add.Size
+			}
+			if a.Remove != nil && a.Remove.Path != "" {
+				delete(live, a.Remove.Path)
+			}
+		}
+	}
+
+	stats := &FileStats{}
+	for _, size := range live {
+		stats.FileCount++
+		stats.TotalBytes += size
+	}
+	return stats, nil
+}
+
+// applyCheckpointFiles seeds live with the checkpoint's file view — its
+// `add` rows become live entries (path → size) and any `remove` rows it
+// carries retire the matching path. It projects to only the `add.path`,
+// `add.size`, and `remove.path` leaf columns so a checkpoint dominated by
+// live-file rows still reads cheaply, and it deliberately uses a separate
+// projection struct from schemaFromCheckpoint's checkpointRow so the
+// schema-only readers stay untouched and never decode file columns.
+func applyCheckpointFiles(logFS fs.FS, partFiles []string, live map[string]int64) error {
+	for _, name := range partFiles {
+		data, err := fs.ReadFile(logFS, name)
+		if err != nil {
+			return fmt.Errorf("read checkpoint part %s: %w", name, err)
+		}
+		pf, err := parquetgo.OpenFile(newBytesReaderAt(data), int64(len(data)))
+		if err != nil {
+			return fmt.Errorf("open checkpoint part %s: %w", name, err)
+		}
+		reader := parquetgo.NewGenericReader[checkpointFileRow](pf)
+		buf := make([]checkpointFileRow, 64)
+		for {
+			n, readErr := reader.Read(buf)
+			for i := 0; i < n; i++ {
+				r := buf[i]
+				if r.Add != nil && r.Add.Path != "" {
+					live[r.Add.Path] = r.Add.Size
+				}
+				if r.Remove != nil && r.Remove.Path != "" {
+					delete(live, r.Remove.Path)
+				}
+			}
+			if readErr == io.EOF || n == 0 {
+				break
+			}
+			if readErr != nil {
+				reader.Close()
+				return fmt.Errorf("read checkpoint part %s: %w", name, readErr)
+			}
+		}
+		reader.Close()
+	}
+	return nil
+}
+
+// checkpointFileRow is the file-accounting projection over a Delta
+// checkpoint parquet — the `add` {path, size} and `remove` {path} leaf
+// columns. It is intentionally separate from checkpointRow (which projects
+// only `metaData.schemaString`) so the cheap schema-only readers never pull
+// the bulky file columns and this reader never pulls the schema string.
+// Add and Remove are pointers so a row that populates neither group (a
+// protocol / metaData / txn row) deserializes to nil rather than a zero
+// struct.
+type checkpointFileRow struct {
+	Add *struct {
+		Path string `parquet:"path"`
+		Size int64  `parquet:"size"`
+	} `parquet:"add"`
+	Remove *struct {
+		Path string `parquet:"path"`
+	} `parquet:"remove"`
+}
+
 // logIndex is the one-pass inventory of a `_delta_log/` listing: the JSON
 // commit versions (sorted ascending) with their file names, plus the
 // checkpoint version → its part file name(s). Both ReadSchema and
@@ -580,9 +727,28 @@ func mtimeMs(logFS fs.FS, name string) int64 {
 type rawAction struct {
 	MetaData   *rawMetaData   `json:"metaData,omitempty"`
 	CommitInfo *rawCommitInfo `json:"commitInfo,omitempty"`
-	// Other action kinds (add, remove, protocol, txn, cdc) — the reader
-	// doesn't need them, so the fields are intentionally absent. Spec:
+	// Add / Remove drive the live-file accounting in ReadFileStats — an
+	// `add` inserts a live file (path → size), a `remove` retires one. The
+	// schema / history readers ignore them; only the file-stats reader
+	// consumes them. Spec:
 	// https://github.com/delta-io/delta/blob/master/PROTOCOL.md#actions
+	Add    *rawAdd    `json:"add,omitempty"`
+	Remove *rawRemove `json:"remove,omitempty"`
+	// Other action kinds (protocol, txn, cdc, domainMetadata) — the reader
+	// doesn't need them, so the fields are intentionally absent.
+}
+
+// rawAdd is the `add` action's subset ReadFileStats consumes: the data
+// file's path (the live-set key) and its byte size (Delta's `add.size`).
+type rawAdd struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+}
+
+// rawRemove is the `remove` action's subset ReadFileStats consumes: the
+// path of the data file being retired from the live set.
+type rawRemove struct {
+	Path string `json:"path"`
 }
 
 type rawMetaData struct {
@@ -754,4 +920,20 @@ func ReadCurrentFromPath(tablePath string) (*Schema, []Commit, error) {
 		return nil, nil, fmt.Errorf("stat _delta_log: %w", err)
 	}
 	return ReadCurrent(os.DirFS(logDir))
+}
+
+// ReadFileStatsFromPath is the table-root convenience wrapper for
+// ReadFileStats, mirroring ReadCurrentFromPath — local callers hold a
+// table directory string and shouldn't have to wrap os.DirFS themselves.
+// Returns ErrNotDelta both when the table directory is missing and when
+// `_delta_log/` is absent.
+func ReadFileStatsFromPath(tablePath string) (*FileStats, error) {
+	logDir := filepath.Join(tablePath, "_delta_log")
+	if _, err := os.Stat(logDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotDelta
+		}
+		return nil, fmt.Errorf("stat _delta_log: %w", err)
+	}
+	return ReadFileStats(os.DirFS(logDir))
 }

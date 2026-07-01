@@ -13,6 +13,7 @@ import {
   ChevronDown,
   ChevronRight,
   FileWarning,
+  HardDrive,
   LayoutDashboard,
   Loader2,
   Terminal,
@@ -39,6 +40,7 @@ import {
   usePipelines,
   useTableSample,
   useTableSnapshots,
+  useTablesState,
   type CatalogTable,
   type ColumnStat,
   type ColumnStatsResult,
@@ -46,8 +48,9 @@ import {
   type ServedInfo,
   type SnapshotInfo,
   type SnapshotsResult,
+  type TableInfo,
 } from "@/lib/queries";
-import { displayTablePath } from "@/lib/format";
+import { avgFileBytes, displayTablePath, fileHealth, formatBytes } from "@/lib/format";
 
 const SAMPLE_LIMIT = 100;
 const SNAPSHOTS_LIMIT = 20;
@@ -152,6 +155,34 @@ export function TableDetail() {
     isClavesaManaged ? tableName : "",
     { dir: owningPipelineDir },
   );
+
+  // Storage layout (GH #26) — file count + total/avg file size for this
+  // table, projected from the owning pipeline's tables-state. One fetch
+  // per owning pipeline; we pick out the row for THIS table below.
+  const tablesState = useTablesState(tableMeta?.owning_pipeline ?? "", {
+    dir: owningPipelineDir,
+    enabled: !!tableMeta?.owning_pipeline && isClavesaManaged,
+  });
+  // Match this table's row robustly: the tables-state `table_name` is the
+  // on-disk directory name (bare `<node>` for default outputs, `<node>__<key>`
+  // for multi-output), which equals the URL `tableName` in the common case.
+  // Fall back to the `__default`-suffixed form (legacy bookmarks) and finally
+  // to a node+output_key match — the catalog stamps `output_key = "default"`
+  // for the single-output case while tables-state leaves it "", so normalize
+  // both to "default" before comparing.
+  const storageRow = useMemo<TableInfo | undefined>(() => {
+    const rows = tablesState.data?.rows;
+    if (!rows) return undefined;
+    return rows.find(
+      (r) =>
+        r.table_name === tableName ||
+        r.table_name === tableNameBare ||
+        r.table_name === `${tableNameBare}__default` ||
+        (!!tableMeta?.owning_node &&
+          r.node === tableMeta.owning_node &&
+          (r.output_key || "default") === (tableMeta.output_key || "default")),
+    );
+  }, [tablesState.data, tableName, tableNameBare, tableMeta]);
 
   useChrome(
     useMemo<PageChrome>(() => {
@@ -293,6 +324,15 @@ export function TableDetail() {
           </div>
         )}
 
+        {isClavesaManaged && (
+          <div className="mt-6">
+            <StorageLayoutCard
+              isLoading={tablesState.isLoading}
+              row={storageRow}
+            />
+          </div>
+        )}
+
         {/* Lineage requires a workspace dir AND an owning_node — system tables
             (node_runs, runs, tables) lack an owning_node and live outside the
             user's DAG, so showing them empty Upstream/Downstream messaging
@@ -365,6 +405,103 @@ function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps)
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// StorageLayoutCard surfaces file count + total/average file size for a
+// clavesa-managed Delta table (GH #26). Small-file fan-out drives up the
+// per-scan S3 GET bill long before it shows anywhere else, so an amber
+// "small files" badge flags a table that OPTIMIZE / compaction would help.
+// When the provider didn't report file metrics (`—`), the card renders a
+// clean unknown state rather than a scary badge.
+function StorageLayoutCard({
+  isLoading,
+  row,
+}: {
+  isLoading: boolean;
+  row: TableInfo | undefined;
+}) {
+  const fileCount = row?.file_count ?? null;
+  const totalBytes = row?.total_bytes ?? null;
+  const avg = avgFileBytes(fileCount, totalBytes);
+  const health = fileHealth(fileCount, totalBytes);
+
+  return (
+    <Card data-testid="storage-layout">
+      <CardHeader className="flex-row items-center justify-between pb-3">
+        <CardTitle className="flex items-center gap-2">
+          <HardDrive className="h-4 w-4 text-muted-foreground" />
+          Storage layout
+        </CardTitle>
+        {health === "small" && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge
+                variant="outline"
+                className="border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-600 dark:text-amber-400"
+              >
+                small files
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              This table has many small data files. Each file is one S3 GET
+              per scan, so read request cost grows with the file count.
+              Running OPTIMIZE / compaction to coalesce them into larger
+              files cuts that cost.
+            </TooltipContent>
+          </Tooltip>
+        )}
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <div className="grid grid-cols-3 gap-4">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+          </div>
+        ) : (
+          <div className="grid grid-cols-3 gap-4">
+            <StorageMetric
+              label="File count"
+              value={fileCount == null ? "—" : fileCount.toLocaleString()}
+            />
+            <StorageMetric label="Total size" value={formatBytes(totalBytes)} />
+            <StorageMetric
+              label="Avg file size"
+              value={formatBytes(avg)}
+              emphasis={health === "small" ? "warn" : "none"}
+            />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function StorageMetric({
+  label,
+  value,
+  emphasis = "none",
+}: {
+  label: string;
+  value: string;
+  emphasis?: "warn" | "none";
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </span>
+      <span
+        className={`font-mono text-lg ${
+          emphasis === "warn"
+            ? "text-amber-600 dark:text-amber-400"
+            : "text-foreground"
+        }`}
+      >
+        {value}
+      </span>
+    </div>
   );
 }
 

@@ -51,8 +51,15 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useCatalogTables, usePipelines, useTableSnapshots, type CatalogTable } from "@/lib/queries";
-import { displayTableName, showOutputKey } from "@/lib/format";
+import {
+  useCatalogTables,
+  usePipelines,
+  useTableSnapshots,
+  useTablesState,
+  type CatalogTable,
+  type TableInfo,
+} from "@/lib/queries";
+import { displayTableName, fileHealth, showOutputKey } from "@/lib/format";
 
 const columnHelper = createColumnHelper<CatalogTable>();
 
@@ -62,6 +69,10 @@ declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData extends RowData> {
     query: string;
+    // Per-table storage stats (file count / size), keyed by the tables-state
+    // `table_name` (== the on-disk table identifier). Only populated for
+    // schemas with an owning pipeline; absent otherwise (system/orphan).
+    fileStats?: Map<string, TableInfo>;
   }
 }
 
@@ -204,6 +215,16 @@ const columns = [
     cell: (info) => <SnapshotsCell table={info.row.original} />,
   }),
   columnHelper.display({
+    id: "files",
+    header: "Files",
+    cell: (info) => (
+      <FilesCell
+        table={info.row.original}
+        stats={info.table.options.meta?.fileStats}
+      />
+    ),
+  }),
+  columnHelper.display({
     id: "updated",
     header: "Updated",
     cell: (info) => <UpdatedCell table={info.row.original} />,
@@ -286,6 +307,73 @@ function SnapshotsCell({ table }: { table: CatalogTable }) {
       {count}
     </Badge>
   );
+}
+
+// FilesCell shows the table's Delta file count (GH #26) plus an amber dot
+// when the file layout has fanned out into many small files — the early
+// signal that OPTIMIZE / compaction would cut the per-scan S3 GET bill.
+// Defensive by design: silent `—` when the schema has no owning pipeline,
+// the stats map hasn't loaded, or this table isn't in it. Never throws,
+// never blocks the row.
+function FilesCell({
+  table,
+  stats,
+}: {
+  table: CatalogTable;
+  stats: Map<string, TableInfo> | undefined;
+}) {
+  const isClavesaManaged = table.table_type === "DELTA";
+  const info = stats ? lookupFileStats(stats, table) : undefined;
+  if (!isClavesaManaged || info?.file_count == null) {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+  const health = fileHealth(info.file_count, info.total_bytes);
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex cursor-default items-center gap-1.5">
+          {health === "small" && (
+            <span
+              className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-amber-500"
+              aria-hidden
+            />
+          )}
+          <Badge variant="outline" className="font-mono text-[10px]">
+            {info.file_count.toLocaleString()}
+          </Badge>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>
+        {health === "small"
+          ? "Small files — OPTIMIZE / compaction would reduce read request cost"
+          : `${info.file_count.toLocaleString()} data file${info.file_count === 1 ? "" : "s"}`}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// lookupFileStats resolves a catalog row to its tables-state entry. The map
+// is keyed by the on-disk `table_name`, which equals `table.name` in the
+// common case; the node/output_key fallback covers any mismatch between the
+// catalog's naming (default output_key "default") and the disk shape (bare
+// node, output_key "").
+function lookupFileStats(
+  stats: Map<string, TableInfo>,
+  table: CatalogTable,
+): TableInfo | undefined {
+  const direct =
+    stats.get(table.name) ??
+    stats.get(`${table.name}__default`) ??
+    stats.get(table.name.replace(/__default$/, ""));
+  if (direct) return direct;
+  if (!table.owning_node) return undefined;
+  const key = table.output_key || "default";
+  for (const info of stats.values()) {
+    if (info.node === table.owning_node && (info.output_key || "default") === key) {
+      return info;
+    }
+  }
+  return undefined;
 }
 
 function UpdatedCell({ table }: { table: CatalogTable }) {
@@ -668,18 +756,33 @@ function SchemaTableSection({
 }) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(true);
-  const tableInstance = useReactTable({
-    data: schema.tables,
-    columns,
-    getCoreRowModel: getCoreRowModel(),
-    meta: { query },
-  });
 
   // ADR-016: a schema is owned by exactly one pipeline. Surface that
   // pipeline so the schema≡pipeline equivalence is visible — every
   // table in the schema carries the same owning pipeline + dir; system
   // and orphaned (un-owned) schemas have neither.
   const owner = schema.tables.find((t) => t.owning_pipeline && t.dir);
+
+  // One tables-state fetch per schema section feeds the Files column for
+  // every row — far cheaper than the per-row snapshot fetches, since a
+  // schema maps to exactly one pipeline (GH #26). Disabled for schemas with
+  // no owning pipeline; the Files cells then render `—`.
+  const tablesState = useTablesState(owner?.owning_pipeline ?? "", {
+    dir: owner?.dir,
+    enabled: !!owner?.owning_pipeline,
+  });
+  const fileStats = useMemo(() => {
+    const m = new Map<string, TableInfo>();
+    for (const r of tablesState.data?.rows ?? []) m.set(r.table_name, r);
+    return m;
+  }, [tablesState.data]);
+
+  const tableInstance = useReactTable({
+    data: schema.tables,
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+    meta: { query, fileStats },
+  });
   const schemaFilterHref = `/?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema.schema)}`;
 
   return (

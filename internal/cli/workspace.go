@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/api"
+	"github.com/vesahyp/clavesa/internal/observability"
 	tuiservice "github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -402,10 +403,13 @@ CLI twin of the Catalog page's ?catalog=&schema= view:
 				}
 				resp.Tables = kept
 			}
-			if jsonOut {
-				return printJSON(os.Stdout, resp)
-			}
 			if len(resp.Tables) == 0 {
+				if jsonOut {
+					return printJSON(os.Stdout, catalogResponseWithMetrics{
+						Tables:       []catalogTableWithMetrics{},
+						AWSAvailable: resp.AWSAvailable,
+					})
+				}
 				if catalogFilter != "" || schemaFilter != "" {
 					fmt.Println("No tables match the filter.")
 				} else {
@@ -416,15 +420,33 @@ CLI twin of the Catalog page's ?catalog=&schema= view:
 				}
 				return nil
 			}
-			rows := make([][]string, len(resp.Tables))
-			for i, t := range resp.Tables {
+
+			// Enrich each table with the observability layer's per-table
+			// file count and byte size (ADR-014: same figures the UI's
+			// tables-state surfaces). Best-effort — a workspace with no
+			// warehouse or no creds simply renders "—" for the metrics
+			// rather than failing the listing. One provider call per
+			// distinct owning pipeline; matched back to catalog rows by
+			// table name.
+			enriched := enrichTablesWithMetrics(cmd, ctx, resp.Tables)
+
+			if jsonOut {
+				return printJSON(os.Stdout, catalogResponseWithMetrics{
+					Tables:       enriched,
+					AWSAvailable: resp.AWSAvailable,
+				})
+			}
+			rows := make([][]string, len(enriched))
+			for i, t := range enriched {
 				rows[i] = []string{
 					t.Database, t.Name,
 					strconv.Itoa(len(t.Columns)),
+					fileCountCell(t.FileCount),
+					avgSizeCell(t.FileCount, t.TotalBytes),
 					t.OwningPipeline,
 				}
 			}
-			printTable(os.Stdout, []string{"DATABASE", "TABLE", "COLUMNS", "PIPELINE"}, rows)
+			printTable(os.Stdout, []string{"DATABASE", "TABLE", "COLUMNS", "FILES", "AVG SIZE", "PIPELINE"}, rows)
 			if !resp.AWSAvailable {
 				fmt.Println("\n(AWS not configured — only local-pipeline tables shown.)")
 			}
@@ -437,6 +459,130 @@ CLI twin of the Catalog page's ?catalog=&schema= view:
 	cmd.Flags().StringVar(&schemaFilter, "schema", "", "show only tables in this schema")
 
 	return cmd
+}
+
+// tablesStateLimit caps how many per-table rows the observability layer
+// returns per owning pipeline when enriching the catalog listing. Well
+// above any realistic single-pipeline output-table count.
+const tablesStateLimit = 500
+
+// catalogTableWithMetrics wraps api.CatalogTable with the observability
+// layer's per-table file count and byte size. It's a CLI-local view struct
+// (not a change to api.CatalogTable) so the enrichment stays contained to
+// the CLI and does not touch the UI's /workspace/tables wire shape or its
+// Zod boundary. The embedded CatalogTable flattens into the JSON at the top
+// level, so `file_count` / `total_bytes` sit alongside the existing fields.
+type catalogTableWithMetrics struct {
+	api.CatalogTable
+	FileCount  *int64 `json:"file_count,omitempty"`
+	TotalBytes *int64 `json:"total_bytes,omitempty"`
+}
+
+// catalogResponseWithMetrics mirrors api.CatalogResponse for the enriched
+// `--json` output.
+type catalogResponseWithMetrics struct {
+	Tables       []catalogTableWithMetrics `json:"tables"`
+	AWSAvailable bool                      `json:"aws_available"`
+}
+
+// enrichTablesWithMetrics attaches per-table file-count / byte-size metrics
+// (from the observability layer) onto each catalog row. It groups the
+// tables by owning pipeline, calls TablesStateForDir once per distinct
+// pipeline, and matches the returned rows back by table name. Best-effort:
+// a failure to build the service or fetch a pipeline's tables leaves the
+// affected rows with nil metrics (rendered "—") rather than failing.
+func enrichTablesWithMetrics(cmd *cobra.Command, ctx context.Context, tables []api.CatalogTable) []catalogTableWithMetrics {
+	byDir := map[string][]observability.TableInfo{}
+	if svc, _, err := newDashboardService(cmd); err == nil {
+		// dir -> owning pipeline (the sanitized schema form the runner
+		// writes into the tables `pipeline` column).
+		seen := map[string]string{}
+		for _, t := range tables {
+			if t.Dir == "" || t.OwningPipeline == "" {
+				continue
+			}
+			seen[t.Dir] = t.OwningPipeline
+		}
+		for dir, pipeline := range seen {
+			res, err := svc.TablesStateForDir(ctx, pipeline, dir, tablesStateLimit)
+			if err != nil || res == nil {
+				continue
+			}
+			byDir[dir] = res.Rows
+		}
+	}
+	return mergeTableMetrics(tables, byDir)
+}
+
+// mergeTableMetrics is the pure join between catalog rows and the
+// observability tables-state rows (keyed by pipeline dir). Match is by
+// table name, falling back to `<node>__<output_key>`. Rows with no owning
+// pipeline dir, or whose dir the fetch couldn't answer for, keep nil
+// metrics. Extracted for unit testing without a live provider.
+func mergeTableMetrics(tables []api.CatalogTable, byDir map[string][]observability.TableInfo) []catalogTableWithMetrics {
+	idx := make(map[string]map[string]observability.TableInfo, len(byDir))
+	for dir, rows := range byDir {
+		m := make(map[string]observability.TableInfo, len(rows)*2)
+		for _, ti := range rows {
+			if ti.TableName != "" {
+				m[ti.TableName] = ti
+			}
+			if ti.Node != "" {
+				m[ti.Node+"__"+ti.OutputKey] = ti
+			}
+		}
+		idx[dir] = m
+	}
+	out := make([]catalogTableWithMetrics, len(tables))
+	for i, t := range tables {
+		out[i] = catalogTableWithMetrics{CatalogTable: t}
+		m, ok := idx[t.Dir]
+		if !ok {
+			continue
+		}
+		ti, ok := m[t.Name]
+		if !ok {
+			ti, ok = m[t.OwningNode+"__"+t.OutputKey]
+		}
+		if !ok {
+			continue
+		}
+		out[i].FileCount = ti.FileCount
+		out[i].TotalBytes = ti.TotalBytes
+	}
+	return out
+}
+
+// fileCountCell renders a nullable file count, or an em-dash when unknown.
+func fileCountCell(v *int64) string {
+	if v == nil {
+		return "—"
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
+// avgSizeCell renders total_bytes / file_count as a human-readable size, or
+// an em-dash when either input is missing or the file count is zero.
+func avgSizeCell(fileCount, totalBytes *int64) string {
+	if fileCount == nil || totalBytes == nil || *fileCount == 0 {
+		return "—"
+	}
+	return formatBytes(*totalBytes / *fileCount)
+}
+
+// formatBytes renders a byte count in binary units (B/KB/MB/GB/…) with one
+// decimal place above the byte range.
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func newWorkspacePlanCmd() *cobra.Command {

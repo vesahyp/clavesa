@@ -541,6 +541,196 @@ func TestReadCurrentCheckpointAware(t *testing.T) {
 	}
 }
 
+// addAction renders a single `add` JSON action line with the given path
+// and size — the shape a write commit carries per live data file.
+func addAction(path string, size int64) string {
+	return `{"add":{"path":"` + path + `","partitionValues":{},"size":` + intStr(size) + `,"modificationTime":1,"dataChange":true}}`
+}
+
+// removeAction renders a single `remove` (tombstone) JSON action line.
+func removeAction(path string) string {
+	return `{"remove":{"path":"` + path + `","dataChange":true}}`
+}
+
+// fileCheckpointRow mirrors delta.checkpointFileRow — the add/remove file
+// projection ReadFileStats reads. Tests write real checkpoint parquet
+// bytes with this shape so applyCheckpointFiles exercises the same leaf
+// columns the production reader projects.
+type fileCheckpointRow struct {
+	Add *struct {
+		Path string `parquet:"path"`
+		Size int64  `parquet:"size"`
+	} `parquet:"add"`
+	Remove *struct {
+		Path string `parquet:"path"`
+	} `parquet:"remove"`
+}
+
+// writeFileCheckpointParquet returns the bytes of a checkpoint part whose
+// `add` rows are the given path→size live files (and no removes — a real
+// checkpoint snapshots only live files). Padding non-file rows aren't
+// needed here; the file-stats reader ignores rows with an empty add path.
+func writeFileCheckpointParquet(t *testing.T, adds map[string]int64) []byte {
+	t.Helper()
+	rows := make([]fileCheckpointRow, 0, len(adds))
+	for path, size := range adds {
+		r := fileCheckpointRow{Add: &struct {
+			Path string `parquet:"path"`
+			Size int64  `parquet:"size"`
+		}{Path: path, Size: size}}
+		rows = append(rows, r)
+	}
+	var buf bytes.Buffer
+	pw := parquetgo.NewGenericWriter[fileCheckpointRow](&buf)
+	if _, err := pw.Write(rows); err != nil {
+		t.Fatalf("write file checkpoint parquet: %v", err)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close file checkpoint parquet: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestReadFileStatsAddsOnly: a create + two write commits, adds only, no
+// removes. Live set is all three files; bytes sum straight.
+func TestReadFileStatsAddsOnly(t *testing.T) {
+	mfs := fstest.MapFS{
+		"00000000000000000000.json": &fstest.MapFile{Data: []byte(
+			`{"metaData":{"id":"x","format":{"provider":"parquet"},"schemaString":` + marshalString(trivialSchemaString) + `,"partitionColumns":[],"configuration":{}}}` + "\n" +
+				`{"commitInfo":{"timestamp":1000,"operation":"CREATE TABLE"}}` + "\n" +
+				addAction("a.parquet", 100) + "\n")},
+		"00000000000000000001.json": &fstest.MapFile{Data: []byte(
+			`{"commitInfo":{"timestamp":2000,"operation":"WRITE"}}` + "\n" +
+				addAction("b.parquet", 250) + "\n")},
+		"00000000000000000002.json": &fstest.MapFile{Data: []byte(
+			`{"commitInfo":{"timestamp":3000,"operation":"WRITE"}}` + "\n" +
+				addAction("c.parquet", 50) + "\n")},
+	}
+
+	stats, err := delta.ReadFileStats(mfs)
+	if err != nil {
+		t.Fatalf("ReadFileStats: %v", err)
+	}
+	if stats.FileCount != 3 {
+		t.Errorf("FileCount = %d, want 3", stats.FileCount)
+	}
+	if stats.TotalBytes != 400 {
+		t.Errorf("TotalBytes = %d, want 400", stats.TotalBytes)
+	}
+}
+
+// TestReadFileStatsAddThenRemove: a file added at v0 is tombstoned at v1;
+// it must not be counted and its bytes must be excluded.
+func TestReadFileStatsAddThenRemove(t *testing.T) {
+	mfs := fstest.MapFS{
+		"00000000000000000000.json": &fstest.MapFile{Data: []byte(
+			`{"metaData":{"id":"x","format":{"provider":"parquet"},"schemaString":` + marshalString(trivialSchemaString) + `,"partitionColumns":[],"configuration":{}}}` + "\n" +
+				`{"commitInfo":{"timestamp":1000,"operation":"CREATE TABLE"}}` + "\n" +
+				addAction("old.parquet", 100) + "\n" +
+				addAction("keep.parquet", 30) + "\n")},
+		"00000000000000000001.json": &fstest.MapFile{Data: []byte(
+			`{"commitInfo":{"timestamp":2000,"operation":"DELETE"}}` + "\n" +
+				removeAction("old.parquet") + "\n")},
+	}
+
+	stats, err := delta.ReadFileStats(mfs)
+	if err != nil {
+		t.Fatalf("ReadFileStats: %v", err)
+	}
+	if stats.FileCount != 1 {
+		t.Errorf("FileCount = %d, want 1 (old.parquet removed)", stats.FileCount)
+	}
+	if stats.TotalBytes != 30 {
+		t.Errorf("TotalBytes = %d, want 30 (only keep.parquet)", stats.TotalBytes)
+	}
+}
+
+// TestReadFileStatsOverwrite: an overwrite commit removes both original
+// files and adds a fresh one. Only the new file survives.
+func TestReadFileStatsOverwrite(t *testing.T) {
+	mfs := fstest.MapFS{
+		"00000000000000000000.json": &fstest.MapFile{Data: []byte(
+			`{"metaData":{"id":"x","format":{"provider":"parquet"},"schemaString":` + marshalString(trivialSchemaString) + `,"partitionColumns":[],"configuration":{}}}` + "\n" +
+				`{"commitInfo":{"timestamp":1000,"operation":"CREATE TABLE"}}` + "\n" +
+				addAction("v0-a.parquet", 100) + "\n" +
+				addAction("v0-b.parquet", 100) + "\n")},
+		"00000000000000000001.json": &fstest.MapFile{Data: []byte(
+			`{"commitInfo":{"timestamp":2000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"}}}` + "\n" +
+				removeAction("v0-a.parquet") + "\n" +
+				removeAction("v0-b.parquet") + "\n" +
+				addAction("v1-a.parquet", 75) + "\n")},
+	}
+
+	stats, err := delta.ReadFileStats(mfs)
+	if err != nil {
+		t.Fatalf("ReadFileStats: %v", err)
+	}
+	if stats.FileCount != 1 {
+		t.Errorf("FileCount = %d, want 1 (overwrite)", stats.FileCount)
+	}
+	if stats.TotalBytes != 75 {
+		t.Errorf("TotalBytes = %d, want 75 (overwrite)", stats.TotalBytes)
+	}
+}
+
+// TestReadFileStatsCheckpointReplay: a checkpoint at v10 snapshots two live
+// files; post-checkpoint commits add one and remove one of the originals.
+// The reader must seed from the checkpoint parquet and replay v11/v12.
+func TestReadFileStatsCheckpointReplay(t *testing.T) {
+	cpBytes := writeFileCheckpointParquet(t, map[string]int64{
+		"base-1.parquet": 200,
+		"base-2.parquet": 300,
+	})
+	mfs := fstest.MapFS{
+		"00000000000000000010.checkpoint.parquet": &fstest.MapFile{Data: cpBytes},
+		"00000000000000000011.json": &fstest.MapFile{Data: []byte(
+			`{"commitInfo":{"timestamp":11000,"operation":"WRITE"}}` + "\n" +
+				addAction("new-1.parquet", 40) + "\n")},
+		"00000000000000000012.json": &fstest.MapFile{Data: []byte(
+			`{"commitInfo":{"timestamp":12000,"operation":"DELETE"}}` + "\n" +
+				removeAction("base-1.parquet") + "\n")},
+	}
+
+	stats, err := delta.ReadFileStats(mfs)
+	if err != nil {
+		t.Fatalf("ReadFileStats: %v", err)
+	}
+	// Live at v12: base-2 (300) + new-1 (40); base-1 removed.
+	if stats.FileCount != 2 {
+		t.Errorf("FileCount = %d, want 2 (checkpoint base + replay)", stats.FileCount)
+	}
+	if stats.TotalBytes != 340 {
+		t.Errorf("TotalBytes = %d, want 340 (300 + 40)", stats.TotalBytes)
+	}
+}
+
+// TestReadFileStatsEmptyReturnsErrNotDelta: no commits, no checkpoint.
+func TestReadFileStatsEmptyReturnsErrNotDelta(t *testing.T) {
+	_, err := delta.ReadFileStats(fstest.MapFS{})
+	if !errors.Is(err, delta.ErrNotDelta) {
+		t.Fatalf("err = %v, want ErrNotDelta", err)
+	}
+}
+
+// TestReadFileStatsFromPath round-trips the on-disk table-root wrapper —
+// the shape readDeltaCurrentSnapshot calls.
+func TestReadFileStatsFromPath(t *testing.T) {
+	dir := t.TempDir()
+	writeLog(t, dir, map[string]string{
+		"00000000000000000000.json": `{"metaData":{"id":"x","format":{"provider":"parquet"},"schemaString":` + marshalString(trivialSchemaString) + `,"partitionColumns":[],"configuration":{}}}` + "\n" +
+			`{"commitInfo":{"timestamp":1000,"operation":"CREATE TABLE"}}` + "\n" +
+			addAction("only.parquet", 512) + "\n",
+	})
+
+	stats, err := delta.ReadFileStatsFromPath(dir)
+	if err != nil {
+		t.Fatalf("ReadFileStatsFromPath: %v", err)
+	}
+	if stats.FileCount != 1 || stats.TotalBytes != 512 {
+		t.Errorf("stats = %+v, want {1 512}", stats)
+	}
+}
+
 // padVersion renders an int64 as Delta's 20-digit zero-padded version
 // prefix.
 func padVersion(v int64) string {

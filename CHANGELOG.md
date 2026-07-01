@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.13.0] — 2026-07-01
+
+### Added
+
+- Per-table file count and average file size, surfaced local-and-cloud on both UI and CLI (GH #26): a "Files" column on the Catalog list, a "Storage layout" card on the table detail page, and `FILES` / `AVG SIZE` columns (plus `file_count` / `total_bytes` in `--json`) on `clavesa workspace tables`. A conservative "small files" badge flags tables whose file fan-out would inflate S3 read-request cost before it shows up on the bill.
+
 ## [v2.12.0] — 2026-06-30
 
 ### Added

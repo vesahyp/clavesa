@@ -28,6 +28,12 @@ type fakeProvider struct {
 	// assert IncludeMetrics is forced on.
 	nodeRuns  []observability.NodeRun
 	nodeRunsQ observability.NodeRunsQuery
+
+	// tables is returned by Tables when set (tests that exercise the
+	// tables-state path). tablesQ records the last query so the test can
+	// assert the wiring.
+	tables  []observability.TableInfo
+	tablesQ observability.TablesQuery
 }
 
 func (f *fakeProvider) Query(_ context.Context, q observability.QueryQuery) (*observability.QueryResult, error) {
@@ -51,8 +57,9 @@ func (f *fakeProvider) NodeRuns(_ context.Context, q observability.NodeRunsQuery
 func (f *fakeProvider) Runs(context.Context, observability.RunsQuery) (*observability.RunsResult, error) {
 	panic("unused")
 }
-func (f *fakeProvider) Tables(context.Context, observability.TablesQuery) (*observability.TablesResult, error) {
-	panic("unused")
+func (f *fakeProvider) Tables(_ context.Context, q observability.TablesQuery) (*observability.TablesResult, error) {
+	f.tablesQ = q
+	return &observability.TablesResult{Rows: f.tables}, nil
 }
 func (f *fakeProvider) Snapshots(context.Context, observability.SnapshotsQuery) (*observability.SnapshotsResult, error) {
 	panic("unused")

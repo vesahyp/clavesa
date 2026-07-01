@@ -755,3 +755,50 @@ func TestFormatExecRefARNPassthrough(t *testing.T) {
 		t.Errorf("local run ID must keep the dir prefix; got %q", got)
 	}
 }
+
+// TestLocalProviderTablesReportsFileMetrics proves the local fast-path now
+// populates FileCount / TotalBytes from the Delta log's live-file set
+// (ADR-014 parity with the cloud `tables` system table; foundation for
+// GH #4). Before this the local reader left both nil.
+func TestLocalProviderTablesReportsFileMetrics(t *testing.T) {
+	workspace := t.TempDir()
+	// Minimal manifest so CatalogIdentifier resolves to clavesa_demo.
+	manifest := `{"name":"demo","cloud":"aws","version":1,"catalog":"clavesa_demo"}`
+	if err := os.WriteFile(filepath.Join(workspace, "clavesa.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	// V2 warehouse layout: <warehouse>/<catalog>/<schema>/<table>/_delta_log.
+	// Pipeline dir "demo" → schema "demo" (no pipeline config → base name).
+	logDir := filepath.Join(workspace, ".clavesa", "warehouse", "clavesa_demo", "demo", "trips__default", "_delta_log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir log: %v", err)
+	}
+	// One create commit with two live data files (sizes 100 + 250).
+	commitJSON := `{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{}}}
+{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationMetrics":{"numOutputRows":"5"}}}
+{"add":{"path":"a.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true}}
+{"add":{"path":"b.parquet","partitionValues":{},"size":250,"modificationTime":1,"dataChange":true}}`
+	if err := os.WriteFile(filepath.Join(logDir, "00000000000000000000.json"), []byte(commitJSON), 0o644); err != nil {
+		t.Fatalf("write commit: %v", err)
+	}
+
+	p := observability.NewLocalProvider(workspace)
+	res, err := p.Tables(context.Background(), observability.TablesQuery{
+		PipelineName: "demo",
+		PipelineDir:  "demo",
+		Limit:        20,
+	})
+	if err != nil {
+		t.Fatalf("Tables: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(res.Rows))
+	}
+	row := res.Rows[0]
+	if row.FileCount == nil || *row.FileCount != 2 {
+		t.Errorf("FileCount = %v, want 2", row.FileCount)
+	}
+	if row.TotalBytes == nil || *row.TotalBytes != 350 {
+		t.Errorf("TotalBytes = %v, want 350", row.TotalBytes)
+	}
+}

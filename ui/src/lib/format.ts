@@ -88,3 +88,40 @@ export function formatBytes(n: number | null | undefined): string {
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
+
+// avgFileBytes is the mean size of a table's Delta data files —
+// total_bytes / file_count. Null when either metric is missing or zero
+// (a table with no files, or a snapshot the provider couldn't size), so
+// callers render "—" rather than NaN / Infinity.
+export function avgFileBytes(
+  fileCount: number | null | undefined,
+  totalBytes: number | null | undefined,
+): number | null {
+  if (fileCount == null || totalBytes == null) return null;
+  if (fileCount <= 0 || totalBytes <= 0) return null;
+  return totalBytes / fileCount;
+}
+
+// The small-file threshold: a table earns the "small files" warning only
+// when it has at least 16 data files AND averages under 16 MB per file.
+// Both bounds are deliberately conservative. Delta's default target file
+// size is 128 MB and the read-request cost that motivates GH #26 (one S3
+// GET per file per scan) only bites once a table has fanned out into many
+// small files — a 1-2 file demo table that happens to be tiny is not a
+// problem worth alarming on, so the file-count floor suppresses it. 16 MB
+// is a full order of magnitude under the 128 MB target, so a table has to
+// be genuinely fragmented (not just slightly-below-target) to trip it.
+const SMALL_FILE_MIN_COUNT = 16;
+const SMALL_FILE_AVG_BYTES = 16 * 1024 * 1024; // 16 MB
+
+export function fileHealth(
+  fileCount: number | null | undefined,
+  totalBytes: number | null | undefined,
+): "ok" | "small" | "unknown" {
+  const avg = avgFileBytes(fileCount, totalBytes);
+  if (fileCount == null || totalBytes == null || avg == null) return "unknown";
+  if (fileCount >= SMALL_FILE_MIN_COUNT && avg < SMALL_FILE_AVG_BYTES) {
+    return "small";
+  }
+  return "ok";
+}

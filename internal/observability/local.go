@@ -701,12 +701,19 @@ func readDeltaCurrentSnapshot(tableDir string) (TableInfo, bool) {
 		v := *latest.AddedRecords
 		info.RowCount = &v
 	}
-	// Delta's per-commit metrics don't expose total-data-files or
-	// total-files-size the way Iceberg's snapshot.summary did. The
-	// runner stamps these into the workspace `tables` system table
-	// via spark.catalog.listTables for cloud reads; the local
-	// fast-path leaves them nil rather than guessing — the UI
-	// renders an "unknown" badge cleanly.
+	// File-count / total-bytes come from enumerating the live data-file
+	// set in the Delta log (add minus remove at the latest version). The
+	// cloud side reads the same numbers out of the workspace `tables`
+	// system table the runner stamps; enumerating locally keeps the metric
+	// available in local mode too (ADR-014). Best-effort — a file-stats
+	// read failure leaves the fields nil so the row still renders its row
+	// count, and the UI shows an "unknown" badge cleanly.
+	if fs, err := delta.ReadFileStatsFromPath(tableDir); err == nil && fs != nil {
+		fc := fs.FileCount
+		info.FileCount = &fc
+		tb := fs.TotalBytes
+		info.TotalBytes = &tb
+	}
 	if latest.UserMetadata != "" {
 		var m map[string]string
 		if err := json.Unmarshal([]byte(latest.UserMetadata), &m); err == nil {
