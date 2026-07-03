@@ -632,6 +632,70 @@ func TestDeleteNode(t *testing.T) {
 	}
 }
 
+// TestDeleteNodeFanIn is the API-level regression test for GH #69: deleting
+// one upstream of a multi-input join transform must remove only that
+// upstream's entry from the join's `inputs` map. The sibling edge — with its
+// authored non-default output key — stays in the user's .tf.
+func TestDeleteNodeFanIn(t *testing.T) {
+	t.Parallel()
+	const joinTF = `module "src_a" {
+  source = "clavesa/source/aws"
+  name   = "src_a"
+  bucket = "a"
+}
+
+module "src_b" {
+  source = "clavesa/source/aws"
+  name   = "src_b"
+  bucket = "b"
+}
+
+module "join" {
+  source = "clavesa/transform/aws"
+  name   = "join"
+  inputs = {
+    a = module.src_a.outputs["default"]
+    b = module.src_b.outputs["dims"]
+  }
+  sql = "SELECT * FROM a JOIN b USING (id)"
+}
+`
+	mux := newMux(t)
+	dir := setupDir(t, joinTF)
+
+	rr := doRequest(t, mux, http.MethodDelete, "/pipeline/nodes/src_a", map[string]interface{}{"dir": dir})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rr.Code, rr.Body.String())
+	}
+	g := decodeGraph(t, rr)
+	if hasNode(g, "src_a") {
+		t.Error("src_a still present after delete")
+	}
+	if hasEdge(g, "src_a", "join") {
+		t.Errorf("edge src_a→join still present after delete; edges: %v", g.Edges)
+	}
+	if !hasEdge(g, "src_b", "join") {
+		t.Fatalf("sibling edge src_b→join was severed by deleting src_a; edges: %v", g.Edges)
+	}
+	for _, e := range g.Edges {
+		if e.FromNode == "src_b" && e.ToNode == "join" && (e.ToInput != "b" || e.FromOutput != "dims") {
+			t.Errorf("surviving edge = %+v, want ToInput=b FromOutput=dims", e)
+		}
+	}
+
+	// The .tf itself must keep the authored sibling entry verbatim.
+	b, err := os.ReadFile(filepath.Join(dir, "main.tf"))
+	if err != nil {
+		t.Fatalf("read main.tf: %v", err)
+	}
+	if !strings.Contains(string(b), `module.src_b.outputs["dims"]`) {
+		t.Errorf("main.tf lost b = module.src_b.outputs[\"dims\"]:\n%s", b)
+	}
+	if strings.Contains(string(b), "module.src_a") {
+		t.Errorf("main.tf still references deleted node src_a:\n%s", b)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // POST /pipeline/edge
 // ---------------------------------------------------------------------------

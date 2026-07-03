@@ -468,6 +468,11 @@ export function PipelineNode({ data, selected }: NodeProps) {
   return (
     <div
       data-testid="dag-node"
+      data-node={label}
+      // Run-status contract for automated walkthroughs (verify-readme.sh):
+      // running | succeeded | failed while a run's colors are applied;
+      // absent when the node carries no live/terminal status.
+      data-status={runStatus}
       className={cn(
         "relative min-w-44 rounded-lg border-2 bg-card text-foreground transition-all",
         borderClass,

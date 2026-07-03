@@ -48,6 +48,12 @@ type Edge struct {
 	FromNode string `json:"from_node"`
 	ToNode   string `json:"to_node"`
 	ToInput  string `json:"to_input"`
+	// FromOutput is the producer's output key, parsed from the
+	// module.<from>.outputs["<key>"] reference. Empty means "default"
+	// (e.g. for synthesized intra-pipeline edges); consumers re-emitting
+	// an edge as HCL must fall back accordingly so authored non-default
+	// output references survive edge rewrites verbatim.
+	FromOutput string `json:"from_output,omitempty"`
 }
 
 // Validation holds the errors and warnings produced during graph validation.

@@ -252,6 +252,29 @@ check_testid() {
   done
 }
 
+# check_eval <js-fn> <timeout_s> <description> [poll_interval_s] — state
+# assertion against the data-testid / data-* contract. Polls a
+# playwright-cli eval of an `() => boolean` function until it prints
+# true. Use for assertions about state (status color, point counts)
+# rather than mere presence — the data-* attributes carry the value.
+check_eval() {
+  local fn="$1" timeout="$2" desc="$3" interval="${4:-2}"
+  local deadline out
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    out="$(pw eval "$fn" || true)"
+    if grep -qw "true" <<<"$out"; then
+      pass "$desc"
+      return 0
+    fi
+    if (( $(date +%s) > deadline )); then
+      fail "$desc — eval never returned true on $CURRENT_PAGE (last output: $out)"
+      return 0
+    fi
+    sleep "$interval"
+  done
+}
+
 # check_absent <ERE> <description> — asserts against the current snapshot
 # (call only after the page has demonstrably rendered).
 check_absent() {
@@ -633,6 +656,13 @@ check_text "Column profile" 180 "Column profile card renders (stats opt-in worke
 check_text "\bNull\b" 15 "column profile shows null %"
 check_text "\bDistinct\b" 15 "column profile shows distinct counts"
 check_text "p50 / p95" 15 "column profile shows p50/p95 for numerics"
+# Per the mandatory list, every profile row shows top-K bars or a "high
+# cardinality" badge (the min→max range is the runner's fallback when
+# top-K was skipped for a low-cardinality column, e.g. the wide-table
+# cap) — presence of the row alone would pass an empty card.
+check_eval '() => { const rows = [...document.querySelectorAll("[data-testid=column-profile-row]")]; return rows.length > 0 && rows.every((r) => r.querySelector("[data-testid=profile-topk], [data-testid=profile-high-cardinality], [data-testid=profile-range]")); }' 30 "every profile row shows top-K bars, a high-cardinality badge, or a min→max range"
+check_eval '() => !!document.querySelector("[data-testid=profile-topk]")' 15 "column profile renders top-K bars for at least one column"
+check_eval '() => !!document.querySelector("[data-testid=profile-min-max], [data-testid=profile-range]")' 15 "column profile shows min/max"
 check_text "\bpayment_type\b" 15 "schema lists payment_type"
 # Sample rows land via the auto-run query pane ("N rows" footer; the
 # column-profile top-K lines also say "rows" but always as "x / y rows").
@@ -676,6 +706,12 @@ check_text "Recent runs" 15 "widget: Recent runs"
 # Widget datasets run on the Spark runner locally — give the recent-runs
 # table time to fill in.
 check_text "SUCCEEDED" 600 "recent-runs table shows SUCCEEDED rows" 10
+# "Run duration trend (with multiple points)" — the README mandates ≥3
+# runs precisely so this chart has more than one data point. The line
+# widget stamps its point count on the chart container
+# (data-point-count) so the assertion doesn't count recharts SVG
+# internals.
+check_eval '() => { const el = document.querySelector("[data-testid=dashboard-widget][data-widget-title=\"Run duration\"] [data-point-count]"); return !!el && Number(el.dataset.pointCount) > 1; }' 300 "Run duration trend has >1 data point" 5
 check_console "/dashboards/pipeline-runs-$PIPELINE"
 
 # ---------------------------------------------------------------------------
@@ -693,6 +729,9 @@ check_console "/pipelines"
 banner "assert: /pipelines/dashboard?dir=$PIPELINE (Runs tab + run-detail sheet)"
 goto_page "/pipelines/dashboard?dir=$PIPELINE"
 check_text "\b$PIPELINE\b" 30 "pipeline dashboard renders"
+# The deployment-status row — the sticky health banner (pipeline name,
+# health verdict, last-run / success-rate stats).
+check_testid "deployment-status" 30 "deployment-status row renders"
 ui_do "open the Runs tab" click '[role=tab]:has-text("Runs")'
 # Run columns are buttons labeled "Run <id> · <status> · <duration>".
 check_text '"Run [^"]+ · ' 60 "Runs tab shows run history columns" 3
@@ -705,6 +744,11 @@ if [[ "${ncols:-0}" -ge "$RUNS_WANTED" ]]; then
 else
   fail "Runs grid: expected ≥ $RUNS_WANTED run columns, observed ${ncols:-0} (snapshot: $(dump_snapshot "$snap"))"
 fi
+# The per-node duration sparkline claim: the Runs grid's duration bars —
+# one per run column, height ∝ duration_ms — are the current incarnation
+# (the old standalone per-node DurationSparkline was folded into this
+# grid when the dashboard was rebuilt around it). One bar per run.
+check_eval "() => document.querySelectorAll('[data-testid=run-duration-bar]').length >= $RUNS_WANTED" 30 "Runs grid renders a duration bar per run column (≥ $RUNS_WANTED)"
 
 # The sheet opens by clicking a run column — the bare URL does not auto-open it.
 if [[ -n "$RUN_ID" ]]; then
@@ -734,6 +778,12 @@ if [[ -n "$RUN_ID" ]]; then
       fail "per-node breakdown: $node missing from the sheet (snapshot: $(dump_snapshot "$sheet"))"
     fi
   done
+  # "Per-node DAG colored by status (both transforms colored)": each DAG
+  # node stamps its run status on data-status — presence of the node name
+  # alone would pass an uncolored/gray DAG. This run SUCCEEDED, so both
+  # transforms must carry succeeded. Scoped to the sheet so the dashboard
+  # canvas behind it can't satisfy the check.
+  check_eval "() => [\"$NODE1\", \"$NODE2\"].every((n) => document.querySelector('[data-testid=run-detail-sheet] [data-testid=dag-node][data-node=\"' + n + '\"]')?.dataset.status === \"succeeded\")" 120 "run-detail DAG colors both transforms by status (succeeded)" 3
 else
   fail "run-detail sheet: no run_id available from /api/data/runs"
 fi

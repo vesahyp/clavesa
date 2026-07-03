@@ -661,7 +661,11 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
   const isNumeric = isNumericType(stat.column_type);
 
   return (
-    <li className="grid grid-cols-12 items-start gap-3 px-6 py-3 text-xs">
+    <li
+      className="grid grid-cols-12 items-start gap-3 px-6 py-3 text-xs"
+      data-testid="column-profile-row"
+      data-column={stat.column_name}
+    >
       <div className="col-span-3 min-w-0">
         <div className="truncate font-mono text-foreground">{stat.column_name}</div>
         <div className="truncate font-mono text-[10px] text-muted-foreground">
@@ -714,7 +718,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
             const shown = top.slice(0, 5);
             const shownSum = shown.reduce((acc, b) => acc + (b.count ?? 0), 0);
             return (
-              <ol className="space-y-0.5">
+              <ol className="space-y-0.5" data-testid="profile-topk">
                 {shown.map((b, i) => {
                   const pct =
                     total != null && total > 0
@@ -782,11 +786,12 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
             variant="outline"
             className="w-fit border-dashed font-mono text-[10px]"
             title="Top-K skipped — high-cardinality column"
+            data-testid="profile-high-cardinality"
           >
             high cardinality
           </Badge>
         ) : (
-          <div className="font-mono text-muted-foreground">
+          <div className="font-mono text-muted-foreground" data-testid="profile-range">
             {stat.min_value !== "" || stat.max_value !== "" ? (
               <>
                 <span title="min">{stat.min_value || "—"}</span>
@@ -818,7 +823,10 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
               : "—"}
           </span>
         ) : (
-          <span className="truncate font-mono text-muted-foreground">
+          <span
+            className="truncate font-mono text-muted-foreground"
+            data-testid="profile-min-max"
+          >
             {stat.min_value || "—"}
             <span className="mx-1 text-muted-foreground/50">→</span>
             {stat.max_value || "—"}

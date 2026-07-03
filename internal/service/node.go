@@ -326,16 +326,10 @@ func (s *Service) AddEdge(dir, fromNode, fromOutput, toNode, toInput string) (Pi
 		edgeAttrs = map[string]fileops.AttributeValue{"input": ref}
 	} else {
 		// Merge into existing inputs map so multiple connections are preserved.
-		// Reconstruct from existing edges since the parser converts inputs to edges.
-		existingInputs := make(map[string]interface{})
-		for _, e := range g.Edges {
-			if e.ToNode == toNode {
-				existingInputs[e.ToInput] = fileops.ModuleReference{
-					Type:       "reference",
-					Expression: fmt.Sprintf(`module.%s.outputs["default"]`, e.FromNode),
-				}
-			}
-		}
+		// Reconstruct from existing edges since the parser converts inputs to
+		// edges; TransformInputsExcluding keeps each surviving entry's parsed
+		// output key (and any registry/external string entries) intact.
+		existingInputs := hclutil.TransformInputsExcluding(g, toNode, "")
 		existingInputs[toInput] = ref
 		edgeAttrs = map[string]fileops.AttributeValue{"inputs": existingInputs}
 	}

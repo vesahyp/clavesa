@@ -105,6 +105,24 @@ def test_sql_lit_str_quote_doubling():
     assert runner._sql_lit("plain") == "'plain'"
 
 
+def test_sql_lit_str_backslash_escaped():
+    # Spark's default parser processes C-style escapes inside string literals,
+    # so a raw backslash must be doubled or the literal != the value (GH #70).
+    assert runner._sql_lit("C:\\temp") == "'C:\\\\temp'"
+    assert runner._sql_lit("a\\b") == "'a\\\\b'"
+
+
+def test_sql_lit_str_backslash_then_quote():
+    # value: a\'b — backslash doubled first, THEN quote doubled; wrong order
+    # would let the doubled backslash swallow the quote escape.
+    assert runner._sql_lit("a\\'b") == "'a\\\\''b'"
+
+
+def test_sql_lit_str_trailing_backslash():
+    # A trailing backslash must not escape the closing quote.
+    assert runner._sql_lit("dir\\") == "'dir\\\\'"
+
+
 def test_sql_lit_float_finite_vs_inf():
     assert runner._sql_lit(1.5) == repr(1.5)
     assert runner._sql_lit(float("inf")) is None
@@ -114,6 +132,14 @@ def test_sql_lit_float_finite_vs_inf():
 
 def test_sql_lit_decimal():
     assert runner._sql_lit(decimal.Decimal("3.14")) == "3.14"
+
+
+def test_sql_lit_decimal_nonfinite_is_none():
+    # str(Decimal("NaN")) is the bare token NaN, which Spark parses as a
+    # column reference — must be skipped like non-finite floats.
+    assert runner._sql_lit(decimal.Decimal("NaN")) is None
+    assert runner._sql_lit(decimal.Decimal("Infinity")) is None
+    assert runner._sql_lit(decimal.Decimal("-Infinity")) is None
 
 
 def test_sql_lit_none_and_unknown():
@@ -132,9 +158,27 @@ def test_bound_predicate_small_in_list():
     assert p == "target.`domain` IN ('a.com', 'b.com')"
 
 
-def test_bound_predicate_drops_untypeable_keeps_rest():
-    p = runner._bound_predicate_sql("k", [1, object(), 3])
-    assert p == "target.`k` IN (1, 3)"
+def test_bound_predicate_any_unrenderable_skips_column():
+    # A partially rendered IN list is unsound (it can exclude a target row the
+    # un-bounded MERGE would match) — any unrenderable value skips the whole
+    # column, never just that value (GH #70).
+    assert runner._bound_predicate_sql("k", [1, object(), 3]) is None
+
+
+def test_bound_predicate_nan_float_skips_column():
+    # Spark treats NaN = NaN as true, so a NaN key CAN match in the un-bounded
+    # MERGE; dropping it from the IN list would silently duplicate that row.
+    assert runner._bound_predicate_sql("k", [1.5, float("nan"), 2.5]) is None
+    assert runner._bound_predicate_sql("k", [1.5, float("inf")]) is None
+
+
+def test_bound_predicate_nonfinite_decimal_skips_column():
+    assert runner._bound_predicate_sql("k", [decimal.Decimal("1"), decimal.Decimal("NaN")]) is None
+
+
+def test_bound_predicate_backslash_values_render_escaped():
+    p = runner._bound_predicate_sql("path", ["C:\\a", "C:\\b"])
+    assert p == "target.`path` IN ('C:\\\\a', 'C:\\\\b')"
 
 
 def test_bound_predicate_empty_is_none():
@@ -183,6 +227,28 @@ def test_merge_bound_cols_defaults_to_merge_keys():
 
 def test_merge_bound_cols_dedup():
     assert runner._merge_bound_cols(["a", "a", "b"], []) == ["a", "b"]
+
+
+def test_merge_bound_cols_caps_at_max_cluster_cols():
+    # _create_delta_table clusters at most 4 columns; keys 5+ can never prune,
+    # so they must not be bounded (each would cost a collect job for nothing).
+    assert runner._MAX_CLUSTER_COLS == 4
+    got = runner._merge_bound_cols(["a", "b", "c", "d", "e"], [])
+    assert got == ["a", "b", "c", "d"]
+
+
+def test_merge_bound_cols_cap_applies_to_explicit_cluster_by():
+    # Only the first 4 of an explicit cluster_by are actually clustered; a
+    # merge key appearing at position 5 is not a skipping column.
+    got = runner._merge_bound_cols(["e"], ["a", "b", "c", "d", "e"])
+    assert got == []
+
+
+def test_merge_bound_cols_bound_by_not_capped():
+    # Tier 2 is the author's explicit opt-in — appended even beyond the cap
+    # (a non-skipping bound column is safe; it just may not prune).
+    got = runner._merge_bound_cols(["a", "b", "c", "d", "e"], [], ["e"])
+    assert got == ["a", "b", "c", "d", "e"]
 
 
 # ---------------------------------------------------------------------------

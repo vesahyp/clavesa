@@ -637,6 +637,65 @@ def test_merge_set_clause_primitives_and_raw():
     assert "target.`other` = source.`other`" in clause  # unlisted → replace
 
 
+def test_merge_set_clause_new_source_column_included():
+    """Additive schema evolution (GH #61): a source column that is new to the
+    target and not named in merge_update must still get a replace-from-source
+    assignment — under MERGE WITH SCHEMA EVOLUTION that assignment is what
+    adds the column to matched rows instead of silently dropping it."""
+    runner = _load_runner()
+    clause = runner._merge_set_clause(
+        ["site", "d", "v", "scroll_depth_sum"],  # scroll_depth_sum newly added
+        ["site", "d"],
+        {"v": "additive"},
+    )
+    assert "target.`scroll_depth_sum` = source.`scroll_depth_sum`" in clause
+    assert "target.`v` = target.`v` + source.`v`" in clause
+
+
+class _FakeField:
+    """Duck-typed StructField for _schema_drifted (name + dataType.simpleString())."""
+
+    def __init__(self, name, type_str):
+        self.name = name
+        self.dataType = types.SimpleNamespace(simpleString=lambda: type_str)
+
+
+def test_schema_drifted_identical():
+    runner = _load_runner()
+    a = [_FakeField("id", "bigint"), _FakeField("amount", "double")]
+    b = [_FakeField("id", "bigint"), _FakeField("amount", "double")]
+    assert runner._schema_drifted(a, b) is False
+
+
+def test_schema_drifted_added_column():
+    runner = _load_runner()
+    a = [_FakeField("id", "bigint")]
+    b = [_FakeField("id", "bigint"), _FakeField("score", "double")]
+    assert runner._schema_drifted(a, b) is True
+
+
+def test_schema_drifted_removed_column():
+    runner = _load_runner()
+    a = [_FakeField("id", "bigint"), _FakeField("score", "double")]
+    b = [_FakeField("id", "bigint")]
+    assert runner._schema_drifted(a, b) is True
+
+
+def test_schema_drifted_type_change():
+    """GH #39: a type change is drift — replace mode must overwrite the schema."""
+    runner = _load_runner()
+    a = [_FakeField("amount", "bigint")]
+    b = [_FakeField("amount", "string")]
+    assert runner._schema_drifted(a, b) is True
+
+
+def test_schema_drifted_reorder():
+    runner = _load_runner()
+    a = [_FakeField("a", "bigint"), _FakeField("b", "string")]
+    b = [_FakeField("b", "string"), _FakeField("a", "bigint")]
+    assert runner._schema_drifted(a, b) is True
+
+
 def test_resolve_output_rejects_unknown_mode():
     runner = _load_runner()
     try:

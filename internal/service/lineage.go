@@ -285,10 +285,10 @@ func buildLineage(g graph.PipelineGraph, db string) []LineageEdge {
 		via := ""
 		if from.Type == "transform" {
 			// All transform outputs land at <db>.<from>__<output_key>.
-			// The orchestration emitter hardcodes "default" because graph.Edge
-			// doesn't carry the from-output today; ADR-019 drops the suffix
-			// for single-output (default-only) tables so the UI's wire-form
-			// matches what the catalog page lists.
+			// The orchestration emitter still hardcodes "default" (it
+			// predates graph.Edge carrying FromOutput); ADR-019 drops the
+			// suffix for single-output (default-only) tables so the UI's
+			// wire-form matches what the catalog page lists.
 			via = db + "." + identutil.Sanitize(e.FromNode)
 		}
 		edges = append(edges, LineageEdge{

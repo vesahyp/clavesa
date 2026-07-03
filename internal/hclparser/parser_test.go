@@ -154,16 +154,16 @@ func TestFourNodePipeline(t *testing.T) {
 		t.Fatalf("len(edges) = %d, want 3", len(g.Edges))
 	}
 	edgeKey := func(e graph.Edge) string {
-		return e.FromNode + "->" + e.ToNode + "." + e.ToInput
+		return e.FromNode + "[" + e.FromOutput + "]->" + e.ToNode + "." + e.ToInput
 	}
 	edgeSet := make(map[string]bool, len(g.Edges))
 	for _, e := range g.Edges {
 		edgeSet[edgeKey(e)] = true
 	}
 	wantEdges := []graph.Edge{
-		{FromNode: "s3_source", ToNode: "validate", ToInput: "raw"},
-		{FromNode: "validate", ToNode: "warehouse", ToInput: "default"},
-		{FromNode: "validate", ToNode: "dead_letter", ToInput: "default"},
+		{FromNode: "s3_source", ToNode: "validate", ToInput: "raw", FromOutput: "default"},
+		{FromNode: "validate", ToNode: "warehouse", ToInput: "default", FromOutput: "valid"},
+		{FromNode: "validate", ToNode: "dead_letter", ToInput: "default", FromOutput: "invalid"},
 	}
 	for _, want := range wantEdges {
 		key := edgeKey(want)
@@ -201,7 +201,7 @@ module "enrich" {
   name   = "enrich"
   inputs = {
     raw    = module.src_a.outputs["default"]
-    lookup = module.src_b.outputs["default"]
+    lookup = module.src_b.outputs["dims"]
   }
   sql = "SELECT r.*, l.category FROM raw r JOIN lookup l ON r.type = l.type_code"
 }
@@ -219,14 +219,14 @@ module "enrich" {
 		t.Fatalf("want 2 edges, got %d: %v", len(g.Edges), g.Edges)
 	}
 
-	type edgeSpec struct{ fromNode, toNode, toInput string }
+	type edgeSpec struct{ fromNode, toNode, toInput, fromOutput string }
 	wantEdges := []edgeSpec{
-		{"src_a", "enrich", "raw"},
-		{"src_b", "enrich", "lookup"},
+		{"src_a", "enrich", "raw", "default"},
+		{"src_b", "enrich", "lookup", "dims"},
 	}
 	found := make(map[edgeSpec]bool)
 	for _, e := range g.Edges {
-		found[edgeSpec{e.FromNode, e.ToNode, e.ToInput}] = true
+		found[edgeSpec{e.FromNode, e.ToNode, e.ToInput, e.FromOutput}] = true
 	}
 	for _, w := range wantEdges {
 		if !found[w] {

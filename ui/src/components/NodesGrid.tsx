@@ -424,6 +424,7 @@ export function NodesGrid({
                       aria-hidden
                     >
                       <div
+                        data-testid="run-duration-bar"
                         className={cn(
                           "w-1.5 rounded-sm",
                           VARIANT_BAR_BG[runVariant(r.status)],

@@ -70,11 +70,12 @@ func reclassifyIntraPipelineEdges(g *graph.PipelineGraph, ownSchema string) {
 			}
 			// Synthesise the intra-pipeline edge the author omitted. ToInput
 			// is the alias so buildInputs/buildNodeInputsExpr key the upstream
-			// table under the right SQL alias. graph.Edge carries no output
-			// field — the consumers (topoSort, the run.go/orchestration.go
-			// parents maps) read FromNode/ToNode/ToInput and resolve the
-			// producer's default output the same way they do for a parsed
-			// module-ref edge.
+			// table under the right SQL alias. FromOutput is left empty
+			// (= default) — the consumers (topoSort, the run.go/
+			// orchestration.go parents maps) read FromNode/ToNode/ToInput and
+			// resolve the producer's default output the same way they do for
+			// a parsed module-ref edge, and these synthesized edges are never
+			// re-emitted as HCL.
 			g.Edges = append(g.Edges, graph.Edge{
 				FromNode: producer,
 				ToNode:   n.ID,

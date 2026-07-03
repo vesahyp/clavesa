@@ -11,6 +11,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/vesahyp/clavesa/internal/fileops"
+	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 )
 
@@ -40,15 +41,26 @@ func FindNodeFile(fo *fileops.FileOps, dir, id string) (string, error) {
 	return "", fmt.Errorf("module %q not found in %s", id, dir)
 }
 
-// RemoveEdgesReferencing removes all input/inputs attributes from module blocks
-// in dir that reference fromNodeID as a module source. This cleans up dangling
-// edges after a node is deleted.
+// RemoveEdgesReferencing removes every edge fed by fromNodeID from module
+// blocks in dir. This cleans up dangling edges after a node is deleted.
+//
+//   - a singular `input = module.<fromNodeID>.outputs[…]` attribute
+//     (destination modules) only ever holds the one reference, so the whole
+//     attribute is cleared;
+//   - an `inputs = { … }` map (transform modules) is rebuilt minus only the
+//     deleted node's entries — a multi-input transform keeps its edges from
+//     other producers (and any registry/external string entries) intact.
 func RemoveEdgesReferencing(fo *fileops.FileOps, dir, fromNodeID string) error {
 	result, err := fo.Read(dir)
 	if err != nil {
 		return err
 	}
 	refMarker := fmt.Sprintf("module.%s.outputs", fromNodeID)
+	// Parsed lazily, at most once: only needed when a transform's inputs map
+	// must be rebuilt, and the parse has to happen after fo.Read so it sees
+	// the same on-disk state (the deleted node's block already removed).
+	var g graph.PipelineGraph
+	parsed := false
 	for _, f := range result.Files {
 		if !strings.Contains(f.Content, refMarker) {
 			continue
@@ -62,7 +74,7 @@ func RemoveEdgesReferencing(fo *fileops.FileOps, dir, fromNodeID string) error {
 				continue
 			}
 			moduleName := block.Labels()[0]
-			attrsToRemove := make(map[string]fileops.AttributeValue)
+			attrUpdates := make(map[string]fileops.AttributeValue)
 			for attrName, attr := range block.Body().Attributes() {
 				if attrName != "input" && attrName != "inputs" {
 					continue
@@ -71,18 +83,81 @@ func RemoveEdgesReferencing(fo *fileops.FileOps, dir, fromNodeID string) error {
 				for _, tok := range attr.BuildTokens(nil) {
 					sb.Write(tok.Bytes)
 				}
-				if strings.Contains(sb.String(), refMarker) {
-					attrsToRemove[attrName] = nil
+				if !strings.Contains(sb.String(), refMarker) {
+					continue
+				}
+				if attrName == "input" {
+					attrUpdates[attrName] = nil
+					continue
+				}
+				if !parsed {
+					g, err = hclparser.Parse(dir)
+					if err != nil {
+						return err
+					}
+					parsed = true
+				}
+				remaining := TransformInputsExcluding(g, moduleName, fromNodeID)
+				if len(remaining) == 0 {
+					attrUpdates[attrName] = nil
+				} else {
+					attrUpdates[attrName] = remaining
 				}
 			}
-			if len(attrsToRemove) > 0 {
-				if _, err := fo.UpdateBlock(f.Path, "module."+moduleName, attrsToRemove); err != nil {
+			if len(attrUpdates) > 0 {
+				if _, err := fo.UpdateBlock(f.Path, "module."+moduleName, attrUpdates); err != nil {
 					return fmt.Errorf("remove edges in %s: %w", f.Path, err)
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// TransformInputsExcluding rebuilds the `inputs` map of transform toNode from
+// the parsed graph, dropping every edge from dropFrom into toNode (pass "" to
+// keep all edges). Module-ref entries keep their parsed output key, so an
+// authored `module.x.outputs["stats"]` reference survives the rewrite
+// verbatim. String entries that also live in the inputs map — legacy
+// `"sources.<name>"` registry references and `"<schema>.<table>"` external
+// refs — are re-emitted too, so an edge rewrite never drops them.
+//
+// Typed source_inputs attachments (kind=s3 blocks) live in their own HCL
+// attribute, not in `inputs`, and are represented as maps in Config —
+// the string-only filter below keeps them out of the rebuilt inputs map.
+func TransformInputsExcluding(g graph.PipelineGraph, toNode, dropFrom string) map[string]interface{} {
+	remaining := make(map[string]interface{})
+	for _, e := range g.Edges {
+		if e.ToNode != toNode {
+			continue
+		}
+		if dropFrom != "" && e.FromNode == dropFrom {
+			continue
+		}
+		out := e.FromOutput
+		if out == "" {
+			out = "default"
+		}
+		remaining[e.ToInput] = fileops.ModuleReference{
+			Type:       "reference",
+			Expression: fmt.Sprintf(`module.%s.outputs["%s"]`, e.FromNode, out),
+		}
+	}
+	for _, n := range g.Nodes {
+		if n.ID != toNode {
+			continue
+		}
+		for _, key := range []string{"source_inputs", "external_inputs"} {
+			entries, _ := n.Config[key].(map[string]interface{})
+			for alias, v := range entries {
+				if s, ok := v.(string); ok {
+					remaining[alias] = s
+				}
+			}
+		}
+		break
+	}
+	return remaining
 }
 
 // RemoveEdge deletes the edge from fromNode into toNode. The shape of the
@@ -124,19 +199,7 @@ func RemoveEdge(fo *fileops.FileOps, dir, fromNode, toNode string) error {
 	// Transform: rebuild the inputs map from existing edges, dropping every
 	// edge from fromNode into toNode (multiple aliases from the same source
 	// are unusual but legal).
-	remaining := make(map[string]interface{})
-	for _, e := range g.Edges {
-		if e.ToNode != toNode {
-			continue
-		}
-		if e.FromNode == fromNode {
-			continue
-		}
-		remaining[e.ToInput] = fileops.ModuleReference{
-			Type:       "reference",
-			Expression: fmt.Sprintf(`module.%s.outputs["default"]`, e.FromNode),
-		}
-	}
+	remaining := TransformInputsExcluding(g, toNode, fromNode)
 	var attrs map[string]fileops.AttributeValue
 	if len(remaining) == 0 {
 		attrs = map[string]fileops.AttributeValue{"inputs": nil}

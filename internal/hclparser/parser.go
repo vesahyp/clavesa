@@ -448,9 +448,10 @@ func parseModuleRef(expr, toNode, toInput string) (graph.Edge, bool) {
 		return graph.Edge{}, false
 	}
 	return graph.Edge{
-		FromNode: m[1],
-		ToNode:   toNode,
-		ToInput:  toInput,
+		FromNode:   m[1],
+		ToNode:     toNode,
+		ToInput:    toInput,
+		FromOutput: m[2],
 	}, true
 }
 

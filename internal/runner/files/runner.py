@@ -1535,7 +1535,15 @@ def _merge_set_clause(source_cols: list[str], merge_keys: list[str], merge_updat
     aggregate-aware merge. Each source column (except merge keys) is set:
     columns named in merge_update use their primitive expr (additive / min /
     max / sketch) or a raw SparkSQL expression; all others replace from
-    source. Uses the `target` / `source` MERGE aliases."""
+    source. Uses the `target` / `source` MERGE aliases.
+
+    Contract for additive schema evolution (GH #61): the iteration is over
+    SOURCE columns, so a newly-added source column not named in merge_update
+    still gets a `target.c = source.c` assignment. The write loop ALTERs the
+    target to add missing columns BEFORE the MERGE — Delta resolves explicit
+    assignments against the current target schema, so without the ALTER a
+    new column fails analysis (DELTA_MERGE_UNRESOLVED_EXPRESSION); `MERGE
+    WITH SCHEMA EVOLUTION` does not rescue it."""
     keys = set(merge_keys)
     parts = []
     for c in source_cols:
@@ -1553,6 +1561,13 @@ def _merge_set_clause(source_cols: list[str], merge_keys: list[str], merge_updat
 
 
 _MERGE_BOUND_IN_THRESHOLD = 200
+
+# Delta liquid clustering accepts at most 4 clustering columns. A merge key
+# wider than that (e.g. a 5-column utm_* composite) is capped to its first 4,
+# which still co-locates the MERGE target well. The MERGE scan-bound uses the
+# same cap: columns beyond the first 4 of the effective clustering are never
+# skipping columns, so bounding them costs a collect job and prunes nothing.
+_MAX_CLUSTER_COLS = 4
 
 
 def _sql_lit(v):
@@ -1576,11 +1591,19 @@ def _sql_lit(v):
     if isinstance(v, _dt.date):
         return "DATE '" + v.isoformat() + "'"
     if isinstance(v, str):
-        return "'" + v.replace("'", "''") + "'"
+        # Escape backslashes BEFORE doubling quotes: Spark's default parser
+        # (escapedStringLiterals=false) processes C-style backslash escapes
+        # inside string literals, so an unescaped '\' would render a literal
+        # that is NOT equal to the value — the bound would then exclude a
+        # genuinely matching target row and the MERGE would silently
+        # duplicate it (GH #70).
+        return "'" + v.replace("\\", "\\\\").replace("'", "''") + "'"
     if isinstance(v, float):
         return repr(v) if math.isfinite(v) else None
     if isinstance(v, decimal.Decimal):
-        return str(v)
+        # Non-finite decimals str() to bare tokens (NaN, Infinity) that Spark
+        # parses as column references — skip them like non-finite floats.
+        return str(v) if v.is_finite() else None
     return None
 
 
@@ -1588,33 +1611,37 @@ def _bound_predicate_sql(col, values, *, threshold=_MERGE_BOUND_IN_THRESHOLD, fo
     """Build a static target-only scan-bound predicate for one column from the
     distinct NON-NULL source values already collected to the driver.
 
-    - Drop any value whose _sql_lit() is None.
-    - If no renderable values remain -> return None (skip; never emit IN ()).
-    - If force_between is False and renderable count <= threshold ->
+    - If ANY value fails to render (_sql_lit() -> None) -> return None (skip
+      the column entirely). A partially rendered bound is unsound: e.g. a NaN
+      float key CAN match in the un-bounded MERGE (Spark treats NaN = NaN as
+      true), so an IN list built from only the finite siblings would exclude
+      that target row and silently duplicate it. A wider bound is always
+      correct; a partial one is not (GH #70).
+    - If there are no values at all -> return None (never emit IN ()).
+    - If force_between is False and count <= threshold ->
       "target.`col` IN (lit, lit, ...)".
     - Else -> "target.`col` BETWEEN <min-lit> AND <max-lit>" using min()/max()
-      over the RENDERABLE python values (compare values, not strings). If
-      min/max can't be computed (mixed/untypeable) -> None.
+      over the python values (compare values, not strings). If min/max can't
+      be computed (mixed/untypeable) -> None.
 
     `force_between` lets the caller pass the table-batch's TRUE (min, max) when
     the collected sample was truncated, so the BETWEEN bound is not derived
     from a partial sample. Pure: stdlib + values only, no Spark."""
+    values = list(values)
     lits = []
-    renderable = []
     for v in values:
         lit = _sql_lit(v)
         if lit is None:
-            continue
+            return None
         lits.append(lit)
-        renderable.append(v)
     if not lits:
         return None
     quoted = "`" + col + "`"
     if not force_between and len(lits) <= threshold:
         return f"target.{quoted} IN (" + ", ".join(lits) + ")"
     try:
-        mn = min(renderable)
-        mx = max(renderable)
+        mn = min(values)
+        mx = max(values)
     except TypeError:
         return None
     mn_lit = _sql_lit(mn)
@@ -1630,7 +1657,9 @@ def _merge_bound_cols(merge_keys, cluster_by, bound_by=None):
     Tier 1: merge_keys that are also skipping columns. For a merge output the
     effective clustering is `cluster_by or merge_keys` (the runner clusters a
     merge table by its merge_keys when cluster_by is unset — see the write
-    loop's `cluster_cols`).
+    loop's `cluster_cols`), capped at _MAX_CLUSTER_COLS to match what
+    _create_delta_table actually clusters — columns beyond the cap can never
+    prune, so bounding them would only cost collect jobs.
 
     Tier 2: every column in `bound_by` is appended unconditionally (even if it
     isn't in cluster_by) — it's the author's explicit assertion that the column
@@ -1639,7 +1668,7 @@ def _merge_bound_cols(merge_keys, cluster_by, bound_by=None):
 
     Tier-1 columns come first (in merge_keys order), then the extra bound_by
     columns (in declared order). De-dup; preserve order. Pure: no Spark."""
-    skipping = set(cluster_by) if cluster_by else set(merge_keys)
+    skipping = set((cluster_by or merge_keys)[:_MAX_CLUSTER_COLS])
     seen = set()
     out = []
     for k in merge_keys:
@@ -1651,6 +1680,20 @@ def _merge_bound_cols(merge_keys, cluster_by, bound_by=None):
             seen.add(b)
             out.append(b)
     return out
+
+
+def _schema_drifted(existing_schema, new_schema) -> bool:
+    """True when two Spark schemas differ in ordered (name, type) shape —
+    added/removed/renamed columns, type changes, or reorders. Nullability is
+    deliberately ignored: user output tables are created from DataFrame
+    writes and stay nullable, so a nullability-only delta never needs a
+    schema overwrite. Pure: works on any iterable of objects exposing
+    ``.name`` and ``.dataType.simpleString()`` (no Spark import)."""
+
+    def shape(schema):
+        return [(f.name, f.dataType.simpleString()) for f in schema]
+
+    return shape(existing_schema) != shape(new_schema)
 
 
 def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dict[str, Any]:
@@ -1807,12 +1850,6 @@ def _ensure_database(spark, db_part: str) -> None:
         # Preview / no warehouse configured: spark.sql.warehouse.dir is
         # the fallback and Hive's local-warehouse resolution kicks in.
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_part}")
-
-
-# Delta liquid clustering accepts at most 4 clustering columns. A merge key
-# wider than that (e.g. a 5-column utm_* composite) is capped to its first 4,
-# which still co-locates the MERGE target well.
-_MAX_CLUSTER_COLS = 4
 
 
 def _create_delta_table(df, table_id: str, cluster_by: list[str]) -> None:
@@ -2112,7 +2149,14 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
                 f"[clavesa] backfill_promote: target {target} does not exist; creating it from staging",
                 file=sys.stderr,
             )
-            spark.table(staging).write.format("delta").mode("overwrite").saveAsTable(target)
+            # overwriteSchema: staging is the new truth for the target,
+            # schema included. Normally inert (the tableExists guard means
+            # this is a create), but it keeps the promote correct if the
+            # guard misfires against a cold metastore and an old-schema
+            # table is actually present (GH #39).
+            spark.table(staging).write.format("delta").mode("overwrite").option(
+                "overwriteSchema", "true"
+            ).saveAsTable(target)
             _sync_glue_table_schema(target, spark.table(target).schema)
             spark.sql(f"DROP TABLE IF EXISTS {staging}")
             return {
@@ -2420,13 +2464,31 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                 if not spark.catalog.tableExists(table_id):
                     _create_delta_table(df, table_id, cluster_cols)
                 else:
-                    try:
-                        existing = set(spark.table(table_id).schema.fieldNames())
-                        new_cols = [c for c in df.schema.fieldNames() if c not in existing]
-                        if new_cols:
-                            print(f"[clavesa] output {key!r}: schema evolved, +{','.join(new_cols)}", file=sys.stderr, flush=True)
-                    except Exception:  # table may not exist yet on first append; skip silently
-                        pass
+                    # Additive schema evolution (GH #61). Delta 4.0's `MERGE
+                    # WITH SCHEMA EVOLUTION` does NOT evolve this runner's SQL
+                    # shape (proven by the TestRunner_SchemaEvolution_Merge*
+                    # docker tests): explicit `target.c = source.c` assignments
+                    # fail analysis against the un-evolved target schema
+                    # (DELTA_MERGE_UNRESOLVED_EXPRESSION), and `UPDATE SET *` /
+                    # `INSERT *` expand over the TARGET's columns, silently
+                    # dropping extra source columns. So the runner evolves the
+                    # target itself: ALTER TABLE ADD COLUMNS for every source-
+                    # frame column missing from the target, typed from the
+                    # source frame's Spark schema, nullable — pre-existing rows
+                    # read NULL. Deliberately loud: a failed ALTER fails the
+                    # run instead of letting the MERGE silently drop a column.
+                    existing = set(spark.table(table_id).schema.fieldNames())
+                    new_fields = [f for f in df.schema.fields if f.name not in existing]
+                    if new_fields:
+                        add_cols = ", ".join(
+                            f"`{f.name}` {f.dataType.simpleString()}" for f in new_fields
+                        )
+                        spark.sql(f"ALTER TABLE {table_id} ADD COLUMNS ({add_cols})")
+                        print(
+                            f"[clavesa] output {key!r}: schema evolved, +{','.join(f.name for f in new_fields)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     staging = f"__merge_src_{key}"
                     df.createOrReplaceTempView(staging)
                     on_clause = " AND ".join(
@@ -2442,74 +2504,102 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                     bound_cols = _merge_bound_cols(
                         spec["merge_keys"], spec.get("cluster_by") or [], spec.get("bound_by")
                     )
-                    bound_preds = []
-                    for bc in bound_cols:
-                        vals = [
-                            r[0]
-                            for r in df.select(bc)
-                            .where(F.col(bc).isNotNull())
-                            .distinct()
-                            .limit(_MERGE_BOUND_IN_THRESHOLD + 1)
-                            .collect()
-                        ]
-                        if len(vals) > _MERGE_BOUND_IN_THRESHOLD:
-                            # Sample was truncated; the limited min/max is NOT
-                            # the true table-batch min/max. Recompute the true
-                            # bounds for the BETWEEN predicate.
-                            mn, mx = df.agg(F.min(bc), F.max(bc)).first()
-                            p = _bound_predicate_sql(bc, [mn, mx], force_between=True)
-                        else:
-                            p = _bound_predicate_sql(bc, vals)
-                        if p:
-                            bound_preds.append(p)
-                    if bound_preds:
-                        on_clause = "(" + on_clause + ") AND " + " AND ".join(bound_preds)
-                        print(
-                            f"[clavesa] output {key!r}: MERGE scan bounded on {bound_cols}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    # Tier 2 determinism tripwire (GH #62): when the author
-                    # opts into bound_by, verify within THIS staging batch that
-                    # the merge keys functionally determine the bound_by columns.
-                    # A key tuple mapping to >1 distinct bound_by tuple proves
-                    # bound_by is NOT determined by the keys, so the static bound
-                    # could drop a real match and silently duplicate. This is a
-                    # tripwire over the small staging batch, not a proof: it
-                    # cannot catch the insert-only case where each key appears
-                    # exactly once in the batch yet collides with a differently-
-                    # valued historical row in the target.
                     bb = spec.get("bound_by") or []
-                    if bb:
-                        offenders = (
-                            df.select(*spec["merge_keys"], *bb)
-                            .distinct()
-                            .groupBy(*spec["merge_keys"])
-                            .count()
-                            .where(F.col("count") > 1)
-                            .limit(1)
-                            .count()
-                        )
-                        if offenders:
-                            raise RuntimeError(
-                                f"output {key!r}: bound_by={bb} is not functionally determined by "
-                                f"merge_keys={spec['merge_keys']} in this batch — refusing to bound "
-                                f"the MERGE scan (would risk silent duplicates). Remove bound_by or "
-                                f"fix the merge keys."
+                    # Persist the staging frame across the bound collects, the
+                    # Tier-2 tripwire, and the MERGE itself. Un-persisted, each
+                    # consumer recomputes the whole transform (several full
+                    # recomputations per merge output), and a non-deterministic
+                    # transform could recompute key values outside the collected
+                    # bounds — the bound would then exclude a real match and
+                    # silently duplicate it. Persisting freezes the batch and
+                    # closes that window (GH #70).
+                    persisted = bool(bound_cols or bb)
+                    if persisted:
+                        df.persist()
+                    try:
+                        bound_preds = []
+                        for bc in bound_cols:
+                            vals = [
+                                r[0]
+                                for r in df.select(bc)
+                                .where(F.col(bc).isNotNull())
+                                .distinct()
+                                .limit(_MERGE_BOUND_IN_THRESHOLD + 1)
+                                .collect()
+                            ]
+                            if len(vals) > _MERGE_BOUND_IN_THRESHOLD:
+                                # Sample was truncated; the limited min/max is NOT
+                                # the true table-batch min/max. Recompute the true
+                                # bounds for the BETWEEN predicate.
+                                mn, mx = df.agg(F.min(bc), F.max(bc)).first()
+                                p = _bound_predicate_sql(bc, [mn, mx], force_between=True)
+                            else:
+                                p = _bound_predicate_sql(bc, vals)
+                            if p:
+                                bound_preds.append(p)
+                        if bound_preds:
+                            on_clause = "(" + on_clause + ") AND " + " AND ".join(bound_preds)
+                            print(
+                                f"[clavesa] output {key!r}: MERGE scan bounded on {bound_cols}",
+                                file=sys.stderr,
+                                flush=True,
                             )
-                    if spec["merge_update"]:
-                        set_clause = _merge_set_clause(
-                            df.schema.fieldNames(), spec["merge_keys"], spec["merge_update"]
+                        # Tier 2 determinism tripwire (GH #62): when the author
+                        # opts into bound_by, verify within THIS staging batch that
+                        # the merge keys functionally determine the bound_by columns.
+                        # A key tuple mapping to >1 distinct bound_by tuple proves
+                        # bound_by is NOT determined by the keys, so the static bound
+                        # could drop a real match and silently duplicate. This is a
+                        # tripwire over the small staging batch, not a proof: it
+                        # cannot catch the insert-only case where each key appears
+                        # exactly once in the batch yet collides with a differently-
+                        # valued historical row in the target.
+                        if bb:
+                            offenders = (
+                                df.select(*spec["merge_keys"], *bb)
+                                .distinct()
+                                .groupBy(*spec["merge_keys"])
+                                .count()
+                                .where(F.col("count") > 1)
+                                .limit(1)
+                                .count()
+                            )
+                            if offenders:
+                                raise RuntimeError(
+                                    f"output {key!r}: bound_by={bb} is not functionally determined by "
+                                    f"merge_keys={spec['merge_keys']} in this batch — refusing to bound "
+                                    f"the MERGE scan (would risk silent duplicates). Remove bound_by or "
+                                    f"fix the merge keys."
+                                )
+                        if spec["merge_update"]:
+                            set_clause = _merge_set_clause(
+                                df.schema.fieldNames(), spec["merge_keys"], spec["merge_update"]
+                            )
+                            when_matched = f"WHEN MATCHED THEN UPDATE SET {set_clause}"
+                        else:
+                            when_matched = "WHEN MATCHED THEN UPDATE SET *"
+                        # Plain MERGE INTO — the former WITH SCHEMA EVOLUTION
+                        # clause was removed deliberately: it never applied to
+                        # this SQL shape in Delta 4.0 (see the evolution
+                        # comment above), so additive column adds are handled
+                        # entirely by the pre-MERGE ALTER. After the ALTER the
+                        # new columns are ordinary target columns: explicit
+                        # `target.c = source.c` assignments resolve, and
+                        # `UPDATE SET *` / `INSERT *` expand over the evolved
+                        # target schema. The scan-bound predicates are
+                        # unaffected by evolution: they bound merge_keys /
+                        # bound_by columns, which exist in both schemas by
+                        # construction. Column removals and type changes stay
+                        # out of scope (additive evolution only).
+                        spark.sql(
+                            f"MERGE INTO {table_id} target USING {staging} source "
+                            f"ON {on_clause} "
+                            f"{when_matched} "
+                            f"WHEN NOT MATCHED THEN INSERT *"
                         )
-                        when_matched = f"WHEN MATCHED THEN UPDATE SET {set_clause}"
-                    else:
-                        when_matched = "WHEN MATCHED THEN UPDATE SET *"
-                    spark.sql(
-                        f"MERGE WITH SCHEMA EVOLUTION INTO {table_id} target USING {staging} source "
-                        f"ON {on_clause} "
-                        f"{when_matched} "
-                        f"WHEN NOT MATCHED THEN INSERT *"
-                    )
+                    finally:
+                        if persisted:
+                            df.unpersist()
             elif spec["mode"] == "append":
                 if cluster_cols and not spark.catalog.tableExists(table_id):
                     # First write of a clustered append table: create it with
@@ -2532,7 +2622,31 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                     # CLUSTER BY. Later overwrites preserve the clustering.
                     _create_delta_table(df, table_id, cluster_cols)
                 else:
-                    df.write.format("delta").mode("overwrite").saveAsTable(table_id)
+                    # Replace semantics: the transform's current output IS the
+                    # table, schema included. When the frame's (name, type)
+                    # shape drifted from the existing table — added or removed
+                    # columns, type changes — overwriteSchema lets the table
+                    # follow the DataFrame instead of failing Delta's schema
+                    # enforcement at saveAsTable (GH #39). Gated on detected
+                    # drift so the steady-state overwrite is byte-identical to
+                    # before and never touches the table metadata.
+                    drifted = False
+                    try:
+                        drifted = _schema_drifted(spark.table(table_id).schema, df.schema)
+                    except Exception:  # table doesn't exist yet; plain overwrite creates it
+                        pass
+                    writer = df.write.format("delta").mode("overwrite")
+                    if drifted:
+                        print(f"[clavesa] output {key!r}: schema changed, overwriting table schema", file=sys.stderr, flush=True)
+                        writer = writer.option("overwriteSchema", "true")
+                    writer.saveAsTable(table_id)
+                    if drifted and cluster_cols:
+                        # overwriteSchema replaces the table metadata wholesale;
+                        # re-assert liquid clustering so the spec survives an
+                        # evolving overwrite (same ALTER the cluster_alter
+                        # operation uses; metadata-only, no rewrite).
+                        cols = ", ".join(f"`{c}`" for c in cluster_cols[:_MAX_CLUSTER_COLS])
+                        spark.sql(f"ALTER TABLE {table_id} CLUSTER BY ({cols})")
             # Write the real schema into Glue's StorageDescriptor.Columns so
             # Athena's browser / information_schema / Lake Formation see the
             # genuine columns instead of Spark's generic `col array<string>`

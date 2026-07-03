@@ -275,7 +275,7 @@ function LineBody({ widget, data }: WidgetBodyProps) {
     y: Number(row[yIdx]),
   }));
   return (
-    <ChartFrame>
+    <ChartFrame pointCount={points.length}>
       <LineChart data={points} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
         <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
         <XAxis
@@ -721,9 +721,22 @@ const tooltipBase = {
   labelStyle: { color: "rgb(255 255 255 / 0.55)" },
 };
 
-function ChartFrame({ children }: { children: React.ReactElement }) {
+// `pointCount` stamps the container with data-point-count so automated
+// walkthroughs (verify-readme.sh) can assert "chart has N points" without
+// counting recharts SVG internals, which are brittle.
+function ChartFrame({
+  children,
+  pointCount,
+}: {
+  children: React.ReactElement;
+  pointCount?: number;
+}) {
   return (
-    <div className="flex-1 px-2 pb-2 text-muted-foreground">
+    <div
+      className="flex-1 px-2 pb-2 text-muted-foreground"
+      data-testid="widget-chart"
+      data-point-count={pointCount}
+    >
       <ResponsiveContainer width="100%" height="100%">
         {children}
       </ResponsiveContainer>

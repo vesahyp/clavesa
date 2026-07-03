@@ -365,11 +365,11 @@ func pyBool(b bool) string {
 
 type promoteResult struct {
 	Result struct {
-		Status        string   `json:"status"`
-		Operation     string   `json:"operation"`
-		Target        string   `json:"target"`
-		StagingDropped string  `json:"staging_dropped"`
-		ColumnsAdded  []string `json:"columns_added"`
+		Status         string   `json:"status"`
+		Operation      string   `json:"operation"`
+		Target         string   `json:"target"`
+		StagingDropped string   `json:"staging_dropped"`
+		ColumnsAdded   []string `json:"columns_added"`
 	} `json:"result"`
 	TargetSchema  [][]string       `json:"target_schema"`
 	TargetRows    []map[string]any `json:"target_rows"`
@@ -991,5 +991,300 @@ print("RESULT_LINE:" + json.dumps({
 	}
 	if msgOK, _ := r["msg_ok"].(bool); !msgOK {
 		t.Errorf("raise-path: tripwire message missing %q substring (msg_ok=%v)", "not functionally determined", r["msg_ok"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Additive schema evolution across output modes (GH #39, GH #61 and the
+// escalated deal_scores replace-mode failure). Grouped under
+// TestRunner_SchemaEvolution_* so `go test -run TestRunner_SchemaEvolution`
+// runs the set.
+// ---------------------------------------------------------------------------
+
+// asStrMap converts a RESULT_LINE JSON object value to map[string]string,
+// tolerating missing keys (empty string).
+func asStrMap(v any) map[string]string {
+	out := map[string]string{}
+	m, _ := v.(map[string]any)
+	for k, val := range m {
+		if s, ok := val.(string); ok {
+			out[k] = s
+		}
+	}
+	return out
+}
+
+// TestRunner_SchemaEvolution_ReplaceAddColumn proves the replace-mode fix:
+// run 2 adds a column to the transform's SQL and must succeed with the new
+// column materialized (previously Delta schema enforcement failed the
+// saveAsTable); run 3 changes an existing column's type and must also
+// succeed (GH #39 — previously required a manual DROP TABLE).
+func TestRunner_SchemaEvolution_ReplaceAddColumn(t *testing.T) {
+	script := `
+import json, os, sys
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_WAREHOUSE"] = "/work/wh"
+os.environ["CLAVESA_WATERMARKS"] = "/work/wm"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_CATALOG"] = "itest_cat"
+os.environ["CLAVESA_SCHEMA"] = "itest"
+os.environ["CLAVESA_PIPELINE"] = "itest"
+os.environ["CLAVESA_NODE"] = "itest"
+os.makedirs("/work/wm", exist_ok=True)
+
+from runner import _spark, handler
+
+spark = _spark()
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
+
+spark.createDataFrame(
+    [{"id": 1, "amount": 10}, {"id": 2, "amount": 20}]
+).write.format("delta").mode("append").saveAsTable("itest.src_rep")
+
+event = {
+    "inputs": {"src": "itest.src_rep"},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.rep", "mode": "replace"}},
+}
+
+# Run 1: baseline two-column table.
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT id, amount FROM src")
+r1 = handler(event, None)
+
+# Run 2: the escalated bug — same output, one added column.
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT id, amount, amount * 2 AS amount_doubled FROM src")
+r2 = handler(event, None)
+schema2 = {f.name: f.dataType.simpleString() for f in spark.table("itest.rep").schema}
+rows2 = {str(r["id"]): r.asDict() for r in spark.table("itest.rep").collect()}
+
+# Run 3: GH #39 — an existing column's type changes.
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT id, CAST(amount AS STRING) AS amount FROM src")
+r3 = handler(event, None)
+schema3 = {f.name: f.dataType.simpleString() for f in spark.table("itest.rep").schema}
+
+print("RESULT_LINE:" + json.dumps({
+    "r1": r1.get("status"), "r2": r2.get("status"), "r3": r3.get("status"),
+    "schema2": schema2, "rows2": rows2, "schema3": schema3,
+}, default=str))
+`
+	r := runRawDriver(t, script)
+	if r["r1"] != "ok" || r["r2"] != "ok" {
+		t.Fatalf("replace add-column: r1=%v r2=%v (want ok/ok)", r["r1"], r["r2"])
+	}
+	schema2 := asStrMap(r["schema2"])
+	if schema2["amount_doubled"] == "" {
+		t.Errorf("run 2: amount_doubled missing from table schema: %v", r["schema2"])
+	}
+	rows2, _ := r["rows2"].(map[string]any)
+	if row, _ := rows2["1"].(map[string]any); row != nil {
+		if got, _ := row["amount_doubled"].(float64); got != 20 {
+			t.Errorf("run 2: id=1 amount_doubled: want 20, got %v", row["amount_doubled"])
+		}
+	} else {
+		t.Errorf("run 2: id=1 row missing: %v", rows2)
+	}
+	if r["r3"] != "ok" {
+		t.Fatalf("replace type-change (GH #39): r3=%v (want ok)", r["r3"])
+	}
+	schema3 := asStrMap(r["schema3"])
+	if schema3["amount"] != "string" {
+		t.Errorf("run 3: amount type: want string, got %q (schema: %v)", schema3["amount"], r["schema3"])
+	}
+}
+
+// TestRunner_SchemaEvolution_MergeAddColumn proves GH #61 on the UPDATE SET * /
+// INSERT * merge path with a multi-column merge key (real rollup shape, not a
+// single id): run 2 adds a `scrolls` column. The matched row must be updated
+// WITH the new column's value, the new row inserted with it, and the row NOT
+// in run 2's source must survive untouched with NULL in the new column —
+// nothing dropped, no destructive reset needed.
+func TestRunner_SchemaEvolution_MergeAddColumn(t *testing.T) {
+	script := `
+import json, os, sys, datetime
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_WAREHOUSE"] = "/work/wh"
+os.environ["CLAVESA_WATERMARKS"] = "/work/wm"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_CATALOG"] = "itest_cat"
+os.environ["CLAVESA_SCHEMA"] = "itest"
+os.environ["CLAVESA_PIPELINE"] = "itest"
+os.environ["CLAVESA_NODE"] = "itest"
+os.makedirs("/work/wm", exist_ok=True)
+
+from runner import _spark, handler
+from pyspark.sql.types import StructType, StructField, StringType, DateType, LongType
+
+spark = _spark()
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
+
+d1 = datetime.date(2026, 6, 1)
+d2 = datetime.date(2026, 6, 2)
+schema = StructType([
+    StructField("site", StringType(), True),
+    StructField("d", DateType(), True),
+    StructField("v", LongType(), True),
+])
+
+event = {
+    "inputs": {"src": "itest.src_m1"},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.rollup1",
+        "mode": "merge", "merge_keys": ["site", "d"]}},
+}
+
+# Run 1: creates the target with the two-key three-column shape.
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT site, d, v FROM src")
+spark.createDataFrame([("a.com", d1, 1), ("b.com", d1, 2)], schema).write.format("delta").mode("overwrite").saveAsTable("itest.src_m1")
+r1 = handler(event, None)
+
+# Run 2: transform gains a column; the batch touches a.com (matched) and
+# c.com (new) but NOT b.com — b.com must keep its data and read NULL scrolls.
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT site, d, v, v * 10 AS scrolls FROM src")
+spark.createDataFrame([("a.com", d1, 5), ("c.com", d2, 3)], schema).write.format("delta").mode("overwrite").saveAsTable("itest.src_m1")
+r2 = handler(event, None)
+
+rows = {}
+for r in spark.table("itest.rollup1").collect():
+    rd = r.asDict()
+    rows[rd["site"]] = {"v": rd["v"], "scrolls": rd.get("scrolls")}
+schema_out = {f.name: f.dataType.simpleString() for f in spark.table("itest.rollup1").schema}
+print("RESULT_LINE:" + json.dumps({
+    "r1": r1.get("status"), "r2": r2.get("status"),
+    "rows": rows, "schema": schema_out,
+}, default=str))
+`
+	r := runRawDriver(t, script)
+	if r["r1"] != "ok" || r["r2"] != "ok" {
+		t.Fatalf("merge add-column: r1=%v r2=%v (want ok/ok)", r["r1"], r["r2"])
+	}
+	if schema := asStrMap(r["schema"]); schema["scrolls"] == "" {
+		t.Fatalf("scrolls column missing from target schema after evolving MERGE: %v", r["schema"])
+	}
+	rows, _ := r["rows"].(map[string]any)
+	if len(rows) != 3 {
+		t.Fatalf("row count: want 3 (a+b+c, nothing dropped), got %d: %v", len(rows), rows)
+	}
+	get := func(site string) map[string]any {
+		m, _ := rows[site].(map[string]any)
+		if m == nil {
+			t.Fatalf("row for %s missing: %v", site, rows)
+		}
+		return m
+	}
+	a := get("a.com")
+	if v, _ := a["v"].(float64); v != 5 {
+		t.Errorf("a.com v: want 5 (matched row updated), got %v", a["v"])
+	}
+	if s, _ := a["scrolls"].(float64); s != 50 {
+		t.Errorf("a.com scrolls: want 50 (matched row gets new column value), got %v", a["scrolls"])
+	}
+	c := get("c.com")
+	if s, _ := c["scrolls"].(float64); s != 30 {
+		t.Errorf("c.com scrolls: want 30 (inserted row), got %v", c["scrolls"])
+	}
+	b := get("b.com")
+	if b["scrolls"] != nil {
+		t.Errorf("b.com scrolls: want NULL (pre-evolution row untouched), got %v", b["scrolls"])
+	}
+	if v, _ := b["v"].(float64); v != 2 {
+		t.Errorf("b.com v: want 2 (untouched row keeps data), got %v", b["v"])
+	}
+}
+
+// TestRunner_SchemaEvolution_MergeUpdateAddColumn is the merge_update variant:
+// with an explicit WHEN MATCHED THEN UPDATE SET clause (_merge_set_clause,
+// here `v = additive`), a newly-added source column must still evolve the
+// target. Delta resolves the clause's `target.scrolls = source.scrolls`
+// assignment against the CURRENT target schema — `WITH SCHEMA EVOLUTION`
+// never rescued it (DELTA_MERGE_UNRESOLVED_EXPRESSION) — so the runner must
+// ALTER the target to add the column before the MERGE. Multi-column merge
+// key, same untouched-row-NULL assertion.
+func TestRunner_SchemaEvolution_MergeUpdateAddColumn(t *testing.T) {
+	script := `
+import json, os, sys, datetime
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_WAREHOUSE"] = "/work/wh"
+os.environ["CLAVESA_WATERMARKS"] = "/work/wm"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_CATALOG"] = "itest_cat"
+os.environ["CLAVESA_SCHEMA"] = "itest"
+os.environ["CLAVESA_PIPELINE"] = "itest"
+os.environ["CLAVESA_NODE"] = "itest"
+os.makedirs("/work/wm", exist_ok=True)
+
+from runner import _spark, handler
+from pyspark.sql.types import StructType, StructField, StringType, DateType, LongType
+
+spark = _spark()
+spark.sql("CREATE DATABASE IF NOT EXISTS itest")
+
+d1 = datetime.date(2026, 6, 1)
+d2 = datetime.date(2026, 6, 2)
+schema = StructType([
+    StructField("site", StringType(), True),
+    StructField("d", DateType(), True),
+    StructField("v", LongType(), True),
+])
+
+event = {
+    "inputs": {"src": "itest.src_m2"},
+    "outputs": {"default": {"kind": "delta_table", "table_id": "itest.rollup2",
+        "mode": "merge", "merge_keys": ["site", "d"],
+        "merge_update": {"v": "additive"}}},
+}
+
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT site, d, v FROM src")
+spark.createDataFrame([("a.com", d1, 1), ("b.com", d1, 2)], schema).write.format("delta").mode("overwrite").saveAsTable("itest.src_m2")
+r1 = handler(event, None)
+
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT site, d, v, v * 10 AS scrolls FROM src")
+spark.createDataFrame([("a.com", d1, 4), ("c.com", d2, 3)], schema).write.format("delta").mode("overwrite").saveAsTable("itest.src_m2")
+r2 = handler(event, None)
+
+rows = {}
+for r in spark.table("itest.rollup2").collect():
+    rd = r.asDict()
+    rows[rd["site"]] = {"v": rd["v"], "scrolls": rd.get("scrolls")}
+print("RESULT_LINE:" + json.dumps({
+    "r1": r1.get("status"), "r2": r2.get("status"), "rows": rows,
+}, default=str))
+`
+	r := runRawDriver(t, script)
+	if r["r1"] != "ok" || r["r2"] != "ok" {
+		t.Fatalf("merge_update add-column: r1=%v r2=%v (want ok/ok)", r["r1"], r["r2"])
+	}
+	rows, _ := r["rows"].(map[string]any)
+	if len(rows) != 3 {
+		t.Fatalf("row count: want 3, got %d: %v", len(rows), rows)
+	}
+	get := func(site string) map[string]any {
+		m, _ := rows[site].(map[string]any)
+		if m == nil {
+			t.Fatalf("row for %s missing: %v", site, rows)
+		}
+		return m
+	}
+	a := get("a.com")
+	if v, _ := a["v"].(float64); v != 5 {
+		t.Errorf("a.com v: want 5 (additive 1+4), got %v", a["v"])
+	}
+	if s, _ := a["scrolls"].(float64); s != 40 {
+		t.Errorf("a.com scrolls: want 40 (new column replaces from source on matched row), got %v", a["scrolls"])
+	}
+	c := get("c.com")
+	if s, _ := c["scrolls"].(float64); s != 30 {
+		t.Errorf("c.com scrolls: want 30 (inserted row), got %v", c["scrolls"])
+	}
+	b := get("b.com")
+	if b["scrolls"] != nil {
+		t.Errorf("b.com scrolls: want NULL (untouched pre-evolution row), got %v", b["scrolls"])
 	}
 }

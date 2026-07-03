@@ -60,7 +60,7 @@ test-go: ## Go unit tests (fast, no binary)
 # runner image — external artifacts Go's test cache can't see — so a
 # cached PASS can predate the binary it claims to verify.
 test-cli: $(if $(SKIP_BUILD),,build-bin) ## Build binary + CLI pipeline cycle (Go-driven)
-	go test -v -count=1 -tags integration ./tests/cli/...
+	go test -v -count=1 -timeout 30m -tags integration ./tests/cli/...
 
 test-runner: ## Docker-gated runner integration tests (preview + handler)
 	@docker info >/dev/null 2>&1 || { \
@@ -68,7 +68,7 @@ test-runner: ## Docker-gated runner integration tests (preview + handler)
 	  echo "  start Docker or run the individual suites (test-go / test-runner-py / test-cli)."; \
 	  exit 1; \
 	}
-	go test -v -count=1 -tags integration ./tests/runner/...
+	go test -v -count=1 -timeout 30m -tags integration ./tests/runner/...
 
 test-runner-py: ## Pure-Python runner unit tests (stdlib only, no docker, no Spark)
 	@for f in tests/runner/test_*.py; do \

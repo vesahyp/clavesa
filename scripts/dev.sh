@@ -21,7 +21,7 @@ echo "  Frontend: http://localhost:5173"
 echo "  Workspace: $WORKSPACE"
 echo ""
 
-go run ./cmd/clavesa/... ui -no-browser -workspace "$WORKSPACE" &
+go run ./cmd/clavesa/... ui --no-browser --workspace "$WORKSPACE" &
 (cd ui && npm run dev) &
 
 wait

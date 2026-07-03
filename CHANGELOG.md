@@ -12,6 +12,21 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.14.0] — 2026-07-03
+
+### Fixed
+
+- Deleting a node upstream of a multi-input (join) transform no longer wipes the transform's whole `inputs` map — surviving edges from other producers, registry references, and external table refs are preserved; edge edits also keep authored non-default output references (`outputs["<key>"]`) instead of rewriting them to `default` (GH #69).
+- `make dev` starts the backend again (single-dash long flags rejected by the CLI).
+- MERGE scan-bound literals now escape backslashes, and a bound column whose values can't all be rendered is skipped entirely (including NaN/Inf floats and decimals), so a backslash- or NaN-bearing merge key can no longer make the GH #62 bound exclude a matching target row and silently duplicate it on merge (GH #70).
+- Local runner failures now end with a `full runner log: <path>` line pointing at the complete Spark output on disk, alongside the inline stderr tail. The bundle log survives even when the run dir can't be created (falls back to the workspace `.clavesa` dir, then the system temp dir), and single-node/backfill failures write their buffered output to the run-log dir instead of discarding it.
+- Replace-mode outputs now follow the transform's schema: adding a column no longer fails the run with a Delta schema mismatch, and changing a column's type no longer requires a manual `DROP TABLE` (GH #39). Liquid clustering is re-asserted after an evolving overwrite.
+- Merge-mode outputs now actually evolve additively: a newly-added column reaches the target (populated on rows the batch touches, NULL elsewhere) instead of being silently dropped — with plain merges and with `merge_update` (GH #61). Delta's `MERGE WITH SCHEMA EVOLUTION`, shipped as the fix in v2.11.0, never applied to the runner's SQL shape; the runner now adds missing columns to the target itself before the MERGE. Evolution is additive only — column removals and type changes on merge/append outputs remain unsupported.
+
+### Changed
+
+- Merge outputs persist the staging frame across bound computation, the `bound_by` tripwire, and the MERGE itself, eliminating up to ~6 full recomputations of the transform per merge output and closing a non-determinism window that could also cause silent duplicates. Tier-1 bound columns are capped at Delta's 4-column clustering limit; columns beyond it never pruned and only cost collect jobs.
+
 ## [v2.13.0] — 2026-07-01
 
 ### Added

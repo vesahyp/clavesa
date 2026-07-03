@@ -1039,7 +1039,10 @@ func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string
 // runTransform writes the node's logic to disk, builds the docker-run argv,
 // pipes the event JSON via stdin, and waits for completion. logPath, when
 // non-empty, receives a copy of stdout+stderr so the local progress channel
-// can surface per-node logs to the UI (mirrors CloudWatch in cloud).
+// can surface per-node logs to the UI (mirrors CloudWatch in cloud). On
+// failure the returned error's last line names the durable full log — the
+// teed logPath file when it exists, else a failure log written under the
+// run-log dir (see transformFailureLogRef).
 //
 // outputTarget is passed straight through to the runner as `outputs.default`.
 // An empty string triggers auto-Iceberg-table mode (the runner generates
@@ -1287,18 +1290,30 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	if logFile != nil {
 		_ = logFile.Close()
 	}
+	// On any failure below, point the error at a durable full log: the
+	// per-node file the run teed into when it exists, else write the
+	// buffered stdout+stderr to the run-log location now (the backfill
+	// path passes logPath="" — previously nothing landed on disk at all).
+	// Inline stderr/stdout stay bounded; the file carries the rest.
+	teedLogPath := ""
+	if logFile != nil {
+		teedLogPath = logPath
+	}
+	failureLogRef := func() string {
+		return transformFailureLogRef(pipelineDir, pipelineRunID, node.ID, teedLogPath, s.workspace, stdout.Bytes(), stderr.Bytes())
+	}
 	if runErr != nil {
-		return "", nil, s.withDerbyHint(fmt.Errorf("docker run: %w\nstderr: %s", runErr, stderr.String()), stderr.String())
+		return "", nil, s.withDerbyHint(fmt.Errorf("docker run: %w\nstderr: %s\n%s", runErr, boundedStderrTail(stderr.String()), failureLogRef()), stderr.String())
 	}
 
 	// Runner writes a single JSON object to stdout. Parse to surface errors.
 	resp := map[string]any{}
 	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &resp); err != nil {
-		return "", nil, fmt.Errorf("parse runner output: %w\nstdout: %s\nstderr: %s",
-			err, stdout.String(), stderr.String())
+		return "", nil, fmt.Errorf("parse runner output: %w\nstdout: %s\nstderr: %s\n%s",
+			err, boundedStderrTail(stdout.String()), boundedStderrTail(stderr.String()), failureLogRef())
 	}
 	if errMsg, _ := resp["error"].(string); errMsg != "" {
-		return "", nil, fmt.Errorf("runner error: %s", errMsg)
+		return "", nil, fmt.Errorf("runner error: %s\n%s", errMsg, failureLogRef())
 	}
 	// output_rows is the added-records sum across this invocation's
 	// Iceberg outputs (runner.py builds it). Optional — path-mode-only
@@ -1328,7 +1343,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		}
 		return reason, outputRows, nil
 	default:
-		return "", nil, fmt.Errorf("runner status: %v\nstdout: %s", resp["status"], stdout.String())
+		return "", nil, fmt.Errorf("runner status: %v\nstdout: %s\n%s", resp["status"], boundedStderrTail(stdout.String()), failureLogRef())
 	}
 }
 
@@ -1513,14 +1528,15 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	// JSON is the final aggregate response. Route all other stdout AND all
 	// stderr into a pipeline-level log so Spark output (and the real stack
 	// trace when the session dies) is recoverable for debugging. Created
-	// before cmd.Stderr so stderr can be teed into it.
-	var bundleLog *os.File
+	// before cmd.Stderr so stderr can be teed into it. Creation can't fail
+	// silently: when the run dir is unusable, createRunnerLogFile falls back
+	// to a temp file (workspace .clavesa dir, then the system temp dir) so
+	// the full Spark output always lands somewhere the failure returns below
+	// can point at. bundleLogPath tracks the path actually used.
 	bundleLogPath := filepath.Join(pipelineDir, ".clavesa", "runs", runID, "_bundle.log")
-	if err := os.MkdirAll(filepath.Dir(bundleLogPath), 0o755); err == nil {
-		if f, ferr := os.Create(bundleLogPath); ferr == nil {
-			bundleLog = f
-			defer bundleLog.Close()
-		}
+	bundleLog, bundleLogPath, bundleLogErr := createRunnerLogFile(bundleLogPath, s.workspace, "clavesa-bundle-"+sanitizeLogToken(runID)+"-*.log")
+	if bundleLog != nil {
+		defer bundleLog.Close()
 	}
 
 	// Keep a bounded in-memory copy for the inline error tail; tee the full
@@ -1571,11 +1587,16 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		}
 	}
 
+	// Every failure return carries the inline bounded stderr tail plus a
+	// pointer at the durable full log — the tail alone truncates the real
+	// Spark stack trace, and without the path the user has no way to know
+	// the full log exists.
+	logRef := runnerLogRef(bundleLogPath, bundleLogErr)
 	if waitErr != nil {
-		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner: %w\nstderr: %s", waitErr, boundedStderrTail(stderrBuf.String())), stderrBuf.String())
+		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner: %w\nstderr: %s\n%s", waitErr, boundedStderrTail(stderrBuf.String()), logRef), stderrBuf.String())
 	}
 	if finalResp == nil {
-		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s", boundedStderrTail(stderrBuf.String())), stderrBuf.String())
+		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s\n%s", boundedStderrTail(stderrBuf.String()), logRef), stderrBuf.String())
 	}
 	if status, _ := finalResp["status"].(string); status == "failed" {
 		failed, _ := finalResp["failed_node"].(string)
@@ -1583,7 +1604,7 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		// failed. Append the stderr tail so the real Spark stack trace
 		// reaches the caller/dashboard rather than blaming a node by name
 		// alone.
-		return statuses, fmt.Errorf("pipeline failed at node %q\nstderr: %s", failed, boundedStderrTail(stderrBuf.String()))
+		return statuses, fmt.Errorf("pipeline failed at node %q\nstderr: %s\n%s", failed, boundedStderrTail(stderrBuf.String()), logRef)
 	}
 	return statuses, nil
 }
