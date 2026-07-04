@@ -273,7 +273,7 @@ func (s *Service) recordCloudLocalRun(ctx context.Context, lambdaEnv map[string]
 
 	// Resolve the workspace-local runner image, refreshed if a CLI upgrade
 	// shipped new runner code — same resolution the dispatcher uses.
-	image := runner.LocalImageName("") + ":latest"
+	image := workspace.LocalRunnerImageTag(s.workspace)
 	if _, err := workspace.Load(s.workspace); err == nil {
 		if ensured, eerr := workspace.EnsureLocalRunnerImage(s.workspace); eerr == nil {
 			image = ensured

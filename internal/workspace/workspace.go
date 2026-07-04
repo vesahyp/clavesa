@@ -392,6 +392,22 @@ func Upgrade(root, targetVersion string) (prevVersion string, rewritten int, err
 	return prevVersion, rewritten, nil
 }
 
+// LocalRunnerImageTag returns the workspace-scoped runner image `:latest`
+// tag for the workspace at root, resolved fresh from clavesa.json on each
+// call (cheap — one small file read — and lazy so a workspace created after
+// `clavesa ui` started is picked up without a restart). Falls back to the
+// empty-workspace-name image when no manifest is readable. Use this instead
+// of composing `runner.LocalImageName(...)+":latest"` inline; it does NOT
+// build the image — callers that need a guaranteed-fresh image use
+// EnsureLocalRunnerImage below.
+func LocalRunnerImageTag(root string) string {
+	name := ""
+	if m, _ := Load(root); m != nil {
+		name = m.Name
+	}
+	return runner.LocalImageName(name) + ":latest"
+}
+
 // EnsureLocalRunnerImage guarantees the workspace at `root` has a current
 // local Docker runner image — built from the runner source embedded in this
 // binary — and returns the `:latest` tag callers pass to `docker run`.

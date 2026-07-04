@@ -21,8 +21,8 @@
  *   - External (non-clavesa-tagged) Glue tables in the workspace
  *     catalog. No data source exists yet — the catalog handler only
  *     surfaces clavesa-managed DBs.
- *   - Removing / renaming attachments (the user can delete the node
- *     or hand-edit `.tf` for now).
+ *   - Renaming attachments (the user can hand-edit `.tf` for now;
+ *     removal ships via the per-row detach button / handleDetach).
  */
 
 import { useMemo, useState } from "react";
@@ -38,8 +38,14 @@ import {
 } from "@/lib/queries";
 import { displayTableName } from "@/lib/format";
 import { addEdge, detachInput } from "@/api/pipeline";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { NativeSelect } from "@/components/ui/native-select";
+
+/** Uppercase micro-label used above each field in the add-input form. */
+const formLabelCls =
+  "text-[11px] font-semibold uppercase tracking-wider text-muted-foreground";
 
 // ---------------------------------------------------------------------------
 // Source-input value
@@ -347,66 +353,45 @@ function defaultAliasForTable(ref: string): string {
           data-testid="add-input-form"
         >
           <div className="flex gap-1" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              onClick={() => onModeChange("source")}
-              disabled={sourceList.length === 0}
-              data-testid="mode-source"
-              className={
-                "h-7 flex-1 rounded border text-[11px] font-medium " +
-                (mode === "source"
-                  ? "border-foreground bg-foreground text-background"
-                  : "border-border bg-background text-muted-foreground hover:border-foreground/40 disabled:opacity-50")
-              }
-            >
-              Source
-            </button>
-            <button
-              type="button"
-              role="tab"
-              onClick={() => onModeChange("table")}
-              disabled={tableList.length === 0}
-              data-testid="mode-table"
-              className={
-                "h-7 flex-1 rounded border text-[11px] font-medium " +
-                (mode === "table"
-                  ? "border-foreground bg-foreground text-background"
-                  : "border-border bg-background text-muted-foreground hover:border-foreground/40 disabled:opacity-50")
-              }
-            >
-              Workspace table
-            </button>
-            <button
-              type="button"
-              role="tab"
-              onClick={() => onModeChange("node")}
-              disabled={nodeList.length === 0}
-              data-testid="mode-node"
-              className={
-                "h-7 flex-1 rounded border text-[11px] font-medium " +
-                (mode === "node"
-                  ? "border-foreground bg-foreground text-background"
-                  : "border-border bg-background text-muted-foreground hover:border-foreground/40 disabled:opacity-50")
-              }
-            >
-              Pipeline node
-            </button>
+            {(
+              [
+                { mode: "source", label: "Source", disabled: sourceList.length === 0 },
+                { mode: "table", label: "Workspace table", disabled: tableList.length === 0 },
+                { mode: "node", label: "Pipeline node", disabled: nodeList.length === 0 },
+              ] as const
+            ).map((tab) => (
+              <button
+                key={tab.mode}
+                type="button"
+                role="tab"
+                onClick={() => onModeChange(tab.mode)}
+                disabled={tab.disabled}
+                data-testid={`mode-${tab.mode}`}
+                className={cn(
+                  "h-7 flex-1 rounded border text-[11px] font-medium",
+                  mode === tab.mode
+                    ? "border-foreground bg-foreground text-background"
+                    : "border-border bg-background text-muted-foreground hover:border-foreground/40 disabled:opacity-50",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
 
           {mode === "source" && (
             <>
-              <label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <label className={formLabelCls}>
                 Source
               </label>
-              <select
+              <NativeSelect
                 value={pickedSource}
                 onChange={(e) => {
                   setPickedSource(e.target.value);
                   setAlias(e.target.value);
                 }}
                 disabled={busy}
-                className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+                className="h-8 px-2 text-xs"
                 data-testid="add-input-source"
               >
                 {sourceList.map((s) => (
@@ -414,23 +399,23 @@ function defaultAliasForTable(ref: string): string {
                     {s.name} ({s.kind})
                   </option>
                 ))}
-              </select>
+              </NativeSelect>
             </>
           )}
 
           {mode === "table" && (
             <>
-              <label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <label className={formLabelCls}>
                 Table (cross-pipeline)
               </label>
-              <select
+              <NativeSelect
                 value={pickedTable}
                 onChange={(e) => {
                   setPickedTable(e.target.value);
                   setAlias(defaultAliasForTable(e.target.value));
                 }}
                 disabled={busy}
-                className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+                className="h-8 px-2 text-xs"
                 data-testid="add-input-table"
               >
                 {tableList.map((t) => {
@@ -445,23 +430,23 @@ function defaultAliasForTable(ref: string): string {
                     </option>
                   );
                 })}
-              </select>
+              </NativeSelect>
             </>
           )}
 
           {mode === "node" && (
             <>
-              <label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              <label className={formLabelCls}>
                 Upstream transform (this pipeline)
               </label>
-              <select
+              <NativeSelect
                 value={pickedNode}
                 onChange={(e) => {
                   setPickedNode(e.target.value);
                   setAlias(e.target.value);
                 }}
                 disabled={busy}
-                className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+                className="h-8 px-2 text-xs"
                 data-testid="add-input-node"
               >
                 {nodeList.map((id) => (
@@ -469,11 +454,11 @@ function defaultAliasForTable(ref: string): string {
                     {id}
                   </option>
                 ))}
-              </select>
+              </NativeSelect>
             </>
           )}
 
-          <label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label className={formLabelCls}>
             Alias (referenced from SQL as <code>{alias || "<alias>"}</code>)
           </label>
           <Input

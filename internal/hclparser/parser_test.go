@@ -282,6 +282,52 @@ module "external_module" {
 	}
 }
 
+// TestRecognisedModuleSourceForms is the regression test for the module-
+// source gating predicate (2026-05-10 P2-5, regressed per 2026-07-02
+// session D P2-2): every recognised source form must parse as a Clavesa
+// node in its own right. The github ?ref= form is the load-bearing case —
+// pre-v0.30 pipelines still author it, and it was twice admitted only by
+// localModuleSourceRE's tail coincidentally matching, so an unrelated
+// tweak to that regex would silently drop those pipelines from the graph.
+func TestRecognisedModuleSourceForms(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		source   string
+		wantType string
+	}{
+		{"github ref form", "github.com/vesahyp/clavesa//modules/source/aws?ref=v0.19.0", "source"},
+		{"clavesa registry form", "clavesa/transform/aws", "transform"},
+		{"embedded form", "../.clavesa/modules/v0.30.0/destination/aws", "destination"},
+		{"local dev form", "../../modules/transform/aws", "transform"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tf := fmt.Sprintf(`
+module "n1" {
+  source = %q
+  name   = "n1"
+}
+`, tc.source)
+			dir := writeFixture(t, "main.tf", tf)
+			g, err := hclparser.Parse(dir)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+			if len(g.Nodes) != 1 {
+				t.Fatalf("source %q: want 1 node, got %d: %v", tc.source, len(g.Nodes), nodeIDs(g.Nodes))
+			}
+			if g.Nodes[0].Type != tc.wantType {
+				t.Errorf("source %q: node type = %q, want %q", tc.source, g.Nodes[0].Type, tc.wantType)
+			}
+			if g.Nodes[0].ModuleSource != tc.source {
+				t.Errorf("ModuleSource = %q, want %q", g.Nodes[0].ModuleSource, tc.source)
+			}
+		})
+	}
+}
+
 // TestOnlyNonClavesaBlocksProducesEmptyGraph verifies that a file with no
 // Clavesa modules produces an empty graph with no errors.
 func TestOnlyNonClavesaBlocksProducesEmptyGraph(t *testing.T) {

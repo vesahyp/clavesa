@@ -31,15 +31,15 @@ import (
 //     idle-reaper goroutine (15 min default) and explicit user "Stop session".
 //   - EvictWarehouse stops every REPL on the given warehouse but does NOT
 //     touch the warm container itself — catalog queries keep working. Hooked
-//     into the existing persistentDockerQueryRunner.EvictWarehouse chain
+//     into the existing PersistentQueryRunner.EvictWarehouse chain
 //     via NotebookEvictionHook in ui.go.
 //
 // Note: this type does NOT spawn its own docker container. It depends on
-// persistentDockerQueryRunner (already alive when `clavesa ui` is up) for
+// PersistentQueryRunner (already alive when `clavesa ui` is up) for
 // the underlying warm worker; if the warm worker is down or spawning, every
 // op fails fast with a clear error.
 type notebookSessionRunner struct {
-	warm   *persistentDockerQueryRunner
+	warm   *PersistentQueryRunner
 	httpC  *http.Client
 	idleTo time.Duration
 
@@ -106,7 +106,7 @@ type CellErrorMsg struct {
 // query runner's containers. Caller is responsible for Close() at shutdown
 // (otherwise REPL subprocesses linger inside the warm container until it
 // dies; not the end of the world but wastes memory).
-func NewNotebookSessionRunner(warm *persistentDockerQueryRunner) *notebookSessionRunner {
+func NewNotebookSessionRunner(warm *PersistentQueryRunner) *notebookSessionRunner {
 	r := &notebookSessionRunner{
 		warm:     warm,
 		httpC:    &http.Client{Timeout: 10 * time.Minute},
@@ -161,7 +161,7 @@ func (r *notebookSessionRunner) Close() {
 }
 
 // EvictWarehouse stops every REPL whose warehouse matches. Called from the
-// persistentDockerQueryRunner's eviction chain on `pipeline run` so the
+// PersistentQueryRunner's eviction chain on `pipeline run` so the
 // warm container's memory budget isn't pressured by lingering notebooks
 // during a transform run.
 func (r *notebookSessionRunner) EvictWarehouse(warehouse string) {

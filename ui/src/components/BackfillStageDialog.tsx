@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { NativeSelect } from "@/components/ui/native-select";
 import { stageBackfill, useWarehouse, type BackfillRun } from "@/lib/queries";
 
 export interface BackfillStageDialogProps {
@@ -135,11 +136,11 @@ export function BackfillStageDialog({
             <Label htmlFor="bf-node" className="text-xs">
               Node
             </Label>
-            <select
+            <NativeSelect
               id="bf-node"
               value={node}
               onChange={(e) => setNode(e.target.value)}
-              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
+              className="mt-1 font-mono text-xs"
             >
               {transformNodes.length === 0 && (
                 <option value="">(no transform nodes)</option>
@@ -149,7 +150,7 @@ export function BackfillStageDialog({
                   {n}
                 </option>
               ))}
-            </select>
+            </NativeSelect>
           </div>
 
           <div className="grid grid-cols-2 gap-2">

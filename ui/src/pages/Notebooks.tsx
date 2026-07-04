@@ -1,9 +1,10 @@
 /**
  * Notebooks — workspace registry of multi-cell SQL + PySpark .ipynb files.
  *
- * Slice 1 of the notebooks feature. Mirrors the Sources / Credentials page
- * shape (list + inline create + delete) since notebooks are a workspace-level
- * registry like sources are; the editor itself lives at /notebooks/:name.
+ * Slice 1 of the notebooks feature. Shares the RegistryList scaffold with
+ * the Sources / Credentials / Dashboards pages (list + inline create +
+ * delete) since notebooks are a workspace-level registry like sources are;
+ * the editor itself lives at /notebooks/:name.
  */
 
 import { useMemo, useState } from "react";
@@ -13,11 +14,10 @@ import { BookOpen, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useChrome } from "@/components/PageChrome";
-import { ListSearch } from "@/components/ListSearch";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
+import { RegistryList } from "@/pages/RegistryList";
 import {
   createNotebook,
   deleteNotebook,
@@ -81,68 +81,26 @@ export function Notebooks() {
         />
       )}
 
-      {list.isLoading && (
-        <div className="space-y-3">
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-16 w-full" />
-        </div>
-      )}
-
-      {list.error && (
-        <Card>
-          <CardContent className="p-6 text-sm text-destructive">
-            Couldn't load notebooks —{" "}
-            {list.error instanceof Error
-              ? list.error.message
-              : "unknown error"}
-          </CardContent>
-        </Card>
-      )}
-
-      {list.data && list.data.notebooks.length === 0 && !showForm && (
-        <EmptyState onAdd={() => setShowForm(true)} />
-      )}
-
-      {list.data && list.data.notebooks.length > 0 && (
-        <div className="mb-4 flex items-center gap-3">
-          <ListSearch
-            value={query}
-            onChange={setQuery}
-            placeholder="Filter notebooks…"
+      <RegistryList
+        query={list}
+        items={allNotebooks}
+        filtered={filtered}
+        search={query}
+        onSearchChange={setQuery}
+        searchPlaceholder="Filter notebooks…"
+        noun="notebooks"
+        empty={<EmptyState onAdd={() => setShowForm(true)} />}
+        showEmpty={!showForm}
+        renderItem={(nb) => (
+          <NotebookRow
+            key={nb.name}
+            summary={nb}
+            onDeleted={() =>
+              qc.invalidateQueries({ queryKey: ["notebooks"] })
+            }
           />
-          {q && (
-            <span className="text-xs text-muted-foreground">
-              <span className="font-semibold text-foreground">
-                {filtered.length}
-              </span>{" "}
-              of {allNotebooks.length}
-            </span>
-          )}
-        </div>
-      )}
-
-      {list.data && list.data.notebooks.length > 0 && filtered.length === 0 && (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No notebooks match{" "}
-            <span className="font-mono text-foreground">{query}</span>.
-          </CardContent>
-        </Card>
-      )}
-
-      {filtered.length > 0 && (
-        <ul className="grid gap-3">
-          {filtered.map((nb) => (
-            <NotebookRow
-              key={nb.name}
-              summary={nb}
-              onDeleted={() =>
-                qc.invalidateQueries({ queryKey: ["notebooks"] })
-              }
-            />
-          ))}
-        </ul>
-      )}
+        )}
+      />
     </div>
   );
 }

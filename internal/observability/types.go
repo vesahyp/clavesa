@@ -28,13 +28,13 @@ type NodeRunsQuery struct {
 	// below) — PipelineName remains for the `pipeline = '...'` row filter
 	// and for legacy callers that don't yet plumb Database through.
 	PipelineName string
-	// Database is the encoded Glue DB / Iceberg namespace this query
-	// reads from (ADR-016 `<catalog>__<schema>`). Required as of
-	// v0.18.0 — callers must supply the resolved DB name (e.g. via
-	// `Resolver.GlueDBFor`); empty queries return an empty result set
-	// since no DB matches. The pre-v0.18 legacy fallback to
-	// `clavesa_<PipelineName>` was removed once the only production
-	// user (cloudfront-analytics) migrated to the encoded form.
+	// Database is the encoded Glue DB name this query reads from
+	// (ADR-016 `<catalog>__<schema>`). Production callers must supply
+	// the resolved DB name (e.g. via `Resolver.SystemGlueDB`); when
+	// empty, the cloud provider falls back defensively to the legacy
+	// `clavesa_<PipelineName>` shape (see legacyDBFallback in cloud.go)
+	// for handler-without-resolver mode — tests and bare curls without
+	// a `dir` param.
 	Database string
 	// PipelineDir is the workspace-relative path to the pipeline directory,
 	// used by the local provider to locate <dir>/.clavesa/warehouse/. May

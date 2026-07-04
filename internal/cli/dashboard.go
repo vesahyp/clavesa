@@ -1,25 +1,15 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/athena"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/glue"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/spf13/cobra"
 
-	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/service"
-	"github.com/vesahyp/clavesa/internal/servingsql"
-	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // newDashboardsCmd implements `clavesa dashboards` — the CLI half of
@@ -55,44 +45,6 @@ Examples:
 	return cmd
 }
 
-// newDashboardService builds a Service wired with an observability
-// resolver — every dashboards subcommand needs it, since the store reads
-// and writes a catalog table. The local provider is always available;
-// the cloud provider lights up only when AWS credentials load (a
-// cloud-mode workspace without them gets a clear error at dispatch).
-func newDashboardService(cmd *cobra.Command) (*service.Service, string, error) {
-	workspace, err := resolveWorkspace(cmd)
-	if err != nil {
-		return nil, "", fmt.Errorf("resolve workspace: %w", err)
-	}
-	var cloud observability.Provider
-	if awsCfg, cfgErr := awsconfig.LoadDefaultConfig(context.Background()); cfgErr == nil {
-		bucket := os.Getenv("ATHENA_OUTPUT_BUCKET")
-		if bucket == "" {
-			bucket = wspkg.PipelineBucket(workspace)
-		}
-		cloud = observability.NewCloudProvider(
-			athena.NewFromConfig(awsCfg), bucket,
-			sfn.NewFromConfig(awsCfg), cloudwatchlogs.NewFromConfig(awsCfg)).
-			WithGlue(glue.NewFromConfig(awsCfg)).
-			WithS3(s3.NewFromConfig(awsCfg))
-	}
-	local := observability.NewLocalProvider(workspace)
-	resolver := observability.NewResolver(workspace, cloud, local)
-	// Lazy SQL parser (Slice 3) — `dashboards apply` parse-checks every
-	// dataset's SQL before persisting, so users see all bad datasets in
-	// one shot instead of after a Spark cold start at first render.
-	warm := observability.NewPersistentQueryRunner(workspace)
-	// Parser resolves the active warehouse (ADR-024) lazily on first
-	// Parse; cloud + undeployed surfaces an actionable error there.
-	parser := warm.SQLParserForWorkspace()
-	registerCloseable(warm.Close)
-	sidecar := observability.NewTranspileSidecar(workspace)
-	registerCloseable(sidecar.Close)
-	transpiler := servingsql.NewCachedTranspiler(filepath.Join(workspace, ".clavesa", "cache", "transpile"), sidecar.ToServing)
-	return service.New(workspace).WithResolver(resolver).WithSQLParser(parser).WithTranspiler(transpiler), workspace, nil
-}
-
 func newDashboardsListCmd() *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{
@@ -100,7 +52,7 @@ func newDashboardsListCmd() *cobra.Command {
 		Short: "List dashboards",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, _, err := newDashboardService(cmd)
+			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}
@@ -134,7 +86,7 @@ func newDashboardsShowCmd() *cobra.Command {
 		Short: "Show a dashboard's datasets and widgets",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, _, err := newDashboardService(cmd)
+			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}
@@ -206,7 +158,7 @@ For a time_range control named "tr", the two keys are "tr.start" and
 			if err != nil {
 				return err
 			}
-			svc, _, err := newDashboardService(cmd)
+			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}
@@ -281,7 +233,7 @@ The slug defaults to the file's base name; override with --slug.`,
 			if slug == "" {
 				slug = strings.TrimSuffix(filepath.Base(args[0]), ".json")
 			}
-			svc, _, err := newDashboardService(cmd)
+			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}
@@ -304,7 +256,7 @@ func newDashboardsDeleteCmd() *cobra.Command {
 		Short: "Delete a dashboard",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, _, err := newDashboardService(cmd)
+			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}

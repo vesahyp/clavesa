@@ -5,50 +5,37 @@ import (
 	"net/http"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // Resetter is the service-layer interface internal/api depends on for the
-// pipeline reset feature. Mirrors the relevant service.Service methods so
-// internal/api stays free of an internal/service import.
+// pipeline reset feature. Satisfied by *service.Service directly — the api
+// package already imports internal/service (handler.go), so the former
+// field-for-field bridge DTOs guarded a boundary that doesn't exist
+// (C2-P2-11, 2026-07-02 review).
 type Resetter interface {
-	PipelineResetPlan(ctx context.Context, req PipelineResetRequest) (*PipelineResetResult, error)
-	PipelineReset(ctx context.Context, req PipelineResetRequest) (*PipelineResetResult, error)
+	PipelineResetPlan(ctx context.Context, req service.PipelineResetRequest) (*service.PipelineResetResult, error)
+	PipelineReset(ctx context.Context, req service.PipelineResetRequest) (*service.PipelineResetResult, error)
 }
 
-// PipelineResetRequest mirrors service.PipelineResetRequest at the api
-// boundary. Node empty = every transform node; IncludeWatermarks also
-// clears the consumer-side CDF watermarks so incremental inputs replay
-// from the start.
-type PipelineResetRequest struct {
+// pipelineResetBody is the HTTP body of both reset endpoints. It exists
+// (rather than decoding into service.PipelineResetRequest) because the
+// service type carries no JSON tags — `include_watermarks` wouldn't
+// decode onto IncludeWatermarks. Node empty = every transform node;
+// IncludeWatermarks also clears the consumer-side CDF watermarks so
+// incremental inputs replay from the start.
+type pipelineResetBody struct {
 	Dir               string `json:"dir"`
 	Node              string `json:"node,omitempty"`
 	IncludeWatermarks bool   `json:"include_watermarks,omitempty"`
 }
 
-// ResetTarget mirrors service.ResetTarget. Same field tags so the UI
-// parses the JSON straight off the wire.
-type ResetTarget struct {
-	Node      string `json:"node"`
-	OutputKey string `json:"output_key"`
-	Table     string `json:"table"`
-	GlueDB    string `json:"glue_db"`
-	Location  string `json:"location"`
-}
-
-// WatermarkTarget mirrors service.WatermarkTarget.
-type WatermarkTarget struct {
-	Consumer string `json:"consumer"`
-	Alias    string `json:"alias"`
-	Path     string `json:"path"`
-}
-
-// PipelineResetResult mirrors service.PipelineResetResult — the plan
-// (POST /pipeline/reset/plan) or the receipt (POST /pipeline/reset).
-type PipelineResetResult struct {
-	Pipeline          string            `json:"pipeline"`
-	Mode              string            `json:"mode"`
-	TablesDropped     []ResetTarget     `json:"tables_dropped"`
-	WatermarksCleared []WatermarkTarget `json:"watermarks_cleared"`
+func (b pipelineResetBody) toService() service.PipelineResetRequest {
+	return service.PipelineResetRequest{
+		Dir:               b.Dir,
+		Node:              b.Node,
+		IncludeWatermarks: b.IncludeWatermarks,
+	}
 }
 
 // ResetHandler serves the /pipeline/reset endpoints.
@@ -73,16 +60,16 @@ func (h *ResetHandler) RegisterRoutes(mux *http.ServeMux) {
 // POST /pipeline/reset/plan
 // Body: { dir, node?, include_watermarks? }
 func (h *ResetHandler) plan(w http.ResponseWriter, r *http.Request) {
-	req, ok := httputil.DecodeJSON[PipelineResetRequest](w, r)
+	req, ok := httputil.DecodeJSON[pipelineResetBody](w, r)
 	if !ok {
 		return
 	}
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
-	res, err := h.svc.PipelineResetPlan(r.Context(), req)
+	res, err := h.svc.PipelineResetPlan(r.Context(), req.toService())
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, normalizeResetResult(res))
@@ -91,16 +78,16 @@ func (h *ResetHandler) plan(w http.ResponseWriter, r *http.Request) {
 // POST /pipeline/reset
 // Body: { dir, node?, include_watermarks? }
 func (h *ResetHandler) reset(w http.ResponseWriter, r *http.Request) {
-	req, ok := httputil.DecodeJSON[PipelineResetRequest](w, r)
+	req, ok := httputil.DecodeJSON[pipelineResetBody](w, r)
 	if !ok {
 		return
 	}
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
-	res, err := h.svc.PipelineReset(r.Context(), req)
+	res, err := h.svc.PipelineReset(r.Context(), req.toService())
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, normalizeResetResult(res))
@@ -108,15 +95,15 @@ func (h *ResetHandler) reset(w http.ResponseWriter, r *http.Request) {
 
 // normalizeResetResult guarantees non-nil slices so the UI's Zod boundary
 // sees `[]` rather than `null`.
-func normalizeResetResult(res *PipelineResetResult) *PipelineResetResult {
+func normalizeResetResult(res *service.PipelineResetResult) *service.PipelineResetResult {
 	if res == nil {
-		res = &PipelineResetResult{}
+		res = &service.PipelineResetResult{}
 	}
 	if res.TablesDropped == nil {
-		res.TablesDropped = []ResetTarget{}
+		res.TablesDropped = []service.ResetTarget{}
 	}
 	if res.WatermarksCleared == nil {
-		res.WatermarksCleared = []WatermarkTarget{}
+		res.WatermarksCleared = []service.WatermarkTarget{}
 	}
 	return res
 }

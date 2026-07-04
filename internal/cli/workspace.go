@@ -493,7 +493,7 @@ type catalogResponseWithMetrics struct {
 // affected rows with nil metrics (rendered "—") rather than failing.
 func enrichTablesWithMetrics(cmd *cobra.Command, ctx context.Context, tables []api.CatalogTable) []catalogTableWithMetrics {
 	byDir := map[string][]observability.TableInfo{}
-	if svc, _, err := newDashboardService(cmd); err == nil {
+	if svc, _, err := newService(cmd); err == nil {
 		// dir -> owning pipeline (the sanitized schema form the runner
 		// writes into the tables `pipeline` column).
 		seen := map[string]string{}

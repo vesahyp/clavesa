@@ -8,7 +8,6 @@
 
 import { useMemo, useState } from "react";
 import { Navigate, useNavigate, useParams, NavLink } from "react-router-dom";
-import { formatDistanceToNow } from "date-fns";
 import {
   ChevronDown,
   ChevronRight,
@@ -20,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import { AdhocQuery } from "@/components/AdhocQuery";
 import { EngineBadge } from "@/components/EngineBadge";
 import { CopyButton } from "@/components/CopyButton";
@@ -50,18 +50,19 @@ import {
   type SnapshotsResult,
   type TableInfo,
 } from "@/lib/queries";
-import { avgFileBytes, displayTablePath, fileHealth, formatBytes } from "@/lib/format";
+import {
+  avgFileBytes,
+  displayTablePath,
+  fileHealth,
+  formatBytes,
+  formatCompactCount,
+  formatRelative,
+  slugify,
+  stripDefaultSuffix,
+} from "@/lib/format";
 
 const SAMPLE_LIMIT = 100;
 const SNAPSHOTS_LIMIT = 20;
-
-// stripDefaultSuffix drops the `__default` output-key suffix from a table
-// identifier for display. A single-output transform keys its output to
-// "default", so `revenue_by_payment__default` reads as noise; multi-output
-// tables (`node__clean`) keep their suffix untouched.
-function stripDefaultSuffix(name: string): string {
-  return name.endsWith("__default") ? name.slice(0, -"__default".length) : name;
-}
 
 export function TableDetail() {
   const params = useParams<{ catalog: string; schema: string; table: string }>();
@@ -371,38 +372,46 @@ function VolumeTimelineCard({ isLoading, error, data }: VolumeTimelineCardProps)
         )}
       </CardHeader>
       <CardContent className="p-0">
-        {isLoading && (
-          <div className="space-y-2 p-6">
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-5/6" />
-            <Skeleton className="h-4 w-2/3" />
-          </div>
-        )}
-        {Boolean(error) && (
-          <div className="m-6 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm">
-            <FileWarning className="mt-0.5 h-4 w-4 flex-shrink-0 text-destructive" />
-            <div className="min-w-0">
-              <div className="font-medium text-destructive">
-                Commit history unavailable
-              </div>
-              <p className="mt-1 break-words text-xs text-muted-foreground">
-                {error instanceof Error ? error.message : String(error)}
-              </p>
+        <QueryShell
+          query={{ isLoading, error, data }}
+          loading={
+            <div className="space-y-2 p-6">
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-5/6" />
+              <Skeleton className="h-4 w-2/3" />
             </div>
-          </div>
-        )}
-        {data && data.snapshots.length === 0 && (
-          <div className="p-6 text-sm text-muted-foreground">
-            No commits recorded for this table.
-          </div>
-        )}
-        {data && data.snapshots.length > 0 && (
-          <ol className="divide-y divide-border">
-            {data.snapshots.map((s) => (
-              <SnapshotRow key={s.snapshot_id} snap={s} />
-            ))}
-          </ol>
-        )}
+          }
+          renderError={(err) => (
+            <div className="m-6 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm">
+              <FileWarning className="mt-0.5 h-4 w-4 flex-shrink-0 text-destructive" />
+              <div className="min-w-0">
+                <div className="font-medium text-destructive">
+                  Commit history unavailable
+                </div>
+                <p className="mt-1 break-words text-xs text-muted-foreground">
+                  {err instanceof Error ? err.message : String(err)}
+                </p>
+              </div>
+            </div>
+          )}
+        >
+          {(d) => (
+            <>
+              {d.snapshots.length === 0 && (
+                <div className="p-6 text-sm text-muted-foreground">
+                  No commits recorded for this table.
+                </div>
+              )}
+              {d.snapshots.length > 0 && (
+                <ol className="divide-y divide-border">
+                  {d.snapshots.map((s) => (
+                    <SnapshotRow key={s.snapshot_id} snap={s} />
+                  ))}
+                </ol>
+              )}
+            </>
+          )}
+        </QueryShell>
       </CardContent>
     </Card>
   );
@@ -552,12 +561,7 @@ function SnapshotRow({ snap }: { snap: SnapshotInfo }) {
   const deleted = snap.deleted_records ?? null;
   const total = snap.total_records ?? null;
 
-  let when = snap.committed_at;
-  try {
-    when = formatDistanceToNow(new Date(snap.committed_at), { addSuffix: true });
-  } catch {
-    /* keep ISO */
-  }
+  const when = formatRelative(snap.committed_at);
 
   // Render +N / -N / total in a single row. Most snapshots are appends, so
   // emphasize the added count; deletions and replaces still show through.
@@ -622,13 +626,6 @@ function isNumericType(t: string): boolean {
     s.startsWith("double") ||
     s.startsWith("decimal")
   );
-}
-
-function formatCount(n: number | null | undefined): string {
-  if (n == null) return "—";
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k`;
-  return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0)}M`;
 }
 
 function ColumnStatsCard({ data }: { data: ColumnStatsResult }) {
@@ -700,10 +697,10 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
           <span className="text-muted-foreground">—</span>
         ) : (
           <span className="font-mono">
-            ≈{formatCount(distinct)}
+            ≈{formatCompactCount(distinct)}
             {total != null && total > 0 && (
               <span className="ml-1 text-muted-foreground">
-                / {formatCount(total)}
+                / {formatCompactCount(total)}
               </span>
             )}
           </span>
@@ -749,7 +746,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
                         </li>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {`${formatCount(b.count)} / ${formatCount(total ?? topTotal)} rows`}
+                        {`${formatCompactCount(b.count)} / ${formatCompactCount(total ?? topTotal)} rows`}
                       </TooltipContent>
                     </Tooltip>
                   );
@@ -760,7 +757,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
                       return (
                         <li
                           className="grid grid-cols-[minmax(0,4.5rem)_1fr_auto] items-center gap-2"
-                          title={`${formatCount(total - shownSum)} / ${formatCount(total)} rows`}
+                          title={`${formatCompactCount(total - shownSum)} / ${formatCompactCount(total)} rows`}
                         >
                           <span className="truncate font-mono text-[10px] text-muted-foreground">
                             other
@@ -1099,7 +1096,7 @@ function CreateDashboardButton({
 
   function onClick() {
     const taken = new Set(dashboards.data?.dashboards.map((d) => d.slug) ?? []);
-    const base = slugifyForDashboard(tableName) || "explore";
+    const base = slugify(tableName) || "explore";
     let slug = base;
     for (let n = 2; taken.has(slug); n++) slug = `${base}-${n}`;
     const title = stripDefaultSuffix(tableName);
@@ -1149,19 +1146,4 @@ function CreateDashboardButton({
       Create dashboard
     </Button>
   );
-}
-
-/**
- * slugifyForDashboard — mirror of `Dashboards.tsx: slugify` (lowercase,
- * `[a-z0-9_-]` only, trim hyphens, ≤64 chars). Duplicated here rather
- * than imported because TableDetail shouldn't need the page module just
- * for one helper; the rule is small enough that a copy is cheaper than
- * a coupling.
- */
-function slugifyForDashboard(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
 }

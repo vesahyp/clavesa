@@ -14,8 +14,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -384,16 +384,16 @@ func (h *Handler) listExecutions(ctx context.Context, arnStr string) ([]executio
 
 	result := make([]executionInfo, 0, len(out.Executions))
 	for _, e := range out.Executions {
-		arn := derefStr(e.ExecutionArn)
+		arn := aws.ToString(e.ExecutionArn)
 		ei := executionInfo{
-			Name:         nameFromARN(derefStr(e.Name)),
+			Name:         nameFromARN(aws.ToString(e.Name)),
 			Status:       string(e.Status),
-			StartedAt:    formatTime(e.StartDate),
+			StartedAt:    observability.FormatTime(e.StartDate),
 			ConsoleURL:   consoleURL(h.awsRegion, arn),
 			ExecutionARN: arn,
 		}
 		if e.StopDate != nil {
-			ei.StoppedAt = formatTime(e.StopDate)
+			ei.StoppedAt = observability.FormatTime(e.StopDate)
 		}
 		result = append(result, ei)
 	}
@@ -473,8 +473,8 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 
 	detail := executionDetail{
 		Status: string(desc.Status),
-		Error:  derefStr(desc.Error),
-		Cause:  derefStr(desc.Cause),
+		Error:  aws.ToString(desc.Error),
+		Cause:  aws.ToString(desc.Cause),
 	}
 
 	hist, err := h.sfnClient.GetExecutionHistory(r.Context(), &sfn.GetExecutionHistoryInput{
@@ -498,8 +498,8 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 //
 // Two dispatch modes:
 //   - dir=<dir>[&run=<id>]: route through the resolver (cloud or local based
-//     on the inspected pipeline's compute attr). Local pipelines must use
-//     this form — ARNs don't exist locally.
+//     on the workspace warehouse, ADR-024). Local pipelines must use this
+//     form — ARNs don't exist locally.
 //   - arn=<arn>: legacy cloud-only path; preserved while UI clients migrate.
 func (h *Handler) GetExecutionStates(w http.ResponseWriter, r *http.Request) {
 	if dir := r.URL.Query().Get("dir"); dir != "" && h.resolver != nil {
@@ -514,7 +514,7 @@ func (h *Handler) GetExecutionStates(w http.ResponseWriter, r *http.Request) {
 			ExecutionRef: ref,
 		})
 		if err != nil {
-			writeProviderError(w, err)
+			httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		httputil.WriteJSON(w, http.StatusOK, res)
@@ -572,7 +572,7 @@ func (h *Handler) GetExecutionLogs(w http.ResponseWriter, r *http.Request) {
 			Step:         step,
 		})
 		if err != nil {
-			writeProviderError(w, err)
+			httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		httputil.WriteJSON(w, http.StatusOK, res)
@@ -600,17 +600,6 @@ func (h *Handler) GetExecutionLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
-}
-
-// writeProviderError translates a provider error into the right HTTP status.
-// LocalProvider's not-yet-implemented sentinel becomes 501; everything else
-// is 500. Keeps the UI's error rendering predictable across backends.
-func writeProviderError(w http.ResponseWriter, err error) {
-	if err == observability.ErrLocalNotImplemented {
-		httputil.WriteError(w, http.StatusNotImplemented, err.Error())
-		return
-	}
-	httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +731,7 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputil.WriteJSON(w, http.StatusOK, runResponse{ExecutionARN: derefStr(out.ExecutionArn)})
+	httputil.WriteJSON(w, http.StatusOK, runResponse{ExecutionARN: aws.ToString(out.ExecutionArn)})
 }
 
 // isLocalCompute consults the observability resolver to decide whether the
@@ -782,27 +771,28 @@ func boolPtr(b bool) *bool { return &b }
 // state that was entered before a task failure and returns its name along
 // with the error/cause from the TaskFailed event. Used by the
 // /pipeline/execution detail endpoint to populate failed_step on the
-// response. The execution-states endpoint instead consumes
-// observability.StateStatusesFromHistory which produces the full status map.
+// response. The execution-states endpoint instead reads the warehouse
+// `_progress` markers via the observability providers (3be08e3) and never
+// walks SFN history for per-node status.
 func findFailedStep(events []sfntypes.HistoryEvent) (step, errCode, cause string) {
 	lastState := ""
 	for _, ev := range events {
 		switch ev.Type {
 		case sfntypes.HistoryEventTypeTaskStateEntered:
 			if ev.StateEnteredEventDetails != nil {
-				lastState = derefStr(ev.StateEnteredEventDetails.Name)
+				lastState = aws.ToString(ev.StateEnteredEventDetails.Name)
 			}
 		case sfntypes.HistoryEventTypeTaskFailed:
 			if ev.TaskFailedEventDetails != nil {
 				return lastState,
-					derefStr(ev.TaskFailedEventDetails.Error),
-					derefStr(ev.TaskFailedEventDetails.Cause)
+					aws.ToString(ev.TaskFailedEventDetails.Error),
+					aws.ToString(ev.TaskFailedEventDetails.Cause)
 			}
 		case sfntypes.HistoryEventTypeExecutionFailed:
 			if ev.ExecutionFailedEventDetails != nil {
 				return "",
-					derefStr(ev.ExecutionFailedEventDetails.Error),
-					derefStr(ev.ExecutionFailedEventDetails.Cause)
+					aws.ToString(ev.ExecutionFailedEventDetails.Error),
+					aws.ToString(ev.ExecutionFailedEventDetails.Cause)
 			}
 		}
 	}
@@ -812,20 +802,6 @@ func findFailedStep(events []sfntypes.HistoryEvent) (step, errCode, cause string
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func derefStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-func formatTime(t *time.Time) string {
-	if t == nil {
-		return ""
-	}
-	return t.UTC().Format(time.RFC3339)
-}
 
 // nameFromARN returns the last segment of an ARN (execution name).
 func nameFromARN(arn string) string {

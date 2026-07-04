@@ -15,7 +15,7 @@
 //
 // This package is a leaf: it depends only on dashboardsql for the
 // placeholder grammar. service imports servingsql, never the reverse,
-// so the cachedTranspiler.ToServing signature structurally matches
+// so the CachedTranspiler.ToServing signature structurally matches
 // service.Transpiler.
 package servingsql
 
@@ -101,19 +101,19 @@ func DesentinelizeTrino(sql string) string {
 // func.
 type TranspileFunc func(ctx context.Context, sql string) (string, error)
 
-// cachedTranspiler memoizes successful transpiles on disk, keyed by a
+// CachedTranspiler memoizes successful transpiles on disk, keyed by a
 // content hash of the input SQL plus TranspilerVersion. Its ToServing
 // method structurally matches service.Transpiler, so the wiring slice
 // can wrap the sidecar in the cache and pass the cache to WithTranspiler.
-type cachedTranspiler struct {
+type CachedTranspiler struct {
 	cacheDir string
 	inner    TranspileFunc
 }
 
-// NewCachedTranspiler builds a cachedTranspiler over cacheDir using inner
+// NewCachedTranspiler builds a CachedTranspiler over cacheDir using inner
 // as the underlying transpiler.
-func NewCachedTranspiler(cacheDir string, inner TranspileFunc) *cachedTranspiler {
-	return &cachedTranspiler{cacheDir: cacheDir, inner: inner}
+func NewCachedTranspiler(cacheDir string, inner TranspileFunc) *CachedTranspiler {
+	return &CachedTranspiler{cacheDir: cacheDir, inner: inner}
 }
 
 // cacheKey is hex(sha256(TranspilerVersion + "\n" + sql)). Folding the
@@ -129,7 +129,7 @@ func cacheKey(sql string) string {
 // returned as-is and never cached — so errors.As for *DialectError still
 // works at the caller, and a transient failure does not poison the
 // cache.
-func (c *cachedTranspiler) ToServing(ctx context.Context, sql string) (string, error) {
+func (c *CachedTranspiler) ToServing(ctx context.Context, sql string) (string, error) {
 	key := cacheKey(sql)
 	path := filepath.Join(c.cacheDir, key+".trino")
 
@@ -152,7 +152,7 @@ func (c *cachedTranspiler) ToServing(ctx context.Context, sql string) (string, e
 // atomic rename, so a concurrent reader never sees a torn file. Any
 // failure is logged and ignored: the transpile already succeeded and the
 // returned value is authoritative.
-func (c *cachedTranspiler) writeCache(path, out string) {
+func (c *CachedTranspiler) writeCache(path, out string) {
 	if err := os.MkdirAll(c.cacheDir, 0o755); err != nil {
 		log.Printf("servingsql: cache mkdir %q failed (ignored): %v", c.cacheDir, err)
 		return

@@ -22,10 +22,12 @@ import { AlertTriangle, Check, Loader2, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
+import { NativeSelect } from "@/components/ui/native-select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatRowCount } from "@/lib/format";
 import {
@@ -235,70 +237,74 @@ export function BackfillDetail() {
             <CardTitle>Staging vs canonical</CardTitle>
           </CardHeader>
           <CardContent>
-            {diff.isLoading && (
-              <div className="space-y-2">
-                <Skeleton className="h-4 w-2/3" />
-                <Skeleton className="h-4 w-1/2" />
-              </div>
-            )}
-            {Boolean(diff.error) && (
-              <div className="text-xs text-status-failed">
-                {diff.error instanceof Error
-                  ? diff.error.message
-                  : String(diff.error)}
-              </div>
-            )}
-            {diff.data && (
-              <dl className="grid grid-cols-1 gap-y-2 text-sm sm:grid-cols-2">
-                <DiffRow
-                  label="Staging"
-                  value={diff.data.staging_table}
-                  meta={formatRowCount(diff.data.staging_rows)}
-                />
-                <DiffRow
-                  label="Canonical"
-                  value={diff.data.canonical_table}
-                  meta={
-                    diff.data.canonical_rows < 0
-                      ? "does not exist — first backfill creates target"
-                      : formatRowCount(diff.data.canonical_rows)
-                  }
-                />
-                <DiffRow
-                  label="Output mode"
-                  value={mode || "—"}
-                  meta={
-                    mergeKeys.length > 0
-                      ? `merge keys: ${mergeKeys.join(", ")}`
-                      : undefined
-                  }
-                />
-                <DiffRow
-                  label="Schema match"
-                  value={diff.data.schema_matches ? "yes" : "no"}
-                  variant={diff.data.schema_matches ? "success" : "failed"}
-                />
-                {mergeKeys.length > 0 && (
-                  <>
+            <QueryShell
+              query={diff}
+              loading={
+                <div className="space-y-2">
+                  <Skeleton className="h-4 w-2/3" />
+                  <Skeleton className="h-4 w-1/2" />
+                </div>
+              }
+              renderError={(error) => (
+                <div className="text-xs text-status-failed">
+                  {error instanceof Error ? error.message : String(error)}
+                </div>
+              )}
+            >
+              {(d) => (
+                <>
+                  <dl className="grid grid-cols-1 gap-y-2 text-sm sm:grid-cols-2">
                     <DiffRow
-                      label="Matching keys"
-                      value={formatRowCount(diff.data.matching_key_rows)}
-                      meta="would UPDATE on promote"
+                      label="Staging"
+                      value={d.staging_table}
+                      meta={formatRowCount(d.staging_rows)}
                     />
                     <DiffRow
-                      label="New keys"
-                      value={formatRowCount(diff.data.new_key_rows)}
-                      meta="would INSERT on promote"
+                      label="Canonical"
+                      value={d.canonical_table}
+                      meta={
+                        d.canonical_rows < 0
+                          ? "does not exist — first backfill creates target"
+                          : formatRowCount(d.canonical_rows)
+                      }
                     />
-                  </>
-                )}
-              </dl>
-            )}
-            {diff.data && diff.data.schema_diff && (
-              <pre className="mt-4 overflow-x-auto whitespace-pre-wrap rounded bg-muted/40 p-3 font-mono text-[11px]">
-                {diff.data.schema_diff}
-              </pre>
-            )}
+                    <DiffRow
+                      label="Output mode"
+                      value={mode || "—"}
+                      meta={
+                        mergeKeys.length > 0
+                          ? `merge keys: ${mergeKeys.join(", ")}`
+                          : undefined
+                      }
+                    />
+                    <DiffRow
+                      label="Schema match"
+                      value={d.schema_matches ? "yes" : "no"}
+                      variant={d.schema_matches ? "success" : "failed"}
+                    />
+                    {mergeKeys.length > 0 && (
+                      <>
+                        <DiffRow
+                          label="Matching keys"
+                          value={formatRowCount(d.matching_key_rows)}
+                          meta="would UPDATE on promote"
+                        />
+                        <DiffRow
+                          label="New keys"
+                          value={formatRowCount(d.new_key_rows)}
+                          meta="would INSERT on promote"
+                        />
+                      </>
+                    )}
+                  </dl>
+                  {d.schema_diff && (
+                    <pre className="mt-4 overflow-x-auto whitespace-pre-wrap rounded bg-muted/40 p-3 font-mono text-[11px]">
+                      {d.schema_diff}
+                    </pre>
+                  )}
+                </>
+              )}
+            </QueryShell>
           </CardContent>
         </Card>
 
@@ -352,7 +358,7 @@ export function BackfillDetail() {
                     Dedup column
                   </Label>
                   {stagingColumns.length > 0 ? (
-                    <select
+                    <NativeSelect
                       id="force-dedup"
                       value={appendAnyway ? "" : forceDedup}
                       onChange={(e) => {
@@ -360,14 +366,14 @@ export function BackfillDetail() {
                         setAppendAnyway(false);
                       }}
                       disabled={appendAnyway}
-                      className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs disabled:opacity-50"
+                      className="h-auto py-2 font-mono text-xs shadow-none"
                     >
                       {stagingColumns.map((c) => (
                         <option key={c.name} value={c.name}>
                           {c.name} ({c.type})
                         </option>
                       ))}
-                    </select>
+                    </NativeSelect>
                   ) : (
                     <div className="text-xs text-muted-foreground">
                       Loading staging schema…

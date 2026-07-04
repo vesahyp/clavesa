@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // transpileServerPort is the in-container port the transpile server binds
@@ -54,7 +56,7 @@ type transpileSidecar struct {
 	// imageOverride pins the image instead of resolving from the workspace
 	// manifest. Test-only (the docker-gated sidecar test points at the
 	// make-build-runner tag directly); empty in production, where spawn
-	// resolves via resolveRunnerImage.
+	// resolves via workspace.LocalRunnerImageTag.
 	imageOverride string
 
 	mu          sync.Mutex
@@ -123,12 +125,12 @@ func (t *transpileSidecar) ensureSpawned(ctx context.Context) error {
 }
 
 // spawn runs the transpile server container, resolves its host port, and
-// blocks until /healthz answers. Mirrors persistentDockerQueryRunner.spawn
+// blocks until /healthz answers. Mirrors PersistentQueryRunner.spawn
 // but far simpler: no warehouse volume, no metastore, no Spark ports.
 func (t *transpileSidecar) spawn(ctx context.Context) (string, int, error) {
 	image := t.imageOverride
 	if image == "" {
-		image = resolveRunnerImage(t.workspaceRoot)
+		image = workspace.LocalRunnerImageTag(t.workspaceRoot)
 	}
 	args := []string{
 		"run", "-d", "--rm",
@@ -166,7 +168,7 @@ func (t *transpileSidecar) spawn(ctx context.Context) (string, int, error) {
 }
 
 // pollHealthz blocks until GET /healthz returns 200 or the health deadline
-// elapses. Mirrors persistentDockerQueryRunner.pollHealthz.
+// elapses. Mirrors PersistentQueryRunner.pollHealthz.
 func (t *transpileSidecar) pollHealthz(ctx context.Context, port int) error {
 	deadline := time.Now().Add(t.healthCtx)
 	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
@@ -190,7 +192,7 @@ func (t *transpileSidecar) pollHealthz(ctx context.Context, port int) error {
 }
 
 // transpileAt POSTs the SparkSQL to /transpile and decodes the envelope.
-// Mirrors persistentDockerQueryRunner.parseAt: 200 and 400 both carry an
+// Mirrors PersistentQueryRunner.parseAt: 200 and 400 both carry an
 // envelope (ok=true on success, ok=false on rejection / empty-sql 400);
 // anything else, or an undecodable body, is a transport error.
 func (t *transpileSidecar) transpileAt(ctx context.Context, port int, sparkSQL string) (string, error) {
@@ -246,7 +248,7 @@ func derefInt(p *int) int {
 }
 
 // Close stops the sidecar container if running (best-effort). Idempotent —
-// a second call is a no-op. Mirrors persistentDockerQueryRunner.Close.
+// a second call is a no-op. Mirrors PersistentQueryRunner.Close.
 func (t *transpileSidecar) Close() {
 	t.mu.Lock()
 	if t.closed {

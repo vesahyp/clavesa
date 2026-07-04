@@ -16,7 +16,14 @@ export const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 z-50 bg-background/80 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      // No backdrop-blur: dialogs (run-confirm, reset, backfill staging) open
+      // over the same pipeline dashboard as the run-detail Sheet (two React
+      // Flow canvases + a 2s live-status poll), and a full-viewport
+      // backdrop-filter forces the browser to re-rasterize that whole moving
+      // backdrop every frame — the cause of the high CPU and sluggish
+      // navigation while the overlay is up. A plain dim is cheap. Mirrors
+      // sheet.tsx's SheetOverlay.
+      "fixed inset-0 z-50 bg-background/70 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
       className
     )}
     {...props}

@@ -140,16 +140,6 @@ func (e NoAWSCredsError) Error() string {
 	return "AWS credentials not available: " + e.Err.Error()
 }
 
-// WarehouseEvictor releases the warm-Spark worker container for one
-// warehouse so a `pipeline run` invocation has the Docker memory
-// budget to itself. Implemented by
-// `observability.persistentDockerQueryRunner.EvictWarehouse`. Wired in
-// from cli/ui.go; nil-safe — `pipeline run` on a CLI-only invocation
-// has no warm worker to evict.
-type WarehouseEvictor interface {
-	EvictWarehouse(warehouse string)
-}
-
 // SQLParser parse-checks one SparkSQL statement against the warm Spark
 // worker (Slice 3). Implementations route to the JVM-side Catalyst
 // SqlParser via POST /parse — the seam that turns "any string" into a
@@ -212,7 +202,6 @@ type Service struct {
 	s3Client   dataquery.S3Client
 	s3Once     sync.Once
 	s3Err      error
-	evictor    WarehouseEvictor
 	sqlParser  SQLParser
 	transpiler Transpiler
 
@@ -282,15 +271,6 @@ func New(workspace string) *Service {
 		recordRun:       recordLocalRun,
 	}
 	s.cloudLocalDispatch = s.runCloudLocalEvent
-	return s
-}
-
-// WithEvictor registers a warm-worker evictor so `pipeline run` can
-// release the Catalog/dashboard worker before spawning its own
-// containers. Without it (CLI-only invocations, tests), `pipeline run`
-// just spawns and Docker handles whatever memory pressure exists.
-func (s *Service) WithEvictor(e WarehouseEvictor) *Service {
-	s.evictor = e
 	return s
 }
 

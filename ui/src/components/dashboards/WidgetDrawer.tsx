@@ -1137,19 +1137,3 @@ export function makeWidget(
     layout: { x: 0, y, w: size.w, h: size.h },
   };
 }
-
-/**
- * useMemoizedDatasetMap — small helper consumers of the drawer use to
- * resolve `widget.dataset` → DashboardDataset without re-deriving each
- * render. Kept here so the drawer's invariants (inline-name prefix,
- * filter rules) live next to the helpers that depend on them.
- */
-export function useMemoizedDatasetMap(
-  datasets: DashboardDataset[],
-): Map<string, DashboardDataset> {
-  return useMemo(() => {
-    const m = new Map<string, DashboardDataset>();
-    for (const d of datasets) m.set(d.name, d);
-    return m;
-  }, [datasets]);
-}

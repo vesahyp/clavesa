@@ -108,7 +108,7 @@ func (h *SourcesHandler) register(w http.ResponseWriter, r *http.Request) {
 	// kind, only the URL).
 	stored, err := h.svc.AddSource(req)
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, stored)
@@ -204,7 +204,7 @@ func (h *SourcesHandler) attach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.AttachSource(req.Dir, name, req.To, req.Alias); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

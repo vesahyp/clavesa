@@ -151,7 +151,7 @@ func MetastoreAddr(workspaceRoot string) string {
 // metastoreImage resolves the workspace-scoped runner image tag the
 // metastore container runs (it REUSES the runner image, selecting Derby
 // Network Server mode via CLAVESA_METASTORE_SERVER=1). Mirrors
-// persistentDockerQueryRunner.resolveImage: lazy, fresh per call, falls
+// PersistentQueryRunner.resolveImage: lazy, fresh per call, falls
 // back to the empty-name image when the workspace manifest isn't
 // readable yet.
 func metastoreImage(workspaceName string) string {

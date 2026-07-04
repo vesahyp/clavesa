@@ -5,17 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/athena"
 	"github.com/spf13/cobra"
 
-	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/service"
-	"github.com/vesahyp/clavesa/internal/servingsql"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -71,10 +66,16 @@ Examples:
 				return fmt.Errorf("no SQL provided (pass as argument or pipe via stdin)")
 			}
 
-			ws, err := resolveWorkspace(cmd)
+			// The shared constructor wires the same resolver + transpiler
+			// stack `clavesa ui` hands the /query route, so the two
+			// surfaces cannot diverge (ADR-015). The transpile sidecar and
+			// warm worker both spawn lazily, so the warehouse that isn't
+			// used costs nothing.
+			deps, err := newServiceDeps(cmd)
 			if err != nil {
-				return fmt.Errorf("resolve workspace: %w", err)
+				return err
 			}
+			ws := deps.workspace
 
 			wh := workspace.LoadWarehouse(ws)
 			// --warehouse wins over the workspace's persisted warehouse
@@ -87,38 +88,14 @@ Examples:
 				wh = w
 			}
 
-			// Wire the same resolver + transpiler stack `clavesa ui` hands
-			// the /query route, so the two surfaces cannot diverge
-			// (ADR-015). The cloud provider needs only Athena for ad-hoc
-			// SQL; it stays nil when credentials don't load, and the
-			// resolver surfaces a clear error if a cloud dispatch is then
-			// attempted. The transpile sidecar and warm worker both spawn
-			// lazily, so the warehouse that isn't used costs nothing.
-			var cloud observability.Provider
-			if awsCfg, cfgErr := awsconfig.LoadDefaultConfig(cmd.Context()); cfgErr == nil {
-				bucket := os.Getenv("ATHENA_OUTPUT_BUCKET")
-				if bucket == "" {
-					bucket = workspace.PipelineBucket(ws)
-				}
-				cloud = observability.NewCloudProvider(athena.NewFromConfig(awsCfg), bucket, nil, nil)
-			}
-			warm := observability.NewPersistentQueryRunner(ws)
-			defer warm.Close()
-			local := observability.NewLocalProvider(ws).WithQueryRunner(warm)
-			resolver := observability.NewResolver(ws, cloud, local)
-			sidecar := observability.NewTranspileSidecar(ws)
-			defer sidecar.Close()
-			transpiler := servingsql.NewCachedTranspiler(filepath.Join(ws, ".clavesa", "cache", "transpile"), sidecar.ToServing)
-			svc := service.New(ws).WithResolver(resolver).WithTranspiler(transpiler)
-
 			if wh == workspace.WarehouseLocal {
 				// Eagerly trigger spawn so the first query doesn't see the
 				// 503-shaped "warm worker not ready" error from the catalog
 				// path; the warmup is synchronous since the user is waiting.
-				warm.Warmup(cmd.Context(), workspace.LocalWarehouseDir(ws))
+				deps.warm.Warmup(cmd.Context(), workspace.LocalWarehouseDir(ws))
 			}
 
-			res, err := svc.Query(cmd.Context(), sql, service.QueryOptions{Warehouse: wh})
+			res, err := deps.svc.Query(cmd.Context(), sql, service.QueryOptions{Warehouse: wh})
 			if err != nil {
 				return err
 			}

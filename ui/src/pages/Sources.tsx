@@ -14,11 +14,12 @@ import { toast } from "sonner";
 
 import { useChrome } from "@/components/PageChrome";
 import { Highlight } from "@/components/Highlight";
-import { ListSearch } from "@/components/ListSearch";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { NativeSelect } from "@/components/ui/native-select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { RegistryList } from "@/pages/RegistryList";
 import {
   deleteSource,
   registerSource,
@@ -94,67 +95,27 @@ export function Sources() {
           />
         )}
 
-        {list.isLoading && (
-          <div className="space-y-3">
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-          </div>
-        )}
-
-        {list.error && (
-          <Card>
-            <CardContent className="p-6 text-sm text-destructive">
-              Couldn't load sources —{" "}
-              {list.error instanceof Error ? list.error.message : "unknown error"}
-            </CardContent>
-          </Card>
-        )}
-
-        {list.data && list.data.sources.length === 0 && !showForm && (
-          <EmptyState onAdd={() => setShowForm(true)} />
-        )}
-
-        {list.data && list.data.sources.length > 0 && (
-          <div className="mb-4 flex items-center gap-3">
-            <ListSearch
-              value={query}
-              onChange={setQuery}
-              placeholder="Filter sources…"
+        <RegistryList
+          query={list}
+          items={allSources}
+          filtered={filtered}
+          search={query}
+          onSearchChange={setQuery}
+          searchPlaceholder="Filter sources…"
+          noun="sources"
+          empty={<EmptyState onAdd={() => setShowForm(true)} />}
+          showEmpty={!showForm}
+          renderItem={(s) => (
+            <SourceRow
+              key={s.name}
+              spec={s}
+              query={q}
+              onChanged={() =>
+                qc.invalidateQueries({ queryKey: ["sources"] })
+              }
             />
-            {q && (
-              <span className="text-xs text-muted-foreground">
-                <span className="font-semibold text-foreground">
-                  {filtered.length}
-                </span>{" "}
-                of {allSources.length}
-              </span>
-            )}
-          </div>
-        )}
-
-        {list.data && list.data.sources.length > 0 && filtered.length === 0 && (
-          <Card>
-            <CardContent className="py-10 text-center text-sm text-muted-foreground">
-              No sources match{" "}
-              <span className="font-mono text-foreground">{query}</span>.
-            </CardContent>
-          </Card>
-        )}
-
-        {filtered.length > 0 && (
-          <ul className="grid gap-3">
-            {filtered.map((s) => (
-              <SourceRow
-                key={s.name}
-                spec={s}
-                query={q}
-                onChanged={() =>
-                  qc.invalidateQueries({ queryKey: ["sources"] })
-                }
-              />
-            ))}
-          </ul>
-        )}
+          )}
+        />
     </div>
   );
 }
@@ -350,14 +311,14 @@ function SourceForm({
           <label className="text-xs text-muted-foreground">
             Credentials (optional):
           </label>
-          {/* Native <select> keeps the slice tight — switch to a custom
+          {/* Native select keeps the slice tight — switch to a custom
               combobox if/when the registry gets bigger than a dozen
               entries. Empty option = anonymous fetch. */}
-          <select
+          <NativeSelect
             value={credentials}
             onChange={(e) => setCredentials(e.target.value)}
             disabled={busy}
-            className="rounded-md border border-input bg-background px-2 py-1 text-sm"
+            className="h-auto w-auto px-2 shadow-none"
           >
             <option value="">(none — public URL / same-account S3)</option>
             {credList.data?.credentials.map((c) => (
@@ -365,7 +326,7 @@ function SourceForm({
                 {c.name} ({c.backend})
               </option>
             ))}
-          </select>
+          </NativeSelect>
         </div>
         <button
           type="button"
@@ -379,17 +340,17 @@ function SourceForm({
           <div className="grid gap-3 rounded-md border border-border p-3 sm:grid-cols-2">
             <div className="space-y-1">
               <label className="text-xs text-muted-foreground">Format</label>
-              <select
+              <NativeSelect
                 value={format}
                 onChange={(e) => setFormat(e.target.value)}
                 disabled={busy}
-                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm"
+                className="h-auto px-2 shadow-none"
               >
                 <option value="">(infer from filename)</option>
                 <option value="parquet">parquet</option>
                 <option value="csv">csv</option>
                 <option value="json">json</option>
-              </select>
+              </NativeSelect>
             </div>
             <div className="space-y-1">
               <label className="text-xs text-muted-foreground">

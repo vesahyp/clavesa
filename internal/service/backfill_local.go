@@ -13,7 +13,6 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/observability"
-	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -174,11 +173,10 @@ func (s *Service) backfillStageLocal(
 	// Resolve image + ADR-016 catalog/schema the same way prepareRun does,
 	// so the runner writes to the same Hadoop catalog `pipeline run --env
 	// local` would have written to.
-	image := runner.LocalImageName("") + ":latest"
+	image := workspace.LocalRunnerImageTag(s.workspace)
 	catalog := ""
 	systemCatalog := ""
 	if m, _ := workspace.Load(s.workspace); m != nil {
-		image = runner.LocalImageName(m.Name) + ":latest"
 		catalog = m.CatalogIdentifier()
 		systemCatalog = m.SystemCatalogIdentifier()
 	}

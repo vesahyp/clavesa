@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/vesahyp/clavesa/internal/delta"
-	"github.com/vesahyp/clavesa/internal/errs"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/pathutil"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -204,18 +203,12 @@ func (p *LocalProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 }
 
 // ---------------------------------------------------------------------------
-// Iceberg-backed surfaces (delegate to Spark via the runner container).
-//
-// Phase 2 ships the filesystem progress channel above (states + logs); the
-// methods below return errors with a stable sentinel so callers can detect
-// "not yet implemented in this slice" without parsing strings. The next slice
-// wires CLAVESA_QUERY=1 to read node_runs, runs, snapshots, and table
-// rows against the local Hadoop catalog.
+// Delta-backed surfaces (NodeRuns / Runs / Tables / Snapshots / ColumnStats /
+// SampleTable / Query). Fast paths read the warehouse `_progress` tree or
+// `_delta_log/` directly from the filesystem; the rest run SQL against the
+// local warehouse via the runner container in CLAVESA_QUERY=1 mode — the
+// same SQL surface the cloud provider drives through Athena (ADR-014).
 // ---------------------------------------------------------------------------
-
-// ErrLocalNotImplemented is re-exported from internal/errs so callers in
-// pipelinestatus + dataquery answer the same sentinel (C10, 2026-05-24).
-var ErrLocalNotImplemented = errs.ErrLocalNotImplemented
 
 // NodeRuns issues the same SQL CloudProvider runs against Athena, but against
 // the local Hadoop catalog via the runner image. Same row shape; the UI sees
@@ -911,10 +904,10 @@ LIMIT %d`, dbName, safePipeline, q.Limit+1)
 	return &TablesResult{Rows: out, Truncated: truncated}, nil
 }
 
-// Snapshots reads <table>.snapshots for any Iceberg table in the
-// workspace-shared local warehouse. The warehouse is one per workspace
-// (ADR-016); PipelineDir is no longer needed to locate it but is still
-// accepted for caller symmetry with the cloud provider.
+// Snapshots reads the Delta `_delta_log/` commit history for any table in
+// the workspace-shared local warehouse (ADR-018). The warehouse is one per
+// workspace (ADR-016); PipelineDir is no longer needed to locate it but is
+// still accepted for caller symmetry with the cloud provider.
 func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*SnapshotsResult, error) {
 	if !validIdentifier(q.Database) {
 		return nil, fmt.Errorf("invalid database name: %q", q.Database)
@@ -939,87 +932,9 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		return nil, fmt.Errorf("read delta log: %w", err)
 	}
 
-	// Compute LatestRecordCount by walking commits oldest-first. Three
-	// shapes matter for table-state row count:
-	//   - Replaces=true commit (CTAS, CREATE OR REPLACE, WRITE Overwrite):
-	//     reset to this commit's AddedRecords.
-	//   - MERGE: net delta is (added - updated - deleted). The log_reader
-	//     folds inserts+updates into AddedRecords for the timeline display;
-	//     subtract UpdatedRecords here because updates don't change row
-	//     count.
-	//   - Otherwise (APPEND, DELETE): net delta is (added - deleted).
-	// commits is newest-first from delta.ReadCurrentFromPath; walk in
-	// reverse to apply oldest-first.
-	var latestCount *int64
-	if len(commits) > 0 {
-		var total int64
-		for i := len(commits) - 1; i >= 0; i-- {
-			ci := commits[i]
-			added := int64(0)
-			if ci.AddedRecords != nil {
-				added = *ci.AddedRecords
-			}
-			updated := int64(0)
-			if ci.UpdatedRecords != nil {
-				updated = *ci.UpdatedRecords
-			}
-			deleted := int64(0)
-			if ci.DeletedRecords != nil {
-				deleted = *ci.DeletedRecords
-			}
-			netDelta := added - updated - deleted
-			if ci.Replaces {
-				total = netDelta
-			} else {
-				total += netDelta
-			}
-		}
-		if total < 0 {
-			total = 0
-		}
-		latestCount = &total
-	}
-
-	// Full commit count before truncation — surfaced as Total so the
-	// catalog shows the real commit count, not "<limit>+".
-	totalCommits := len(commits)
-
-	limit := q.Limit
-	if limit <= 0 {
-		limit = len(commits)
-	}
-	truncated := false
-	if len(commits) > limit {
-		commits = commits[:limit]
-		truncated = true
-	}
-
-	out := make([]SnapshotInfo, 0, len(commits))
-	for _, ci := range commits {
-		trigger, runID := extractProvenance(ci.UserMetadata)
-		info := SnapshotInfo{
-			SnapshotID:     strconv.FormatInt(ci.Version, 10),
-			CommittedAt:    formatMillis(ci.TimestampMs),
-			Operation:      ci.Operation,
-			AddedRecords:   ci.AddedRecords,
-			DeletedRecords: ci.DeletedRecords,
-			TotalRecords:   ci.TotalRecords,
-			Trigger:        trigger,
-			WriterRunID:    runID,
-		}
-		if ci.Version > 0 {
-			info.ParentID = strconv.FormatInt(ci.Version-1, 10)
-		}
-		out = append(out, info)
-	}
-	result := &SnapshotsResult{Snapshots: out, Truncated: truncated, Total: totalCommits}
-	if len(out) > 0 && out[0].TotalRecords != nil {
-		v := *out[0].TotalRecords
-		result.LatestRecordCount = &v
-	} else if latestCount != nil {
-		result.LatestRecordCount = latestCount
-	}
-	return result, nil
+	// Projection (incl. the LatestRecordCount fold) is shared with
+	// CloudProvider.Snapshots so local and cloud agree (ADR-014).
+	return snapshotsResultFromCommits(commits, q.Limit), nil
 }
 
 // ColumnStats reads the latest-snapshot row per column from the workspace

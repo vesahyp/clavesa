@@ -13,7 +13,7 @@ import (
 
 	"github.com/vesahyp/clavesa/internal/api"
 	"github.com/vesahyp/clavesa/internal/observability"
-	"github.com/vesahyp/clavesa/internal/workspace"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // fakeStore is an in-memory api.DashboardStore for the handler tests.
@@ -56,56 +56,33 @@ func (s *fakeStore) DeleteDashboard(_ context.Context, slug string) error {
 	return nil
 }
 
-// fakeQueryProvider is enough Provider surface to exercise the dashboards
-// query route. Other Provider methods aren't reachable from the dashboards
-// handler so they panic — failing loud beats silently returning empty.
-type fakeQueryProvider struct {
-	gotSQL string
-	gotDir string
-	result *observability.QueryResult
-	err    error
+// fakeQuerySeam records what the handler hands the shared ad-hoc query
+// seam (service.Service.Query in production) and plays back a canned
+// result or error.
+type fakeQuerySeam struct {
+	gotSQL     string
+	gotDir     string
+	gotMaxRows int
+	result     *observability.QueryResult
+	err        error
 }
 
-func (f *fakeQueryProvider) Query(_ context.Context, q observability.QueryQuery) (*observability.QueryResult, error) {
-	f.gotSQL = q.SQL
-	f.gotDir = q.PipelineDir
+func (f *fakeQuerySeam) fn(_ context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error) {
+	f.gotSQL = sql
+	f.gotDir = dir
+	f.gotMaxRows = maxRows
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.result, nil
 }
 
-func (f *fakeQueryProvider) NodeRuns(context.Context, observability.NodeRunsQuery) (*observability.NodeRunsResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) Runs(context.Context, observability.RunsQuery) (*observability.RunsResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) Tables(context.Context, observability.TablesQuery) (*observability.TablesResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) Snapshots(context.Context, observability.SnapshotsQuery) (*observability.SnapshotsResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) ColumnStats(context.Context, observability.ColumnStatsQuery) (*observability.ColumnStatsResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) SampleTable(context.Context, observability.SampleTableQuery) (*observability.SampleTableResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) ExecutionStates(context.Context, observability.ExecutionStatesQuery) (*observability.ExecutionStatesResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) ExecutionLogs(context.Context, observability.ExecutionLogsQuery) (*observability.ExecutionLogsResult, error) {
-	panic("unused")
-}
-func (f *fakeQueryProvider) Exec(context.Context, observability.ExecQuery) error {
-	panic("unused")
-}
-
-func newDashboardsMux(t *testing.T, store api.DashboardStore, p observability.Provider) *http.ServeMux {
+func newDashboardsMux(t *testing.T, store api.DashboardStore, seam *fakeQuerySeam) *http.ServeMux {
 	t.Helper()
-	h := api.NewDashboardsHandler(store, p)
+	h := api.NewDashboardsHandler(store)
+	if seam != nil {
+		h = h.WithQueryService(seam.fn)
+	}
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 	return mux
@@ -126,7 +103,7 @@ func sampleDashboard(slug string) api.Dashboard {
 // TestDashboardsListEmpty surfaces the first-run case — no dashboards yet.
 // The list endpoint should 200 with an empty array, not 404.
 func TestDashboardsListEmpty(t *testing.T) {
-	mux := newDashboardsMux(t, newFakeStore(), &fakeQueryProvider{})
+	mux := newDashboardsMux(t, newFakeStore(), nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/dashboards", nil))
 
@@ -148,7 +125,7 @@ func TestDashboardsListAndGet(t *testing.T) {
 	store := newFakeStore()
 	store.dashboards["pipeline-runs"] = sampleDashboard("pipeline-runs")
 	store.dashboards["sessions"] = sampleDashboard("sessions")
-	mux := newDashboardsMux(t, store, &fakeQueryProvider{})
+	mux := newDashboardsMux(t, store, nil)
 
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/dashboards", nil))
@@ -180,7 +157,7 @@ func TestDashboardsListAndGet(t *testing.T) {
 // TestDashboardsGetMissing returns 404, not 500 — the UI differentiates
 // "the slug you bookmarked is gone" from "server is broken."
 func TestDashboardsGetMissing(t *testing.T) {
-	mux := newDashboardsMux(t, newFakeStore(), &fakeQueryProvider{})
+	mux := newDashboardsMux(t, newFakeStore(), nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/dashboards/ghost", nil))
 	if rr.Code != http.StatusNotFound {
@@ -191,7 +168,7 @@ func TestDashboardsGetMissing(t *testing.T) {
 // TestDashboardsCreate creates a dashboard, then asserts a second create on
 // the same slug is rejected with 409 rather than silently clobbering.
 func TestDashboardsCreate(t *testing.T) {
-	mux := newDashboardsMux(t, newFakeStore(), &fakeQueryProvider{})
+	mux := newDashboardsMux(t, newFakeStore(), nil)
 
 	body, _ := json.Marshal(sampleDashboard("revenue"))
 	rr := httptest.NewRecorder()
@@ -211,7 +188,7 @@ func TestDashboardsCreate(t *testing.T) {
 // removal via DELETE, including the 404 on deleting an unknown slug.
 func TestDashboardsPutAndDelete(t *testing.T) {
 	store := newFakeStore()
-	mux := newDashboardsMux(t, store, &fakeQueryProvider{})
+	mux := newDashboardsMux(t, store, nil)
 
 	body, _ := json.Marshal(sampleDashboard("revenue"))
 	rr := httptest.NewRecorder()
@@ -240,7 +217,7 @@ func TestDashboardsPutAndDelete(t *testing.T) {
 // slug in the request body.
 func TestDashboardsPutSlugFromPath(t *testing.T) {
 	store := newFakeStore()
-	mux := newDashboardsMux(t, store, &fakeQueryProvider{})
+	mux := newDashboardsMux(t, store, nil)
 
 	d := sampleDashboard("body-slug")
 	body, _ := json.Marshal(d)
@@ -255,15 +232,17 @@ func TestDashboardsPutSlugFromPath(t *testing.T) {
 }
 
 // TestDashboardsQueryDispatch confirms the POST query route reaches the
-// Provider with the SQL + dir from the request body.
+// shared query seam with the SQL + dir from the request body and the
+// route's row cap. Dialect policy / transpile behavior lives inside the
+// seam (service.Query) and is pinned by internal/service/query_test.go.
 func TestDashboardsQueryDispatch(t *testing.T) {
-	prov := &fakeQueryProvider{
+	seam := &fakeQuerySeam{
 		result: &observability.QueryResult{
 			Columns: []observability.SampleTableColumn{{Name: "n"}},
 			Rows:    [][]string{{"42"}},
 		},
 	}
-	mux := newDashboardsMux(t, newFakeStore(), prov)
+	mux := newDashboardsMux(t, newFakeStore(), seam)
 
 	body := `{"dir":"demo","sql":"SELECT 42 AS n"}`
 	rr := httptest.NewRecorder()
@@ -272,95 +251,80 @@ func TestDashboardsQueryDispatch(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
 	}
-	if prov.gotSQL != "SELECT 42 AS n" {
-		t.Errorf("provider got SQL = %q", prov.gotSQL)
+	if seam.gotSQL != "SELECT 42 AS n" {
+		t.Errorf("seam got SQL = %q", seam.gotSQL)
 	}
-	if prov.gotDir != "demo" {
-		t.Errorf("provider got dir = %q, want demo", prov.gotDir)
+	if seam.gotDir != "demo" {
+		t.Errorf("seam got dir = %q, want demo", seam.gotDir)
+	}
+	if seam.gotMaxRows <= 0 {
+		t.Errorf("seam got maxRows = %d, want the route's positive row cap", seam.gotMaxRows)
 	}
 }
 
-// TestDashboardsQueryCloudTranspiles confirms that on a CLOUD workspace the
-// ad-hoc query route transpiles the expanded SQL (via the injected hook)
-// before dispatching to the provider. The response shape is the provider's
-// QueryResult either way (ADR-014).
-func TestDashboardsQueryCloudTranspiles(t *testing.T) {
-	prov := &fakeQueryProvider{
-		result: &observability.QueryResult{
-			Columns: []observability.SampleTableColumn{{Name: "n"}},
-			Rows:    [][]string{{"42"}},
-		},
-	}
-	ws := t.TempDir()
-	if err := workspace.WriteWarehouse(ws, workspace.WarehouseCloud); err != nil {
-		t.Fatalf("WriteWarehouse(cloud): %v", err)
-	}
-	resolver := observability.NewResolver(ws, prov, prov)
-	var hookCalls int
-	h := api.NewDashboardsHandler(newFakeStore(), prov).
-		WithResolver(resolver).
-		WithTranspiler(func(_ context.Context, sql string) (string, error) {
-			hookCalls++
-			return "TRANSPILED " + sql, nil
-		})
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux)
+// TestDashboardsQueryExpandsPlaceholders confirms `{{control}}` tokens are
+// substituted before the SQL reaches the seam — placeholder expansion is
+// the one query concern the handler still owns.
+func TestDashboardsQueryExpandsPlaceholders(t *testing.T) {
+	seam := &fakeQuerySeam{result: &observability.QueryResult{}}
+	mux := newDashboardsMux(t, newFakeStore(), seam)
 
-	body := `{"dir":"demo","sql":"SELECT 42 AS n"}`
+	body := `{"dir":"demo","sql":"SELECT * FROM t WHERE env = {{env}}","params":{"env":"prod"}}`
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(body))))
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
 	}
-	if hookCalls != 1 {
-		t.Errorf("transpile hook should be called once on cloud, got %d", hookCalls)
-	}
-	if prov.gotSQL != "TRANSPILED SELECT 42 AS n" {
-		t.Errorf("provider got SQL = %q, want the transpiled form", prov.gotSQL)
+	if want := "SELECT * FROM t WHERE env = 'prod'"; seam.gotSQL != want {
+		t.Errorf("seam got SQL = %q, want %q", seam.gotSQL, want)
 	}
 }
 
-// TestDashboardsQueryLocalRunsRaw confirms that on a LOCAL workspace the
-// ad-hoc query route runs the authored Spark SQL unchanged and never calls
-// the transpile hook (local serving runs Spark — ADR-014).
-func TestDashboardsQueryLocalRunsRaw(t *testing.T) {
-	prov := &fakeQueryProvider{
-		result: &observability.QueryResult{
-			Columns: []observability.SampleTableColumn{{Name: "n"}},
-			Rows:    [][]string{{"42"}},
-		},
-	}
-	ws := t.TempDir() // no environment.json → local mode
-	resolver := observability.NewResolver(ws, prov, prov)
-	var hookCalls int
-	h := api.NewDashboardsHandler(newFakeStore(), prov).
-		WithResolver(resolver).
-		WithTranspiler(func(_ context.Context, sql string) (string, error) {
-			hookCalls++
-			return "TRANSPILED " + sql, nil
-		})
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux)
+// TestDashboardsQueryDialectRejection maps a *service.DialectError from the
+// seam to 400 — a non-portable SparkSQL widget query is the author's
+// problem (ADR-023), surfaced inline in the editor, not a server fault.
+func TestDashboardsQueryDialectRejection(t *testing.T) {
+	seam := &fakeQuerySeam{err: &service.DialectError{Message: "PIVOT has no Trino equivalent", Line: 1, Col: 8}}
+	mux := newDashboardsMux(t, newFakeStore(), seam)
 
-	body := `{"dir":"demo","sql":"SELECT 42 AS n"}`
+	body := `{"dir":"demo","sql":"SELECT 1"}`
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(body))))
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, body: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", rr.Code, rr.Body.String())
 	}
-	if hookCalls != 0 {
-		t.Errorf("transpile hook must not be called on local, got %d calls", hookCalls)
+}
+
+// TestDashboardsQueryOpaqueSeamError keeps non-dialect seam failures at 500.
+func TestDashboardsQueryOpaqueSeamError(t *testing.T) {
+	seam := &fakeQuerySeam{err: fmt.Errorf("provider exploded")}
+	mux := newDashboardsMux(t, newFakeStore(), seam)
+
+	body := `{"dir":"demo","sql":"SELECT 1"}`
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(body))))
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body: %s)", rr.Code, rr.Body.String())
 	}
-	if prov.gotSQL != "SELECT 42 AS n" {
-		t.Errorf("local provider got SQL = %q, want the raw Spark unchanged", prov.gotSQL)
+}
+
+// TestDashboardsQueryUnwired answers 500 when no query seam is injected —
+// production wiring (cli/ui.go) always provides one.
+func TestDashboardsQueryUnwired(t *testing.T) {
+	mux := newDashboardsMux(t, newFakeStore(), nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(`{"dir":"demo","sql":"SELECT 1"}`))))
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rr.Code)
 	}
 }
 
 // TestDashboardsQueryEmptySQL rejects at 400.
 func TestDashboardsQueryEmptySQL(t *testing.T) {
-	mux := newDashboardsMux(t, newFakeStore(), &fakeQueryProvider{})
+	mux := newDashboardsMux(t, newFakeStore(), nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(`{"dir":"demo","sql":""}`))))
 	if rr.Code != http.StatusBadRequest {
@@ -371,7 +335,7 @@ func TestDashboardsQueryEmptySQL(t *testing.T) {
 // TestDashboardsQueryEmptyDir rejects at 400 — without a dir we don't know
 // which Provider serves the request (ADR-014 symmetric reject).
 func TestDashboardsQueryEmptyDir(t *testing.T) {
-	mux := newDashboardsMux(t, newFakeStore(), &fakeQueryProvider{})
+	mux := newDashboardsMux(t, newFakeStore(), nil)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(`{"dir":"","sql":"SELECT 1"}`))))
 	if rr.Code != http.StatusBadRequest {

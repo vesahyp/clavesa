@@ -26,7 +26,6 @@ import (
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/preview"
-	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/sources"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -147,7 +146,7 @@ func (s *Service) PreviewTransform(ctx context.Context, dir, nodeID string, rowC
 	}
 
 	image, _ := node.Config["runner_image"].(string)
-	localTag := runner.LocalImageName("") + ":latest"
+	localTag := workspace.LocalRunnerImageTag(s.workspace)
 	if _, err := workspace.Load(s.workspace); err == nil {
 		ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
 		if err != nil {
@@ -310,7 +309,7 @@ func (s *Service) resolveInputData(ctx context.Context, g *graph.PipelineGraph, 
 		// internal/preview/resolve.go.
 		if extInputs, ok := target.Config["external_inputs"].(map[string]interface{}); ok && len(extInputs) > 0 {
 			catalog := ""
-			localTag := runner.LocalImageName("") + ":latest"
+			localTag := workspace.LocalRunnerImageTag(s.workspace)
 			if m, _ := workspace.Load(s.workspace); m != nil {
 				catalog = m.CatalogIdentifier()
 				ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
@@ -473,7 +472,7 @@ func (s *Service) executeTransform(ctx context.Context, g *graph.PipelineGraph, 
 	}
 
 	image, _ := node.Config["runner_image"].(string)
-	localTag := runner.LocalImageName("") + ":latest"
+	localTag := workspace.LocalRunnerImageTag(s.workspace)
 	if _, err := workspace.Load(s.workspace); err == nil {
 		ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
 		if err != nil {

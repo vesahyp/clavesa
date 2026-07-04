@@ -310,7 +310,7 @@ function RefreshControl() {
     const id = window.setInterval(() => {
       // Hits every widget query AND the dataset-column probes; matches
       // the React-Query key prefix used by useDashboardQuery /
-      // useDatasetColumns / SqlPreview.
+      // useDatasetColumns.
       void qc.invalidateQueries({ queryKey: ["dashboards", "query"] });
     }, opt.ms);
     return () => window.clearInterval(id);

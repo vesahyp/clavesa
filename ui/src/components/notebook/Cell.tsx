@@ -23,6 +23,7 @@ import { CodeEditor } from "@/components/CodeEditor";
 import { EngineBadge } from "@/components/EngineBadge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { NativeSelect } from "@/components/ui/native-select";
 import { cn } from "@/lib/utils";
 import type { NotebookCell, ServedInfo } from "@/lib/queries";
 import { CellOutput } from "./CellOutput";
@@ -167,14 +168,14 @@ function Toolbar({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <select
-        className="h-7 rounded border bg-background px-2 text-xs"
+      <NativeSelect
+        className="h-7 w-auto rounded px-2 text-xs"
         value={cellType}
         onChange={(e) => onChangeType(e.target.value as "code" | "markdown")}
       >
         <option value="code">code</option>
         <option value="markdown">markdown</option>
-      </select>
+      </NativeSelect>
       {cellType === "code" && (
         <span className="rounded bg-muted px-2 py-0.5 font-mono text-[11px] uppercase text-muted-foreground">
           {language}

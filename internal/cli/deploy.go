@@ -188,15 +188,8 @@ func (d deployFlow) verifyAWSCredentials() error {
 	if err != nil {
 		return fmt.Errorf("AWS credentials check failed: %w (check AWS_PROFILE / AWS_REGION / ~/.aws/credentials)", err)
 	}
-	fmt.Fprintf(d.stdout(), "→ AWS account %s as %s\n", derefStr(out.Account), derefStr(out.Arn))
+	fmt.Fprintf(d.stdout(), "→ AWS account %s as %s\n", aws.ToString(out.Account), aws.ToString(out.Arn))
 	return nil
-}
-
-func derefStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }
 
 // pushRunnerImage tags the freshly-built local runner image into the
@@ -231,7 +224,7 @@ func (d deployFlow) pushRunnerImage() error {
 		return fmt.Errorf("push runner image: resolve AWS account: %w", err)
 	}
 
-	registry := fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com", derefStr(ident.Account), region)
+	registry := fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com", aws.ToString(ident.Account), region)
 	// Mirrors aws_ecr_repository.runner.name in the workspace main.tf.
 	repoURL := fmt.Sprintf("%s/clavesa-%s/transform-runner", registry, m.Name)
 	// The build (EnsureLocalRunnerImage) always tags the local image with the

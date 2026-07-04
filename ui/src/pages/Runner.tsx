@@ -13,6 +13,7 @@ import { Package } from "lucide-react";
 import { toast } from "sonner";
 
 import { useChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -78,24 +79,16 @@ export function Runner() {
         </p>
       </div>
 
-      {reqs.isLoading && (
-        <div className="space-y-3">
-          <Skeleton className="h-48 w-full" />
-        </div>
-      )}
-
-      {reqs.error && (
-        <Card>
-          <CardContent className="p-6 text-sm text-destructive">
-            Couldn't load runner requirements —{" "}
-            {reqs.error instanceof Error
-              ? reqs.error.message
-              : "unknown error"}
-          </CardContent>
-        </Card>
-      )}
-
-      {reqs.data && (
+      <QueryShell
+        query={reqs}
+        loading={
+          <div className="space-y-3">
+            <Skeleton className="h-48 w-full" />
+          </div>
+        }
+        errorPrefix="Couldn't load runner requirements"
+      >
+        {() => (
         <Card>
           <CardContent className="space-y-4 p-6">
             <div className="space-y-2">
@@ -165,7 +158,8 @@ export function Runner() {
             </div>
           </CardContent>
         </Card>
-      )}
+        )}
+      </QueryShell>
     </div>
   );
 }

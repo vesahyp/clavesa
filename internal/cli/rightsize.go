@@ -34,7 +34,7 @@ Spark memory metrics yet show confidence "n/a".
 			if err != nil {
 				return err
 			}
-			svc, _, err := newDashboardService(cmd)
+			svc, _, err := newService(cmd)
 			if err != nil {
 				return err
 			}

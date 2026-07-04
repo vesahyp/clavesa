@@ -24,7 +24,7 @@ import (
 // container with so prior-session orphans can be swept on startup.
 const warmWorkerLabel = "clavesa.warm-worker"
 
-// persistentDockerQueryRunner keeps one warm Spark process per warehouse
+// PersistentQueryRunner keeps one warm Spark process per warehouse
 // alive in a background container and reuses it across HTTP queries.
 //
 // The cold price of starting Spark (~18-30s) was the dominant cost on every
@@ -36,7 +36,7 @@ const warmWorkerLabel = "clavesa.warm-worker"
 // Only `clavesa ui` wires this — CLI one-shots stay on the per-call
 // `dockerQueryRunner` to avoid surprising users with lingering containers
 // they didn't ask for.
-type persistentDockerQueryRunner struct {
+type PersistentQueryRunner struct {
 	// workspaceRoot is kept (rather than a pre-resolved image name) so the
 	// runner image is resolved lazily at spawn time. `clavesa ui` can
 	// be started in an empty directory and have the workspace created
@@ -72,7 +72,7 @@ type warmWorker struct {
 	spawnErr    error
 	// state and startedAt are the observable runtime status the UI's
 	// runtime indicator polls via Workers() / GET /api/runtime/workers.
-	// Both are written under persistentDockerQueryRunner.mu.
+	// Both are written under PersistentQueryRunner.mu.
 	state     workerState
 	startedAt time.Time
 }
@@ -98,8 +98,8 @@ type WorkerStatus struct {
 // Callers are responsible for Close() at shutdown; otherwise the docker
 // containers keep running. SweepWarmWorkers handles orphans from prior
 // sessions that died without calling Close (kill -9, panic, etc.).
-func NewPersistentQueryRunner(workspaceRoot string) *persistentDockerQueryRunner {
-	return &persistentDockerQueryRunner{
+func NewPersistentQueryRunner(workspaceRoot string) *PersistentQueryRunner {
+	return &PersistentQueryRunner{
 		workspaceRoot: workspaceRoot,
 		labelKV:       warmWorkerLabel + "=" + workspaceRoot,
 		httpC:         &http.Client{Timeout: 10 * time.Minute},
@@ -108,30 +108,17 @@ func NewPersistentQueryRunner(workspaceRoot string) *persistentDockerQueryRunner
 	}
 }
 
-// resolveRunnerImage returns the workspace-scoped runner image tag,
-// resolved fresh from clavesa.json each call. Cheap (one small file read)
-// and rare (once per spawn) — and it has to be lazy so a workspace created
-// after `clavesa ui` started is picked up without a restart. Shared by the
-// warm query runner and the transpile sidecar (both spawn the same runner
-// image, just with a different server-mode env var).
-func resolveRunnerImage(workspaceRoot string) string {
-	if m, _ := workspace.Load(workspaceRoot); m != nil {
-		return runner.LocalImageName(m.Name) + ":latest"
-	}
-	return runner.LocalImageName("") + ":latest"
-}
-
 // resolveImage returns the workspace-scoped runner image tag for this
-// warm runner; delegates to the package-level resolveRunnerImage.
-func (p *persistentDockerQueryRunner) resolveImage() string {
-	return resolveRunnerImage(p.workspaceRoot)
+// warm runner; delegates to the shared workspace.LocalRunnerImageTag.
+func (p *PersistentQueryRunner) resolveImage() string {
+	return workspace.LocalRunnerImageTag(p.workspaceRoot)
 }
 
 // metastoreWorkspaceName resolves the workspace name EnsureMetastore needs
 // to pick the runner image the metastore container reuses. Empty when the
 // manifest isn't readable yet — EnsureMetastore then falls back to the
 // empty-name image, matching resolveImage's own fallback.
-func (p *persistentDockerQueryRunner) metastoreWorkspaceName() string {
+func (p *PersistentQueryRunner) metastoreWorkspaceName() string {
 	if m, _ := workspace.Load(p.workspaceRoot); m != nil {
 		return m.Name
 	}
@@ -158,7 +145,7 @@ func (e *ParseError) Error() string { return e.Message }
 // carrying the parser's message. Any other return is a transport or
 // runner failure (worker dead, docker gone, network) — callers must
 // not surface those as parse errors.
-func (p *persistentDockerQueryRunner) Parse(ctx context.Context, warehouse, sql string) error {
+func (p *PersistentQueryRunner) Parse(ctx context.Context, warehouse, sql string) error {
 	w, err := p.getOrSpawn(ctx, warehouse)
 	if err != nil {
 		return err
@@ -177,7 +164,7 @@ func (p *persistentDockerQueryRunner) Parse(ctx context.Context, warehouse, sql 
 	return err
 }
 
-func (p *persistentDockerQueryRunner) parseAt(ctx context.Context, w *warmWorker, sql string) error {
+func (p *PersistentQueryRunner) parseAt(ctx context.Context, w *warmWorker, sql string) error {
 	body, _ := json.Marshal(map[string]string{"sql": sql})
 	url := fmt.Sprintf("http://127.0.0.1:%d/parse", w.port)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -220,7 +207,7 @@ func (p *persistentDockerQueryRunner) parseAt(ctx context.Context, w *warmWorker
 // Run satisfies QueryRunner. First call per warehouse spawns the container
 // and blocks until /healthz responds (~30s). Subsequent calls reuse the
 // warm worker.
-func (p *persistentDockerQueryRunner) Run(ctx context.Context, warehouse, sql string) (*QueryRunnerResult, error) {
+func (p *PersistentQueryRunner) Run(ctx context.Context, warehouse, sql string) (*QueryRunnerResult, error) {
 	w, err := p.getOrSpawn(ctx, warehouse)
 	if err != nil {
 		return nil, err
@@ -249,7 +236,7 @@ func (p *persistentDockerQueryRunner) Run(ctx context.Context, warehouse, sql st
 // *service.ParseError at the seam so callers in internal/cli +
 // internal/api can `errors.As(&service.ParseError{})` without
 // reaching into the observability package.
-func (p *persistentDockerQueryRunner) SQLParserFor(warehouse string) *boundSQLParser {
+func (p *PersistentQueryRunner) SQLParserFor(warehouse string) *boundSQLParser {
 	return &boundSQLParser{runner: p, resolve: func() (string, error) { return warehouse, nil }}
 }
 
@@ -261,20 +248,20 @@ func (p *persistentDockerQueryRunner) SQLParserFor(warehouse string) *boundSQLPa
 // coexist), and a cloud warehouse on an undeployed workspace surfaces
 // WarehouseURI's actionable error at the moment a parse is requested —
 // never a silent fallback to local.
-func (p *persistentDockerQueryRunner) SQLParserForWorkspace() *boundSQLParser {
+func (p *PersistentQueryRunner) SQLParserForWorkspace() *boundSQLParser {
 	return &boundSQLParser{runner: p, resolve: func() (string, error) {
 		return workspace.WarehouseURI(p.workspaceRoot)
 	}}
 }
 
-// boundSQLParser binds a persistentDockerQueryRunner to one warehouse
+// boundSQLParser binds a PersistentQueryRunner to one warehouse
 // resolver so it satisfies the service-layer SQLParser shape (no
 // warehouse parameter). The translation to *service.ParseError happens
 // at the caller (cli/api) by detecting the *observability.ParseError
 // this returns — keeps the observability package free of an import
 // cycle.
 type boundSQLParser struct {
-	runner  *persistentDockerQueryRunner
+	runner  *PersistentQueryRunner
 	resolve func() (string, error)
 }
 
@@ -309,14 +296,14 @@ func (b *boundSQLParser) Parse(ctx context.Context, sql string) error {
 // Errors are logged to stderr and swallowed — there's no caller waiting on
 // the result, and the next user-triggered query will surface a real spawn
 // failure in-context anyway.
-func (p *persistentDockerQueryRunner) Warmup(ctx context.Context, warehouse string) {
+func (p *PersistentQueryRunner) Warmup(ctx context.Context, warehouse string) {
 	if _, err := p.getOrSpawn(ctx, warehouse); err != nil {
 		fmt.Fprintf(os.Stderr, "clavesa: warm Spark spawn failed (will retry on first query): %v\n", err)
 	}
 }
 
 // Close stops every tracked container. Idempotent — second call is a no-op.
-func (p *persistentDockerQueryRunner) Close() {
+func (p *PersistentQueryRunner) Close() {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -341,7 +328,7 @@ func (p *persistentDockerQueryRunner) Close() {
 // together OOM. Releasing the warm worker for the duration of a run
 // keeps memory pressure off the user; the next Catalog / dashboard
 // query pays the ~15s warm-up again but only once.
-func (p *persistentDockerQueryRunner) EvictWarehouse(warehouse string) {
+func (p *PersistentQueryRunner) EvictWarehouse(warehouse string) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -359,7 +346,7 @@ func (p *persistentDockerQueryRunner) EvictWarehouse(warehouse string) {
 	}
 }
 
-func (p *persistentDockerQueryRunner) getOrSpawn(ctx context.Context, warehouse string) (*warmWorker, error) {
+func (p *PersistentQueryRunner) getOrSpawn(ctx context.Context, warehouse string) (*warmWorker, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -397,7 +384,7 @@ func (p *persistentDockerQueryRunner) getOrSpawn(ctx context.Context, warehouse 
 //
 // Returning a base URL string (not the port) keeps callers from having to
 // know about IPv4 binding details; the warm worker spawn pins 127.0.0.1.
-func (p *persistentDockerQueryRunner) WarmWorkerBaseURL(warehouse string) string {
+func (p *PersistentQueryRunner) WarmWorkerBaseURL(warehouse string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	w, ok := p.workers[warehouse]
@@ -410,7 +397,7 @@ func (p *persistentDockerQueryRunner) WarmWorkerBaseURL(warehouse string) string
 // Workers reports the warm-Spark workers currently tracked and their
 // state, for the UI's runtime indicator. Safe for concurrent use;
 // returns an empty slice when none are tracked or the runner is closed.
-func (p *persistentDockerQueryRunner) Workers() []WorkerStatus {
+func (p *PersistentQueryRunner) Workers() []WorkerStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := make([]WorkerStatus, 0, len(p.workers))
@@ -425,7 +412,7 @@ func (p *persistentDockerQueryRunner) Workers() []WorkerStatus {
 	return out
 }
 
-func (p *persistentDockerQueryRunner) spawn(ctx context.Context, warehouse string) (string, int, error) {
+func (p *PersistentQueryRunner) spawn(ctx context.Context, warehouse string) (string, int, error) {
 	isS3 := strings.HasPrefix(warehouse, "s3://")
 	if !isS3 {
 		if err := os.MkdirAll(warehouse, 0o755); err != nil {
@@ -595,7 +582,7 @@ func dockerTailLogs(containerID string, n int) string {
 	return strings.TrimSpace(string(out))
 }
 
-func (p *persistentDockerQueryRunner) pollHealthz(ctx context.Context, port int) error {
+func (p *PersistentQueryRunner) pollHealthz(ctx context.Context, port int) error {
 	deadline := time.Now().Add(p.healthCtx)
 	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
 	// Use a short per-request timeout — long ones serialize poorly with
@@ -619,7 +606,7 @@ func (p *persistentDockerQueryRunner) pollHealthz(ctx context.Context, port int)
 	return fmt.Errorf("did not become healthy within %s", p.healthCtx)
 }
 
-func (p *persistentDockerQueryRunner) query(ctx context.Context, w *warmWorker, sql string) (*QueryRunnerResult, error) {
+func (p *PersistentQueryRunner) query(ctx context.Context, w *warmWorker, sql string) (*QueryRunnerResult, error) {
 	body, _ := json.Marshal(map[string]string{"sql": sql})
 	url := fmt.Sprintf("http://127.0.0.1:%d/query", w.port)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -677,7 +664,7 @@ func trimSparkStackTrace(s string) string {
 	return strings.TrimRight(s, "\n ")
 }
 
-func (p *persistentDockerQueryRunner) evict(warehouse string, w *warmWorker) {
+func (p *PersistentQueryRunner) evict(warehouse string, w *warmWorker) {
 	p.mu.Lock()
 	if cur, ok := p.workers[warehouse]; ok && cur == w {
 		delete(p.workers, warehouse)

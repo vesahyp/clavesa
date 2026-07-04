@@ -128,7 +128,7 @@ func (h *BackfillHandler) list(w http.ResponseWriter, r *http.Request) {
 	}
 	runs, err := h.svc.BackfillList(r.Context(), dir)
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, backfillsListResponse{Backfills: runs})
@@ -158,7 +158,7 @@ func (h *BackfillHandler) stage(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteJSON(w, http.StatusBadGateway, run)
 			return
 		}
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, run)
@@ -176,7 +176,7 @@ func (h *BackfillHandler) diff(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := h.svc.BackfillDiff(r.Context(), dir, runID)
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, d)
@@ -201,7 +201,7 @@ func (h *BackfillHandler) dedupCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.svc.BackfillDedupCheck(r.Context(), dir, runID, col)
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
@@ -231,7 +231,7 @@ func (h *BackfillHandler) promote(w http.ResponseWriter, r *http.Request) {
 		Compute:         body.Compute,
 	})
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	if res == nil {
@@ -260,7 +260,7 @@ func (h *BackfillHandler) discard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.BackfillDiscard(r.Context(), body.Dir, runID, body.Compute); err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

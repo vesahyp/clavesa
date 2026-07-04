@@ -17,10 +17,9 @@ package credentials
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
+
+	"github.com/vesahyp/clavesa/internal/registry"
 )
 
 // RelDir is the workspace-relative directory holding credential JSON
@@ -81,50 +80,42 @@ func (s Spec) SecretBackend() string {
 // Store is the file-backed credentials registry rooted at a workspace
 // directory.
 type Store struct {
-	workspaceRoot string
+	reg *registry.Store[Spec]
 }
 
-// New returns a Store rooted at workspaceRoot.
+// New returns a Store rooted at workspaceRoot. Name rules come from
+// registry.ValidName — same rules as sources so users learn one.
 func New(workspaceRoot string) *Store {
-	return &Store{workspaceRoot: workspaceRoot}
+	return &Store{reg: registry.New(workspaceRoot, registry.Config[Spec]{
+		Kind:   "credential",
+		RelDir: RelDir,
+		Ext:    ".json",
+		Marshal: func(spec Spec) ([]byte, error) {
+			return registry.MarshalIndentJSON(spec)
+		},
+		Unmarshal: func(name string, data []byte) (Spec, error) {
+			var spec Spec
+			if err := json.Unmarshal(data, &spec); err != nil {
+				return Spec{}, fmt.Errorf("parse %s.json: %w", name, err)
+			}
+			spec.Name = name
+			return spec, nil
+		},
+	})}
 }
 
 // Dir returns the absolute path of the registry directory.
 func (s *Store) Dir() string {
-	return filepath.Join(s.workspaceRoot, RelDir)
+	return s.reg.Dir()
 }
 
 // Path returns the absolute path of a credential's JSON file.
 func (s *Store) Path(name string) string {
-	return filepath.Join(s.Dir(), name+".json")
-}
-
-// validName mirrors sources.validName — same rules so users learn one.
-func validName(s string) error {
-	if s == "" {
-		return fmt.Errorf("name is required")
-	}
-	if len(s) > 64 {
-		return fmt.Errorf("name must be <=64 chars (got %d)", len(s))
-	}
-	first := s[0]
-	if !(first >= 'a' && first <= 'z') {
-		return fmt.Errorf("name must start with a lowercase letter")
-	}
-	for i, c := range s {
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= '0' && c <= '9':
-		case c == '-' || c == '_':
-		default:
-			return fmt.Errorf("name has invalid char %q at index %d (allowed: a-z 0-9 - _)", c, i)
-		}
-	}
-	return nil
+	return s.reg.Path(name)
 }
 
 func (s Spec) validate() error {
-	if err := validName(s.Name); err != nil {
+	if err := registry.ValidName(s.Name); err != nil {
 		return err
 	}
 	switch s.Kind {
@@ -150,79 +141,22 @@ func (s *Store) Add(spec Spec) error {
 	if err := spec.validate(); err != nil {
 		return err
 	}
-	path := s.Path(spec.Name)
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("credential %q already exists", spec.Name)
-	}
-	if err := os.MkdirAll(s.Dir(), 0o755); err != nil {
-		return fmt.Errorf("create credentials dir: %w", err)
-	}
-	return writeJSON(path, spec)
+	return s.reg.Create(spec.Name, spec)
 }
 
 // Get reads one credential by name. Returns os.ErrNotExist when absent.
 func (s *Store) Get(name string) (Spec, error) {
-	if err := validName(name); err != nil {
-		return Spec{}, err
-	}
-	data, err := os.ReadFile(s.Path(name))
-	if err != nil {
-		return Spec{}, err
-	}
-	var spec Spec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		return Spec{}, fmt.Errorf("parse %s.json: %w", name, err)
-	}
-	spec.Name = name
-	return spec, nil
+	return s.reg.Get(name)
 }
 
 // List returns every registered credential, sorted by name.
 func (s *Store) List() ([]Spec, error) {
-	entries, err := os.ReadDir(s.Dir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []Spec{}, nil
-		}
-		return nil, err
-	}
-	out := make([]Spec, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		name := strings.TrimSuffix(e.Name(), ".json")
-		if err := validName(name); err != nil {
-			continue
-		}
-		spec, err := s.Get(name)
-		if err != nil {
-			continue
-		}
-		out = append(out, spec)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return s.reg.List()
 }
 
 // Delete removes a credential. Caller is responsible for the source-scan
 // deletion guard (see service.DeleteCredential) — this layer just owns
 // the file.
 func (s *Store) Delete(name string) error {
-	if err := validName(name); err != nil {
-		return err
-	}
-	return os.Remove(s.Path(name))
-}
-
-func writeJSON(path string, v interface{}) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return s.reg.Delete(name)
 }

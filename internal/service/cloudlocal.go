@@ -144,7 +144,7 @@ func (s *Service) runCloudLocalEvent(ctx context.Context, env, perNodeEnv map[st
 
 	// Workspace-local runner image, refreshed if a CLI upgrade shipped new
 	// runner code. Same resolution runOperation uses.
-	image := runner.LocalImageName("") + ":latest"
+	image := workspace.LocalRunnerImageTag(s.workspace)
 	if _, err := workspace.Load(s.workspace); err == nil {
 		ensured, err := workspace.EnsureLocalRunnerImage(s.workspace)
 		if err != nil {

@@ -16,12 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/athena"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/glue"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/sfn"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/spf13/cobra"
@@ -36,7 +31,6 @@ import (
 	"github.com/vesahyp/clavesa/internal/pipelinestatus"
 	"github.com/vesahyp/clavesa/internal/preview"
 	tuiservice "github.com/vesahyp/clavesa/internal/service"
-	"github.com/vesahyp/clavesa/internal/servingsql"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -557,102 +551,8 @@ func toAPIBackfillRun(r *tuiservice.BackfillRun) *api.BackfillRun {
 	return out
 }
 
-// resetBridge adapts service.Service onto api.Resetter. Same seam as
-// backfillBridge: the service and API types mirror each other
-// field-for-field so internal/api stays free of an internal/service
-// import.
-type resetBridge struct {
-	svc *tuiservice.Service
-}
-
-func (b resetBridge) PipelineResetPlan(ctx context.Context, req api.PipelineResetRequest) (*api.PipelineResetResult, error) {
-	res, err := b.svc.PipelineResetPlan(ctx, toServiceResetRequest(req))
-	if err != nil {
-		return nil, err
-	}
-	return toAPIResetResult(res), nil
-}
-
-func (b resetBridge) PipelineReset(ctx context.Context, req api.PipelineResetRequest) (*api.PipelineResetResult, error) {
-	res, err := b.svc.PipelineReset(ctx, toServiceResetRequest(req))
-	if err != nil {
-		return nil, err
-	}
-	return toAPIResetResult(res), nil
-}
-
-func toServiceResetRequest(req api.PipelineResetRequest) tuiservice.PipelineResetRequest {
-	return tuiservice.PipelineResetRequest{
-		Dir:               req.Dir,
-		Node:              req.Node,
-		IncludeWatermarks: req.IncludeWatermarks,
-	}
-}
-
-func toAPIResetResult(r *tuiservice.PipelineResetResult) *api.PipelineResetResult {
-	if r == nil {
-		return nil
-	}
-	out := &api.PipelineResetResult{
-		Pipeline:          r.Pipeline,
-		Mode:              r.Mode,
-		TablesDropped:     make([]api.ResetTarget, len(r.TablesDropped)),
-		WatermarksCleared: make([]api.WatermarkTarget, len(r.WatermarksCleared)),
-	}
-	for i, t := range r.TablesDropped {
-		out.TablesDropped[i] = api.ResetTarget{
-			Node:      t.Node,
-			OutputKey: t.OutputKey,
-			Table:     t.Table,
-			GlueDB:    t.GlueDB,
-			Location:  t.Location,
-		}
-	}
-	for i, w := range r.WatermarksCleared {
-		out.WatermarksCleared[i] = api.WatermarkTarget{
-			Consumer: w.Consumer,
-			Alias:    w.Alias,
-			Path:     w.Path,
-		}
-	}
-	return out
-}
-
 func (b lineageBridge) Lineage(dir string) (*lineagetype.Response, error) {
 	return b.svc.Lineage(dir)
-}
-
-// optimizeBridge adapts service.Service onto api.Optimizer. The service and
-// API request/result types mirror each other field-for-field; this bridge is
-// the seam that keeps internal/api free of an internal/service import.
-type optimizeBridge struct {
-	svc *tuiservice.Service
-}
-
-func (b optimizeBridge) OptimizeTable(ctx context.Context, req api.OptimizeRequest) ([]api.OptimizeTableResult, error) {
-	src, err := b.svc.OptimizeTable(ctx, tuiservice.OptimizeRequest{
-		Dir:         req.Dir,
-		Node:        req.Node,
-		Recluster:   req.Recluster,
-		Vacuum:      req.Vacuum,
-		RetainHours: req.RetainHours,
-	})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]api.OptimizeTableResult, len(src))
-	for i, r := range src {
-		out[i] = api.OptimizeTableResult{
-			Table:     r.Table,
-			Node:      r.Node,
-			OutputKey: r.OutputKey,
-			Operation: r.Operation,
-			Vacuumed:  r.Vacuumed,
-			Status:    r.Status,
-			Error:     r.Error,
-		}
-	}
-	return out, nil
 }
 
 func newUICmd() *cobra.Command {
@@ -691,96 +591,63 @@ Examples:
 			// AWS clients built below and the AWS_PROFILE forwarded into
 			// the runner (service/run.go) agree on one profile.
 
-			// Athena output bucket: explicit env var wins; otherwise
-			// auto-derive from the workspace's terraform.tfstate
-			// (`pipeline_bucket` output, the same bucket the Athena
-			// workgroup uses for `athena-results/`). Empty in local-only
-			// or pre-deploy mode — Athena calls would fail anyway, the
-			// resolver routes those requests to the local provider.
-			athenaOutputBucket := os.Getenv("ATHENA_OUTPUT_BUCKET")
-			if athenaOutputBucket == "" {
-				athenaOutputBucket = wspkg.PipelineBucket(workspace)
-			}
+			// Sweep leftovers from a prior SIGKILL'd session before the
+			// shared constructor's lazy pieces can spawn fresh ones: warm
+			// Spark workers; the stale metastore container that would
+			// otherwise keep holding the Derby DB lock and block a fresh
+			// EnsureMetastore (EnsureMetastore itself runs in the startup
+			// goroutine below so a cold image pull doesn't block `ui`
+			// startup); and orphaned per-workspace metastore networks left
+			// by pre-shared-network clavesa versions (GH #42), so a machine
+			// that accumulated them self-heals instead of exhausting
+			// docker's address pool.
+			observability.SweepWarmWorkers(workspace)
+			observability.SweepMetastores(workspace)
+			observability.SweepLegacyMetastoreNetworks()
 
-			var s3Client *s3.Client
-			var athenaClient *athena.Client
-			var glueClient *glue.Client
-			var sfnClient *sfn.Client
-			var cwlClient *cloudwatchlogs.Client
+			// Shared CLI service constructor — the same fully-wired stack
+			// every command gets: AWS clients + cloud provider, the
+			// warm-Spark-per-warehouse query runner (the Catalog /
+			// dashboards / TableDetail surfaces fire many read queries on
+			// load; first call still ~30s, every subsequent call <100ms),
+			// the transpile sidecar behind its on-disk cache, resolver,
+			// SQL parser, transpiler, metastore ensurer. The ui command's
+			// extras layer on top below: the STS identity probe, the
+			// notebook REPL pool, the eager Spark warmup, and the HTTP
+			// handlers that consume the individual pieces directly.
+			deps, err := newServiceDeps(cmd)
+			if err != nil {
+				return err
+			}
+			clients := deps.clients
+			athenaOutputBucket := clients.AthenaOutputBucket
+			warmQuery := deps.warm
+			resolver := deps.resolver
+			s3Client := clients.S3
+			athenaClient := clients.Athena
+			glueClient := clients.Glue
+
 			// awsIdentity: the server's effective AWS account/profile,
 			// resolved once here so the UI header can show "operating as
 			// account X" — the fast diagnosis for a creds-mismatch 403.
 			// Zero value (Available=false) is the local-only answer.
 			var awsIdentity api.AWSIdentity
-			if awsCfg, err := awsconfig.LoadDefaultConfig(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "clavesa: AWS config unavailable (local-only mode): %v\n", err)
+			if clients.Err != nil {
+				fmt.Fprintf(os.Stderr, "clavesa: AWS config unavailable (local-only mode): %v\n", clients.Err)
 			} else {
-				s3Client = s3.NewFromConfig(awsCfg)
-				athenaClient = athena.NewFromConfig(awsCfg)
-				glueClient = glue.NewFromConfig(awsCfg)
-				sfnClient = sfn.NewFromConfig(awsCfg)
-				cwlClient = cloudwatchlogs.NewFromConfig(awsCfg)
 				// One cached GetCallerIdentity. Short timeout so a hung
 				// credential provider can't stall `clavesa ui` startup.
 				idCtx, idCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				if out, idErr := sts.NewFromConfig(awsCfg).GetCallerIdentity(idCtx, &sts.GetCallerIdentityInput{}); idErr == nil {
+				if out, idErr := sts.NewFromConfig(clients.Config).GetCallerIdentity(idCtx, &sts.GetCallerIdentityInput{}); idErr == nil {
 					awsIdentity = api.AWSIdentity{
 						Available: true,
-						AccountID: derefStr(out.Account),
-						ARN:       derefStr(out.Arn),
+						AccountID: aws.ToString(out.Account),
+						ARN:       aws.ToString(out.Arn),
 						Profile:   os.Getenv("AWS_PROFILE"),
 					}
 				}
 				idCancel()
 			}
-
-			// Per-pipeline observability resolver: routes states/logs/snapshots/
-			// node-runs/runs queries to either the cloud provider (Athena+SFN+
-			// CloudWatch) or the local provider (filesystem progress channel +
-			// runner-container Spark) based on the inspected pipeline's compute
-			// attr. ADR-014 binds parity here.
-			var cloudProv observability.Provider
-			if athenaClient != nil {
-				cp := observability.NewCloudProvider(athenaClient, athenaOutputBucket, sfnClient, cwlClient)
-				// ADR-018: snapshot timeline reads Delta `_delta_log/`
-				// from S3 (Athena's Delta support is read-only and
-				// can't run `DESCRIBE HISTORY`). Wire the Glue+S3
-				// clients so Snapshots() can resolve the table's S3
-				// location and read its commit log.
-				if glueClient != nil {
-					cp = cp.WithGlue(glueClient)
-				}
-				if s3Client != nil {
-					cp = cp.WithS3(s3Client)
-				}
-				cloudProv = cp
-			}
-			// Warm-Spark-per-warehouse: the Catalog / dashboards / TableDetail
-			// surfaces fire many read queries on load, each previously paying
-			// the ~18-30s Spark JVM cold start. The persistent runner keeps
-			// one warm container per pipeline warehouse and reuses it across
-			// queries — first call still ~30s, every subsequent call <100ms.
-			// SweepWarmWorkers cleans up any containers left behind by a
-			// prior SIGKILL'd session before we spawn fresh.
-			observability.SweepWarmWorkers(workspace)
-			// Shared local Derby metastore: a SIGKILL'd prior session can
-			// leave a stale metastore container holding the Derby DB lock,
-			// which would block a fresh EnsureMetastore. Sweep it before the
-			// startup goroutine below brings up a fresh one. (EnsureMetastore
-			// itself is in the goroutine so a cold image pull doesn't block
-			// `ui` startup.)
-			observability.SweepMetastores(workspace)
-			// Reap orphaned per-workspace metastore networks left by pre-shared-
-			// network clavesa versions (GH #42), so a machine that accumulated
-			// them self-heals instead of exhausting docker's address pool.
-			observability.SweepLegacyMetastoreNetworks()
-			warmQuery := observability.NewPersistentQueryRunner(workspace)
-			// Slice 4: SparkSQL-to-Trino/Athena transpile sidecar (lazily
-			// spawned, non-Spark sqlglot server) behind an on-disk cache.
-			// Dashboard save runs the transpile-portability gate through
-			// this; render re-derives from the same cache.
-			transpileSidecar := observability.NewTranspileSidecar(workspace)
-			transpiler := servingsql.NewCachedTranspiler(filepath.Join(workspace, ".clavesa", "cache", "transpile"), transpileSidecar.ToServing)
 
 			// Eager Spark warmup: the Catalog landing page itself doesn't
 			// fire a Spark query (it reads from Glue + filesystem state),
@@ -846,32 +713,16 @@ Examples:
 				}()
 			}
 
-			localProv := observability.NewLocalProvider(workspace).WithQueryRunner(warmQuery)
-			resolver := observability.NewResolver(workspace, cloudProv, localProv)
-
 			// Per-notebook REPL pool — shares the warm container's Spark
 			// Connect plugin via per-notebook session_ids. Evict-on-pipeline-
 			// run targets only notebook REPLs (not the warm container itself)
 			// so catalog rendering stays alive during a `pipeline run`.
+			// This is the one Service seam beyond the shared constructor's
+			// set — an explicit ui-only addition, not a divergent recipe.
 			nbRunner := observability.NewNotebookSessionRunner(warmQuery)
 
 			fo := fileops.New()
-			// Slice 3: parse-validate authoring SQL before persistence /
-			// dispatch. The warm worker is the same one /query rides on,
-			// so /parse is a single in-JVM call (~milliseconds) instead
-			// of a fresh container spawn. The parser resolves the active
-			// warehouse (ADR-024) lazily per Parse, so a warehouse flip
-			// mid-session reaches the right worker, and cloud+undeployed
-			// surfaces an actionable error instead of parsing against a
-			// warehouse the workspace isn't using.
-			sqlParser := warmQuery.SQLParserForWorkspace()
-			svc := tuiservice.New(workspace).
-				WithEvictor(nbRunner).
-				WithResolver(resolver).
-				WithNotebookRunner(nbRunner).
-				WithSQLParser(sqlParser).
-				WithTranspiler(transpiler).
-				WithMetastoreEnsurer(metastoreEnsurer())
+			svc := deps.svc.WithNotebookRunner(nbRunner)
 			// lineageAdapter shims the JSON shape the api package owns onto the
 			// derivation owned by service. Two shapes mirror each other field-
 			// for-field; the adapter is the seam keeping api.Handler from
@@ -929,15 +780,14 @@ Examples:
 				catalogHandler = catalogHandler.WithS3(s3Client)
 			}
 			// Dashboards: CRUD against the `dashboards` system Iceberg table
-			// via the service layer, plus a Provider-dispatched query route
-			// for widget SQL. Cloud fallback lights up when the resolver
-			// can't dispatch on a dir.
-			dashboardsHandler := api.NewDashboardsHandler(dashboardStoreBridge{svc: svc}, cloudProv).
-				WithResolver(resolver).
-				// Share the same cached transpiler save/render use, so an
-				// ad-hoc cloud /query whose SQL was transpiled at save is a
-				// cache hit; local-mode requests skip the hook entirely.
-				WithTranspiler(transpiler.ToServing)
+			// via the service layer. The widget-SQL query route rides the
+			// same Service.Query seam as /data/query and `clavesa query`
+			// (ADR-015/ADR-023): warehouse dispatch plus the Spark→Trino
+			// portability gate/transpile, one dialect policy everywhere.
+			dashboardsHandler := api.NewDashboardsHandler(dashboardStoreBridge{svc: svc}).
+				WithQueryService(func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error) {
+					return svc.Query(ctx, sql, tuiservice.QueryOptions{Dir: dir, MaxRows: maxRows})
+				})
 			sourcesHandler := api.NewSourcesHandler(sourceRegistryBridge{svc: svc})
 			credentialsHandler := api.NewCredentialsHandler(credentialRegistryBridge{svc: svc})
 			notebooksHandler := api.NewNotebooksHandler(notebookRegistryBridge{svc: svc})
@@ -947,8 +797,11 @@ Examples:
 			// api.RunnerRequirementsService directly.
 			runnerHandler := api.NewRunnerHandler(svc)
 			backfillHandler := api.NewBackfillHandler(backfillBridge{svc: svc})
-			resetHandler := api.NewResetHandler(resetBridge{svc: svc})
-			optimizeHandler := api.NewOptimizeHandler(optimizeBridge{svc: svc})
+			// Reset/optimize: the api interfaces take the service types
+			// directly (C2-P2-11 dropped the bridge DTOs), so the service
+			// satisfies api.Resetter / api.Optimizer as-is.
+			resetHandler := api.NewResetHandler(svc)
+			optimizeHandler := api.NewOptimizeHandler(svc)
 			runtimeHandler := api.NewRuntimeHandler(warmQuery, awsIdentity)
 
 			hclParserFunc := func(dir string) (*graph.PipelineGraph, error) {
@@ -1012,9 +865,13 @@ Examples:
 			// database" (#21). SweepWarmWorkers / SweepMetastores clean both
 			// up on the next UI start, but a local run in between would still
 			// be blocked, so we release on exit rather than on next start.
+			// runCloseables stops what newServiceDeps registered (warm
+			// query workers, transpile sidecar) — idempotent, so Execute's
+			// own post-command call becomes a no-op; the metastore is
+			// workspace-shared rather than per-invocation, hence the
+			// explicit stop here instead of a closeable.
 			shutdown := func() {
-				warmQuery.Close()
-				transpileSidecar.Close()
+				runCloseables()
 				observability.StopMetastore(workspace)
 			}
 			srv := &http.Server{Addr: addr, Handler: mux}

@@ -13,6 +13,7 @@ import { useLocation, useNavigate, useParams, useSearchParams } from "react-rout
 import { Pencil } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import {
   ControlStrip,
   useDashboardParams,
@@ -173,36 +174,34 @@ export function Dashboard() {
         // 404 hint that would flash through the dialog backdrop.
         null
       ) : (
-        <>
-          {dashboard.isLoading && (
+        <QueryShell
+          query={dashboard}
+          loading={
             <div className="mt-2 space-y-3">
               <Skeleton className="h-8 w-1/3" />
               <Skeleton className="h-64 w-full" />
             </div>
-          )}
-
-          {dashboard.error && (
+          }
+          renderError={(error) => (
             <Card>
               <CardContent className="p-6 text-sm text-destructive">
-                {dashboard.error instanceof Error
-                  ? dashboard.error.message
-                  : String(dashboard.error)}
+                {error instanceof Error ? error.message : String(error)}
               </CardContent>
             </Card>
           )}
-
-          {dashboard.data && (
+        >
+          {(spec) => (
             <>
               <div className="mb-6 flex items-start justify-between gap-4">
                 <div>
                   <h1 className="font-mono text-2xl font-semibold tracking-tight">
-                    {dashboard.data.title}
+                    {spec.title}
                   </h1>
-                  {dashboard.data.datasets.length > 0 && (
+                  {spec.datasets.length > 0 && (
                     <p className="mt-1 text-sm text-muted-foreground">
-                      {dashboard.data.datasets.length} dataset
-                      {dashboard.data.datasets.length === 1 ? "" : "s"} over{" "}
-                      {pipelineScopeLabel(dashboard.data.datasets)}
+                      {spec.datasets.length} dataset
+                      {spec.datasets.length === 1 ? "" : "s"} over{" "}
+                      {pipelineScopeLabel(spec.datasets)}
                     </p>
                   )}
                 </div>
@@ -210,7 +209,7 @@ export function Dashboard() {
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    if (dashboard.data) setEditorInitial(dashboard.data);
+                    setEditorInitial(spec);
                     setEditing(true);
                   }}
                 >
@@ -218,14 +217,14 @@ export function Dashboard() {
                 </Button>
               </div>
 
-              {dashboard.data.controls.length > 0 && (
+              {spec.controls.length > 0 && (
                 <ControlStrip
-                  controls={dashboard.data.controls}
+                  controls={spec.controls}
                   params={controlParams}
                 />
               )}
 
-              {dashboard.data.widgets.length === 0 ? (
+              {spec.widgets.length === 0 ? (
                 <Card>
                   <CardContent className="p-6 text-sm text-muted-foreground">
                     This dashboard has no widgets yet — click Edit to add some.
@@ -239,7 +238,7 @@ export function Dashboard() {
                     gridAutoRows: "minmax(80px, auto)",
                   }}
                 >
-                  {dashboard.data.widgets.map((w) => {
+                  {spec.widgets.map((w) => {
                     const ds = datasetMap.get(w.dataset);
                     return (
                       <Widget
@@ -248,9 +247,7 @@ export function Dashboard() {
                         sql={ds?.sql ?? ""}
                         dir={ds?.dir ?? ""}
                         params={
-                          dashboard.data?.controls.length
-                            ? controlParams
-                            : undefined
+                          spec.controls.length ? controlParams : undefined
                         }
                       />
                     );
@@ -259,7 +256,7 @@ export function Dashboard() {
               )}
             </>
           )}
-        </>
+        </QueryShell>
       )}
     </div>
   );

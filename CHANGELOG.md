@@ -12,6 +12,17 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.15.0] — 2026-07-04
+
+### Fixed
+
+- CLI `pipeline optimize` (and every other command) now runs against the shared local Derby metastore instead of the embedded fallback, matching `pipeline run` and the UI's optimize route — no more "Another instance of Derby may have already booted" when a warm worker is live (GH #76).
+
+### Changed
+
+- The dashboard widget editor's query route (`POST /api/dashboards/query`) now runs through the same query seam as `/data/query` and `clavesa query`: the ADR-023 Trino-portability gate applies on a local warehouse (non-portable SparkSQL is rejected at edit time with the dialect error, instead of succeeding locally and failing at dashboard save), and querying a cloud warehouse that isn't deployed returns the actionable "run `clavesa workspace deploy`" error instead of an empty result.
+- Dialog overlays no longer blur the background (perf parity with sheets); native selects share one styled primitive, so a few pickers gained the standard focus ring.
+
 ## [v2.14.0] — 2026-07-03
 
 ### Fixed

@@ -12,7 +12,6 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
-	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -21,21 +20,17 @@ const (
 	previewMaxLimit     = 500
 )
 
-// localImageForDir returns the workspace-scoped local Docker image name for the
-// given pipeline directory. It loads clavesa.json from the parent directory.
-// Falls back to "clavesa//transform-runner" if no manifest is found.
+// localImageForDir returns the workspace-scoped local runner image tag for
+// the given pipeline directory (the workspace root is its parent directory).
+// Falls back to the empty-workspace-name image when no manifest is found.
 func localImageForDir(dir string) string {
-	m, _ := workspace.Load(filepath.Dir(dir))
-	if m != nil {
-		return runner.LocalImageName(m.Name)
-	}
-	return runner.LocalImageName("")
+	return workspace.LocalRunnerImageTag(filepath.Dir(dir))
 }
 
 // NewHandler returns an http.Handler that serves:
 //
 //	GET /preview/source      — browse items from an S3 source node
-//	GET /preview/transform   — execute a transform node's SQL via DuckDB
+//	GET /preview/transform   — execute a transform node's SQL/PySpark via the runner container
 //	GET /preview/destination — preview rows written to a destination (traces upstream)
 //
 // resolveDir maps a query-string `dir` (typically a pipeline name like

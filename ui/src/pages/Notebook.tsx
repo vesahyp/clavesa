@@ -22,6 +22,7 @@ import { CatalogBrowser } from "@/components/CatalogBrowser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { NativeSelect } from "@/components/ui/native-select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Cell } from "@/components/notebook/Cell";
 import {
@@ -497,8 +498,8 @@ function GraduateModal({
             <span className="mb-1 block text-xs font-semibold uppercase text-muted-foreground">
               Target pipeline
             </span>
-            <select
-              className="h-9 w-full rounded border bg-background px-2 text-sm"
+            <NativeSelect
+              className="rounded px-2 shadow-none"
               value={pipeline}
               onChange={(e) => setPipeline(e.target.value)}
               disabled={busy}
@@ -509,7 +510,7 @@ function GraduateModal({
                   {p.name} ({p.dir})
                 </option>
               ))}
-            </select>
+            </NativeSelect>
           </label>
 
           <label className="block">

@@ -7,9 +7,9 @@
  * `useDashboardQuery` per dataset would break the rules of hooks;
  * `useQueries` takes a dynamic-length array instead.
  *
- * The query key matches `useDashboardQuery` / `SqlPreview`, so all three
- * share one cache entry per (dir, sql, params) — running a SQL preview
- * warms the dropdowns and vice versa.
+ * The query key matches `useDashboardQuery`, so both share one cache
+ * entry per (dir, sql, params) — running a widget query warms the
+ * dropdowns and vice versa.
  *
  * The hook also exposes `rows` / `rowCount` / `truncated` straight off
  * the same result, so the widget drawer can render a results preview
@@ -25,6 +25,7 @@ import { useRef } from "react";
 import { useQueries } from "@tanstack/react-query";
 
 import {
+  paramsCacheKey,
   runDashboardQuery,
   type DashboardDataset,
   type ServedInfo,
@@ -97,11 +98,4 @@ export function useDatasetColumns(
     });
   });
   return map;
-}
-
-function paramsCacheKey(p: Record<string, string> | undefined): string {
-  if (!p) return "";
-  const keys = Object.keys(p).sort();
-  if (keys.length === 0) return "";
-  return keys.map((k) => `${k}=${p[k]}`).join("&");
 }

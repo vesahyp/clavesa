@@ -5,37 +5,30 @@ import (
 	"net/http"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // Optimizer is the service-layer interface internal/api depends on for the
-// Delta-maintenance feature. Mirrors service.Service.OptimizeTable so
-// internal/api stays free of an internal/service import.
+// Delta-maintenance feature. Satisfied by *service.Service directly — the
+// api package already imports internal/service (handler.go), so the former
+// field-for-field bridge DTOs guarded a boundary that doesn't exist
+// (C2-P2-11, 2026-07-02 review).
 type Optimizer interface {
-	OptimizeTable(ctx context.Context, req OptimizeRequest) ([]OptimizeTableResult, error)
+	OptimizeTable(ctx context.Context, req service.OptimizeRequest) ([]service.OptimizeTableResult, error)
 }
 
-// OptimizeRequest mirrors service.OptimizeRequest at the api boundary. With no
-// Node it targets every transform output; Recluster migrates a table to (or
-// re-applies) liquid clustering before compacting; Vacuum additionally prunes
-// tombstoned files past the retention window.
-type OptimizeRequest struct {
+// optimizeBody is the HTTP body of the optimize endpoint. It exists
+// (rather than decoding into service.OptimizeRequest) because the service
+// type carries no JSON tags — `retain_hours` wouldn't decode onto
+// RetainHours. With no Node it targets every transform output; Recluster
+// migrates a table to (or re-applies) liquid clustering before compacting;
+// Vacuum additionally prunes tombstoned files past the retention window.
+type optimizeBody struct {
 	Dir         string `json:"dir"`
 	Node        string `json:"node,omitempty"`
 	Recluster   bool   `json:"recluster,omitempty"`
 	Vacuum      bool   `json:"vacuum,omitempty"`
 	RetainHours int    `json:"retain_hours,omitempty"`
-}
-
-// OptimizeTableResult mirrors service.OptimizeTableResult. Same field tags so
-// the UI parses the JSON straight off the wire.
-type OptimizeTableResult struct {
-	Table     string `json:"table"`
-	Node      string `json:"node"`
-	OutputKey string `json:"output_key"`
-	Operation string `json:"operation"`
-	Vacuumed  bool   `json:"vacuumed"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
 }
 
 // OptimizeHandler serves the /pipelines/optimize endpoint.
@@ -55,26 +48,32 @@ func (h *OptimizeHandler) RegisterRoutes(mux *http.ServeMux) {
 }
 
 type optimizeResponse struct {
-	Results []OptimizeTableResult `json:"results"`
+	Results []service.OptimizeTableResult `json:"results"`
 }
 
 // POST /pipelines/optimize
 // Body: { dir, node?, recluster?, vacuum?, retain_hours? }
 func (h *OptimizeHandler) optimize(w http.ResponseWriter, r *http.Request) {
-	req, ok := httputil.DecodeJSON[OptimizeRequest](w, r)
+	req, ok := httputil.DecodeJSON[optimizeBody](w, r)
 	if !ok {
 		return
 	}
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
-	results, err := h.svc.OptimizeTable(r.Context(), req)
+	results, err := h.svc.OptimizeTable(r.Context(), service.OptimizeRequest{
+		Dir:         req.Dir,
+		Node:        req.Node,
+		Recluster:   req.Recluster,
+		Vacuum:      req.Vacuum,
+		RetainHours: req.RetainHours,
+	})
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadGateway, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
 		return
 	}
 	if results == nil {
-		results = []OptimizeTableResult{}
+		results = []service.OptimizeTableResult{}
 	}
 	httputil.WriteJSON(w, http.StatusOK, optimizeResponse{Results: results})
 }

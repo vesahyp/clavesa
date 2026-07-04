@@ -9,6 +9,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/dashboardsql"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/service"
 )
 
 // queryMaxRowsCap bounds how many rows any one widget query can return to
@@ -37,15 +38,15 @@ type DashboardDataset struct {
 // DashboardWidget is one chart/table. It binds to a dataset by name;
 // the *_field hints map result columns to the renderer.
 type DashboardWidget struct {
-	ID           string                `json:"id"`
-	Type         string                `json:"type"`
-	Title        string                `json:"title"`
-	Dataset      string                `json:"dataset"`
-	ValueField   string                `json:"value_field,omitempty"`
-	XField       string                `json:"x_field,omitempty"`
-	YField       string                `json:"y_field,omitempty"`
-	SeriesFields []string              `json:"series_fields,omitempty"`
-	LineField    string                `json:"line_field,omitempty"`
+	ID           string   `json:"id"`
+	Type         string   `json:"type"`
+	Title        string   `json:"title"`
+	Dataset      string   `json:"dataset"`
+	ValueField   string   `json:"value_field,omitempty"`
+	XField       string   `json:"x_field,omitempty"`
+	YField       string   `json:"y_field,omitempty"`
+	SeriesFields []string `json:"series_fields,omitempty"`
+	LineField    string   `json:"line_field,omitempty"`
 	// RegionField + TooltipField are world_map-only (mirrors the service
 	// struct). Missing here meant the API silently dropped region_field
 	// when re-serializing a dashboard, blanking the choropleth.
@@ -84,8 +85,8 @@ type DashboardSummary struct {
 }
 
 // DashboardStore is the service-layer interface the dashboards handler
-// depends on. Mirrors service.Service's dashboard methods so internal/api
-// stays free of an internal/service import (the cli package bridges them).
+// depends on. Mirrors service.Service's dashboard methods with the api
+// package's own Dashboard shape (the cli package bridges the two).
 type DashboardStore interface {
 	ListDashboards(ctx context.Context) ([]DashboardSummary, error)
 	GetDashboard(ctx context.Context, slug string) (Dashboard, error)
@@ -99,13 +100,13 @@ type DashboardsListResponse struct {
 }
 
 // DashboardQueryRequest is the body of POST /api/dashboards/query. The dir
-// scopes the Provider dispatch — it is the pipeline dir of the dataset the
-// widget is bound to. The UI resolves widget → dataset → {dir, sql} and
-// posts that here, so cross-pipeline datasets just work.
+// scopes the query seam's pipeline reference — it is the pipeline dir of
+// the dataset the widget is bound to. The UI resolves widget → dataset →
+// {dir, sql} and posts that here, so cross-pipeline datasets just work.
 //
 // `Params` carries the current dashboard control values. The handler
 // substitutes `{{name}}` tokens in `SQL` against this map before
-// dispatching to the Provider; unknown placeholders fail with a clear
+// dispatching to the query seam; unknown placeholders fail with a clear
 // 400 so a typo in dataset SQL surfaces in the UI.
 type DashboardQueryRequest struct {
 	Dir    string            `json:"dir"`
@@ -113,44 +114,37 @@ type DashboardQueryRequest struct {
 	Params map[string]string `json:"params,omitempty"`
 }
 
+// QueryFunc runs one ad-hoc SQL statement through the shared service seam
+// (service.Service.Query): provider dispatch by the workspace warehouse
+// plus the ADR-023 SparkSQL→Trino portability gate / transpile — the exact
+// path `clavesa query` and POST /data/query ride (ADR-015; mirrors
+// dataquery.QueryFunc). Wired via WithQueryService from cli/ui.go.
+type QueryFunc func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error)
+
 // DashboardsHandler serves the dashboards endpoints. CRUD goes through the
 // service-layer DashboardStore (the `dashboards` system Iceberg table);
-// the query route runs widget SQL through the observability Provider.
+// the query route runs widget SQL through the shared ad-hoc query seam
+// (service.Query via WithQueryService). The handler itself only expands
+// `{{control}}` placeholders — dialect policy, provider dispatch, and the
+// Served/Transpiled stamping all live in the seam, so `/dashboards/query`,
+// `/data/query`, and `clavesa query` cannot drift (P2-N2, 2026-07-02
+// review: the previous private dispatch copy had already skipped the
+// local portability gate).
 type DashboardsHandler struct {
-	store    DashboardStore
-	cloud    observability.Provider
-	resolver *observability.Resolver
-	// transpile, when set, transpiles ad-hoc /query SQL from the authored
-	// Spark dialect to the Trino/Athena serving dialect before it is
-	// dispatched to a CLOUD provider. nil-safe: a local-mode request (or a
-	// handler with no hook wired) runs the authored Spark unchanged. The
-	// api package deliberately does not import internal/service, so the hook
-	// is injected (the cli package shares the same cached transpiler used by
-	// dashboard save/render).
-	transpile func(ctx context.Context, sql string) (string, error)
+	store   DashboardStore
+	queryFn QueryFunc
 }
 
-// NewDashboardsHandler wires the handler against a service-layer store and
-// a CloudProvider fallback for query requests without a resolver dispatch.
-func NewDashboardsHandler(store DashboardStore, cloud observability.Provider) *DashboardsHandler {
-	return &DashboardsHandler{store: store, cloud: cloud}
+// NewDashboardsHandler wires the handler against a service-layer store.
+func NewDashboardsHandler(store DashboardStore) *DashboardsHandler {
+	return &DashboardsHandler{store: store}
 }
 
-// WithResolver enables per-request cloud/local provider dispatch for the
-// query route.
-func (h *DashboardsHandler) WithResolver(r *observability.Resolver) *DashboardsHandler {
-	h.resolver = r
-	return h
-}
-
-// WithTranspiler injects the Spark-to-Trino serving transpile hook the
-// ad-hoc /query route applies before dispatching to a cloud provider.
-// Local-mode requests never call it (local serving runs the authored
-// Spark). Wiring the SAME cached transpiler the service layer uses for
-// dashboard save/render means a query whose SQL was already transpiled at
-// save is a cache hit here.
-func (h *DashboardsHandler) WithTranspiler(fn func(ctx context.Context, sql string) (string, error)) *DashboardsHandler {
-	h.transpile = fn
+// WithQueryService routes POST /dashboards/query through the shared ad-hoc
+// query seam (service.Service.Query). Without it the query route answers
+// 500 — production wiring (cli/ui.go) always provides it.
+func (h *DashboardsHandler) WithQueryService(fn QueryFunc) *DashboardsHandler {
+	h.queryFn = fn
 	return h
 }
 
@@ -229,7 +223,7 @@ func (h *DashboardsHandler) save(w http.ResponseWriter, r *http.Request, d Dashb
 		// widget type) are the common case — 400. A genuine backend
 		// failure also lands here; 400 keeps parity with the sources
 		// handler and the message carries the detail.
-		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, stored)
@@ -260,9 +254,8 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	provider := h.providerFor(req.Dir)
-	if provider == nil {
-		httputil.WriteError(w, http.StatusInternalServerError, "no provider configured for this request")
+	if h.queryFn == nil {
+		httputil.WriteError(w, http.StatusInternalServerError, "no query service configured for this request")
 		return
 	}
 
@@ -275,40 +268,22 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// On a CLOUD workspace, transpile the (already-expanded) Spark SQL to
-	// the Trino/Athena serving dialect before dispatch — local serving runs
-	// the authored Spark unchanged (ADR-014). Ad-hoc SQL carries no `{{ }}`
-	// here (it is expanded above), so transpile the expanded form directly;
-	// no sentinel scheme is needed.
-	sqlToRun := expanded
-	transpiled := false
-	if h.resolver != nil && !h.resolver.IsLocal() && h.transpile != nil {
-		t, terr := h.transpile(r.Context(), expanded)
-		if terr != nil {
-			// A dialect rejection is the author's problem (400); the
-			// transpile hook returns a plain error otherwise. Surface 400 so
-			// the editor shows it inline rather than as a 500.
-			httputil.WriteError(w, http.StatusBadRequest, terr.Error())
+	// The seam applies the ADR-023 dialect policy on BOTH warehouses
+	// (transpile-and-dispatch-Trino on cloud, portability-gate-then-run-
+	// Spark on local) and stamps Served/Transpiled itself (ADR-024).
+	res, err := h.queryFn(r.Context(), expanded, req.Dir, queryMaxRowsCap)
+	if err != nil {
+		// A dialect rejection (SparkSQL the ADR-023 transpiler can't map
+		// to Trino/Athena) is the author's problem — 400, mirroring
+		// /data/query, so the widget editor surfaces it inline instead
+		// of as a server fault.
+		var de *service.DialectError
+		if errors.As(err, &de) {
+			httputil.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		sqlToRun = t
-		transpiled = true
-	}
-
-	res, err := provider.Query(r.Context(), observability.QueryQuery{
-		SQL:         sqlToRun,
-		PipelineDir: req.Dir,
-		MaxRows:     queryMaxRowsCap,
-	})
-	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-	// The provider stamps engine + warehouse; only this handler knows the
-	// SQL was dialect-translated first (ADR-024: served metadata is set by
-	// the code that did the work, never derived from workspace state).
-	if transpiled && res.Served != nil {
-		res.Served.Transpiled = true
 	}
 	httputil.WriteJSON(w, http.StatusOK, res)
 }
@@ -317,16 +292,4 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 // shared with internal/service/dashboard.go (C13, 2026-05-24).
 func expandDashboardPlaceholders(sql string, params map[string]string) (string, error) {
 	return dashboardsql.ExpandPlaceholders(sql, params)
-}
-
-// providerFor dispatches the query through the resolver (cloud or local
-// per the workspace warehouse); falls back to the cloud-only
-// provider when no resolver is wired.
-func (h *DashboardsHandler) providerFor(dir string) observability.Provider {
-	if h.resolver != nil && dir != "" {
-		if p, err := h.resolver.For(dir); err == nil {
-			return p
-		}
-	}
-	return h.cloud
 }

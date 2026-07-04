@@ -12,7 +12,6 @@ import { NavLink, useNavigate } from "react-router-dom";
 import { LayoutDashboard, ChevronRight, Plus } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
-import { ListSearch } from "@/components/ListSearch";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -24,22 +23,13 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Skeleton } from "@/components/ui/skeleton";
+import { slugify } from "@/lib/format";
 import { useDashboards } from "@/lib/queries";
+import { RegistryList } from "@/pages/RegistryList";
 
 const DASHBOARDS_CHROME: PageChrome = {
   breadcrumbs: [{ label: "Dashboards", to: "/dashboards" }],
 };
-
-// slugify maps a free-text name to the [a-z0-9_-] slug the dashboard
-// store keys on.
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
-}
 
 export function Dashboards() {
   const list = useDashboards();
@@ -75,72 +65,34 @@ export function Dashboards() {
         <NewDashboardButton existing={list.data?.dashboards.map((d) => d.slug) ?? []} />
       </div>
 
-      {list.isLoading && (
-        <div className="space-y-3">
-          <Skeleton className="h-12 w-full" />
-          <Skeleton className="h-12 w-full" />
-        </div>
-      )}
-
-      {list.error && (
-        <Card>
-          <CardContent className="p-6 text-sm text-destructive">
-            Couldn't load dashboards —{" "}
-            {list.error instanceof Error ? list.error.message : "unknown error"}
-          </CardContent>
-        </Card>
-      )}
-
-      {list.data && list.data.dashboards.length === 0 && <EmptyState />}
-
-      {list.data && list.data.dashboards.length > 0 && (
-        <div className="mb-4 flex items-center gap-3">
-          <ListSearch
-            value={query}
-            onChange={setQuery}
-            placeholder="Filter dashboards…"
-          />
-          {q && (
-            <span className="text-xs text-muted-foreground">
-              <span className="font-semibold text-foreground">
-                {filtered.length}
-              </span>{" "}
-              of {all.length}
-            </span>
-          )}
-        </div>
-      )}
-
-      {list.data && list.data.dashboards.length > 0 && filtered.length === 0 && (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No dashboards match{" "}
-            <span className="font-mono text-foreground">{query}</span>.
-          </CardContent>
-        </Card>
-      )}
-
-      {filtered.length > 0 && (
-        <ul className="grid gap-3">
-          {filtered.map((d) => (
-            <li key={d.slug}>
-              <NavLink
-                to={`/dashboards/${encodeURIComponent(d.slug)}`}
-                className="group flex items-center gap-3 rounded-md border border-border bg-card px-4 py-3 hover:border-primary/40 hover:bg-muted/30"
-              >
-                <LayoutDashboard className="h-4 w-4 flex-shrink-0 text-muted-foreground group-hover:text-primary" />
-                <div className="min-w-0 flex-1">
-                  <div className="font-medium">{d.title}</div>
-                  <code className="font-mono text-xs text-muted-foreground">
-                    {d.slug}
-                  </code>
-                </div>
-                <ChevronRight className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-              </NavLink>
-            </li>
-          ))}
-        </ul>
-      )}
+      <RegistryList
+        query={list}
+        items={all}
+        filtered={filtered}
+        search={query}
+        onSearchChange={setQuery}
+        searchPlaceholder="Filter dashboards…"
+        noun="dashboards"
+        skeletonClassName="h-12 w-full"
+        empty={<EmptyState />}
+        renderItem={(d) => (
+          <li key={d.slug}>
+            <NavLink
+              to={`/dashboards/${encodeURIComponent(d.slug)}`}
+              className="group flex items-center gap-3 rounded-md border border-border bg-card px-4 py-3 hover:border-primary/40 hover:bg-muted/30"
+            >
+              <LayoutDashboard className="h-4 w-4 flex-shrink-0 text-muted-foreground group-hover:text-primary" />
+              <div className="min-w-0 flex-1">
+                <div className="font-medium">{d.title}</div>
+                <code className="font-mono text-xs text-muted-foreground">
+                  {d.slug}
+                </code>
+              </div>
+              <ChevronRight className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+            </NavLink>
+          </li>
+        )}
+      />
     </div>
   );
 }

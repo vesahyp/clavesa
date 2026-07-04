@@ -329,7 +329,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	// CLAVESA_CATALOG / CLAVESA_SCHEMA env vars and end up
 	// encoded as the Glue DB name `_glue_db()` writes to — keeps local
 	// runs writing to the same backend names as their cloud twin.
-	image := runner.LocalImageName("") + ":latest"
+	image := workspace.LocalRunnerImageTag(workspaceRoot)
 	catalog := ""
 	systemCatalog := ""
 	if m, _ := workspace.Load(workspaceRoot); m != nil {
@@ -1136,39 +1136,27 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		return "", nil, fmt.Errorf("create watermarks dir: %w", err)
 	}
 
-	args := []string{"run", "--rm", "-i"}
-	args = append(args, "-e", "CLAVESA_RUN=1")
-	// Shared local Derby metastore. runTransform is reached by the
-	// single-node backfill path (the bundle path resolves the metastore
-	// once in prepareRun and threads it in); resolve it here too so a
-	// backfill container connects to the Derby Network Server as a client
-	// rather than opening the embedded single-writer DB. EnsureMetastore
-	// is idempotent + fast. Best-effort: the injected ensurer returns
-	// empty on failure (and in unit tests), so we fall back to embedded
-	// Derby (safe, since no server is serving).
-	if network, addr := s.metastoreEnsure(ctx, s.workspace, s.workspaceName()); addr != "" {
-		args = appendMetastoreArgs(args, network, addr)
+	env := []string{
+		"CLAVESA_LOGIC_S3_PATH=" + logicPath,
+		"CLAVESA_LANGUAGE=" + language,
+		"CLAVESA_WATERMARKS=" + watermarks,
+		"CLAVESA_PIPELINE=" + pipelineName,
+		"CLAVESA_NODE=" + node.ID,
+		// Three-level namespace (ADR-016). Empty catalog passes through as
+		// the legacy signal — the runner's _glue_db() falls back to today's
+		// `clavesa_<schema>` literal so pre-ADR pipelines keep finding
+		// their data without migration. The system catalog (ADR-016
+		// v0.20.0) is where the runner writes node_runs / runs / tables
+		// regardless of the pipeline schema.
+		"CLAVESA_CATALOG=" + catalog,
+		"CLAVESA_SCHEMA=" + schema,
+		"CLAVESA_SYSTEM_CATALOG=" + systemCatalog,
 	}
-	args = append(args, "-e", "CLAVESA_LOGIC_S3_PATH="+logicPath)
-	args = append(args, "-e", "CLAVESA_LANGUAGE="+language)
-	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
-	args = append(args, "-e", "CLAVESA_WATERMARKS="+watermarks)
-	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
-	args = append(args, "-e", "CLAVESA_NODE="+node.ID)
-	// Three-level namespace (ADR-016). Empty catalog passes through as
-	// the legacy signal — the runner's _glue_db() falls back to today's
-	// `clavesa_<schema>` literal so pre-ADR pipelines keep finding
-	// their data without migration.
-	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
-	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
-	// Workspace system catalog (ADR-016 v0.20.0). Runner writes
-	// node_runs / runs / tables here regardless of the pipeline schema.
-	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
 	// ADR-017 slice 2: forward env vars referenced by env:-backend
 	// credentials so the runner's _resolve_secret can read them. We only
 	// forward names referenced by inputs on this transform — no
 	// indiscriminate env passthrough. file:-backed credentials need the
-	// path mounted (see input mount loop below); arn: backends fetch via
+	// path mounted (see input mounts below); arn: backends fetch via
 	// boto3 and need AWS creds (out-of-scope, the user's docker AWS env
 	// covers that if any).
 	for _, name := range envVarsForCredentials(inputs) {
@@ -1176,7 +1164,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		if !present {
 			return "", nil, fmt.Errorf("credential references env var %q which is not set in the current shell", name)
 		}
-		args = append(args, "-e", name+"="+v)
+		env = append(env, name+"="+v)
 	}
 	// ADR-017 slice 3: forward AWS credentials when any input on this
 	// transform is kind=s3. Spark's S3A reads use the
@@ -1184,45 +1172,20 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	// pass through whatever the host shell has so `compute=local`
 	// pipelines work against same-account S3 sources without extra
 	// configuration. No-op for transforms with no s3 inputs.
+	var awsArgs []string
 	if hasS3Input(inputs) {
 		// Shared passthrough + host-resolved explicit credentials —
 		// same args every host-spawned AWS-reaching container gets,
 		// see runner.AWSEnvDockerArgs.
-		args = append(args, runner.AWSEnvDockerArgs(ctx)...)
+		awsArgs = runner.AWSEnvDockerArgs(ctx)
 	}
-	// Triage-column env: which exact image and module version produced this
-	// row. The digest comes from `docker image inspect` and changes every
-	// time the runner is rebuilt. Failures here are non-fatal — passing empty
-	// strings degrades to the older runner behavior of leaving the columns
-	// blank.
-	//
-	// CLAVESA_MODULE_VERSION is baked as an ENV inside the image at build
-	// time, but the cache-retag path in `workspace.EnsureLocalRunnerImage`
-	// can rebrand an image built at a different version (same runner SHA,
-	// different `--build-arg CLAVESA_MODULE_VERSION`). Override at run-time
-	// so `node_runs.module_version` always reflects the CLI version that
-	// orchestrated the run, regardless of what the image was originally
-	// built with.
-	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
-	if digest := dockerImageDigest(image); digest != "" {
-		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
-	}
-	// Size the Spark JVM heap from the Docker VM (GH #58) — an uncapped local
-	// container otherwise leaves spark-class on its 1 GB fallback. Reserve for
-	// the co-resident metastore container.
-	args = append(args, localHeapArgs(reserveSharedVMMB)...)
 
-	// Mount the workdir so logic + outputs are accessible.
-	args = append(args, "-v", workdir+":"+workdir)
-	// Mount the per-pipeline warehouse so Iceberg metadata + data files
-	// persist across runs. Same path inside and outside the container so
-	// table identifiers remain stable.
-	args = append(args, "-v", warehouse+":"+warehouse)
-	// Mount the per-pipeline watermarks dir for v0.24.0's
-	// iceberg_table_incremental kind. Runner reads/writes
-	// `<watermarks>/<consumer>__<alias>.json` to track the last-seen
-	// upstream snapshot id.
-	args = append(args, "-v", watermarks+":"+watermarks)
+	// Mount the workdir so logic + outputs are accessible, and the
+	// per-pipeline watermarks dir for v0.24.0's incremental kinds (runner
+	// reads/writes `<watermarks>/<consumer>__<alias>.json` to track the
+	// last-seen upstream snapshot id). The warehouse mount comes from the
+	// shared builder.
+	mounts := []dockerMount{{Host: workdir}, {Host: watermarks}}
 	// ADR-017 slice 2: file:-backed credential payloads live in the
 	// workspace credentials dir; mount read-only so the runner's
 	// _resolve_secret can open them at the host-absolute path the
@@ -1231,7 +1194,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	// `workspace init` has run.
 	credsDir := filepath.Join(s.workspace, ".clavesa", "credentials")
 	if st, err := os.Stat(credsDir); err == nil && st.IsDir() {
-		args = append(args, "-v", credsDir+":"+credsDir+":ro")
+		mounts = append(mounts, dockerMount{Host: credsDir, RO: true})
 	}
 	// Mount each input path so the runner can read it. Sources may live
 	// outside the workdir. Inputs may be string-form (back-compat: parquet) or
@@ -1245,12 +1208,30 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		}
 		root := mountRoot(p)
 		if !mounted[root] {
-			args = append(args, "-v", root+":"+root+":ro")
+			mounts = append(mounts, dockerMount{Host: root, RO: true})
 			mounted[root] = true
 		}
 	}
 
-	args = append(args, image)
+	// Shared local Derby metastore. runTransform is reached by the
+	// single-node backfill path (the bundle path resolves the metastore
+	// once in prepareRun and threads it in); resolve it here too so a
+	// backfill container connects to the Derby Network Server as a client
+	// rather than opening the embedded single-writer DB. EnsureMetastore
+	// is idempotent + fast. Best-effort: the injected ensurer returns
+	// empty on failure (and in unit tests), so we fall back to embedded
+	// Derby (safe, since no server is serving).
+	metastoreNetwork, metastoreAddr := s.metastoreEnsure(ctx, s.workspace, s.workspaceName())
+	args := dockerRunArgs(dockerRunSpec{
+		Image:            image,
+		Warehouse:        warehouse,
+		MetastoreNetwork: metastoreNetwork,
+		MetastoreAddr:    metastoreAddr,
+		Env:              env,
+		ExtraArgs:        awsArgs,
+		Heap:             true,
+		Mounts:           mounts,
+	})
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(eventJSON)
@@ -1423,30 +1404,13 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	}
 	eventJSON, _ := json.Marshal(event)
 
-	args := []string{"run", "--rm", "-i"}
-	args = append(args, "-e", "CLAVESA_RUN=1")
-	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
-	args = append(args, "-e", "CLAVESA_WATERMARKS="+watermarks)
-	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
-	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
-	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
-	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
-	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
-	// Shared local Derby metastore (resolved once in prepareRun). Joins the
-	// per-workspace network + sets CLAVESA_METASTORE_ADDR so this run's
-	// Spark connects to the Derby Network Server as a client rather than
-	// opening the embedded single-writer DB — lets the UI warm worker keep
-	// serving queries while this run writes to the same warehouse. No-op
-	// when EnsureMetastore failed (falls back to embedded Derby).
-	args = appendMetastoreArgs(args, metastoreNetwork, metastoreAddr)
-	if digest := dockerImageDigest(image); digest != "" {
-		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
+	env := []string{
+		"CLAVESA_WATERMARKS=" + watermarks,
+		"CLAVESA_PIPELINE=" + pipelineName,
+		"CLAVESA_CATALOG=" + catalog,
+		"CLAVESA_SCHEMA=" + schema,
+		"CLAVESA_SYSTEM_CATALOG=" + systemCatalog,
 	}
-	// Size the Spark JVM heap from the Docker VM (GH #58) — one container runs
-	// the whole bundle, so the uncapped 1 GB fallback throttles every node.
-	// Reserve for the co-resident metastore container.
-	args = append(args, localHeapArgs(reserveSharedVMMB)...)
-
 	// Credential env passthrough — union across every transform's
 	// inputs, since one container reads them all. Mirrors the per-
 	// transform logic in runTransform.
@@ -1461,44 +1425,30 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 			if !present {
 				return nil, fmt.Errorf("credential references env var %q which is not set in the current shell", name)
 			}
-			args = append(args, "-e", name+"="+v)
+			env = append(env, name+"="+v)
 		}
 	}
-	// AWS env passthrough when any input is kind=s3 (same union policy).
-	needsAWS := false
+	// AWS credential forward when any input is kind=s3 (same union policy
+	// as runTransform, and the same runner.AWSEnvDockerArgs vector — env
+	// passthrough, read-only ~/.aws mount, plus host-resolved explicit
+	// credentials so SSO / credential_process profiles work inside the
+	// container's JVMs too).
+	var awsArgs []string
 	for _, bt := range bundle {
 		if hasS3Input(bt.Inputs) {
-			needsAWS = true
+			awsArgs = runner.AWSEnvDockerArgs(ctx)
 			break
 		}
 	}
-	if needsAWS {
-		for _, name := range []string{
-			"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-			"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE",
-			"CLAVESA_S3_ENDPOINT",
-		} {
-			if v, ok := os.LookupEnv(name); ok {
-				args = append(args, "-e", name+"="+v)
-			}
-		}
-		if home, err := os.UserHomeDir(); err == nil {
-			awsDir := filepath.Join(home, ".aws")
-			if st, err := os.Stat(awsDir); err == nil && st.IsDir() {
-				args = append(args, "-v", awsDir+":/root/.aws:ro")
-			}
-		}
-	}
 
-	// Mount workdir + warehouse + watermarks unconditionally.
-	args = append(args, "-v", workdir+":"+workdir)
-	args = append(args, "-v", warehouse+":"+warehouse)
-	args = append(args, "-v", watermarks+":"+watermarks)
+	// Mount workdir + watermarks unconditionally (the warehouse mount comes
+	// from the shared builder), the credentials dir when present, and the
+	// union of input mount roots across every transform's inputs.
+	mounts := []dockerMount{{Host: workdir}, {Host: watermarks}}
 	credsDir := filepath.Join(s.workspace, ".clavesa", "credentials")
 	if st, err := os.Stat(credsDir); err == nil && st.IsDir() {
-		args = append(args, "-v", credsDir+":"+credsDir+":ro")
+		mounts = append(mounts, dockerMount{Host: credsDir, RO: true})
 	}
-	// Union of input mount roots across every transform's inputs.
 	mounted := map[string]bool{workdir: true, warehouse: true, watermarks: true}
 	for _, bt := range bundle {
 		for _, v := range bt.Inputs {
@@ -1508,13 +1458,29 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 			}
 			root := mountRoot(p)
 			if !mounted[root] {
-				args = append(args, "-v", root+":"+root+":ro")
+				mounts = append(mounts, dockerMount{Host: root, RO: true})
 				mounted[root] = true
 			}
 		}
 	}
 
-	args = append(args, image)
+	// Metastore network/addr were resolved once in prepareRun and threaded
+	// in: this run's Spark connects to the shared Derby Network Server as a
+	// client rather than opening the embedded single-writer DB, which lets
+	// the UI warm worker keep serving queries while this run writes to the
+	// same warehouse. Heap is sized for the whole bundle — one container
+	// runs every node, so the uncapped 1 GB fallback would throttle all of
+	// them (GH #58).
+	args := dockerRunArgs(dockerRunSpec{
+		Image:            image,
+		Warehouse:        warehouse,
+		MetastoreNetwork: metastoreNetwork,
+		MetastoreAddr:    metastoreAddr,
+		Env:              env,
+		ExtraArgs:        awsArgs,
+		Heap:             true,
+		Mounts:           mounts,
+	})
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(eventJSON)
@@ -1732,9 +1698,6 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, outcome *run
 		return
 	}
 
-	args := []string{"run", "--rm", "-i"}
-	args = append(args, "-e", "CLAVESA_RECORD_RUN=1")
-	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
 	// Shared local Derby metastore — the runs-row write hits the same
 	// hive→Derby warehouse the transforms just wrote, and runs while the
 	// UI warm worker may still be serving, so it must speak to the Derby
@@ -1746,20 +1709,20 @@ func recordLocalRun(ctx context.Context, image, pipelineDir string, outcome *run
 	if m, _ := workspace.Load(recordWorkspaceRoot); m != nil {
 		recordWorkspaceName = m.Name
 	}
-	if network, addr := ensureMetastore(ctx, recordWorkspaceRoot, recordWorkspaceName); addr != "" {
-		args = appendMetastoreArgs(args, network, addr)
-	}
-	args = append(args, "-e", "CLAVESA_PIPELINE="+pipelineName)
-	args = append(args, "-e", "CLAVESA_CATALOG="+catalog)
-	args = append(args, "-e", "CLAVESA_SCHEMA="+schema)
-	args = append(args, "-e", "CLAVESA_SYSTEM_CATALOG="+systemCatalog)
-	// Override the baked-in version — see runTransform for the rationale.
-	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
-	if digest := dockerImageDigest(image); digest != "" {
-		args = append(args, "-e", "CLAVESA_RUNNER_IMAGE_DIGEST="+digest)
-	}
-	args = append(args, "-v", warehouse+":"+warehouse)
-	args = append(args, image)
+	metastoreNetwork, metastoreAddr := ensureMetastore(ctx, recordWorkspaceRoot, recordWorkspaceName)
+	args := dockerRunArgs(dockerRunSpec{
+		Image:            image,
+		RecordRun:        true,
+		Warehouse:        warehouse,
+		MetastoreNetwork: metastoreNetwork,
+		MetastoreAddr:    metastoreAddr,
+		Env: []string{
+			"CLAVESA_PIPELINE=" + pipelineName,
+			"CLAVESA_CATALOG=" + catalog,
+			"CLAVESA_SCHEMA=" + schema,
+			"CLAVESA_SYSTEM_CATALOG=" + systemCatalog,
+		},
+	})
 
 	execRecordRunContainer(ctx, args, body)
 }
@@ -2191,7 +2154,7 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 // reads what it needs). An error covers both transport failures and runner-
 // reported `{"error": "..."}` envelopes — the caller treats both the same.
 func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[string]any, error) {
-	image := runner.LocalImageName("") + ":latest"
+	image := workspace.LocalRunnerImageTag(s.workspace)
 	if _, err := workspace.Load(s.workspace); err == nil {
 		// Auto-refresh the workspace runner image if a CLI upgrade
 		// shipped new runner code (see EnsureLocalRunnerImage).
@@ -2212,26 +2175,22 @@ func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[stri
 		return nil, err
 	}
 
-	args := []string{"run", "--rm", "-i"}
-	args = append(args, "-e", "CLAVESA_RUN=1")
-	args = append(args, "-e", "CLAVESA_WAREHOUSE="+warehouse)
 	// Shared local Derby metastore. The operation handler (backfill
 	// promote / discard) reads + rewrites Delta tables in the same
 	// hive→Derby warehouse and can run while the UI warm worker is live,
 	// so it connects to the Derby Network Server as a client when one is
 	// up. Best-effort: fall back to embedded Derby on Ensure failure.
-	if network, addr := s.metastoreEnsure(ctx, s.workspace, s.workspaceName()); addr != "" {
-		args = appendMetastoreArgs(args, network, addr)
-	}
-	// Override the baked-in version — see runTransform for the rationale.
-	args = append(args, "-e", "CLAVESA_MODULE_VERSION="+ModuleVersion)
-	// Size the Spark JVM heap from the Docker VM (GH #58). OPTIMIZE/VACUUM of a
-	// table with many small files is heap-hungry — exactly the _maintenance
-	// path that surfaced the 1 GB throttle. Reserve for the co-resident
-	// metastore container.
-	args = append(args, localHeapArgs(reserveSharedVMMB)...)
-	args = append(args, "-v", warehouse+":"+warehouse)
-	args = append(args, image)
+	// Heap is sized because OPTIMIZE/VACUUM of a table with many small
+	// files is heap-hungry — exactly the _maintenance path that surfaced
+	// the 1 GB throttle (GH #58).
+	metastoreNetwork, metastoreAddr := s.metastoreEnsure(ctx, s.workspace, s.workspaceName())
+	args := dockerRunArgs(dockerRunSpec{
+		Image:            image,
+		Warehouse:        warehouse,
+		MetastoreNetwork: metastoreNetwork,
+		MetastoreAddr:    metastoreAddr,
+		Heap:             true,
+	})
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(body)

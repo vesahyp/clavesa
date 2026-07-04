@@ -11,7 +11,6 @@ import (
 
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/identutil"
-	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -91,7 +90,7 @@ func ResolveUpstreamFromSnapshot(
 		return nil, false, nil
 	}
 
-	localTag := runner.LocalImageName("") + ":latest"
+	localTag := workspace.LocalRunnerImageTag(root)
 	if _, err := workspace.Load(root); err == nil {
 		ensured, err := workspace.EnsureLocalRunnerImage(root)
 		if err != nil {

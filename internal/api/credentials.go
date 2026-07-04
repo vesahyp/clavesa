@@ -100,7 +100,7 @@ func (h *CredentialsHandler) register(w http.ResponseWriter, r *http.Request) {
 	}
 	stored, err := h.svc.AddCredential(req)
 	if err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, stored)

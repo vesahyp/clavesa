@@ -174,6 +174,22 @@ var pipelineNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 // matching what `clavesa pipeline create` accepts.
 func IsValidPipelineName(s string) bool { return pipelineNameRE.MatchString(s) }
 
+// legacyDBFallback returns db when set; otherwise the legacy
+// `clavesa_<pipeline>` database name. The fallback exists for
+// handler-without-resolver mode (tests and bare /data/runs?pipeline=foo
+// curls without a `dir` param). Production code always wires a Resolver
+// and sets Database via it. The fallback uses today's
+// `clavesa_<PipelineName>` shape — a no-op for v0.17 schemas, broken for
+// post-migration workspaces (whose DB names start `<catalog>__`). Tests
+// pass a pipeline name that matches a `clavesa_<pipeline>` DB; real
+// callers should pass `dir` so the resolver can compute the encoded DB.
+func legacyDBFallback(db, pipelineName string) string {
+	if db != "" {
+		return db
+	}
+	return "clavesa_" + pipelineName
+}
+
 // ---------------------------------------------------------------------------
 // NodeRuns
 // ---------------------------------------------------------------------------
@@ -192,19 +208,7 @@ func (c *CloudProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
 		return nil, fmt.Errorf("invalid node name: %q", q.Node)
 	}
 
-	dbName := q.Database
-	if dbName == "" {
-		// Defensive fallback for handler-without-resolver mode (tests
-		// and bare /data/runs?pipeline=foo curls without a `dir` param).
-		// Production code always wires a Resolver and sets Database via
-		// it. The fallback uses today's `clavesa_<PipelineName>`
-		// shape — a no-op for v0.17 schemas, broken for post-migration
-		// workspaces (whose DB names start `<catalog>__`). Tests pass a
-		// pipeline name that matches an `clavesa_<pipeline>` DB; real
-		// callers should pass `dir` so the resolver can compute the
-		// encoded DB.
-		dbName = "clavesa_" + q.PipelineName
-	}
+	dbName := legacyDBFallback(q.Database, q.PipelineName)
 	// Workspace-wide system DB (ADR-016 v0.20.0) — multi-writer; filter
 	// by the `pipeline` column so the per-pipeline UI surface keeps the
 	// same row shape.
@@ -257,22 +261,12 @@ FROM "%s"."node_runs"
 ORDER BY started_at DESC
 LIMIT %d`, dbName, whereClause, q.Limit+1)
 
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	rows, truncated, _, err := c.runAthenaSelect(ctx, sql, q.Limit)
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			return &NodeRunsResult{Rows: []NodeRun{}}, nil
 		}
 		return nil, err
-	}
-
-	rows := rs.Rows
-	if len(rows) > 0 {
-		rows = rows[1:] // drop Athena header row
-	}
-	truncated := false
-	if len(rows) > q.Limit {
-		rows = rows[:q.Limit]
-		truncated = true
 	}
 
 	out := make([]NodeRun, 0, len(rows))
@@ -334,19 +328,7 @@ func (c *CloudProvider) Runs(ctx context.Context, q RunsQuery) (*RunsResult, err
 		return nil, fmt.Errorf("invalid pipeline name: %q", q.PipelineName)
 	}
 
-	dbName := q.Database
-	if dbName == "" {
-		// Defensive fallback for handler-without-resolver mode (tests
-		// and bare /data/runs?pipeline=foo curls without a `dir` param).
-		// Production code always wires a Resolver and sets Database via
-		// it. The fallback uses today's `clavesa_<PipelineName>`
-		// shape — a no-op for v0.17 schemas, broken for post-migration
-		// workspaces (whose DB names start `<catalog>__`). Tests pass a
-		// pipeline name that matches an `clavesa_<pipeline>` DB; real
-		// callers should pass `dir` so the resolver can compute the
-		// encoded DB.
-		dbName = "clavesa_" + q.PipelineName
-	}
+	dbName := legacyDBFallback(q.Database, q.PipelineName)
 	safePipeline := strings.ReplaceAll(q.PipelineName, "'", "''")
 	sql := fmt.Sprintf(
 		`SELECT
@@ -366,22 +348,12 @@ WHERE pipeline = '%s'
 ORDER BY started_at DESC
 LIMIT %d`, dbName, safePipeline, q.Limit+1)
 
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	rows, truncated, _, err := c.runAthenaSelect(ctx, sql, q.Limit)
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			return &RunsResult{Rows: []Run{}}, nil
 		}
 		return nil, err
-	}
-
-	rows := rs.Rows
-	if len(rows) > 0 {
-		rows = rows[1:]
-	}
-	truncated := false
-	if len(rows) > q.Limit {
-		rows = rows[:q.Limit]
-		truncated = true
 	}
 
 	out := make([]Run, 0, len(rows))
@@ -421,19 +393,7 @@ func (c *CloudProvider) Tables(ctx context.Context, q TablesQuery) (*TablesResul
 		return nil, fmt.Errorf("invalid pipeline name: %q", q.PipelineName)
 	}
 
-	dbName := q.Database
-	if dbName == "" {
-		// Defensive fallback for handler-without-resolver mode (tests
-		// and bare /data/runs?pipeline=foo curls without a `dir` param).
-		// Production code always wires a Resolver and sets Database via
-		// it. The fallback uses today's `clavesa_<PipelineName>`
-		// shape — a no-op for v0.17 schemas, broken for post-migration
-		// workspaces (whose DB names start `<catalog>__`). Tests pass a
-		// pipeline name that matches an `clavesa_<pipeline>` DB; real
-		// callers should pass `dir` so the resolver can compute the
-		// encoded DB.
-		dbName = "clavesa_" + q.PipelineName
-	}
+	dbName := legacyDBFallback(q.Database, q.PipelineName)
 	// Latest snapshot per table_id via ROW_NUMBER. Same idiom as the local
 	// provider's Spark version — the SQL surface stays uniform.
 	safePipeline := strings.ReplaceAll(q.PipelineName, "'", "''")
@@ -451,22 +411,12 @@ WHERE rn = 1
 ORDER BY snapshot_ts DESC
 LIMIT %d`, dbName, safePipeline, q.Limit+1)
 
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	rows, truncated, _, err := c.runAthenaSelect(ctx, sql, q.Limit)
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			return &TablesResult{Rows: []TableInfo{}}, nil
 		}
 		return nil, err
-	}
-
-	rows := rs.Rows
-	if len(rows) > 0 {
-		rows = rows[1:]
-	}
-	truncated := false
-	if len(rows) > q.Limit {
-		rows = rows[:q.Limit]
-		truncated = true
 	}
 
 	out := make([]TableInfo, 0, len(rows))
@@ -546,88 +496,9 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		return nil, fmt.Errorf("read delta log: %w", err)
 	}
 
-	// Full commit count before any limit truncation — the catalog shows
-	// this as the real number of commits instead of "<limit>+".
-	totalCommits := len(commits)
-
-	// Compute LatestRecordCount by walking commits oldest-first — the
-	// MERGE-mode commits that dominate cloud pipelines carry added/deleted
-	// per commit but no per-commit TotalRecords, so reading only the latest
-	// commit's TotalRecords (the old behaviour) left the catalog row count
-	// blank. Mirrors LocalProvider.Snapshots so local and cloud agree
-	// (ADR-014). Replaces resets the running total; MERGE nets out updates
-	// (they don't change row count); APPEND/DELETE net added-deleted.
-	var latestCount *int64
-	if len(commits) > 0 {
-		var total int64
-		for i := len(commits) - 1; i >= 0; i-- {
-			ci := commits[i]
-			added := int64(0)
-			if ci.AddedRecords != nil {
-				added = *ci.AddedRecords
-			}
-			updated := int64(0)
-			if ci.UpdatedRecords != nil {
-				updated = *ci.UpdatedRecords
-			}
-			deleted := int64(0)
-			if ci.DeletedRecords != nil {
-				deleted = *ci.DeletedRecords
-			}
-			netDelta := added - updated - deleted
-			if ci.Replaces {
-				total = netDelta
-			} else {
-				total += netDelta
-			}
-		}
-		if total < 0 {
-			total = 0
-		}
-		latestCount = &total
-	}
-
-	limit := q.Limit
-	if limit <= 0 {
-		limit = len(commits)
-	}
-	truncated := false
-	if len(commits) > limit {
-		commits = commits[:limit]
-		truncated = true
-	}
-
-	out := make([]SnapshotInfo, 0, len(commits))
-	for _, ci := range commits {
-		trigger, runID := extractProvenance(ci.UserMetadata)
-		info := SnapshotInfo{
-			SnapshotID:     strconv.FormatInt(ci.Version, 10),
-			CommittedAt:    formatMillis(ci.TimestampMs),
-			Operation:      ci.Operation,
-			AddedRecords:   ci.AddedRecords,
-			DeletedRecords: ci.DeletedRecords,
-			TotalRecords:   ci.TotalRecords,
-			Trigger:        trigger,
-			WriterRunID:    runID,
-		}
-		// Delta doesn't carry a `parent_id` per commit the way Iceberg
-		// did — versions are strictly monotonic, so the previous
-		// version's id is "this one minus 1" for v > 0. Surface that
-		// for UI back-compat; the field is optional in the JSON shape
-		// and the UI uses it for nothing more than rendering "v3 ← v2".
-		if ci.Version > 0 {
-			info.ParentID = strconv.FormatInt(ci.Version-1, 10)
-		}
-		out = append(out, info)
-	}
-	res := &SnapshotsResult{Snapshots: out, Truncated: truncated, Total: totalCommits}
-	if len(out) > 0 && out[0].TotalRecords != nil {
-		v := *out[0].TotalRecords
-		res.LatestRecordCount = &v
-	} else if latestCount != nil {
-		res.LatestRecordCount = latestCount
-	}
-	return res, nil
+	// Projection (incl. the LatestRecordCount fold) is shared with
+	// LocalProvider.Snapshots so local and cloud agree (ADR-014).
+	return snapshotsResultFromCommits(commits, q.Limit), nil
 }
 
 // errTableNotFound is the sentinel tableS3Location returns when Glue's
@@ -735,7 +606,7 @@ func formatMillis(ms int64) string {
 // ---------------------------------------------------------------------------
 
 // ColumnStats reads the latest-snapshot row per column from the workspace
-// system column_stats Iceberg table. Empty result on undeployed
+// system column_stats Delta table. Empty result on undeployed
 // workspaces or fresh tables that haven't been profiled yet — same
 // "no rows means no card" contract the UI gates on.
 func (c *CloudProvider) ColumnStats(ctx context.Context, q ColumnStatsQuery) (*ColumnStatsResult, error) {
@@ -774,7 +645,7 @@ FROM (
 WHERE rn = 1
 ORDER BY column_name`, q.Database, safeIdent)
 
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	rows, _, _, err := c.runAthenaSelect(ctx, sql, -1)
 	if err != nil {
 		// Athena returns SYNTAX_ERROR for "no such table" — surface as
 		// empty so a workspace that's never run a stats-on transform
@@ -785,10 +656,6 @@ ORDER BY column_name`, q.Database, safeIdent)
 		return nil, err
 	}
 
-	rows := rs.Rows
-	if len(rows) > 0 {
-		rows = rows[1:]
-	}
 	out := make([]ColumnStat, 0, len(rows))
 	for _, row := range rows {
 		if len(row.Data) < 13 {
@@ -856,7 +723,7 @@ func (c *CloudProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 	}
 
 	sql := fmt.Sprintf("SELECT * FROM %s.%s LIMIT %d", q.Database, tableForSQL, limit+1)
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	dataRows, truncated, rs, err := c.runAthenaSelect(ctx, sql, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -869,17 +736,6 @@ func (c *CloudProvider) SampleTable(ctx context.Context, q SampleTableQuery) (*S
 				Type: aws.ToString(ci.Type),
 			})
 		}
-	}
-
-	// Athena returns the header row as the first row; skip it.
-	dataRows := rs.Rows
-	if len(dataRows) > 0 {
-		dataRows = dataRows[1:]
-	}
-	truncated := false
-	if len(dataRows) > limit {
-		dataRows = dataRows[:limit]
-		truncated = true
 	}
 
 	rows := make([][]string, len(dataRows))
@@ -918,7 +774,13 @@ func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 		return nil, fmt.Errorf("query: sql is required")
 	}
 
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, q.SQL)
+	// MaxRows <= 0 means "no cap" — runAthenaSelect treats a negative
+	// limit as trim-disabled.
+	maxRows := q.MaxRows
+	if maxRows <= 0 {
+		maxRows = -1
+	}
+	dataRows, truncated, rs, err := c.runAthenaSelect(ctx, q.SQL, maxRows)
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			// Dashboards widget against a workspace that's been deployed
@@ -938,17 +800,6 @@ func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 				Type: aws.ToString(ci.Type),
 			})
 		}
-	}
-
-	// Athena returns the header row first; skip it.
-	dataRows := rs.Rows
-	if len(dataRows) > 0 {
-		dataRows = dataRows[1:]
-	}
-	truncated := false
-	if q.MaxRows > 0 && len(dataRows) > q.MaxRows {
-		dataRows = dataRows[:q.MaxRows]
-		truncated = true
 	}
 
 	rows := make([][]string, len(dataRows))
@@ -1146,62 +997,6 @@ func (c *CloudProvider) liveProgressStates(ctx context.Context, execARN string, 
 	return progressStates(ctx, c.progressStore(), execARN, now.UnixMilli())
 }
 
-// StateStatusesFromHistory walks SFN history events in order and computes the
-// latest known status for every state name observed. Exported because the
-// pipelinestatus package's older /pipeline/execution detail endpoint also
-// uses it during failure-step lookup.
-//
-// Rules (events arrive newest-last in default SFN ordering):
-//   - TaskStateEntered: status[name] = RUNNING; record entered time.
-//   - TaskStateExited:  status[name] = SUCCEEDED.
-//   - TaskFailed:       status[currentState] = FAILED. Retries re-enter and
-//     reset to RUNNING.
-func StateStatusesFromHistory(events []sfntypes.HistoryEvent) map[string]StateStatus {
-	out := make(map[string]StateStatus)
-	currentState := ""
-
-	for _, ev := range events {
-		switch ev.Type {
-		case sfntypes.HistoryEventTypeTaskStateEntered:
-			if ev.StateEnteredEventDetails == nil {
-				continue
-			}
-			name := derefStr(ev.StateEnteredEventDetails.Name)
-			if name == "" {
-				continue
-			}
-			currentState = name
-			out[name] = StateStatus{
-				Status:    "RUNNING",
-				EnteredAt: formatTime(ev.Timestamp),
-			}
-		case sfntypes.HistoryEventTypeTaskStateExited:
-			if ev.StateExitedEventDetails == nil {
-				continue
-			}
-			name := derefStr(ev.StateExitedEventDetails.Name)
-			if name == "" {
-				continue
-			}
-			prev := out[name]
-			out[name] = StateStatus{
-				Status:    "SUCCEEDED",
-				EnteredAt: prev.EnteredAt,
-			}
-		case sfntypes.HistoryEventTypeTaskFailed:
-			if currentState == "" {
-				continue
-			}
-			prev := out[currentState]
-			out[currentState] = StateStatus{
-				Status:    "FAILED",
-				EnteredAt: prev.EnteredAt,
-			}
-		}
-	}
-	return out
-}
-
 // ---------------------------------------------------------------------------
 // ExecutionLogs
 // ---------------------------------------------------------------------------
@@ -1269,7 +1064,7 @@ func (c *CloudProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 		}
 		events = append(events, LogEvent{
 			Timestamp: ts,
-			Message:   derefStr(ev.Message),
+			Message:   aws.ToString(ev.Message),
 		})
 	}
 
@@ -1317,7 +1112,7 @@ func StepTimeWindow(events []sfntypes.HistoryEvent, step string) (start, end tim
 			if ev.StateEnteredEventDetails == nil {
 				continue
 			}
-			name := derefStr(ev.StateEnteredEventDetails.Name)
+			name := aws.ToString(ev.StateEnteredEventDetails.Name)
 			currentState = name
 			if name == step && ev.Timestamp != nil {
 				if start.IsZero() || ev.Timestamp.Before(start) {
@@ -1328,7 +1123,7 @@ func StepTimeWindow(events []sfntypes.HistoryEvent, step string) (start, end tim
 			if ev.StateExitedEventDetails == nil {
 				continue
 			}
-			if derefStr(ev.StateExitedEventDetails.Name) == step && ev.Timestamp != nil {
+			if aws.ToString(ev.StateExitedEventDetails.Name) == step && ev.Timestamp != nil {
 				if ev.Timestamp.After(end) {
 					end = *ev.Timestamp
 				}
@@ -1347,6 +1142,32 @@ func StepTimeWindow(events []sfntypes.HistoryEvent, step string) (start, end tim
 // ---------------------------------------------------------------------------
 // Athena query helpers
 // ---------------------------------------------------------------------------
+
+// runAthenaSelect runs one SELECT through runAthenaQuery and applies the
+// shared result-set dance every Athena-backed read repeats: drop the header
+// row Athena returns first, then truncate the data rows to limit (callers
+// query LIMIT limit+1 so overflow signals truncation; limit < 0 disables
+// truncation for full-result reads like ColumnStats). Returns the data rows,
+// whether truncation happened, and the raw result set for callers that also
+// read ResultSetMetadata (SampleTable / Query column info). Error mapping
+// (isAthenaMissingTableErr → empty result) stays with each caller — the
+// methods disagree on it deliberately.
+func (c *CloudProvider) runAthenaSelect(ctx context.Context, sql string, limit int) ([]athenatypes.Row, bool, *athenatypes.ResultSet, error) {
+	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	rows := rs.Rows
+	if len(rows) > 0 {
+		rows = rows[1:] // drop Athena header row
+	}
+	truncated := false
+	if limit >= 0 && len(rows) > limit {
+		rows = rows[:limit]
+		truncated = true
+	}
+	return rows, truncated, rs, nil
+}
 
 // runAthenaQuery starts a query, polls for completion, and returns the result
 // set. Shared across NodeRuns/Runs/Snapshots.
@@ -1469,14 +1290,10 @@ func boolDatum(d athenatypes.Datum) *bool {
 	}
 }
 
-func derefStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-func formatTime(t *time.Time) string {
+// FormatTime renders an optional AWS SDK timestamp as RFC3339 UTC, or ""
+// when nil. Shared with the pipelinestatus handler (it renders the same
+// SFN timestamps) so the wire format cannot drift between the two.
+func FormatTime(t *time.Time) string {
 	if t == nil {
 		return ""
 	}

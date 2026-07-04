@@ -17,10 +17,9 @@ package sources
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
+
+	"github.com/vesahyp/clavesa/internal/registry"
 )
 
 // RelDir is the workspace-relative directory holding source JSON files.
@@ -93,55 +92,43 @@ type Spec struct {
 // Methods are filesystem-naive (no locking) — intended for the single-user
 // CLI / single-process UI shape clavesa runs in today.
 type Store struct {
-	workspaceRoot string
+	reg *registry.Store[Spec]
 }
 
 // New returns a Store rooted at workspaceRoot. The directory itself is
 // created lazily on first write, so callers don't need to pre-create it.
+//
+// Name rules come from registry.ValidName (1–64 chars, lowercase alnum +
+// `-` `_`, must start with a lowercase letter): the name doubles as a
+// filename and stays lowercase to match the Hive identifier convention the
+// runner uses for table names.
 func New(workspaceRoot string) *Store {
-	return &Store{workspaceRoot: workspaceRoot}
+	return &Store{reg: registry.New(workspaceRoot, registry.Config[Spec]{
+		Kind:   "source",
+		RelDir: RelDir,
+		Ext:    ".json",
+		Marshal: func(spec Spec) ([]byte, error) {
+			return registry.MarshalIndentJSON(spec)
+		},
+		Unmarshal: func(name string, data []byte) (Spec, error) {
+			var spec Spec
+			if err := json.Unmarshal(data, &spec); err != nil {
+				return Spec{}, fmt.Errorf("parse %s.json: %w", name, err)
+			}
+			spec.Name = name
+			return spec, nil
+		},
+	})}
 }
 
 // Dir returns the absolute path of the registry directory.
 func (s *Store) Dir() string {
-	return filepath.Join(s.workspaceRoot, RelDir)
+	return s.reg.Dir()
 }
 
 // Path returns the absolute path of a source's JSON file.
 func (s *Store) Path(name string) string {
-	return filepath.Join(s.Dir(), name+".json")
-}
-
-// validNameRE-style guard inlined to avoid a regex import — name rules:
-// 1–64 chars, lowercase alnum + `-` + `_`, must start with a letter.
-// Mirrors `validSlug` in api/dashboards.go and the same guarantee dashboards
-// give: the name doubles as a filename, so reject anything that could
-// traverse paths or surprise a shell.
-//
-// Names are lowercase to match the Hive identifier convention the runner
-// uses for table names — registered sources surface as input descriptors;
-// keeping their names lowercase avoids a separate sanitize step downstream.
-func validName(s string) error {
-	if s == "" {
-		return fmt.Errorf("name is required")
-	}
-	if len(s) > 64 {
-		return fmt.Errorf("name must be <=64 chars (got %d)", len(s))
-	}
-	first := s[0]
-	if !(first >= 'a' && first <= 'z') {
-		return fmt.Errorf("name must start with a lowercase letter")
-	}
-	for i, c := range s {
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= '0' && c <= '9':
-		case c == '-' || c == '_':
-		default:
-			return fmt.Errorf("name has invalid char %q at index %d (allowed: a-z 0-9 - _)", c, i)
-		}
-	}
-	return nil
+	return s.reg.Path(name)
 }
 
 // validKind enforces what the runner can actually read today. Slice 1
@@ -157,9 +144,19 @@ func validKind(kind string) error {
 	}
 }
 
+// normalize applies the write-time canonicalizations shared by Add and
+// Update: kind=s3 prefixes always end in "/" so the runner walks the whole
+// keyspace, not just keys starting with the literal. Empty prefix stays
+// empty (whole-bucket scan).
+func (s *Spec) normalize() {
+	if s.Kind == "s3" && s.Prefix != "" && !strings.HasSuffix(s.Prefix, "/") {
+		s.Prefix += "/"
+	}
+}
+
 // validate runs name/kind/spec consistency checks before write.
 func (s Spec) validate() error {
-	if err := validName(s.Name); err != nil {
+	if err := registry.ValidName(s.Name); err != nil {
 		return err
 	}
 	if err := validKind(s.Kind); err != nil {
@@ -224,23 +221,11 @@ func (s Spec) validate() error {
 // Add writes a new source spec to disk. Refuses to overwrite an existing
 // source — call Delete first or use a different name.
 func (s *Store) Add(spec Spec) error {
-	// Normalize: kind=s3 prefixes always end in "/" so the runner walks
-	// the whole keyspace, not just keys starting with the literal.
-	// Empty prefix stays empty (whole-bucket scan).
-	if spec.Kind == "s3" && spec.Prefix != "" && !strings.HasSuffix(spec.Prefix, "/") {
-		spec.Prefix += "/"
-	}
+	spec.normalize()
 	if err := spec.validate(); err != nil {
 		return err
 	}
-	path := s.Path(spec.Name)
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("source %q already exists", spec.Name)
-	}
-	if err := os.MkdirAll(s.Dir(), 0o755); err != nil {
-		return fmt.Errorf("create sources dir: %w", err)
-	}
-	return writeJSON(path, spec)
+	return s.reg.Create(spec.Name, spec)
 }
 
 // Update overwrites an existing source spec. Unlike Add it requires the
@@ -249,91 +234,29 @@ func (s *Store) Add(spec Spec) error {
 // and pipelines reference it by that name, so renaming is a delete +
 // register, not an edit.
 func (s *Store) Update(spec Spec) error {
-	// Same prefix normalization as Add — kind=s3 prefixes end in "/".
-	if spec.Kind == "s3" && spec.Prefix != "" && !strings.HasSuffix(spec.Prefix, "/") {
-		spec.Prefix += "/"
-	}
+	spec.normalize()
 	if err := spec.validate(); err != nil {
 		return err
 	}
-	path := s.Path(spec.Name)
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("source %q does not exist", spec.Name)
-		}
-		return err
-	}
-	return writeJSON(path, spec)
+	return s.reg.Update(spec.Name, spec)
 }
 
 // Get reads one source by name. Returns os.ErrNotExist when absent.
 func (s *Store) Get(name string) (Spec, error) {
-	if err := validName(name); err != nil {
-		return Spec{}, err
-	}
-	data, err := os.ReadFile(s.Path(name))
-	if err != nil {
-		return Spec{}, err
-	}
-	var spec Spec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		return Spec{}, fmt.Errorf("parse %s.json: %w", name, err)
-	}
-	spec.Name = name
-	return spec, nil
+	return s.reg.Get(name)
 }
 
 // List returns every registered source, sorted by name. A missing registry
 // directory returns an empty slice (the empty-state) rather than an error,
-// matching how dashboards list works for first-run workspaces.
+// matching how dashboards list works for first-run workspaces. Unreadable /
+// malformed files are skipped; the error surfaces via Get on demand.
 func (s *Store) List() ([]Spec, error) {
-	entries, err := os.ReadDir(s.Dir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return []Spec{}, nil
-		}
-		return nil, err
-	}
-	out := make([]Spec, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		name := strings.TrimSuffix(e.Name(), ".json")
-		if err := validName(name); err != nil {
-			continue // skip files whose names couldn't have been registered
-		}
-		spec, err := s.Get(name)
-		if err != nil {
-			continue // skip unreadable / malformed files; surface via Get on demand
-		}
-		out = append(out, spec)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return s.reg.List()
 }
 
 // Delete removes a source from the registry. Caller is responsible for the
 // pipeline-scan deletion guard (see service.DeleteSource) — this layer just
 // owns the file.
 func (s *Store) Delete(name string) error {
-	if err := validName(name); err != nil {
-		return err
-	}
-	return os.Remove(s.Path(name))
-}
-
-// writeJSON marshals v with indent and atomically writes to path via rename.
-// Atomic so a crash between truncate and write doesn't leave a half-written
-// file the next List would skip.
-func writeJSON(path string, v interface{}) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return s.reg.Delete(name)
 }

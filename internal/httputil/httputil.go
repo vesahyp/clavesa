@@ -3,9 +3,12 @@ package httputil
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
+
+	"github.com/vesahyp/clavesa/internal/errs"
 )
 
 // WriteJSON serialises v as JSON and writes it with the given status code.
@@ -18,6 +21,31 @@ func WriteJSON(w http.ResponseWriter, status int, v interface{}) {
 // WriteError writes a JSON error response: {"error": "<message>"}.
 func WriteError(w http.ResponseWriter, status int, message string) {
 	WriteJSON(w, status, map[string]string{"error": message})
+}
+
+// WriteServiceError maps a service-layer error onto an HTTP status and
+// writes the canonical {"error": "<message>"} envelope. The status is
+// picked from the internal/errs sentinels (errors.Is against the wrap
+// chain); an error carrying no sentinel falls back to the caller's
+// legacy per-route status. This is the one shared mapping the 2026-05-29
+// / 2026-07-02 reviews asked for (A P2-11, P2-N1): handlers stop
+// hand-rolling blanket-status blocks, and as the service layer adopts
+// sentinel tagging the statuses improve here with no handler changes.
+func WriteServiceError(w http.ResponseWriter, err error, fallback int) {
+	status := fallback
+	switch {
+	case errors.Is(err, errs.ErrNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, errs.ErrInvalidInput):
+		status = http.StatusBadRequest
+	case errors.Is(err, errs.ErrConflict), errors.Is(err, errs.ErrRunInFlight):
+		status = http.StatusConflict
+	case errors.Is(err, errs.ErrUpstream):
+		status = http.StatusBadGateway
+	case errors.Is(err, errs.ErrLocalNotImplemented):
+		status = http.StatusNotImplemented
+	}
+	WriteError(w, status, err.Error())
 }
 
 // DecodeJSON reads and JSON-decodes the request body into a fresh T.

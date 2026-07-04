@@ -4,8 +4,8 @@
  * the URL (`?run=…`), so deep links work and the back button does the
  * intuitive thing.
  *
- * The body is the same `RunDetailView` the standalone /pipelines/run
- * route renders; this is just the chrome.
+ * The body is `RunDetailView`; this is just the chrome. (The old
+ * standalone /pipelines/run page is a redirect-only shell now.)
  */
 import {
   Sheet,
@@ -40,7 +40,7 @@ export function RunDetailSheet({ dir, runId, onClose }: RunDetailSheetProps) {
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1">
-          {runId && <RunDetailView dir={dir} runId={runId} embedded />}
+          {runId && <RunDetailView dir={dir} runId={runId} />}
         </div>
       </SheetContent>
     </Sheet>

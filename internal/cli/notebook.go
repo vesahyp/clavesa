@@ -239,20 +239,20 @@ which adds ~30s of Spark cold start on first invocation. Subsequent runs
 in the same workspace reuse the running container.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-			svc, wsRoot, err := newService(cmd)
+			deps, err := newServiceDeps(cmd)
 			if err != nil {
 				return err
 			}
+			svc, wsRoot := deps.svc, deps.workspace
 			nb, err := svc.GetNotebook(name)
 			if err != nil {
 				return err
 			}
 
-			// Spin up a warm container for the duration of this CLI run.
-			// Stays alive across cells (one cold start, not N). Stops on
-			// process exit via defer.
-			warm := observability.NewPersistentQueryRunner(wsRoot)
-			defer warm.Close()
+			// The shared constructor's warm container stays alive across
+			// cells for the duration of this CLI run (one cold start, not
+			// N); runCloseables stops it on command exit.
+			warm := deps.warm
 			ctx := cmd.Context()
 			warehouseURI, err := activeWarehouseURI(wsRoot)
 			if err != nil {
@@ -321,19 +321,18 @@ func newNotebookSessionCmd() *cobra.Command {
 			Args:  cobra.ExactArgs(1),
 			RunE: func(cmd *cobra.Command, args []string) error {
 				name := args[0]
-				svc, wsRoot, err := newService(cmd)
+				deps, err := newServiceDeps(cmd)
 				if err != nil {
 					return err
 				}
+				svc := deps.svc
 				// We need the same notebookSessionRunner that the running
 				// `clavesa ui` has so its in-memory REPL map gets cleared.
 				// CLI processes don't share memory with the UI, so the best
 				// we can do is DELETE on the warm worker's HTTP supervisor
 				// directly — the UI's runner will discover the REPL is gone
 				// on next access.
-				warm := observability.NewPersistentQueryRunner(wsRoot)
-				defer warm.Close()
-				nbRunner := observability.NewNotebookSessionRunner(warm)
+				nbRunner := observability.NewNotebookSessionRunner(deps.warm)
 				defer nbRunner.Close()
 				if err := svc.WithNotebookRunner(nbRunner).StopNotebookSession(cmd.Context(), name); err != nil {
 					return err

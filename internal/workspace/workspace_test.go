@@ -259,3 +259,18 @@ func TestInitManifestContents(t *testing.T) {
 		t.Errorf("main.tf does not reference workspace_name:\n%s", content)
 	}
 }
+
+func TestLocalRunnerImageTag(t *testing.T) {
+	// No manifest: falls back to the empty-workspace-name image.
+	if got := workspace.LocalRunnerImageTag(t.TempDir()); got != "clavesa//transform-runner:latest" {
+		t.Errorf("LocalRunnerImageTag(no manifest) = %q, want clavesa//transform-runner:latest", got)
+	}
+
+	dir := t.TempDir()
+	if err := workspace.Init(dir, "my-test", "aws", "", "v0.5.0"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if got := workspace.LocalRunnerImageTag(dir); got != "clavesa/my-test/transform-runner:latest" {
+		t.Errorf("LocalRunnerImageTag = %q, want clavesa/my-test/transform-runner:latest", got)
+	}
+}

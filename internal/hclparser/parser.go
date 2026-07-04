@@ -290,9 +290,13 @@ func (p *parser) parseModuleBlock() (*graph.Node, []graph.Edge, error) {
 	if !ok {
 		return nil, nil, nil // source is not a string literal — skip
 	}
-	if !strings.HasPrefix(source, "clavesa/") &&
-		!localModuleSourceRE.MatchString(source) &&
-		!embeddedModuleSourceRE.MatchString(source) {
+	// One predicate for all four recognised source forms (clavesa/,
+	// github ?ref=, embedded, local) — keep this in sync with
+	// nodeTypeFromSource by never inlining a subset here: the github
+	// form was twice admitted only by localModuleSourceRE's tail
+	// coincidence when this check drifted (2026-05-10 P2-5, 2026-07-02
+	// session D P2-2).
+	if !IsRecognisedModuleSource(source) {
 		return nil, nil, nil // not a Clavesa module
 	}
 

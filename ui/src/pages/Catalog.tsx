@@ -12,7 +12,6 @@
 
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { formatDistanceToNow } from "date-fns";
 import {
   ArrowRight,
   ChevronDown,
@@ -32,6 +31,7 @@ import {
 } from "@tanstack/react-table";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import { Highlight } from "@/components/Highlight";
 import { ListSearch } from "@/components/ListSearch";
 import { Badge } from "@/components/ui/badge";
@@ -59,7 +59,14 @@ import {
   type CatalogTable,
   type TableInfo,
 } from "@/lib/queries";
-import { displayTableName, fileHealth, showOutputKey } from "@/lib/format";
+import {
+  displayTableName,
+  fileHealth,
+  formatCompactCount,
+  formatRelative,
+  formatSLABudget,
+  showOutputKey,
+} from "@/lib/format";
 
 const columnHelper = createColumnHelper<CatalogTable>();
 
@@ -73,23 +80,6 @@ declare module "@tanstack/react-table" {
     // `table_name` (== the on-disk table identifier). Only populated for
     // schemas with an owning pipeline; absent otherwise (system/orphan).
     fileStats?: Map<string, TableInfo>;
-  }
-}
-
-function formatUpdate(t: CatalogTable): string {
-  if (!t.update_time) return "—";
-  try {
-    return formatDistanceToNow(new Date(t.update_time), { addSuffix: true });
-  } catch {
-    return t.update_time;
-  }
-}
-
-function formatRelative(iso: string): string {
-  try {
-    return formatDistanceToNow(new Date(iso), { addSuffix: true });
-  } catch {
-    return iso;
   }
 }
 
@@ -109,13 +99,6 @@ const CLAVESA_SYSTEM_TABLES = new Set([
 
 function isSystemTable(name: string): boolean {
   return CLAVESA_SYSTEM_TABLES.has(name);
-}
-
-function formatRowCount(n: number): string {
-  if (n < 1_000) return n.toString();
-  if (n < 1_000_000) return `${(n / 1_000).toFixed(n < 10_000 ? 1 : 0)}k`;
-  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0)}M`;
-  return `${(n / 1_000_000_000).toFixed(1)}B`;
 }
 
 // Workspace system catalogs end in `_system` by convention
@@ -270,7 +253,7 @@ function RowsCell({ table }: { table: CatalogTable }) {
     <Tooltip>
       <TooltipTrigger asChild>
         <Badge variant="secondary" className="cursor-default font-mono text-[10px]">
-          {formatRowCount(data.latest_record_count)}
+          {formatCompactCount(data.latest_record_count)}
         </Badge>
       </TooltipTrigger>
       <TooltipContent>
@@ -388,7 +371,9 @@ function UpdatedCell({ table }: { table: CatalogTable }) {
   // the actual data freshness signal. Glue's UpdateTime is only the catalog
   // metadata mtime and lags behind real writes.
   const latest = data?.snapshots?.[0]?.committed_at;
-  const text = latest ? formatRelative(latest) : formatUpdate(table);
+  const text = latest
+    ? formatRelative(latest)
+    : formatRelative(table.update_time ?? "");
 
   // SLA chip — green when within budget, amber at >50%, red over.
   // Hidden when freshness_sla_seconds is 0 (HCL didn't declare one) or
@@ -422,17 +407,6 @@ function UpdatedCell({ table }: { table: CatalogTable }) {
       <span>{text}</span>
     </span>
   );
-}
-
-// Render the SLA budget back as the human shorthand the user wrote
-// (4h, 30m, 7d). Hours is the most common write; default to it for
-// inputs that don't divide cleanly into a single unit.
-function formatSLABudget(seconds: number): string {
-  if (seconds <= 0) return "—";
-  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
-  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
-  if (seconds % 60 === 0) return `${seconds / 60}m`;
-  return `${seconds}s`;
 }
 
 interface SchemaGroup {
@@ -618,72 +592,78 @@ export function Catalog() {
           </div>
         )}
 
-        {error && (
-          <Card className="border-destructive/40 bg-destructive/5">
-            <CardHeader className="flex-row items-start gap-3">
-              <FileWarning className="mt-0.5 h-5 w-5 text-destructive" />
-              <div>
-                <CardTitle className="text-destructive">
-                  Failed to load catalog
-                </CardTitle>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {error instanceof Error ? error.message : String(error)}
-                </p>
-              </div>
-            </CardHeader>
-          </Card>
-        )}
+        <QueryShell
+          query={{ isLoading, error, data }}
+          loading={
+            <div className="space-y-3">
+              <Skeleton className="h-6 w-40" />
+              <Skeleton className="h-24 w-full" />
+              <Skeleton className="h-24 w-full" />
+            </div>
+          }
+          renderError={(err) => (
+            <Card className="border-destructive/40 bg-destructive/5">
+              <CardHeader className="flex-row items-start gap-3">
+                <FileWarning className="mt-0.5 h-5 w-5 text-destructive" />
+                <div>
+                  <CardTitle className="text-destructive">
+                    Failed to load catalog
+                  </CardTitle>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {err instanceof Error ? err.message : String(err)}
+                  </p>
+                </div>
+              </CardHeader>
+            </Card>
+          )}
+        >
+          {(d) => (
+            <>
+              {d.tables.length === 0 && (
+                <WelcomeEmptyState
+                  hasPipelines={(pipelines.data?.length ?? 0) > 0}
+                  awsAvailable={d.aws_available}
+                />
+              )}
 
-        {isLoading && (
-          <div className="space-y-3">
-            <Skeleton className="h-6 w-40" />
-            <Skeleton className="h-24 w-full" />
-            <Skeleton className="h-24 w-full" />
-          </div>
-        )}
+              {d.tables.length > 0 && !d.aws_available && (
+                <Card className="mb-4 border-muted bg-muted/30">
+                  <CardContent className="flex items-center gap-3 py-3 text-xs text-muted-foreground">
+                    <CloudOff className="h-4 w-4 flex-shrink-0" />
+                    <span>
+                      AWS not configured — showing local pipelines only. Set{" "}
+                      <code className="font-mono">AWS_PROFILE</code> and restart to
+                      include Glue-registered tables from deployed pipelines.
+                    </span>
+                  </CardContent>
+                </Card>
+              )}
 
-        {data && data.tables.length === 0 && (
-          <WelcomeEmptyState
-            hasPipelines={(pipelines.data?.length ?? 0) > 0}
-            awsAvailable={data.aws_available}
-          />
-        )}
+              {filtered.length > 0 && (
+                <div className="space-y-6">
+                  {filtered.map((c) => (
+                    <CatalogCard key={c.catalog} catalog={c} query={q} />
+                  ))}
+                </div>
+              )}
 
-        {data && data.tables.length > 0 && !data.aws_available && (
-          <Card className="mb-4 border-muted bg-muted/30">
-            <CardContent className="flex items-center gap-3 py-3 text-xs text-muted-foreground">
-              <CloudOff className="h-4 w-4 flex-shrink-0" />
-              <span>
-                AWS not configured — showing local pipelines only. Set{" "}
-                <code className="font-mono">AWS_PROFILE</code> and restart to
-                include Glue-registered tables from deployed pipelines.
-              </span>
-            </CardContent>
-          </Card>
-        )}
-
-        {filtered.length > 0 && (
-          <div className="space-y-6">
-            {filtered.map((c) => (
-              <CatalogCard key={c.catalog} catalog={c} query={q} />
-            ))}
-          </div>
-        )}
-
-        {data && data.tables.length > 0 && isFiltered && filtered.length === 0 && (
-          <Card className="border-dashed">
-            <CardContent className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
-              <span>Nothing matches this filter.</span>
-              <Link
-                to="/"
-                onClick={() => setQuery("")}
-                className="text-xs text-primary hover:underline"
-              >
-                clear filter
-              </Link>
-            </CardContent>
-          </Card>
-        )}
+              {d.tables.length > 0 && isFiltered && filtered.length === 0 && (
+                <Card className="border-dashed">
+                  <CardContent className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
+                    <span>Nothing matches this filter.</span>
+                    <Link
+                      to="/"
+                      onClick={() => setQuery("")}
+                      className="text-xs text-primary hover:underline"
+                    >
+                      clear filter
+                    </Link>
+                  </CardContent>
+                </Card>
+              )}
+            </>
+          )}
+        </QueryShell>
     </div>
   );
 }

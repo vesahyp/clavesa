@@ -8,6 +8,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/athena"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/glue"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/observability"
@@ -197,15 +204,14 @@ func walkUpForManifest() string {
 	}
 }
 
-// cliCloseables holds Close functions registered by newService so the
+// cliCloseables holds Close functions registered by newServiceDeps so the
 // CLI can shut down warm-worker containers spawned during a one-shot
 // command. Each `clavesa <cmd>` invocation that touches the SQL parser
 // would otherwise leave a ~1GB container behind.
 var cliCloseables []func()
 
 // registerCloseable appends a teardown to run after the current CLI
-// command finishes. Safe to call from any newService /
-// newDashboardService path.
+// command finishes. Safe to call from any newServiceDeps path.
 func registerCloseable(fn func()) {
 	cliCloseables = append(cliCloseables, fn)
 }
@@ -221,32 +227,135 @@ func runCloseables() {
 	cliCloseables = nil
 }
 
-// newService builds a service.Service after resolving the workspace from the
-// command's flags.
+// awsClients bundles the AWS SDK clients (and the derived Athena output
+// bucket) the CLI wires into the cloud observability provider — and that
+// `clavesa ui` additionally hands to its HTTP handlers. All clients are
+// nil when the default AWS config can't load (local-only mode); Err
+// carries the load failure for surfaces that want to explain it.
+type awsClients struct {
+	Config aws.Config
+	Err    error // non-nil ⇔ config load failed ⇔ every client below is nil
+	S3     *s3.Client
+	Athena *athena.Client
+	Glue   *glue.Client
+	SFN    *sfn.Client
+	CWL    *cloudwatchlogs.Client
+	// AthenaOutputBucket: explicit $ATHENA_OUTPUT_BUCKET wins; otherwise
+	// auto-derived from the workspace's terraform.tfstate
+	// (`pipeline_bucket` output, the same bucket the Athena workgroup uses
+	// for `athena-results/`). Empty in local-only or pre-deploy mode —
+	// Athena calls would fail anyway, the resolver routes those requests
+	// to the local provider.
+	AthenaOutputBucket string
+}
+
+// loadAWSClients resolves the AWS config once and constructs the client
+// set. Cheap: LoadDefaultConfig only parses local config files, and client
+// construction opens no connections — the network is touched only when a
+// cloud dispatch actually calls one.
+func loadAWSClients(ctx context.Context, workspaceRoot string) awsClients {
+	bucket := os.Getenv("ATHENA_OUTPUT_BUCKET")
+	if bucket == "" {
+		bucket = wspkg.PipelineBucket(workspaceRoot)
+	}
+	c := awsClients{AthenaOutputBucket: bucket}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		c.Err = err
+		return c
+	}
+	c.Config = cfg
+	c.S3 = s3.NewFromConfig(cfg)
+	c.Athena = athena.NewFromConfig(cfg)
+	c.Glue = glue.NewFromConfig(cfg)
+	c.SFN = sfn.NewFromConfig(cfg)
+	c.CWL = cloudwatchlogs.NewFromConfig(cfg)
+	return c
+}
+
+// cloudProvider builds the full-client cloud observability provider, or
+// nil when AWS config didn't load (the resolver then routes everything to
+// the local provider and surfaces a clear error on an attempted cloud
+// dispatch). Glue+S3 ride along for the ADR-018 Delta `_delta_log/` reads
+// (snapshot timelines, real schemas behind Glue's Delta stubs).
+func (c awsClients) cloudProvider() observability.Provider {
+	if c.Err != nil {
+		return nil
+	}
+	return observability.NewCloudProvider(c.Athena, c.AthenaOutputBucket, c.SFN, c.CWL).
+		WithGlue(c.Glue).
+		WithS3(c.S3)
+}
+
+// serviceDeps is what newServiceDeps assembles: the fully-wired Service
+// plus the individual pieces the commands with extra wiring need beyond
+// the Service itself (`clavesa ui` hands the clients/resolver/warm runner
+// to its HTTP handlers and layers the notebook runner on top; `clavesa
+// query` and `clavesa notebook` eagerly warm the local worker). Everything
+// is lazy — no container spawns, no network calls — until a command
+// actually uses a piece.
+type serviceDeps struct {
+	svc       *service.Service
+	workspace string
+	clients   awsClients
+	warm      *observability.PersistentQueryRunner
+	resolver  *observability.Resolver
+}
+
+// newServiceDeps is the single CLI service constructor (2026-07-02 session
+// I P2-1; GH #76). Every command-side service.Service is built here with
+// the FULL option set — resolver, SQL parser, transpiler, metastore
+// ensurer — so no per-command recipe can silently drop a seam again (the
+// dashboards constructor once omitted the metastore ensurer, putting CLI
+// `pipeline optimize` on embedded Derby while every other local dispatch
+// used the shared metastore). Unused pieces cost nothing:
+//   - the SQL parser's persistent runner only spawns a docker container on
+//     first Parse (node edit, node preview, dashboards apply, sql lint pay
+//     one ~30s cold spawn per invocation; everything else stays docker-free),
+//   - the transpile sidecar spawns on first ToServing,
+//   - the AWS clients open no connections until a cloud dispatch,
+//   - the metastore ensurer runs only when a local runner container launches.
 //
-// The service gets a lazy SQL parser wired (Slice 3): the underlying
-// persistent runner only spawns a docker container the first time
-// Parse is called, so commands that never validate SQL stay
-// docker-free. Commands that do hit the parser (node edit, node
-// preview, dashboards apply, sql lint) pay one ~30s cold spawn per
-// CLI invocation; the container is torn down by runCloseables() at
-// command exit.
-func newService(cmd *cobra.Command) (*service.Service, string, error) {
+// Teardown is uniform too: the warm runner and sidecar are registered as
+// closeables and stopped by runCloseables() when the root command exits.
+func newServiceDeps(cmd *cobra.Command) (*serviceDeps, error) {
 	workspace, err := resolveWorkspace(cmd)
 	if err != nil {
-		return nil, "", fmt.Errorf("resolve workspace: %w", err)
+		return nil, fmt.Errorf("resolve workspace: %w", err)
 	}
-	svc := service.New(workspace)
+	clients := loadAWSClients(cmd.Context(), workspace)
+	cloud := clients.cloudProvider()
 	warm := observability.NewPersistentQueryRunner(workspace)
-	// Parser resolves the active warehouse (ADR-024) lazily on first
-	// Parse; cloud + undeployed surfaces an actionable error there.
-	parser := warm.SQLParserForWorkspace()
 	registerCloseable(warm.Close)
+	local := observability.NewLocalProvider(workspace).WithQueryRunner(warm)
+	resolver := observability.NewResolver(workspace, cloud, local)
 	sidecar := observability.NewTranspileSidecar(workspace)
 	registerCloseable(sidecar.Close)
 	transpiler := servingsql.NewCachedTranspiler(filepath.Join(workspace, ".clavesa", "cache", "transpile"), sidecar.ToServing)
-	svc = svc.WithSQLParser(parser).WithTranspiler(transpiler).WithMetastoreEnsurer(metastoreEnsurer())
-	return svc, workspace, nil
+	svc := service.New(workspace).
+		WithResolver(resolver).
+		// Parser resolves the active warehouse (ADR-024) lazily on first
+		// Parse; cloud + undeployed surfaces an actionable error there.
+		WithSQLParser(warm.SQLParserForWorkspace()).
+		WithTranspiler(transpiler).
+		WithMetastoreEnsurer(metastoreEnsurer())
+	return &serviceDeps{
+		svc:       svc,
+		workspace: workspace,
+		clients:   clients,
+		warm:      warm,
+		resolver:  resolver,
+	}, nil
+}
+
+// newService is the plain-command entry point over newServiceDeps for the
+// ~60 call sites that need only the Service and the workspace root.
+func newService(cmd *cobra.Command) (*service.Service, string, error) {
+	deps, err := newServiceDeps(cmd)
+	if err != nil {
+		return nil, "", err
+	}
+	return deps.svc, deps.workspace, nil
 }
 
 // metastoreEnsurer returns the production shared-metastore ensurer wired

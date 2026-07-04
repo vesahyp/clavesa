@@ -5,8 +5,8 @@
  * Closes the loop between the Catalog drill-in (TableDetail) and editor
  * authoring without forcing the user into the editor. Three panes:
  *   - DAG with last-run state overlaid (reuses the live SFN status hook)
- *   - Recent SFN executions (links to console; expandable failures show
- *     CloudWatch logs via the same component the StatusPanel uses)
+ *   - Recent SFN executions (links to console; per-node logs live in the
+ *     run-detail sheet's NodeDetailDrawer)
  *   - Output tables produced by this pipeline (filtered Catalog rows,
  *     each linking back to /tables/:db/:table)
  *
@@ -23,6 +23,7 @@ import { toast } from "sonner";
 import "@xyflow/react/dist/style.css";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import { formatRelative } from "@/lib/format";
 import {
   topoOrder,
@@ -822,29 +823,32 @@ export function PipelineDashboard() {
                 )}
               </CardHeader>
               <CardContent className="space-y-4 p-6 pt-0">
-                {cost.isLoading && (
-                  <div className="space-y-2">
-                    <Skeleton className="h-7 w-1/2" />
-                    <Skeleton className="h-4 w-2/3" />
-                  </div>
-                )}
-                {Boolean(cost.error) && !cost.isLoading && (
-                  <div className="text-xs text-muted-foreground">
-                    Couldn't compute cost for this pipeline yet. Run it at
-                    least once so there are billed runs to aggregate.
-                  </div>
-                )}
-                {cost.data && (
+                <QueryShell
+                  query={cost}
+                  loading={
+                    <div className="space-y-2">
+                      <Skeleton className="h-7 w-1/2" />
+                      <Skeleton className="h-4 w-2/3" />
+                    </div>
+                  }
+                  renderError={() => (
+                    <div className="text-xs text-muted-foreground">
+                      Couldn't compute cost for this pipeline yet. Run it at
+                      least once so there are billed runs to aggregate.
+                    </div>
+                  )}
+                >
+                  {(costData) => (
                   <>
                     <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                      {cost.data.totalCostUsd === 0 ? (
+                      {costData.totalCostUsd === 0 ? (
                         <span className="text-2xl font-semibold tabular-nums">
                           $0.00 compute (local)
                         </span>
                       ) : (
                         <>
                           <span className="text-2xl font-semibold tabular-nums">
-                            {formatUsd(cost.data.costPerBillion)}
+                            {formatUsd(costData.costPerBillion)}
                           </span>
                           <span className="text-sm text-muted-foreground">
                             per billion records
@@ -852,14 +856,14 @@ export function PipelineDashboard() {
                         </>
                       )}
                       <span className="text-sm text-muted-foreground tabular-nums">
-                        {cost.data.totalCostUsd === 0 ? "" : "· "}
-                        {formatRate(cost.data.recordsPerSec)} rec/s
+                        {costData.totalCostUsd === 0 ? "" : "· "}
+                        {formatRate(costData.recordsPerSec)} rec/s
                       </span>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      {cost.data.priceBasis}
+                      {costData.priceBasis}
                     </p>
-                    {cost.data.perNode.length > 0 && (
+                    {costData.perNode.length > 0 && (
                       <div className="overflow-hidden rounded-md border border-border">
                         <table className="w-full text-sm">
                           <thead className="bg-muted/50 text-xs text-muted-foreground">
@@ -882,7 +886,7 @@ export function PipelineDashboard() {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-border">
-                            {cost.data.perNode.map((n) => (
+                            {costData.perNode.map((n) => (
                               <tr key={n.node}>
                                 <td className="px-3 py-2">{n.node}</td>
                                 <td className="px-3 py-2">
@@ -908,7 +912,8 @@ export function PipelineDashboard() {
                       </div>
                     )}
                   </>
-                )}
+                  )}
+                </QueryShell>
               </CardContent>
             </Card>
 
@@ -919,36 +924,45 @@ export function PipelineDashboard() {
                   <CardTitle>Recent executions</CardTitle>
                 </CardHeader>
                 <CardContent className="p-0">
-                  {status.isLoading && (
-                    <div className="space-y-2 p-6">
-                      <Skeleton className="h-4 w-full" />
-                      <Skeleton className="h-4 w-5/6" />
-                      <Skeleton className="h-4 w-2/3" />
-                    </div>
-                  )}
-                  {status.data && !status.data.deployed && (
-                    <div className="p-6 text-sm text-muted-foreground">
-                      Pipeline is not deployed yet. Run{" "}
-                      <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
-                        terraform apply
-                      </code>{" "}
-                      in <code className="font-mono">{dir}</code> to deploy.
-                    </div>
-                  )}
-                  {status.data &&
-                    status.data.deployed &&
-                    status.data.executions.length === 0 && (
-                      <div className="p-6 text-sm text-muted-foreground">
-                        No executions yet.
+                  <QueryShell
+                    query={status}
+                    loading={
+                      <div className="space-y-2 p-6">
+                        <Skeleton className="h-4 w-full" />
+                        <Skeleton className="h-4 w-5/6" />
+                        <Skeleton className="h-4 w-2/3" />
                       </div>
+                    }
+                    // Errors render nothing — the 5s status poll recovers on
+                    // its own and the card has no error affordance today.
+                    renderError={() => null}
+                  >
+                    {(s) => (
+                      <>
+                        {!s.deployed && (
+                          <div className="p-6 text-sm text-muted-foreground">
+                            Pipeline is not deployed yet. Run{" "}
+                            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+                              terraform apply
+                            </code>{" "}
+                            in <code className="font-mono">{dir}</code> to deploy.
+                          </div>
+                        )}
+                        {s.deployed && s.executions.length === 0 && (
+                          <div className="p-6 text-sm text-muted-foreground">
+                            No executions yet.
+                          </div>
+                        )}
+                        {s.executions.length > 0 && (
+                          <ul className="divide-y divide-border">
+                            {s.executions.slice(0, 10).map((e) => (
+                              <ExecutionListItem key={e.execution_arn} e={e} />
+                            ))}
+                          </ul>
+                        )}
+                      </>
                     )}
-                  {status.data && status.data.executions.length > 0 && (
-                    <ul className="divide-y divide-border">
-                      {status.data.executions.slice(0, 10).map((e) => (
-                        <ExecutionListItem key={e.execution_arn} e={e} />
-                      ))}
-                    </ul>
-                  )}
+                  </QueryShell>
                 </CardContent>
               </Card>
             )}
@@ -981,33 +995,40 @@ export function PipelineDashboard() {
                 </div>
               </CardHeader>
               <CardContent className="p-0">
-                {backfills.isLoading && (
-                  <div className="space-y-2 p-6">
-                    <Skeleton className="h-4 w-2/3" />
-                    <Skeleton className="h-4 w-1/2" />
-                  </div>
-                )}
-                {Boolean(backfills.error) && (
-                  <div className="p-6 text-xs text-muted-foreground">
-                    {isLocalWarehouse
-                      ? "Couldn't list backfills for this local pipeline. Run the pipeline at least once so the warehouse has a canonical target."
-                      : "Backfills require a deployed pipeline (Lambda + Glue). Apply the pipeline first, then stage a backfill here."}
-                  </div>
-                )}
-                {backfills.data &&
-                  backfills.data.backfills.length === 0 && (
-                    <div className="p-6 text-sm text-muted-foreground">
-                      No open backfills. Stage one to replay a transform
-                      over a historical partition window.
+                <QueryShell
+                  query={backfills}
+                  loading={
+                    <div className="space-y-2 p-6">
+                      <Skeleton className="h-4 w-2/3" />
+                      <Skeleton className="h-4 w-1/2" />
+                    </div>
+                  }
+                  renderError={() => (
+                    <div className="p-6 text-xs text-muted-foreground">
+                      {isLocalWarehouse
+                        ? "Couldn't list backfills for this local pipeline. Run the pipeline at least once so the warehouse has a canonical target."
+                        : "Backfills require a deployed pipeline (Lambda + Glue). Apply the pipeline first, then stage a backfill here."}
                     </div>
                   )}
-                {backfills.data && backfills.data.backfills.length > 0 && (
-                  <ul className="divide-y divide-border">
-                    {backfills.data.backfills.map((b) => (
-                      <BackfillRow key={b.run_id} bf={b} dir={dir} />
-                    ))}
-                  </ul>
-                )}
+                >
+                  {(bfs) => (
+                    <>
+                      {bfs.backfills.length === 0 && (
+                        <div className="p-6 text-sm text-muted-foreground">
+                          No open backfills. Stage one to replay a transform
+                          over a historical partition window.
+                        </div>
+                      )}
+                      {bfs.backfills.length > 0 && (
+                        <ul className="divide-y divide-border">
+                          {bfs.backfills.map((b) => (
+                            <BackfillRow key={b.run_id} bf={b} dir={dir} />
+                          ))}
+                        </ul>
+                      )}
+                    </>
+                  )}
+                </QueryShell>
               </CardContent>
             </Card>
 

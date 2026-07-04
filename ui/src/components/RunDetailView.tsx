@@ -1,11 +1,10 @@
 /**
- * RunDetailView — the body of the per-execution drill-down, decoupled
- * from URL/page chrome so it can render both as a full page and inside a
- * right-side Sheet on the pipeline dashboard.
- *
- * Inputs: dir + runId. Same queries, same sub-components as the old
- * RunDetail page; `embedded` drops the outer max-w-6xl page wrapper and
- * the breadcrumb chrome since the Sheet owns its own header.
+ * RunDetailView — the body of the per-execution drill-down, rendered
+ * inside the right-side Sheet on the pipeline dashboard
+ * (RunDetailSheet). The Sheet owns the header chrome; this component
+ * owns the scrollable body. Inputs: dir + runId. Same queries and
+ * sub-components as the old standalone RunDetail page (now a
+ * redirect-only shell).
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -48,15 +47,9 @@ import type { PipelineGraph as PipelineGraphType } from "@/types/pipeline";
 export interface RunDetailViewProps {
   dir: string;
   runId: string;
-  /**
-   * When true, drop the page-level wrapper (max-w / px / py). The Sheet
-   * provides its own padding; the standalone page keeps the centred
-   * 6xl wrapper for readability.
-   */
-  embedded?: boolean;
 }
 
-export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
+export function RunDetailView({ dir, runId }: RunDetailViewProps) {
   const pipelineName = dir.split("/").pop() ?? dir;
 
   // Local vs cloud — controls how StepLogs addresses CloudWatch / runner
@@ -285,7 +278,7 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
 
   if (!dir || !runId) {
     return (
-      <div className={embedded ? "p-6" : "mx-auto w-full max-w-6xl px-6 py-8"}>
+      <div className="p-6">
         <p className="text-sm text-muted-foreground">
           Missing required <code>dir</code> and <code>run</code> values.
         </p>
@@ -420,10 +413,7 @@ export function RunDetailView({ dir, runId, embedded }: RunDetailViewProps) {
     </>
   );
 
-  if (embedded) {
-    return <div className="h-full overflow-y-auto p-6">{body}</div>;
-  }
-  return <div className="mx-auto w-full max-w-6xl px-6 py-8">{body}</div>;
+  return <div className="h-full overflow-y-auto p-6">{body}</div>;
 }
 
 // ---------------------------------------------------------------------------

@@ -89,9 +89,8 @@ func New(fo *fileops.FileOps, root string) *Handler {
 
 // WithService attaches the canonical service.Service so handlers that
 // previously instantiated service.New(h.root) per request route through
-// the wired Service instead — picking up its WithEvictor / WithResolver
-// state. Without this, RenameNode and AddEdge silently bypass cache
-// eviction (A P1-1 / C P1-1, 2026-05-24 review).
+// the wired Service instead — picking up its WithResolver /
+// WithTranspiler state (A P1-1 / C P1-1, 2026-05-24 review).
 func (h *Handler) WithService(s *service.Service) *Handler {
 	h.svc = s
 	return h
@@ -561,9 +560,14 @@ func (h *Handler) DetachInput(w http.ResponseWriter, r *http.Request) {
 // Removes the edge identified by the path parameter.
 // Edge id format: {from_node}->{to_node}
 // Expects body: {"dir": "<terraform_directory>"}
+//
+// Delegates to service.DeleteEdge — the same code path the CLI's `node
+// disconnect` uses (ADR-015). The edge id is pre-parsed here only to keep
+// the 400 message and the 404's to_node reference identical to the prior
+// hand-rolled contract.
 func (h *Handler) DeleteEdge(w http.ResponseWriter, r *http.Request) {
 	edgeID := r.PathValue("id")
-	fromNode, toNode, ok := hclutil.ParseEdgeID(edgeID)
+	_, toNode, ok := hclutil.ParseEdgeID(edgeID)
 	if !ok {
 		httputil.WriteError(w, http.StatusBadRequest, "invalid edge id: expected {from_node}->{to_node}")
 		return
@@ -579,9 +583,9 @@ func (h *Handler) DeleteEdge(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": body.Dir}) {
 		return
 	}
-	body.Dir = h.resolve(body.Dir)
+	dir := h.resolve(body.Dir)
 
-	if err := hclutil.RemoveEdge(h.fo, body.Dir, fromNode, toNode); err != nil {
+	if _, err := h.service().DeleteEdge(dir, edgeID); err != nil {
 		// FindNodeFile returns a wrapped not-found; surface as 404 to match
 		// the prior contract.
 		if strings.Contains(err.Error(), "not found") {
@@ -591,8 +595,8 @@ func (h *Handler) DeleteEdge(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, fileOpsStatus(err), err.Error())
 		return
 	}
-	h.syncOrchestration(body.Dir)
-	h.parseAndRespond(w, body.Dir)
+	// service.DeleteEdge re-syncs orchestration internally; no h.syncOrchestration here.
+	h.parseAndRespond(w, dir)
 }
 
 // GET /pipeline/validate?dir=<path>

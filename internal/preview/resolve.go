@@ -12,7 +12,6 @@ import (
 	"github.com/vesahyp/clavesa/internal/dataquery"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/identutil"
-	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/sources"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -249,7 +248,7 @@ func ResolveInputData(ctx context.Context, s3c dataquery.S3Client, g *graph.Pipe
 		if extInputs, ok := target.Config["external_inputs"].(map[string]interface{}); ok && len(extInputs) > 0 {
 			root := filepath.Dir(dir)
 			catalog := ""
-			localTag := runner.LocalImageName("") + ":latest"
+			localTag := workspace.LocalRunnerImageTag(root)
 			if m, _ := workspace.Load(root); m != nil {
 				catalog = m.CatalogIdentifier()
 				ensured, err := workspace.EnsureLocalRunnerImage(root)
@@ -382,8 +381,8 @@ func executeTransformChain(ctx context.Context, s3c dataquery.S3Client, g *graph
 		}
 	}
 
-	localTag := runner.LocalImageName("") + ":latest"
 	root := filepath.Dir(dir)
+	localTag := workspace.LocalRunnerImageTag(root)
 	if _, err := workspace.Load(root); err == nil {
 		ensured, err := workspace.EnsureLocalRunnerImage(root)
 		if err != nil {

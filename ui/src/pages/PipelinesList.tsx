@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { useChrome } from "@/components/PageChrome";
+import { QueryShell } from "@/components/QueryShell";
 import { Highlight } from "@/components/Highlight";
 import { ListSearch } from "@/components/ListSearch";
 import { Badge } from "@/components/ui/badge";
@@ -218,31 +219,34 @@ export function PipelinesList() {
           </div>
         )}
 
-        {error && (
-          <Card className="border-destructive/40 bg-destructive/5">
-            <CardHeader className="flex-row items-start gap-3">
-              <FileWarning className="mt-0.5 h-5 w-5 text-destructive" />
-              <div>
-                <CardTitle className="text-destructive">
-                  Failed to list pipelines
-                </CardTitle>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {error instanceof Error ? error.message : String(error)}
-                </p>
-              </div>
-            </CardHeader>
-          </Card>
-        )}
-
-        {isLoading && (
-          <div className="grid gap-3">
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-          </div>
-        )}
-
-        {data && data.length === 0 && (
+        <QueryShell
+          query={{ isLoading, error, data }}
+          loading={
+            <div className="grid gap-3">
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+            </div>
+          }
+          renderError={(err) => (
+            <Card className="border-destructive/40 bg-destructive/5">
+              <CardHeader className="flex-row items-start gap-3">
+                <FileWarning className="mt-0.5 h-5 w-5 text-destructive" />
+                <div>
+                  <CardTitle className="text-destructive">
+                    Failed to list pipelines
+                  </CardTitle>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {err instanceof Error ? err.message : String(err)}
+                  </p>
+                </div>
+              </CardHeader>
+            </Card>
+          )}
+        >
+          {(d) => (
+            <>
+              {d.length === 0 && (
           <Card className="border-dashed">
             <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
               <span className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
@@ -259,18 +263,18 @@ export function PipelinesList() {
               </Button>
             </CardContent>
           </Card>
-        )}
+              )}
 
-        {data && data.length > 0 && filtered.length === 0 && (
+              {d.length > 0 && filtered.length === 0 && (
           <Card className="border-dashed">
             <CardContent className="py-10 text-center text-sm text-muted-foreground">
               No pipelines match{" "}
               <span className="font-mono text-foreground">{query}</span>.
             </CardContent>
           </Card>
-        )}
+              )}
 
-        {data && data.length > 0 && filtered.length > 0 && (
+              {d.length > 0 && filtered.length > 0 && (
           <div className="grid gap-3">
             {filtered.map((p) => (
               <Card
@@ -343,7 +347,10 @@ export function PipelinesList() {
               </Card>
             ))}
           </div>
-        )}
+              )}
+            </>
+          )}
+        </QueryShell>
 
       {showNew && <NewPipelineDialog onClose={() => setShowNew(false)} />}
     </div>

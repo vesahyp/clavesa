@@ -60,11 +60,11 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 	warehouse := workspace.LocalWarehouseDir(workspaceRoot)
 
 	// ADR-019 Slice 4: new on-disk layout is
-	// ``<warehouse>/<catalog>/<schema>/<table>/`` (V2 multi-catalog
+	// `<warehouse>/<catalog>/<schema>/<table>/` (V2 multi-catalog
 	// DeltaCatalog with per-catalog warehouse). Legacy layout from pre-
 	// Slice-4 (Hive metastore federation) was
-	// ``<warehouse>/<catalog>__<schema>.db/<table>/``. Walk both — the JSON
-	// shape stays at ``Database = <catalog>__<schema>`` for this slice; the
+	// `<warehouse>/<catalog>__<schema>.db/<table>/`. Walk both — the JSON
+	// shape stays at `Database = <catalog>__<schema>` for this slice; the
 	// UI keeps its existing splitDatabase decoder until Slice 6 rewires
 	// API + UI to three-level fields natively.
 	for _, ns := range listWarehouseNamespaces(warehouse, workspaceCatalog, systemCatalog) {
@@ -114,7 +114,7 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 }
 
 // localNamespace is one resolved namespace location on disk plus the
-// logical ``<catalog>__<schema>`` key listLocalTables uses to look up the
+// logical `<catalog>__<schema>` key listLocalTables uses to look up the
 // owning pipeline. `catalog` and `schema` carry the three-piece form
 // (ADR-020) populated from on-disk path components when the V2 layout
 // is in use, and from splitting `logicalDB` on `__` for the two
@@ -122,7 +122,7 @@ func listLocalTables(workspaceRoot, workspaceCatalog, systemCatalog string, pipe
 // form for one-release back-compat.
 type localNamespace struct {
 	dir       string // absolute path to walk for `<table>/_delta_log/` directories
-	logicalDB string // ``<catalog>__<schema>`` form (key into userDBToPipeline)
+	logicalDB string // `<catalog>__<schema>` form (key into userDBToPipeline)
 	catalog   string
 	schema    string
 }
@@ -131,15 +131,15 @@ type localNamespace struct {
 // directory in the workspace warehouse across the three on-disk
 // layouts the catalog page surfaces:
 //
-//  1. ADR-019 V2 (Slice 4): ``<warehouse>/<catalog>/<schema>/<table>/``.
+//  1. ADR-019 V2 (Slice 4): `<warehouse>/<catalog>/<schema>/<table>/`.
 //     Restricted to known workspace + system catalogs so unrelated
-//     warehouse-root entries (e.g. Derby's ``_metastore/``) don't get
+//     warehouse-root entries (e.g. Derby's `_metastore/`) don't get
 //     mistakenly probed as catalogs.
-//  2. Legacy Hive with ``.db`` suffix:
-//     ``<warehouse>/<catalog>__<schema>.db/<table>/`` — what v2.0.0
+//  2. Legacy Hive with `.db` suffix:
+//     `<warehouse>/<catalog>__<schema>.db/<table>/` — what v2.0.0
 //     through Slice-3 wrote via the persistent Hive metastore.
-//  3. Legacy flat without ``.db`` suffix:
-//     ``<warehouse>/<catalog>__<schema>/<table>/`` — pre-v2.0.0
+//  3. Legacy flat without `.db` suffix:
+//     `<warehouse>/<catalog>__<schema>/<table>/` — pre-v2.0.0
 //     in-memory-Hive layout, still showing up in workspaces migrated
 //     from per-pipeline warehouses (migrateLocalWarehouses keeps the
 //     namespace dir name as-is).
@@ -174,7 +174,7 @@ func listWarehouseNamespaces(warehouse, workspaceCatalog, systemCatalog string) 
 		}
 		if strings.Contains(name, "__") {
 			// Pre-v2.0.0 flat layout. The flat-encoded
-			// ``<catalog>__<schema>`` name is its own logicalDB —
+			// `<catalog>__<schema>` name is its own logicalDB —
 			// listLocalTables filters by exact match against the
 			// known catalog/schema set so noise gets skipped there.
 			cat, sch := splitGlueDB(name)

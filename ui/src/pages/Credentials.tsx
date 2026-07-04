@@ -12,11 +12,10 @@ import { KeyRound, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useChrome } from "@/components/PageChrome";
-import { ListSearch } from "@/components/ListSearch";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
+import { RegistryList } from "@/pages/RegistryList";
 import {
   deleteCredential,
   registerCredential,
@@ -96,68 +95,26 @@ export function Credentials() {
           />
         )}
 
-        {list.isLoading && (
-          <div className="space-y-3">
-            <Skeleton className="h-16 w-full" />
-            <Skeleton className="h-16 w-full" />
-          </div>
-        )}
-
-        {list.error && (
-          <Card>
-            <CardContent className="p-6 text-sm text-destructive">
-              Couldn't load credentials —{" "}
-              {list.error instanceof Error
-                ? list.error.message
-                : "unknown error"}
-            </CardContent>
-          </Card>
-        )}
-
-        {list.data && list.data.credentials.length === 0 && !showForm && (
-          <EmptyState onAdd={() => setShowForm(true)} />
-        )}
-
-        {list.data && list.data.credentials.length > 0 && (
-          <div className="mb-4 flex items-center gap-3">
-            <ListSearch
-              value={query}
-              onChange={setQuery}
-              placeholder="Filter credentials…"
+        <RegistryList
+          query={list}
+          items={allCredentials}
+          filtered={filtered}
+          search={query}
+          onSearchChange={setQuery}
+          searchPlaceholder="Filter credentials…"
+          noun="credentials"
+          empty={<EmptyState onAdd={() => setShowForm(true)} />}
+          showEmpty={!showForm}
+          renderItem={(c) => (
+            <CredentialRow
+              key={c.name}
+              spec={c}
+              onDeleted={() =>
+                qc.invalidateQueries({ queryKey: ["credentials"] })
+              }
             />
-            {q && (
-              <span className="text-xs text-muted-foreground">
-                <span className="font-semibold text-foreground">
-                  {filtered.length}
-                </span>{" "}
-                of {allCredentials.length}
-              </span>
-            )}
-          </div>
-        )}
-
-        {list.data && list.data.credentials.length > 0 && filtered.length === 0 && (
-          <Card>
-            <CardContent className="py-10 text-center text-sm text-muted-foreground">
-              No credentials match{" "}
-              <span className="font-mono text-foreground">{query}</span>.
-            </CardContent>
-          </Card>
-        )}
-
-        {filtered.length > 0 && (
-          <ul className="grid gap-3">
-            {filtered.map((c) => (
-              <CredentialRow
-                key={c.name}
-                spec={c}
-                onDeleted={() =>
-                  qc.invalidateQueries({ queryKey: ["credentials"] })
-                }
-              />
-            ))}
-          </ul>
-        )}
+          )}
+        />
     </div>
   );
 }

@@ -31,6 +31,7 @@ import {
 } from "./TransformInputsSection";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { NativeSelect } from "@/components/ui/native-select";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import {
@@ -43,11 +44,12 @@ import {
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 
-// Native <select> styled like shadcn's Input. Used over the Radix-based Select
-// primitive when we need testability via getByLabelText().value (the Radix one
-// is a custom button, not a native select).
-const nativeSelectCls =
-  "flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50";
+// Shared section-header / inline-error class recipes used by the Settings
+// sections below.
+const sectionLabelCls =
+  "mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground";
+const errorNoteCls =
+  "rounded-md border border-status-failed/40 bg-status-failed/10 p-2 text-xs text-status-failed";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -164,16 +166,15 @@ function S3SourceForm({
         />
       </Field>
       <Field label="Format" htmlFor="cfg-format">
-        <select
+        <NativeSelect
           id="cfg-format"
-          className={nativeSelectCls}
           value={format}
           onChange={(e) => onChange({ ...config, format: e.target.value })}
         >
           <option value="csv">csv</option>
           <option value="json">json</option>
           <option value="parquet">parquet</option>
-        </select>
+        </NativeSelect>
       </Field>
       {format === "json" && (
         <Field label="JSON Path (optional)" htmlFor="cfg-json-path">
@@ -221,27 +222,25 @@ function S3DestinationForm({
         />
       </Field>
       <Field label="Format" htmlFor="cfg-dest-format">
-        <select
+        <NativeSelect
           id="cfg-dest-format"
-          className={nativeSelectCls}
           value={format}
           onChange={(e) => onChange({ ...config, format: e.target.value })}
         >
           <option value="csv">csv</option>
           <option value="json">json</option>
           <option value="parquet">parquet</option>
-        </select>
+        </NativeSelect>
       </Field>
       <Field label="Write Mode" htmlFor="cfg-dest-write-mode">
-        <select
+        <NativeSelect
           id="cfg-dest-write-mode"
-          className={nativeSelectCls}
           value={writeMode}
           onChange={(e) => onChange({ ...config, write_mode: e.target.value })}
         >
           <option value="append">append</option>
           <option value="overwrite">overwrite</option>
-        </select>
+        </NativeSelect>
       </Field>
     </>
   );
@@ -442,13 +441,12 @@ function TransformOutputSection({
 
   return (
     <div className="mb-3 border-t border-border pt-3">
-      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+      <div className={sectionLabelCls}>
         Output
       </div>
       <Field label="Mode" htmlFor="cfg-output-mode">
-        <select
+        <NativeSelect
           id="cfg-output-mode"
-          className={nativeSelectCls}
           value={mode}
           onChange={(e) => setMode(e.target.value)}
         >
@@ -456,7 +454,7 @@ function TransformOutputSection({
           <option value="replace">replace</option>
           <option value="append">append</option>
           <option value="merge">merge</option>
-        </select>
+        </NativeSelect>
       </Field>
       <Field label="Merge Keys" htmlFor="cfg-output-merge-keys">
         <Input
@@ -541,7 +539,7 @@ function TransformOutputSection({
       {error && (
         <div
           role="alert"
-          className="mt-2 rounded-md border border-status-failed/40 bg-status-failed/10 p-2 text-xs text-status-failed"
+          className={cn("mt-2", errorNoteCls)}
         >
           {error}
         </div>
@@ -602,13 +600,12 @@ function ComputeSection({
 
   return (
     <div className="mb-3 border-t border-border pt-3">
-      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+      <div className={sectionLabelCls}>
         Compute
       </div>
       <Field label="Deploy target" htmlFor="cfg-compute">
-        <select
+        <NativeSelect
           id="cfg-compute"
-          className={nativeSelectCls}
           value={value}
           disabled={saving}
           onChange={(e) => handleChange(e.target.value)}
@@ -616,7 +613,7 @@ function ComputeSection({
           <option value="lambda">lambda</option>
           <option value="fargate">fargate</option>
           <option value="emr-serverless">emr-serverless</option>
-        </select>
+        </NativeSelect>
       </Field>
       <p className="mb-1 text-[11px] text-muted-foreground">
         AWS target for a deployed pipeline. Local runs ignore it — pick
@@ -629,7 +626,7 @@ function ComputeSection({
       {error && (
         <div
           role="alert"
-          className="mt-2 rounded-md border border-status-failed/40 bg-status-failed/10 p-2 text-xs text-status-failed"
+          className={cn("mt-2", errorNoteCls)}
         >
           {error}
         </div>
@@ -718,7 +715,7 @@ function IncrementalUpstreamSection({
 
   return (
     <div className="mb-3 border-t border-border pt-3">
-      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+      <div className={sectionLabelCls}>
         Incremental upstream reads
       </div>
       <ul className="mb-2 space-y-1">
@@ -1538,7 +1535,7 @@ export function ConfigPanel({
         {destTab !== "live" && error && (
           <div
             role="alert"
-            className="mt-2.5 rounded-md border border-status-failed/40 bg-status-failed/10 p-2 text-xs text-status-failed"
+            className={cn("mt-2.5", errorNoteCls)}
           >
             {error}
           </div>
@@ -1568,7 +1565,7 @@ export function ConfigPanel({
         {isTransformNode && error && (
           <div
             role="alert"
-            className="rounded-md border border-status-failed/40 bg-status-failed/10 p-2 text-xs text-status-failed"
+            className={errorNoteCls}
           >
             {error}
           </div>

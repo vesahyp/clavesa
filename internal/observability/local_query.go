@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/vesahyp/clavesa/internal/runner"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -73,13 +72,15 @@ type dockerQueryRunner struct {
 }
 
 func newDockerQueryRunner(workspaceRoot string) *dockerQueryRunner {
-	image := runner.LocalImageName("") + ":latest"
 	name := ""
 	if m, _ := workspace.Load(workspaceRoot); m != nil {
-		image = runner.LocalImageName(m.Name) + ":latest"
 		name = m.Name
 	}
-	return &dockerQueryRunner{image: image, workspaceRoot: workspaceRoot, workspaceName: name}
+	return &dockerQueryRunner{
+		image:         workspace.LocalRunnerImageTag(workspaceRoot),
+		workspaceRoot: workspaceRoot,
+		workspaceName: name,
+	}
 }
 
 func (d *dockerQueryRunner) Run(ctx context.Context, warehouse, sql string) (*QueryRunnerResult, error) {
