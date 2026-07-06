@@ -488,7 +488,7 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	logPrefix := strings.TrimSuffix(prefix, "/") + "/_delta_log/"
 
 	fsys := s3fs.New(ctx, c.s3, bucket, logPrefix)
-	_, commits, err := delta.ReadCurrent(fsys)
+	st, err := delta.ReadTableState(fsys)
 	if err != nil {
 		if errors.Is(err, delta.ErrNotDelta) {
 			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
@@ -496,9 +496,9 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		return nil, fmt.Errorf("read delta log: %w", err)
 	}
 
-	// Projection (incl. the LatestRecordCount fold) is shared with
+	// Projection (incl. the LatestRecordCount derivation) is shared with
 	// LocalProvider.Snapshots so local and cloud agree (ADR-014).
-	return snapshotsResultFromCommits(commits, q.Limit), nil
+	return snapshotsResultFromCommits(st.Commits, q.Limit, st.RowCount), nil
 }
 
 // errTableNotFound is the sentinel tableS3Location returns when Glue's
@@ -782,11 +782,13 @@ func (c *CloudProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 	}
 	dataRows, truncated, rs, err := c.runAthenaSelect(ctx, q.SQL, maxRows)
 	if err != nil {
-		if isAthenaMissingTableErr(err) {
+		if !q.StrictMissing && isAthenaMissingTableErr(err) {
 			// Dashboards widget against a workspace that's been deployed
 			// but never run — system Delta tables don't exist yet.
 			// Surface as an empty result so the widget renders cleanly
-			// instead of 500-ing the whole dashboard.
+			// instead of 500-ing the whole dashboard. StrictMissing opts
+			// out (interactive query / render smoke test) so a missing
+			// table surfaces as an error, matching the local provider.
 			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedAthenaCloud()}, nil
 		}
 		return nil, err
@@ -845,16 +847,16 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 		return nil, fmt.Errorf("execution ref is required")
 	}
 
-	// The ExecutionRef arrives in one of two on-the-wire shapes (FormatExecRef):
-	// a full SFN execution ARN (real cloud run), or a "dir:runID" composite for
-	// a non-ARN run id — a cloud-local run (ADR-024) carries `dir:local-…`. The
-	// warehouse progress tree is keyed by the run id ALONE (the dir is a local
-	// addressing detail, irrelevant to the cloud bucket), so extract it; an ARN
-	// is self-contained and used as-is.
+	// The ExecutionRef arrives in one of the exec-ref shapes (execref.go): a
+	// full SFN execution ARN (real cloud run), a "local:<dir>#<runID>"
+	// composite, or a bare run id — a cloud-local run (ADR-024) carries
+	// `local-<uuid>`. The warehouse progress tree is keyed by the run id
+	// ALONE (the dir is a local addressing detail, irrelevant to the cloud
+	// bucket), so extract it; an ARN is self-contained and used as-is.
 	isARN := StateMachineNameFromExecutionARN(q.ExecutionRef) != ""
 	runID := q.ExecutionRef
 	if !isARN {
-		if _, rid := splitExecRef(q.ExecutionRef); rid != "" {
+		if _, rid := SplitExecRef(q.ExecutionRef); rid != "" {
 			runID = rid
 		}
 	}
@@ -934,7 +936,9 @@ func (c *CloudProvider) progressStore() ProgressStore {
 // projects its failure context. Found=false when no marker exists (a
 // fully-cloud SFN run carries its failure context in SFN history, not a run
 // marker; cloud-local runs do write the marker). Backs the
-// GET /pipeline/execution detail endpoint.
+// GET /pipeline/execution detail endpoint for non-ARN exec refs — the
+// handler routes any ref that isn't an SFN execution ARN (e.g. a cloud-local
+// `local-<uuid>`) here instead of DescribeExecution (GH #65).
 func (c *CloudProvider) RunDetail(ctx context.Context, run string) (RunDetail, error) {
 	store := c.progressStore()
 	if store == nil {
@@ -954,6 +958,17 @@ func (c *CloudProvider) RunDetail(ctx context.Context, run string) (RunDetail, e
 		ErrorMsg:   m.ErrorMsg,
 		Found:      true,
 	}, nil
+}
+
+// ProgressRuns lists the S3 warehouse's `_progress/<run>/_run.json` run
+// markers for one pipeline, newest-first. Only cloud-local runs (ADR-024
+// `--compute local` against a cloud warehouse) write the run-level marker —
+// fully-cloud SFN runs get their rollup from SFN / the runs table — so this
+// listing is exactly the cloud-local complement GET /pipeline/status merges
+// into the SFN execution list (GH #65). Best-effort: an unwired store (no
+// S3 client, undeployed workspace) returns empty with nil error.
+func (c *CloudProvider) ProgressRuns(ctx context.Context, pipeline string, limit int) ([]Run, error) {
+	return progressRuns(ctx, c.progressStore(), pipeline, limit)
 }
 
 // progressSnapshot is the JSON the runner writes to

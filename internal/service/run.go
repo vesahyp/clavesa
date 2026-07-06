@@ -1037,12 +1037,12 @@ func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string
 }
 
 // runTransform writes the node's logic to disk, builds the docker-run argv,
-// pipes the event JSON via stdin, and waits for completion. logPath, when
-// non-empty, receives a copy of stdout+stderr so the local progress channel
-// can surface per-node logs to the UI (mirrors CloudWatch in cloud). On
-// failure the returned error's last line names the durable full log — the
-// teed logPath file when it exists, else a failure log written under the
-// run-log dir (see transformFailureLogRef).
+// pipes the event JSON via stdin, and waits for completion. On failure the
+// returned error's last line names the durable full log — the buffered
+// stdout+stderr written to the run-log dir at failure time (GH #82, see
+// transformFailureLogRef). Pipeline runs go through runPipelineBundle (which
+// tees the whole run to `_bundle.log`); this single-node path serves
+// backfill replays.
 //
 // outputTarget is passed straight through to the runner as `outputs.default`.
 // An empty string triggers auto-Iceberg-table mode (the runner generates
@@ -1068,7 +1068,7 @@ func upstreamOutput(g *graph.PipelineGraph, nodeID string, outputPath map[string
 // is the seam BackfillStage uses to thread its `_backfill` block (and to
 // override `_trigger` from "manual" to "backfill"/"backfill-direct") without
 // `pipeline run --env local` having to know anything about backfill.
-func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, logPath, pipelineRunID, catalog, schema, systemCatalog string, extraEvent map[string]any) (string, *int64, error) {
+func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir string, node *graph.Node, inputs map[string]any, outputTarget, pipelineRunID, catalog, schema, systemCatalog string, extraEvent map[string]any) (string, *int64, error) {
 	language, _ := node.Config["language"].(string)
 	if language == "" {
 		language = "sql"
@@ -1236,52 +1236,16 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(eventJSON)
 	var stdout, stderr bytes.Buffer
-	// Tee to the per-node log file when requested. The runner's JSON result
-	// is the last stdout line; multiwriter doesn't reorder bytes so the JSON
-	// parse below still works against the in-memory buffer.
-	var stdoutWriters []io.Writer = []io.Writer{&stdout}
-	var stderrWriters []io.Writer = []io.Writer{&stderr}
-	var logFile *os.File
-	var logTS io.WriteCloser
-	if logPath != "" {
-		if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err == nil {
-			f, ferr := os.Create(logPath)
-			if ferr == nil {
-				logFile = f
-				// Wrap once so stdout and stderr lines share a single
-				// timestamping writer with line buffering — interleaved
-				// writes are split at newline boundaries and each
-				// completed line gets its own ISO timestamp at write
-				// time. ExecutionLogs splits the prefix back off when
-				// reading so the response carries real per-line
-				// timestamps (ADR-014 parity with cloud's CloudWatch).
-				logTS = observability.NewTimestampedLogWriter(f)
-				stdoutWriters = append(stdoutWriters, logTS)
-				stderrWriters = append(stderrWriters, logTS)
-			}
-		}
-	}
-	cmd.Stdout = io.MultiWriter(stdoutWriters...)
-	cmd.Stderr = io.MultiWriter(stderrWriters...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	runErr := cmd.Run()
-	if logTS != nil {
-		_ = logTS.Close()
-	}
-	if logFile != nil {
-		_ = logFile.Close()
-	}
 	// On any failure below, point the error at a durable full log: the
-	// per-node file the run teed into when it exists, else write the
-	// buffered stdout+stderr to the run-log location now (the backfill
-	// path passes logPath="" — previously nothing landed on disk at all).
-	// Inline stderr/stdout stay bounded; the file carries the rest.
-	teedLogPath := ""
-	if logFile != nil {
-		teedLogPath = logPath
-	}
+	// buffered stdout+stderr written to the run-log location at failure
+	// time (GH #82). Inline stderr/stdout stay bounded; the file carries
+	// the rest.
 	failureLogRef := func() string {
-		return transformFailureLogRef(pipelineDir, pipelineRunID, node.ID, teedLogPath, s.workspace, stdout.Bytes(), stderr.Bytes())
+		return transformFailureLogRef(pipelineDir, pipelineRunID, node.ID, s.workspace, stdout.Bytes(), stderr.Bytes())
 	}
 	if runErr != nil {
 		return "", nil, s.withDerbyHint(fmt.Errorf("docker run: %w\nstderr: %s\n%s", runErr, boundedStderrTail(stderr.String()), failureLogRef()), stderr.String())
@@ -1488,28 +1452,35 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	// Per-run log file under the pipeline's run dir. The runner no longer
-	// emits per-node `_event` progress lines (it writes per-node `<node>.json`
-	// markers into the warehouse `_progress` tree directly); the only stdout
-	// JSON is the final aggregate response. Route all other stdout AND all
-	// stderr into a pipeline-level log so Spark output (and the real stack
-	// trace when the session dies) is recoverable for debugging. Created
-	// before cmd.Stderr so stderr can be teed into it. Creation can't fail
-	// silently: when the run dir is unusable, createRunnerLogFile falls back
-	// to a temp file (workspace .clavesa dir, then the system temp dir) so
-	// the full Spark output always lands somewhere the failure returns below
-	// can point at. bundleLogPath tracks the path actually used.
-	bundleLogPath := filepath.Join(pipelineDir, ".clavesa", "runs", runID, "_bundle.log")
+	// Per-run log file under the pipeline's run dir — the file
+	// LocalProvider.ExecutionLogs serves as the run's Logs surface (GH #64).
+	// The runner no longer emits per-node `_event` progress lines (it writes
+	// per-node `<node>.json` markers into the warehouse `_progress` tree
+	// directly); the only stdout JSON is the final aggregate response. Route
+	// all other stdout AND all stderr into this pipeline-level log so Spark
+	// output (and the real stack trace when the session dies) is recoverable
+	// for debugging. Created before cmd.Stderr so stderr can be teed into
+	// it. Creation can't fail silently: when the run dir is unusable,
+	// createRunnerLogFile falls back to a temp file (workspace .clavesa dir,
+	// then the system temp dir) so the full Spark output always lands
+	// somewhere the failure returns below can point at. bundleLogPath tracks
+	// the path actually used.
+	bundleLogPath := observability.RunBundleLogPath(pipelineDir, runID)
 	bundleLog, bundleLogPath, bundleLogErr := createRunnerLogFile(bundleLogPath, s.workspace, "clavesa-bundle-"+sanitizeLogToken(runID)+"-*.log")
-	if bundleLog != nil {
-		defer bundleLog.Close()
-	}
 
 	// Keep a bounded in-memory copy for the inline error tail; tee the full
-	// stream to the bundle log so the Spark stack trace isn't swallowed.
+	// stream to the bundle log so the Spark stack trace isn't swallowed. The
+	// log writes go through one shared timestamping writer (line-buffered,
+	// concurrency-safe) so every captured line carries the wall-clock moment
+	// it was emitted — ExecutionLogs strips the prefix back off and the UI's
+	// Logs drawer shows real per-line timestamps (ADR-014 parity with
+	// cloud's CloudWatch payload).
 	var stderrBuf bytes.Buffer
+	var bundleTS io.WriteCloser
 	if bundleLog != nil {
-		cmd.Stderr = io.MultiWriter(&stderrBuf, bundleLog)
+		defer bundleLog.Close()
+		bundleTS = observability.NewTimestampedLogWriter(bundleLog)
+		cmd.Stderr = io.MultiWriter(&stderrBuf, bundleTS)
 	} else {
 		cmd.Stderr = &stderrBuf
 	}
@@ -1526,8 +1497,8 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		var msg map[string]any
 		if json.Unmarshal(line, &msg) != nil {
 			// Non-JSON: Spark log noise. Tee to the per-bundle log.
-			if bundleLog != nil {
-				fmt.Fprintln(bundleLog, scanner.Text())
+			if bundleTS != nil {
+				fmt.Fprintln(bundleTS, scanner.Text())
 			}
 			continue
 		}
@@ -1538,6 +1509,11 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		finalResp = msg
 	}
 	waitErr := cmd.Wait()
+	if bundleTS != nil {
+		// Flush any partial trailing line so the log is complete before the
+		// failure returns below point a reader at it.
+		_ = bundleTS.Close()
+	}
 
 	// Per-transform statuses come from the runner's aggregate `transforms`
 	// array (the runner is the source of per-node truth now). Materialize in

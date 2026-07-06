@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,18 +48,20 @@ module "xform" {
 	}
 }
 
-// writeRunFixture seeds one run's per-node log file under
-// <pipelineDir>/.clavesa/runs/<runID>/logs/ — the surface ExecutionLogs reads.
+// writeRunFixture seeds one run's `_bundle.log` under
+// <pipelineDir>/.clavesa/runs/<runID>/ — the file ExecutionLogs serves
+// (GH #64; the production writer is service.runPipelineBundle's tee).
 // Per-run state moved to the warehouse `_progress/<run>/_run.json` marker
-// (ADR-024); only logs remain in the per-pipeline runs dir.
+// (ADR-024); only the captured runner output remains in the per-pipeline
+// runs dir.
 func writeRunFixture(t *testing.T, pipelineDir, runID string) {
 	t.Helper()
-	logPath := observability.RunLogPath(pipelineDir, runID, "xform")
+	logPath := observability.RunBundleLogPath(pipelineDir, runID)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		t.Fatalf("mkdir log dir: %v", err)
+		t.Fatalf("mkdir run dir: %v", err)
 	}
 	if err := os.WriteFile(logPath, []byte("starting xform\nselected 1 row\n"), 0o644); err != nil {
-		t.Fatalf("write log: %v", err)
+		t.Fatalf("write bundle log: %v", err)
 	}
 }
 
@@ -163,8 +166,213 @@ func TestExecutionLogsDispatchToLocal(t *testing.T) {
 	if len(res.Events) != 2 {
 		t.Errorf("len(Events) = %d, want 2", len(res.Events))
 	}
-	if res.FunctionName != "xform" {
-		t.Errorf("FunctionName = %q, want xform", res.FunctionName)
+	// Local logs are the per-run bundle log, labeled per-run (GH #64).
+	if res.FunctionName != "run-xyz" {
+		t.Errorf("FunctionName = %q, want run-xyz (per-run labeling)", res.FunctionName)
+	}
+}
+
+// TestExecutionLogsAcceptsExecRefViaArn — the states/logs endpoints accept
+// the same `local:<dir>#<runID>` token /pipeline/status mints (GH #78: one
+// encoding, both halves of the flow can exchange refs).
+func TestExecutionLogsAcceptsExecRefViaArn(t *testing.T) {
+	workspace := t.TempDir()
+	pipelineDir := filepath.Join(workspace, "demo")
+	if err := os.MkdirAll(pipelineDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeLocalPipeline(t, pipelineDir)
+	writeRunFixture(t, pipelineDir, "run-xyz")
+
+	resolver := observability.NewResolver(
+		workspace,
+		nil,
+		observability.NewLocalProvider(workspace),
+	)
+	h := pipelinestatus.NewHandler(workspace).WithResolver(resolver)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	q := url.Values{}
+	q.Set("arn", observability.FormatExecRef("demo", "run-xyz"))
+	q.Set("step", "xform")
+	req := httptest.NewRequest(http.MethodGet, "/pipeline/execution/logs?"+q.Encode(), nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var res observability.ExecutionLogsResult
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(res.Events) != 2 {
+		t.Errorf("len(Events) = %d, want 2 — arn=<exec ref> did not route to the local provider", len(res.Events))
+	}
+}
+
+// TestExecutionStatesAcceptsExecRefViaArn mirrors the logs test for the
+// states endpoint: a `local:<dir>#<runID>` arn value routes through the
+// resolver instead of the SFN path.
+func TestExecutionStatesAcceptsExecRefViaArn(t *testing.T) {
+	workspace := t.TempDir()
+	pipelineDir := filepath.Join(workspace, "demo")
+	if err := os.MkdirAll(pipelineDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeLocalPipeline(t, pipelineDir)
+	writeProgressFixture(t, workspace, "run-xyz", "demo")
+
+	resolver := observability.NewResolver(
+		workspace,
+		nil,
+		observability.NewLocalProvider(workspace),
+	)
+	h := pipelinestatus.NewHandler(workspace).WithResolver(resolver)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	q := url.Values{}
+	q.Set("arn", observability.FormatExecRef("demo", "run-xyz"))
+	req := httptest.NewRequest(http.MethodGet, "/pipeline/execution/states?"+q.Encode(), nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var res observability.ExecutionStatesResult
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := res.States["xform"].Status; got != "RUNNING" {
+		t.Errorf("xform status = %q, want RUNNING — arn=<exec ref> did not route to the local provider", got)
+	}
+}
+
+// TestExecutionDetailLocalExecRef — GET /pipeline/execution with the
+// `local:<dir>#<runID>` token /pipeline/status mints reads the run's
+// `_run.json` failure context through the provider's RunDetail.
+func TestExecutionDetailLocalExecRef(t *testing.T) {
+	workspace := t.TempDir()
+	pipelineDir := filepath.Join(workspace, "demo")
+	if err := os.MkdirAll(pipelineDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeLocalPipeline(t, pipelineDir)
+	store := observability.NewFileProgressStore(filepath.Join(workspace, ".clavesa", "warehouse"))
+	if err := observability.WriteRunMarker(context.Background(), store, "run-xyz", observability.RunMarker{
+		Status: "FAILED", Pipeline: "demo", FailedStep: "xform",
+		ErrorClass: "Boom", ErrorMsg: "kaboom",
+	}); err != nil {
+		t.Fatalf("WriteRunMarker: %v", err)
+	}
+
+	resolver := observability.NewResolver(
+		workspace,
+		nil,
+		observability.NewLocalProvider(workspace),
+	)
+	h := pipelinestatus.NewHandler(workspace).WithResolver(resolver)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	q := url.Values{}
+	q.Set("arn", observability.FormatExecRef(pipelineDir, "run-xyz"))
+	req := httptest.NewRequest(http.MethodGet, "/pipeline/execution?"+q.Encode(), nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var res struct {
+		Status     string `json:"status"`
+		FailedStep string `json:"failed_step"`
+		StepCause  string `json:"step_cause"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if res.Status != "FAILED" || res.FailedStep != "xform" || res.StepCause != "kaboom" {
+		t.Errorf("detail = %+v, want the run marker's failure context", res)
+	}
+}
+
+// TestExecutionDetailBareRunID — GH #65: a bare non-ARN run id (the ADR-024
+// cloud-local `local-<uuid>` shape) must route to the provider's RunDetail,
+// never into the SFN DescribeExecution path. On a local warehouse the
+// workspace-level local provider serves it from the `_run.json` marker.
+func TestExecutionDetailBareRunID(t *testing.T) {
+	workspace := t.TempDir()
+	store := observability.NewFileProgressStore(filepath.Join(workspace, ".clavesa", "warehouse"))
+	if err := observability.WriteRunMarker(context.Background(), store, "local-abc123", observability.RunMarker{
+		Status: "SUCCEEDED", Pipeline: "demo",
+	}); err != nil {
+		t.Fatalf("WriteRunMarker: %v", err)
+	}
+
+	resolver := observability.NewResolver(
+		workspace,
+		nil,
+		observability.NewLocalProvider(workspace),
+	)
+	h := pipelinestatus.NewHandler(workspace).WithResolver(resolver)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	q := url.Values{}
+	q.Set("arn", "local-abc123")
+	req := httptest.NewRequest(http.MethodGet, "/pipeline/execution?"+q.Encode(), nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var res struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if res.Status != "SUCCEEDED" {
+		t.Errorf("status = %q, want SUCCEEDED from the run marker", res.Status)
+	}
+}
+
+// TestExecutionDetailBareRunIDRoutesCloudOnCloudWarehouse — same bare
+// `local-<uuid>` ref on a CLOUD warehouse must dispatch to the cloud
+// provider's RunDetail (which reads the S3 `_run.json`), not fall into the
+// SFN decode path. With a nil cloud provider the request surfaces the
+// cloud-unavailable error — the proof it routed via the resolver, not SFN.
+func TestExecutionDetailBareRunIDRoutesCloudOnCloudWarehouse(t *testing.T) {
+	workspace := t.TempDir()
+	if err := workspaceWriteCloud(t, workspace); err != nil {
+		t.Fatalf("write cloud warehouse: %v", err)
+	}
+
+	resolver := observability.NewResolver(
+		workspace,
+		nil, // no cloud provider wired
+		observability.NewLocalProvider(workspace),
+	)
+	h := pipelinestatus.NewHandler(workspace).WithResolver(resolver)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	q := url.Values{}
+	q.Set("arn", "local-abc123")
+	req := httptest.NewRequest(http.MethodGet, "/pipeline/execution?"+q.Encode(), nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (cloud provider unavailable → resolver path), got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cloud provider unavailable") {
+		t.Errorf("error should surface the resolver's cloud-unavailable message, got: %s", w.Body.String())
 	}
 }
 

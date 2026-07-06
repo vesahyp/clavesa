@@ -258,17 +258,11 @@ export function PipelineDashboard() {
     [graph, lineage.data],
   );
 
-  // Live status overlay. For local pipelines we don't have an SFN ARN —
-  // dispatch by `dir` and let LocalProvider read the filesystem progress
-  // channel (ADR-014). Cloud pipelines keep the legacy ARN path so the SFN
-  // history continues to back the polling.
-  const isLocal = pipelineMeta?.compute === "local";
-  // The workspace warehouse is the right gate for "is this user running
-  // cloud stuff right now?" decisions (Recent executions, Backfills).
-  // `isLocal` above is per-pipeline and tells us which runner channel to
-  // poll — distinct concept; don't conflate the two. A workspace on the
-  // local warehouse shouldn't nag about cloud deployments even for
-  // pipelines that haven't declared `compute = "local"`.
+  // The workspace warehouse (ADR-024) gates every local-vs-cloud decision
+  // here: which channel the live-status poll reads, how the node drawer
+  // addresses execution logs, and whether to nag about cloud deployments
+  // (Recent executions, Backfills). The per-pipeline `compute` attr is a
+  // deploy target only — it never steers observability addressing.
   const wh = useWarehouse();
   const isLocalWarehouse = wh.data?.warehouse === "local";
   // A pipeline with zero nodes has no compute target, no warehouse, no
@@ -287,14 +281,13 @@ export function PipelineDashboard() {
     if (running) return running.execution_arn;
     return execs[0]?.execution_arn ?? "";
   }, [status.data, isLocalWarehouse]);
-  // Live-states dispatch follows the workspace env mode, not the per-
-  // pipeline `compute` attr. The local channel (state.json) is written
-  // by `clavesa pipeline run` regardless of whether the pipeline
-  // declares compute = "local", so a workspace in local env always has
-  // a valid filesystem source to poll. Conflating the two surfaces the
-  // same kind of bug the cloud-nag fix already had: a pipeline that
-  // doesn't declare compute silently falls into the cloud path and
-  // never sees its live state.
+  // Live-states dispatch follows the workspace warehouse, not the per-
+  // pipeline `compute` attr. The local `_progress` marker tree is written
+  // by `clavesa pipeline run` regardless of what compute the transforms
+  // declare, so a local-warehouse workspace always has a valid filesystem
+  // source to poll. Conflating the two surfaces the same kind of bug the
+  // cloud-nag fix already had: a pipeline that doesn't declare compute
+  // silently falls into the cloud path and never sees its live state.
   const states = useExecutionStates(
     isLocalWarehouse ? { dir: queryDir } : { arn: trackedExecutionArn },
   );
@@ -799,7 +792,7 @@ export function PipelineDashboard() {
                     nodeInfo={nodeInfo}
                     nodeSpecs={nodeSpecs}
                     liveStates={nodeStatuses}
-                    isLocal={isLocal}
+                    isLocal={isLocalWarehouse}
                     dir={dir}
                     pipelineName={pipelineName}
                     onRunSelect={openRunDetail}
@@ -1431,18 +1424,15 @@ interface RunPipelineButtonProps {
 }
 
 /**
- * Triggers POST /pipeline/run, which backend-routes by compute attr:
- *   - local pipelines block until service.RunPipeline returns (~30-60s for
- *     a single-node pipeline against the warm Spark worker we boot at UI
- *     start; cold Spark in a freshly-started session adds ~15s once).
- *   - cloud pipelines start an SFN execution and return immediately with
- *     execution_arn; observability polling picks the run up from there.
- *
- * Local long-blocking is fine for one user / one pipeline; the spinner +
- * disabled state are the entire UX while it runs. If we ever want
- * streaming progress on local runs the filesystem progress channel under
- * .clavesa/runs/<id>/ is already there — wire to the same polling
- * surface the cloud-side already uses.
+ * Triggers POST /pipeline/run, which backend-routes by the workspace
+ * warehouse (ADR-024):
+ *   - local warehouse: service.RunPipeline dispatches asynchronously and
+ *     returns a run_id; the dashboard polls the warehouse `_progress`
+ *     marker tree for live per-node state.
+ *   - cloud warehouse: starts an SFN execution and returns immediately
+ *     with execution_arn (or, with compute="local", runs the bundle in
+ *     local docker and returns a `local-<uuid>` run_id); observability
+ *     polling picks the run up from there.
  */
 function RunPipelineButton({ dir, disabled, cloudWarehouse, onRunSucceeded }: RunPipelineButtonProps) {
   // runningKind is which placement is mid-flight (null = idle), so the

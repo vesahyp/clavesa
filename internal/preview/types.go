@@ -1,5 +1,7 @@
-// Package preview implements the DATA-PREVIEW API: HTTP endpoints for browsing
-// source data items and executing SQL transforms locally via DuckDB.
+// Package preview implements the DATA-PREVIEW API: HTTP endpoints for
+// browsing source data items and executing SQL/PySpark transforms through
+// the PySpark runner container (ADR-012 — one engine; preview.RunPreview
+// shells out to the same image production runs use).
 package preview
 
 import (

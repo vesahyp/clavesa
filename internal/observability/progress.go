@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -261,6 +262,74 @@ func isMissingKeyErr(err error) bool {
 	}
 	s := err.Error()
 	return strings.Contains(s, "NoSuchKey") || strings.Contains(s, "NotFound") || strings.Contains(s, "status code: 404")
+}
+
+// progressRuns projects the `_progress/<run>/_run.json` run markers under
+// store into Run rows for one pipeline, newest-first by the marker's
+// started_ms (markers without one sort last). Backend-blind — the cloud
+// provider's ProgressRuns drives it against the S3 store so the status
+// listing can include cloud-local runs (GH #65). A nil store returns empty
+// with nil error. Per-marker read/parse failures skip that run rather than
+// failing the listing.
+func progressRuns(ctx context.Context, store ProgressStore, pipeline string, limit int) ([]Run, error) {
+	if store == nil {
+		return nil, nil
+	}
+	keys, err := store.ListKeys(ctx, "_progress/")
+	if err != nil {
+		return nil, err
+	}
+	type row struct {
+		run       Run
+		startedMs int64
+	}
+	rows := make([]row, 0, 8)
+	for _, key := range keys {
+		rest, ok := strings.CutPrefix(key, "_progress/")
+		if !ok {
+			continue
+		}
+		rid, ok := strings.CutSuffix(rest, "/_run.json")
+		if !ok || rid == "" || strings.Contains(rid, "/") {
+			continue
+		}
+		m, ok, _ := readRunMarker(ctx, store, rid)
+		if !ok || m == nil {
+			continue
+		}
+		if pipeline != "" && m.Pipeline != pipeline {
+			continue
+		}
+		started := int64(0)
+		if m.StartedMs != nil {
+			started = *m.StartedMs
+		}
+		rows = append(rows, row{
+			run: Run{
+				RunID:          rid,
+				Pipeline:       m.Pipeline,
+				SfExecutionARN: rid,
+				Status:         m.Status,
+				Trigger:        m.Trigger,
+				StartedAt:      millisToISO(m.StartedMs),
+				EndedAt:        millisToISO(m.EndedMs),
+				DurationMs:     durationMs(m.StartedMs, m.EndedMs),
+				FailedStep:     m.FailedStep,
+				ErrorClass:     m.ErrorClass,
+				ErrorMsg:       m.ErrorMsg,
+			},
+			startedMs: started,
+		})
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].startedMs > rows[j].startedMs })
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	out := make([]Run, len(rows))
+	for i, r := range rows {
+		out[i] = r.run
+	}
+	return out, nil
 }
 
 // progressStates reads the per-node `_progress/<run>/<node>.json` markers

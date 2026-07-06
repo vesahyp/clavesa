@@ -21,9 +21,12 @@ func TestSnapshotsResultLatestRecordCountFold(t *testing.T) {
 		// v0: overwrite establishing 100 rows.
 		{Version: 0, Operation: "CREATE OR REPLACE TABLE AS SELECT", AddedRecords: i64(100), Replaces: true},
 	}
-	res := snapshotsResultFromCommits(commits, 0)
+	res := snapshotsResultFromCommits(commits, 0, nil)
 	if res.LatestRecordCount == nil || *res.LatestRecordCount != 111 {
 		t.Fatalf("LatestRecordCount = %v, want 111", res.LatestRecordCount)
+	}
+	if res.LatestRecordCountApproximate {
+		t.Error("Approximate = true, want false (window anchors at version 0)")
 	}
 	if res.Total != 3 {
 		t.Errorf("Total = %d, want 3", res.Total)
@@ -33,12 +36,73 @@ func TestSnapshotsResultLatestRecordCountFold(t *testing.T) {
 	}
 }
 
+// TestSnapshotsResultAuthoritativeRowCountWins: the row count delta derives
+// from snapshot state (checkpoint stats + replay) beats both the fold and
+// the writer-stamped TotalRecords — it is the GH #66 fix and stays exact
+// regardless of window truncation.
+func TestSnapshotsResultAuthoritativeRowCountWins(t *testing.T) {
+	commits := []delta.Commit{
+		// Fold would say 43; writer stamp says 42; snapshot state says 5000.
+		{Version: 1, Operation: "WRITE", AddedRecords: i64(1), TotalRecords: i64(42)},
+		{Version: 0, Operation: "WRITE", AddedRecords: i64(42), Replaces: true},
+	}
+	res := snapshotsResultFromCommits(commits, 0, i64(5000))
+	if res.LatestRecordCount == nil || *res.LatestRecordCount != 5000 {
+		t.Fatalf("LatestRecordCount = %v, want 5000 (authoritative row count wins)", res.LatestRecordCount)
+	}
+	if res.LatestRecordCountApproximate {
+		t.Error("Approximate = true, want false for the authoritative count")
+	}
+}
+
+// TestSnapshotsResultFoldApproximateWhenUnanchored: a MERGE/append table
+// whose surviving window starts mid-history (no version 0, no Replaces)
+// folds from an arbitrary zero — the value must be flagged approximate,
+// and Total must still report the true lifetime commit count derived from
+// the newest version (GH #66).
+func TestSnapshotsResultFoldApproximateWhenUnanchored(t *testing.T) {
+	commits := []delta.Commit{
+		{Version: 250, Operation: "MERGE", AddedRecords: i64(5), UpdatedRecords: i64(3)},
+		{Version: 249, Operation: "WRITE", AddedRecords: i64(10)},
+	}
+	res := snapshotsResultFromCommits(commits, 0, nil)
+	if res.LatestRecordCount == nil || *res.LatestRecordCount != 12 {
+		t.Fatalf("LatestRecordCount = %v, want 12 (fold over the visible window)", res.LatestRecordCount)
+	}
+	if !res.LatestRecordCountApproximate {
+		t.Error("Approximate = false, want true (window starts mid-history)")
+	}
+	if res.Total != 251 {
+		t.Errorf("Total = %d, want 251 (newest version 250 + 1)", res.Total)
+	}
+}
+
+// TestSnapshotsResultFoldExactWhenReplacesInWindow: an overwrite inside the
+// window resets the fold to a known-complete state, so the fold is exact
+// even though the window doesn't reach version 0.
+func TestSnapshotsResultFoldExactWhenReplacesInWindow(t *testing.T) {
+	commits := []delta.Commit{
+		{Version: 301, Operation: "WRITE", AddedRecords: i64(2)},
+		{Version: 300, Operation: "WRITE", AddedRecords: i64(7), Replaces: true},
+	}
+	res := snapshotsResultFromCommits(commits, 0, nil)
+	if res.LatestRecordCount == nil || *res.LatestRecordCount != 9 {
+		t.Fatalf("LatestRecordCount = %v, want 9", res.LatestRecordCount)
+	}
+	if res.LatestRecordCountApproximate {
+		t.Error("Approximate = true, want false (Replaces anchors the fold)")
+	}
+	if res.Total != 302 {
+		t.Errorf("Total = %d, want 302", res.Total)
+	}
+}
+
 func TestSnapshotsResultReplacesResetsRunningSum(t *testing.T) {
 	commits := []delta.Commit{
 		{Version: 1, Operation: "WRITE", AddedRecords: i64(7), Replaces: true},
 		{Version: 0, Operation: "WRITE", AddedRecords: i64(1000)},
 	}
-	res := snapshotsResultFromCommits(commits, 0)
+	res := snapshotsResultFromCommits(commits, 0, nil)
 	if res.LatestRecordCount == nil || *res.LatestRecordCount != 7 {
 		t.Fatalf("LatestRecordCount = %v, want 7 (Replaces resets the sum)", res.LatestRecordCount)
 	}
@@ -51,7 +115,7 @@ func TestSnapshotsResultNegativeSumClampsToZero(t *testing.T) {
 		{Version: 1, Operation: "DELETE", DeletedRecords: i64(50)},
 		{Version: 0, Operation: "WRITE", AddedRecords: i64(10)},
 	}
-	res := snapshotsResultFromCommits(commits, 0)
+	res := snapshotsResultFromCommits(commits, 0, nil)
 	if res.LatestRecordCount == nil || *res.LatestRecordCount != 0 {
 		t.Fatalf("LatestRecordCount = %v, want 0 (clamped)", res.LatestRecordCount)
 	}
@@ -62,14 +126,14 @@ func TestSnapshotsResultPrefersNewestTotalRecords(t *testing.T) {
 		{Version: 1, Operation: "WRITE", AddedRecords: i64(1), TotalRecords: i64(42)},
 		{Version: 0, Operation: "WRITE", AddedRecords: i64(1)},
 	}
-	res := snapshotsResultFromCommits(commits, 0)
+	res := snapshotsResultFromCommits(commits, 0, nil)
 	if res.LatestRecordCount == nil || *res.LatestRecordCount != 42 {
 		t.Fatalf("LatestRecordCount = %v, want 42 (newest commit's TotalRecords wins over the fold)", res.LatestRecordCount)
 	}
 }
 
 func TestSnapshotsResultEmptyCommits(t *testing.T) {
-	res := snapshotsResultFromCommits(nil, 0)
+	res := snapshotsResultFromCommits(nil, 0, nil)
 	if res.LatestRecordCount != nil {
 		t.Errorf("LatestRecordCount = %v, want nil for empty history", res.LatestRecordCount)
 	}
@@ -85,7 +149,7 @@ func TestSnapshotsResultLimitTruncationAndProjection(t *testing.T) {
 		{Version: 1, TimestampMs: 1700000001000, Operation: "WRITE", AddedRecords: i64(2)},
 		{Version: 0, TimestampMs: 1700000000000, Operation: "WRITE", AddedRecords: i64(3), Replaces: true},
 	}
-	res := snapshotsResultFromCommits(commits, 2)
+	res := snapshotsResultFromCommits(commits, 2, nil)
 	if len(res.Snapshots) != 2 {
 		t.Fatalf("len(Snapshots) = %d, want 2", len(res.Snapshots))
 	}

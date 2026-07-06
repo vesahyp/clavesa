@@ -29,5 +29,6 @@ __pycache__/
 # Local gate stamps (written by scripts/green-stamp.sh, read by release-check)
 .test-green.json
 .verify-readme-green.json
+.verify-cookbook-green.json
 # Per-gate logs from make release-gates
 .gates/

@@ -12,6 +12,18 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.16.0] — 2026-07-06
+
+### Fixed
+
+- Catalog row counts for MERGE/append tables with long histories are now exact: derived from Delta snapshot state (checkpoint stats + commit replay) instead of summing per-commit deltas over a 200-commit window; when stats are unavailable the fallback estimate is marked with `~`, and the commit count reports the table's lifetime total (GH #66).
+- The Logs drawer for local runs shows the run's captured runner output again (the per-run bundle log, with per-line timestamps) instead of always coming up empty (GH #64).
+- Cloud-local runs (`--compute local` on a cloud warehouse) now appear in the pipeline dashboard's Recent executions list, and opening their run detail reads the run's failure context instead of erroring (GH #65).
+- Local execution references use one encoding across `/pipeline/status` and the execution detail/states/logs endpoints, so a ref from the status listing is accepted everywhere (the old `<dir>:<runID>` form still decodes) (GH #78).
+- Local-warehouse backfill `list` and `diff` work again: the staging-table scan, on-disk path resolution, and schema reads now follow the current Delta (`_delta_log`) and ADR-019 nested warehouse layout instead of the retired Iceberg/flat layout, so `pipeline backfill list`/`diff` no longer come up empty or fail with "malformed staging table id" (GH #68).
+- Partitioned S3 sources work against a custom S3 endpoint (moto/MinIO/LocalStack) in local runs: the runner's boto3 clients now honor `CLAVESA_S3_ENDPOINT` (previously only Spark's S3A did, so partition discovery hit real AWS and failed). No effect in cloud, where the endpoint override is unset (GH #87).
+- `clavesa query` (and the UI's ad-hoc query panel) against a nonexistent table now errors instead of silently returning zero rows with a success exit — so it's safe as a script check. `dashboards render` likewise exits non-zero when a widget's query fails. Dashboard-live views and catalog surfaces over a not-yet-materialized table still render empty rather than erroring.
+
 ## [v2.15.0] — 2026-07-04
 
 ### Fixed

@@ -29,8 +29,8 @@ import {
   useExecutionStates,
   useLineage,
   useNodeRuns,
-  usePipelines,
   useRuns,
+  useWarehouse,
 } from "@/lib/queries";
 import type { NodeRun, Run } from "@/lib/queries";
 import { formatDuration, formatRelative, formatRowCount } from "@/lib/format";
@@ -52,10 +52,13 @@ export interface RunDetailViewProps {
 export function RunDetailView({ dir, runId }: RunDetailViewProps) {
   const pipelineName = dir.split("/").pop() ?? dir;
 
-  // Local vs cloud — controls how StepLogs addresses CloudWatch / runner
-  // log files in the drawer it opens.
-  const pipelines = usePipelines();
-  const isLocal = pipelines.data?.find((p) => p.dir === dir)?.compute === "local";
+  // Local vs cloud — controls how StepLogs addresses CloudWatch / the
+  // runner bundle log in the drawer it opens. Follows the workspace
+  // WAREHOUSE (ADR-024), not the per-pipeline compute attr: on a local
+  // warehouse every run's logs live on the local filesystem regardless of
+  // what compute the transforms declare for deploy.
+  const wh = useWarehouse();
+  const isLocal = wh.data?.warehouse === "local";
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedSyntheticId, setInspectedSyntheticId] = useState<string | null>(null);
@@ -83,10 +86,10 @@ export function RunDetailView({ dir, runId }: RunDetailViewProps) {
   // node_runs / runs are read via Athena (cloud) or the warm Spark worker
   // (local) and gated until the run is settled: locally that avoids racing
   // the runner's transform container for memory mid-run; on both surfaces
-  // the live DAG colours come from the `states` channel (S3 `_progress`
-  // terminal markers for cloud, state.json for local — both authoritative
-  // per node), so node_runs is needed only at settle for durations / the
-  // triage strip / the per-node breakdown.
+  // the live DAG colours come from the `states` channel (the warehouse
+  // `_progress` markers — S3 for cloud, filesystem for local, both
+  // authoritative per node), so node_runs is needed only at settle for
+  // durations / the triage strip / the per-node breakdown.
   const runs = useRuns(pipelineName, {
     dir,
     limit: 200,
@@ -142,7 +145,8 @@ export function RunDetailView({ dir, runId }: RunDetailViewProps) {
   }, [nodeRuns.data, graph]);
 
   // The DAG's node colours merge two laggy, independent channels: the live
-  // progress states (S3 `_progress` for cloud, state.json for local — both
+  // progress states (the `_progress` markers — S3 for cloud, filesystem for
+  // local; both
   // report only RUNNING nodes and drop a node a few seconds after it stops
   // emitting) and node_runs (the authoritative ok/failed record, but written
   // then read back through Athena on a poll, so it lands seconds later). A

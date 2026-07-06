@@ -7,15 +7,22 @@ import (
 )
 
 // snapshotsResultFromCommits projects a table's Delta commit history
-// (newest-first, as delta.ReadCurrent / ReadCurrentFromPath return it) into
-// the SnapshotsResult wire shape: LatestRecordCount, Total, the
+// (newest-first, as delta.ReadTableState / ReadTableStateFromPath return
+// it) into the SnapshotsResult wire shape: LatestRecordCount, Total, the
 // limit-truncated SnapshotInfo list, and the Truncated flag. Shared by
 // CloudProvider.Snapshots and LocalProvider.Snapshots so the two providers
 // cannot drift on the catalog row count — the number ADR-014 most visibly
 // binds. limit <= 0 means "no truncation".
 //
-// LatestRecordCount folds commits oldest-first. Three commit shapes matter
-// for table-state row count:
+// rowCount is delta.TableState.RowCount — the exact current row count
+// derived from Delta snapshot state (checkpoint stats + post-checkpoint
+// replay). When present it wins outright; it is the GH #66 fix, immune to
+// the commit-window and log-retention truncation the fold below suffers.
+// When nil, the newest commit's writer-stamped TotalRecords is used, and
+// failing that the per-commit fold.
+//
+// The fold walks commits oldest-first. Three commit shapes matter for
+// table-state row count:
 //   - Replaces=true (CTAS, CREATE OR REPLACE, WRITE Overwrite): reset the
 //     running total to this commit's net delta.
 //   - MERGE: net delta is (added - updated - deleted). The delta log_reader
@@ -23,19 +30,29 @@ import (
 //     subtract UpdatedRecords here because updates don't change row count.
 //   - Otherwise (APPEND, DELETE): net delta is (added - deleted).
 //
-// KNOWN BUG (GH #66): delta.ReadCurrent caps the commit list at the newest
-// 200 commits (and Delta log retention deletes older JSON commits anyway),
-// so for a table without a Replaces commit inside the surviving window the
-// fold starts from an arbitrary mid-history zero and understates the row
-// count; Total is capped the same way. Deliberately preserved by this
-// extraction — the #66 fix lands once, here.
-func snapshotsResultFromCommits(commits []delta.Commit, limit int) *SnapshotsResult {
-	// Full commit count before any limit truncation — the catalog shows
-	// this as the real number of commits instead of "<limit>+".
-	totalCommits := len(commits)
-
-	var latestCount *int64
+// The fold is exact only when the window anchors — it reaches the table's
+// creation (version 0) or contains a Replaces commit. Otherwise it starts
+// from an arbitrary mid-history zero and the result is flagged
+// LatestRecordCountApproximate so the UI can say so instead of asserting a
+// wrong number.
+func snapshotsResultFromCommits(commits []delta.Commit, limit int, rowCount *int64) *SnapshotsResult {
+	// Total: the number of commits ever made to the table. Delta versions
+	// are contiguous from 0, so newest version + 1 is exact even when log
+	// retention or the read window hides older commits — len(commits)
+	// would understate both ways (GH #66).
+	totalCommits := 0
 	if len(commits) > 0 {
+		totalCommits = int(commits[0].Version) + 1
+	}
+
+	var foldCount *int64
+	anchored := false
+	if len(commits) > 0 {
+		// Window reaching version 0 sees the whole history; a Replaces
+		// commit resets the fold to a known-complete state either way.
+		if commits[len(commits)-1].Version == 0 {
+			anchored = true
+		}
 		var total int64
 		for i := len(commits) - 1; i >= 0; i-- {
 			ci := commits[i]
@@ -54,6 +71,7 @@ func snapshotsResultFromCommits(commits []delta.Commit, limit int) *SnapshotsRes
 			netDelta := added - updated - deleted
 			if ci.Replaces {
 				total = netDelta
+				anchored = true
 			} else {
 				total += netDelta
 			}
@@ -61,7 +79,7 @@ func snapshotsResultFromCommits(commits []delta.Commit, limit int) *SnapshotsRes
 		if total < 0 {
 			total = 0
 		}
-		latestCount = &total
+		foldCount = &total
 	}
 
 	if limit <= 0 {
@@ -98,13 +116,17 @@ func snapshotsResultFromCommits(commits []delta.Commit, limit int) *SnapshotsRes
 	}
 
 	res := &SnapshotsResult{Snapshots: out, Truncated: truncated, Total: totalCommits}
-	// Prefer the newest commit's own TotalRecords when the writer stamped
-	// it; fall back to the folded running sum.
-	if len(out) > 0 && out[0].TotalRecords != nil {
+	switch {
+	case rowCount != nil:
+		v := *rowCount
+		res.LatestRecordCount = &v
+	case len(out) > 0 && out[0].TotalRecords != nil:
+		// Writer-stamped total on the newest commit — exact when present.
 		v := *out[0].TotalRecords
 		res.LatestRecordCount = &v
-	} else if latestCount != nil {
-		res.LatestRecordCount = latestCount
+	case foldCount != nil:
+		res.LatestRecordCount = foldCount
+		res.LatestRecordCountApproximate = !anchored
 	}
 	return res
 }

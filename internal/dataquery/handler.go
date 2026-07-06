@@ -165,9 +165,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // WithResolver enables per-request cloud/local provider dispatch on the
-// observability endpoints. When the request carries `dir=…`, the resolver
-// inspects that pipeline's compute attr; without `dir`, the cloud path
-// (Athena over Glue) is used unchanged.
+// observability endpoints. The resolver routes by the workspace warehouse
+// (ADR-024, workspace.LoadWarehouse); `dir` scopes the request to a
+// pipeline but never changes which provider answers. Without a resolver
+// (tests), the legacy cloud path (Athena over Glue) is used unchanged.
 func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 	h.resolver = r
 	return h
@@ -310,9 +311,9 @@ func handleSource(w http.ResponseWriter, r *http.Request, s3c S3Client) {
 // `<catalog>__<schema>` the provider expects. `catalog_db` wins when also
 // supplied so legacy callers keep working byte-for-byte.
 //
-// Dispatches through observability.Provider so local pipelines (compute =
-// "local") query their per-pipeline Hadoop catalog instead of falling back
-// to Athena, which has nothing to read from. Cloud pipelines unchanged
+// Dispatches through observability.Provider so local-warehouse workspaces
+// (ADR-024) query the local Hadoop catalog instead of falling back to
+// Athena, which has nothing to read from. Cloud warehouses unchanged
 // (Athena over Glue). Same response shape from both providers.
 func handleTable(w http.ResponseWriter, r *http.Request, p observability.Provider) {
 	q := r.URL.Query()
@@ -683,9 +684,9 @@ func handleRuns(w http.ResponseWriter, r *http.Request, p observability.Provider
 // Computes a per-node memory recommendation from the pipeline's recent
 // runner invocations (p95 peak RSS vs allocated memory, factoring spill).
 // Recommend-only. IncludeMetrics forces the metrics-bearing scan — the
-// local provider's state.json fast path omits the Spark-metric columns this
-// reads. Same shape from both providers (ADR-014); the run-detail node
-// drawer consumes it.
+// local provider's `_progress`-marker fast path omits the Spark-metric
+// columns this reads. Same shape from both providers (ADR-014); the
+// run-detail node drawer consumes it.
 func handleRightsize(w http.ResponseWriter, r *http.Request, p observability.Provider, database string) {
 	pipeline := r.URL.Query().Get("pipeline")
 	if pipeline == "" {

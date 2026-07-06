@@ -172,7 +172,7 @@ export interface NodesGridProps {
   nodeSpecs: Map<string, NodeSpec>;
   /** Live per-node status for an in-flight run (node id → state). */
   liveStates: Map<string, "running" | "succeeded" | "failed">;
-  /** Local pipeline — selects the execution-logs addressing mode. */
+  /** Local warehouse (ADR-024) — selects the execution-logs addressing mode. */
   isLocal: boolean;
   dir: string;
   /** SQL pipeline name, threaded to the drawer's rightsizing query. */

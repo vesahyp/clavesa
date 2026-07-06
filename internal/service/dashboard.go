@@ -490,6 +490,12 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string, params map[s
 						SQL:         expanded,
 						PipelineDir: ds.Dir,
 						MaxRows:     10_000,
+						// RenderDashboard backs only the `dashboards render`
+						// CLI smoke check (the UI renders widgets through the
+						// dataquery handler, which stays soft). Strict so a
+						// widget over a missing table surfaces as w.Error and
+						// the command exits non-zero — its whole contract.
+						StrictMissing: true,
 					})
 					if qErr != nil {
 						r = execd{err: qErr}

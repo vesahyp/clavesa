@@ -91,16 +91,12 @@ func writeRunnerFailureLog(preferred, workspaceRoot, pattern string, stdout, std
 }
 
 // transformFailureLogRef makes the full output of a failed single-node
-// runner invocation durable and returns the "full runner log: …" line for
-// the error message. When the run already teed to a per-node log file
-// (teedLogPath non-empty — the pipeline-run flow), it just references that
-// file; otherwise (backfill passes logPath="", or the tee create failed) it
-// writes the buffered stdout+stderr to the standard run-log location now,
-// with the same fallback ladder as the bundle path.
-func transformFailureLogRef(pipelineDir, runID, nodeID, teedLogPath, workspaceRoot string, stdout, stderr []byte) string {
-	if teedLogPath != "" {
-		return runnerLogRef(teedLogPath, nil)
-	}
+// runner invocation (the backfill-replay path) durable and returns the
+// "full runner log: …" line for the error message (GH #82). Writes the
+// buffered stdout+stderr to the standard run-log location
+// (observability.RunLogPath), with the same fallback ladder as the bundle
+// path.
+func transformFailureLogRef(pipelineDir, runID, nodeID, workspaceRoot string, stdout, stderr []byte) string {
 	preferred := ""
 	if runID != "" {
 		preferred = observability.RunLogPath(pipelineDir, runID, nodeID)

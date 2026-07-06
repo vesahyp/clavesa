@@ -1,15 +1,17 @@
-// Package observability provides a per-pipeline Provider abstraction over the
+// Package observability provides a Provider abstraction over the
 // run-history, snapshot, and execution-state surfaces the UI consumes.
 //
 // ADR-014 makes local–cloud parity binding: every observability feature must
-// work for compute = "local" pipelines as well as deployed ones. The Provider
-// interface here is the seam — cloudProvider talks to Athena/SFN/CloudWatch,
-// localProvider reads filesystem-backed Iceberg metadata + a per-run progress
-// channel. Backends differ; response shapes do not, so the UI layer stays
+// work on a local-warehouse workspace as well as a deployed one. The Provider
+// interface here is the seam — CloudProvider talks to Athena/SFN/CloudWatch
+// plus the S3 warehouse's `_progress` marker tree, LocalProvider reads
+// filesystem Delta transaction logs plus the local warehouse's `_progress`
+// tree. Backends differ; response shapes do not, so the UI layer stays
 // agnostic.
 //
-// Resolver picks per request based on the inspected pipeline's `compute` attr,
-// not host AWS availability.
+// Resolver picks per request from the workspace warehouse (ADR-024,
+// workspace.LoadWarehouse) — never from a per-pipeline compute attribute,
+// and never from host AWS availability.
 package observability
 
 import (
@@ -53,7 +55,7 @@ type NodeRunsQuery struct {
 	// internally to detect truncation).
 	Limit int
 	// IncludeMetrics forces the metrics-bearing SQL scan even with no arn
-	// filter; the dashboard grid's state.json fast path omits the
+	// filter; the dashboard grid's `_progress`-marker fast path omits the
 	// Spark-metric columns.
 	IncludeMetrics bool
 }
@@ -177,10 +179,18 @@ type SnapshotInfo struct {
 type SnapshotsResult struct {
 	Snapshots         []SnapshotInfo `json:"snapshots"`
 	LatestRecordCount *int64         `json:"latest_record_count,omitempty"`
-	Truncated         bool           `json:"truncated"`
-	// Total is the full commit count for the table, independent of the
-	// returned (possibly limit-truncated) Snapshots slice — so the catalog
-	// can show the real number of commits instead of "<limit>+".
+	// LatestRecordCountApproximate is true when the count had to be folded
+	// from per-commit deltas over a window that doesn't anchor at table
+	// creation or an overwrite — the exact snapshot-state count and the
+	// writer-stamped total were both unavailable (GH #66). The UI renders
+	// the value with a ~ prefix in that case.
+	LatestRecordCountApproximate bool `json:"latest_record_count_approximate,omitempty"`
+	Truncated                    bool `json:"truncated"`
+	// Total is the number of commits ever made to the table — derived from
+	// the newest surviving Delta version (versions are contiguous from 0),
+	// so it stays exact past log retention and the history read window. It
+	// is independent of the returned (possibly limit-truncated) Snapshots
+	// slice, which can hold far fewer entries.
 	Total int `json:"total"`
 }
 
@@ -343,6 +353,15 @@ type QueryQuery struct {
 	// caller's SQL has no LIMIT. Zero means "no UI-side cap" — the SQL
 	// is trusted to bound itself. Defaults applied at the handler.
 	MaxRows int
+	// StrictMissing makes a query against a nonexistent table return the
+	// error instead of an empty result. Default false keeps the
+	// observability convention: a catalog/dashboard-live surface over a
+	// not-yet-materialized table renders empty, not a stack trace. Set
+	// true on interactive paths — `clavesa query`, the ad-hoc query
+	// panel, `dashboards render` — where "0 rows, success" on a table
+	// that doesn't exist is silently wrong (the same reasoning the
+	// undeployed-warehouse guard in service.Query already applies).
+	StrictMissing bool
 }
 
 // QueryResult mirrors SampleTableResult — same JSON shape, distinct type
@@ -409,7 +428,8 @@ type TablesResult struct {
 }
 
 // ExecutionStatesQuery selects per-node state for one execution. ExecutionRef
-// is an SFN ARN for cloud and a local run-id for local pipelines.
+// is an exec-ref token (execref.go): an SFN ARN, a "local:<dir>#<runID>"
+// composite, or a bare run id.
 type ExecutionStatesQuery struct {
 	ExecutionRef string
 }
@@ -422,10 +442,11 @@ type StateStatus struct {
 	// EnteredAt is the latest time the state was entered (ISO 8601 UTC).
 	EnteredAt string `json:"entered_at,omitempty"`
 	// In-flight Spark progress for a RUNNING node, mirrored from the
-	// runner's periodic `progress` event. All nullable: nil until the
-	// first tick, and absent once the node reaches a terminal state.
-	// Cloud doesn't populate these yet (a later slice fills them from SFN
-	// map-run metadata); local copies them from NodeRunState.
+	// runner's periodic `_progress/<run>/<node>.json` marker. All nullable:
+	// nil until the first tick, and absent once the node reaches a terminal
+	// state. Both providers populate them from the same marker shape via
+	// the shared progressStates helper (3be08e3) — cloud reads the S3 tree,
+	// local the filesystem tree.
 	StagesTotal     *int64 `json:"stages_total,omitempty"`
 	StagesCompleted *int64 `json:"stages_completed,omitempty"`
 	TasksTotal      *int64 `json:"tasks_total,omitempty"`
@@ -468,7 +489,7 @@ type LogEvent struct {
 // UI surfaces as "where these logs came from" so a developer eyeballing
 // the panel can find the same logs in the underlying tooling. They have
 // different semantics per backend (CloudWatch group + Lambda function on
-// cloud; filesystem path + step ID on local) and must not be parsed.
+// cloud; the `_bundle.log` path + run id on local) and must not be parsed.
 // Source is the typed discriminator the UI branches on for backend-specific
 // affordances ("query CloudWatch directly" vs. "tail the file"); LogGroup
 // and FunctionName are the human-friendly text to render alongside.

@@ -109,24 +109,16 @@ func TestWriteRunnerFailureLog(t *testing.T) {
 	}
 }
 
-// transformFailureLogRef: a teed per-node log is referenced as-is; without
-// one, the buffered output is written to the standard run-log location.
+// transformFailureLogRef (GH #82, the backfill-replay path): the buffered
+// output is written to the standard run-log location and referenced.
 func TestTransformFailureLogRef(t *testing.T) {
 	ws := t.TempDir()
 	pipelineDir := filepath.Join(ws, "demo")
 
-	// Teed case — no new file, just the reference.
-	teed := filepath.Join(pipelineDir, ".clavesa", "runs", "r1", "logs", "t1.log")
-	if got := transformFailureLogRef(pipelineDir, "r1", "t1", teed, ws, nil, nil); got != "full runner log: "+teed {
-		t.Errorf("teed ref = %q", got)
-	}
-
-	// Non-teed case (backfill: logPath="") — writes stdout+stderr to the
-	// run-log path and references it.
-	ref := transformFailureLogRef(pipelineDir, "backfill-42", "t1", "", ws, []byte("OUT"), []byte("FULL STDERR"))
+	ref := transformFailureLogRef(pipelineDir, "backfill-42", "t1", ws, []byte("OUT"), []byte("FULL STDERR"))
 	wantPath := observability.RunLogPath(pipelineDir, "backfill-42", "t1")
 	if ref != "full runner log: "+wantPath {
-		t.Errorf("non-teed ref = %q, want path %q", ref, wantPath)
+		t.Errorf("failure ref = %q, want path %q", ref, wantPath)
 	}
 	data, err := os.ReadFile(wantPath)
 	if err != nil {

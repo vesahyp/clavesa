@@ -1,6 +1,10 @@
-// Package pipelinestatus provides the GET /pipeline/status endpoint which
-// reads terraform.tfstate from the pipeline directory and queries AWS Step
-// Functions for recent execution history.
+// Package pipelinestatus provides the GET /pipeline/status endpoint plus the
+// per-execution detail/states/logs endpoints. Dispatch follows the workspace
+// warehouse (ADR-024): a local warehouse serves run history from the
+// warehouse `_progress` tree via the local observability provider; a cloud
+// warehouse reads terraform.tfstate for the deployed state machine and
+// queries AWS Step Functions for recent execution history, merging in
+// cloud-local (`local-<uuid>`) runs from the S3 `_progress` tree.
 package pipelinestatus
 
 import (
@@ -38,8 +42,8 @@ type RunOpts struct {
 	ForceNodes []string
 }
 
-// LocalPipelineRunner is the local-execution path used when a pipeline has
-// any `compute = "local"` transform. StartRunWithOpts begins the run
+// LocalPipelineRunner is the local-execution path used when the workspace
+// warehouse is local (ADR-024). StartRunWithOpts begins the run
 // asynchronously and returns a run id immediately so the UI can navigate
 // to the run page without blocking; it returns ErrRunInFlight when the
 // pipeline already has a run executing. Implemented by service.Service;
@@ -49,12 +53,12 @@ type LocalPipelineRunner interface {
 	StartRunWithOpts(dir string, opts RunOpts) (string, error)
 }
 
-// CloudPipelineRunner is the cloud-execution path used when the
-// inspected pipeline's compute attr is not "local". RunPipelineCloud
-// looks up the deployed SFN state machine by name, starts an execution
-// with the optional force payload, and returns the execution ARN.
-// Implemented by service.Service; the interface lives here so
-// internal/pipelinestatus stays free of an internal/service import.
+// CloudPipelineRunner is the cloud-execution path used when the workspace
+// warehouse is cloud (ADR-024). RunPipelineCloud looks up the deployed SFN
+// state machine by name, starts an execution with the optional force
+// payload, and returns the execution ARN. Implemented by service.Service;
+// the interface lives here so internal/pipelinestatus stays free of an
+// internal/service import.
 type CloudPipelineRunner interface {
 	RunPipelineCloud(ctx context.Context, dir string, opts RunOpts) (string, error)
 }
@@ -96,13 +100,14 @@ type Handler struct {
 	// short-circuits and in-flight node states never surface.
 	athenaOutputBucket string
 
-	// resolver, when set, lets states/logs dispatch per-pipeline based on
-	// `compute` attr (ADR-014). When nil, the handler falls through to the
-	// cloud-only ARN path — preserves the pre-resolver call shape for tests.
+	// resolver, when set, lets the execution endpoints dispatch by the
+	// workspace warehouse (ADR-024, workspace.LoadWarehouse). When nil, the
+	// handler falls through to the cloud-only ARN path — preserves the
+	// pre-resolver call shape for tests.
 	resolver *observability.Resolver
 
 	// localRunner, when set, lets POST /pipeline/run dispatch
-	// compute = "local" pipelines through service.RunPipeline (the same
+	// local-warehouse workspaces through service.RunPipeline (the same
 	// code path `clavesa pipeline run` uses). Without it, all run
 	// requests fall through to the SFN StartExecution path.
 	localRunner LocalPipelineRunner
@@ -272,7 +277,7 @@ func (h *Handler) GetStatus(w http.ResponseWriter, r *http.Request) {
 				StartedAt:    run.StartedAt,
 				StoppedAt:    run.EndedAt,
 				ConsoleURL:   "",
-				ExecutionARN: formatLocalExecRef(abs, run.RunID),
+				ExecutionARN: observability.FormatExecRef(abs, run.RunID),
 			})
 		}
 		httputil.WriteJSON(w, http.StatusOK, statusResponse{
@@ -301,35 +306,33 @@ func (h *Handler) GetStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge cloud-local runs (ADR-024 `--compute local` against the cloud
+	// warehouse). They never appear in SFN ListExecutions — their dispatch
+	// writes a `_progress/<run>/_run.json` marker to the S3 warehouse
+	// instead — so without this merge the recent-executions panel had a
+	// hole (GH #65). Best-effort: a listing failure degrades to SFN-only.
+	if localRuns, lerr := h.cloud.ProgressRuns(r.Context(), filepath.Base(abs), 20); lerr == nil {
+		for _, run := range localRuns {
+			execs = append(execs, executionInfo{
+				Name:         run.RunID,
+				Status:       run.Status,
+				StartedAt:    run.StartedAt,
+				StoppedAt:    run.EndedAt,
+				ConsoleURL:   "",
+				ExecutionARN: observability.FormatExecRef(abs, run.RunID),
+			})
+		}
+		sort.SliceStable(execs, func(i, j int) bool {
+			return execs[i].StartedAt > execs[j].StartedAt
+		})
+	}
+
 	httputil.WriteJSON(w, http.StatusOK, statusResponse{
 		Deployed:        true,
 		Cloud:           "aws",
 		StateMachineARN: stateARN,
 		Executions:      execs,
 	})
-}
-
-// formatLocalExecRef synthesises a recognisable execution reference for
-// a local run so the same /pipeline/execution?arn=… endpoint serves
-// both cloud and local. Prefix `local:` makes splitLocalExecRef easy;
-// `#` (vs `:`) separates dir from runID so dirs containing colons
-// round-trip (B P2-5).
-func formatLocalExecRef(dir, runID string) string {
-	return "local:" + dir + "#" + runID
-}
-
-// splitLocalExecRef is the inverse of formatLocalExecRef. Returns
-// (dir, runID, ok) — ok=false means the input is a cloud ARN.
-func splitLocalExecRef(ref string) (string, string, bool) {
-	rest, ok := strings.CutPrefix(ref, "local:")
-	if !ok {
-		return "", "", false
-	}
-	dir, runID, ok := strings.Cut(rest, "#")
-	if !ok {
-		return "", "", false
-	}
-	return dir, runID, true
 }
 
 // readStateMachineARN reads terraform.tfstate from dir and extracts the ARN
@@ -416,6 +419,14 @@ func (h *Handler) listExecutions(ctx context.Context, arnStr string) ([]executio
 // GetExecutionDetail returns error details for a single execution.
 // For failed/timed-out executions it also scans the event history to identify
 // which step failed and what error it produced.
+//
+// `arn` is an exec-ref token (observability/execref.go). Real SFN execution
+// ARNs go through DescribeExecution + history; every other shape — the
+// `local:<dir>#<runID>` composite GetStatus mints for local-warehouse and
+// cloud-local rows, and a bare non-ARN run id such as an ADR-024
+// `local-<uuid>` — reads the warehouse `_run.json` run marker via the
+// provider's RunDetail (GH #65: bare `local-` refs used to fall into the
+// SFN path and 500).
 func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 	arn := r.URL.Query().Get("arn")
 	if arn == "" {
@@ -423,12 +434,16 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Local-mode dispatch: arn is `local:<dir>#<runID>` synthesised by
-	// GetStatus above. The failure context comes from the warehouse
-	// `_run.json` run marker (ADR-024), read via the provider's RunDetail.
-	if dir, runID, ok := splitLocalExecRef(arn); ok {
+	if observability.StateMachineNameFromExecutionARN(arn) == "" {
+		// Non-ARN ref: failure context comes from the warehouse `_run.json`
+		// run marker (ADR-024), read via the provider's RunDetail.
 		if h.resolver == nil {
 			httputil.WriteError(w, http.StatusInternalServerError, "no observability resolver configured")
+			return
+		}
+		dir, runID := observability.SplitExecRef(arn)
+		if runID == "" {
+			httputil.WriteError(w, http.StatusBadRequest, "execution ref carries no run id: "+arn)
 			return
 		}
 		prov, err := h.providerForRun(dir, runID)
@@ -492,18 +507,42 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 // GET /pipeline/execution/states?arn=<execution-arn>
 // ---------------------------------------------------------------------------
 
+// resolveExecRef normalises the two addressing modes the states/logs
+// endpoints accept into a (dir, run) pair routed through the resolver:
+//
+//   - dir=<dir>[&run=<id>]: explicit params (what the UI threads).
+//   - arn=<non-ARN exec ref>: a single exec-ref token — the
+//     `local:<dir>#<runID>` composite /pipeline/status mints, a legacy
+//     `<dir>:<runID>` composite, or a bare run id. GH #78: the status
+//     listing and the read endpoints share one encoding, so the value of
+//     `executions[].execution_arn` is always decodable here.
+//
+// ok=false means "no resolver-routable ref" — the caller falls through to
+// the legacy cloud-only ARN path (real SFN ARNs, or no resolver wired).
+func (h *Handler) resolveExecRef(r *http.Request) (dir, run string, ok bool) {
+	if h.resolver == nil {
+		return "", "", false
+	}
+	q := r.URL.Query()
+	if dir := q.Get("dir"); dir != "" {
+		return dir, q.Get("run"), true
+	}
+	arn := q.Get("arn")
+	if arn == "" || observability.StateMachineNameFromExecutionARN(arn) != "" {
+		return "", "", false
+	}
+	dir, run = observability.SplitExecRef(arn)
+	return dir, run, true
+}
+
 // GetExecutionStates returns per-state status for one execution, designed to
 // be polled (~2s) by the editor to overlay live DAG colors during a running
 // execution.
 //
-// Two dispatch modes:
-//   - dir=<dir>[&run=<id>]: route through the resolver (cloud or local based
-//     on the workspace warehouse, ADR-024). Local pipelines must use this
-//     form — ARNs don't exist locally.
-//   - arn=<arn>: legacy cloud-only path; preserved while UI clients migrate.
+// Dispatch: resolver-routed for dir[+run] params or a non-ARN `arn=` exec
+// ref (see resolveExecRef); real SFN ARNs keep the legacy cloud-only path.
 func (h *Handler) GetExecutionStates(w http.ResponseWriter, r *http.Request) {
-	if dir := r.URL.Query().Get("dir"); dir != "" && h.resolver != nil {
-		run := r.URL.Query().Get("run")
+	if dir, run, ok := h.resolveExecRef(r); ok {
 		p, err := h.providerForRun(dir, run)
 		if err != nil {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
@@ -549,9 +588,11 @@ func (h *Handler) GetExecutionStates(w http.ResponseWriter, r *http.Request) {
 
 // GetExecutionLogs returns log lines for one step within one execution.
 //
-// Cloud serves CloudWatch FilterLogEvents output; local serves the captured
-// runner stdout/stderr at <pipelineDir>/.clavesa/runs/<runID>/logs/.
-// Dispatch follows the same dir-vs-arn convention as GetExecutionStates.
+// Cloud serves CloudWatch FilterLogEvents output windowed to the step; local
+// serves the run's captured runner output — the `_bundle.log` at
+// <pipelineDir>/.clavesa/runs/<runID>/ (per-run, since the bundle runner
+// shares one container across every node; GH #64). Dispatch follows the same
+// addressing convention as GetExecutionStates.
 func (h *Handler) GetExecutionLogs(w http.ResponseWriter, r *http.Request) {
 	step := r.URL.Query().Get("step")
 	if step == "" {
@@ -559,8 +600,7 @@ func (h *Handler) GetExecutionLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if dir := r.URL.Query().Get("dir"); dir != "" && h.resolver != nil {
-		run := r.URL.Query().Get("run")
+	if dir, run, ok := h.resolveExecRef(r); ok {
 		p, err := h.providerForRun(dir, run)
 		if err != nil {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
@@ -630,10 +670,11 @@ type runResponse struct {
 	Nodes any `json:"nodes,omitempty"`
 }
 
-// RunPipeline triggers a pipeline run. Local pipelines (any transform with
-// `compute = "local"`) dispatch through service.RunPipeline; cloud pipelines
-// start a Step Functions execution. ADR-014 / ADR-015 binds parity: the UI
-// button works in both modes, response shape signals which path ran.
+// RunPipeline triggers a pipeline run. On a local warehouse (ADR-024) it
+// dispatches through service.RunPipeline; on a cloud warehouse it starts a
+// Step Functions execution (or, with body compute="local", the cloud-local
+// docker bundle). ADR-014 / ADR-015 binds parity: the UI button works in
+// both modes, response shape signals which path ran.
 func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 	var req runRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -648,11 +689,11 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 
 	opts := RunOpts{Force: req.Force, ForceNodes: req.ForceNodes}
 
-	// Local-first dispatch: if the resolver says this pipeline is local-
-	// compute and a runner is wired, fire the in-process path. Same code
+	// Local-first dispatch: if the workspace warehouse is local (ADR-024)
+	// and a runner is wired, fire the in-process path. Same code
 	// `clavesa pipeline run` uses. Falls through to cloud (SFN start)
-	// when the resolver returns cloud or isn't wired.
-	if h.localRunner != nil && h.isLocalCompute(abs) {
+	// when the warehouse is cloud or no resolver is wired.
+	if h.localRunner != nil && h.isLocalWarehouse() {
 		// StartRunWithOpts dispatches asynchronously: it prepares the run
 		// (so the run id + RUNNING progress channel exist) and returns
 		// the id immediately, then walks the DAG in the background. The
@@ -734,33 +775,37 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 	httputil.WriteJSON(w, http.StatusOK, runResponse{ExecutionARN: aws.ToString(out.ExecutionArn)})
 }
 
-// isLocalCompute consults the observability resolver to decide whether the
+// isLocalWarehouse consults the observability resolver to decide whether the
 // workspace operates locally. The resolver encapsulates the local/cloud
-// routing rule (the workspace warehouse); reusing it here keeps
+// routing rule (the workspace warehouse, ADR-024); reusing it here keeps
 // that rule in one place. Without a resolver wired (test mode), the
 // handler defaults to cloud — preserves the legacy behavior.
-func (h *Handler) isLocalCompute(_ string) bool {
+func (h *Handler) isLocalWarehouse() bool {
 	if h.resolver == nil {
 		return false
 	}
 	return h.resolver.IsLocal()
 }
 
-// providerForRun picks the observability provider for a states/logs request.
-// Routing is purely by warehouse via the resolver (ADR-024): a cloud-local
-// run (cloud warehouse, local compute) is read by the cloud provider off the
-// S3 `_progress` tree the runner wrote there, exactly like a fully-cloud run
-// — the provider seam reads the warehouse, not SFN, for per-node state, so
-// the old `local-`-prefix special-case (which forced the local provider) is
-// no longer needed. The run id no longer steers dispatch.
+// providerForRun picks the observability provider for an execution
+// detail/states/logs request. Routing is purely by warehouse via the
+// resolver (ADR-024): a cloud-local run (cloud warehouse, local compute) is
+// read by the cloud provider off the S3 `_progress` tree the runner wrote
+// there, exactly like a fully-cloud run — the provider seam reads the
+// warehouse, not SFN, so the run id never steers dispatch. dir may be empty
+// (a bare run-id ref carries no pipeline dir): the workspace-level provider
+// is the same warehouse-selected provider, minus the dir guard.
 func (h *Handler) providerForRun(dir, run string) (observability.Provider, error) {
+	if dir == "" {
+		return h.resolver.Workspace()
+	}
 	return h.resolver.For(dir)
 }
 
-// runDetailer is the narrow capability the local execution-detail path needs:
-// reading the warehouse `_run.json` run marker for failure context. Both the
-// cloud and local providers satisfy it; asserted (not part of the Provider
-// interface) so the seam stays minimal.
+// runDetailer is the narrow capability the non-ARN execution-detail path
+// needs: reading the warehouse `_run.json` run marker for failure context.
+// Both the cloud and local providers satisfy it; asserted (not part of the
+// Provider interface) so the seam stays minimal.
 type runDetailer interface {
 	RunDetail(ctx context.Context, run string) (observability.RunDetail, error)
 }

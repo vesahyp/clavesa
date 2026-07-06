@@ -249,15 +249,21 @@ function RowsCell({ table }: { table: CatalogTable }) {
   if (data?.latest_record_count == null) {
     return <span className="text-xs text-muted-foreground">—</span>;
   }
+  // Approximate counts (folded from a truncated commit window — GH #66)
+  // render with a ~ prefix instead of asserting an exact number.
+  const approx = data.latest_record_count_approximate;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <Badge variant="secondary" className="cursor-default font-mono text-[10px]">
+          {approx ? "~" : ""}
           {formatCompactCount(data.latest_record_count)}
         </Badge>
       </TooltipTrigger>
       <TooltipContent>
+        {approx ? "~" : ""}
         {data.latest_record_count.toLocaleString()} rows
+        {approx ? " (approximate: commit history truncated)" : ""}
       </TooltipContent>
     </Tooltip>
   );

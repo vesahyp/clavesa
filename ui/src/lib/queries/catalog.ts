@@ -82,8 +82,13 @@ export type SnapshotInfo = z.infer<typeof SnapshotInfo>;
 const SnapshotsResult = z.object({
   snapshots: z.array(SnapshotInfo),
   latest_record_count: z.number().nullish(),
+  // True when the backend had to fold the count from a commit window that
+  // doesn't reach table creation or an overwrite (GH #66) — render with a
+  // ~ prefix instead of asserting an exact number.
+  latest_record_count_approximate: z.boolean().optional().default(false),
   truncated: z.boolean(),
-  // Full commit count, independent of the (limit-truncated) snapshots slice.
+  // Lifetime commit count (newest Delta version + 1) — exact even past log
+  // retention, independent of the (limit-truncated) snapshots slice.
   total: z.number().optional().default(0),
 });
 export type SnapshotsResult = z.infer<typeof SnapshotsResult>;

@@ -138,7 +138,10 @@ func ReadSchema(logFS fs.FS) (*Schema, error) {
 	if len(idx.versions) == 0 && !idx.hasCheckpoint() {
 		return nil, ErrNotDelta
 	}
-	return resolveSchema(logFS, idx)
+	getActions := func(v int64) ([]rawAction, error) {
+		return readCommitActions(logFS, idx.versionToFile[v])
+	}
+	return resolveSchema(idx, getActions, checkpointLoader(logFS, idx))
 }
 
 // ReadCurrent loads the latest schema + recent commit history from a
@@ -148,18 +151,52 @@ func ReadSchema(logFS fs.FS) (*Schema, error) {
 // matches the catalog walker's "silently skip non-Delta directories"
 // contract.
 //
-// The schema half is resolved checkpoint-aware (see resolveSchema), so a
-// long-lived table no longer pays a full backward walk just to render the
-// snapshot timeline. The commit-history half is unchanged: it returns the
-// last maxCommitsScanned commits, newest first.
-//
-// A malformed commit file surfaces as an error rather than a silent
-// skip — silent skips would hide schema-evolution bugs that a future
-// refactor introduces.
+// Thin compatibility wrapper over ReadTableState for callers that don't
+// need the row count. A malformed commit file surfaces as an error rather
+// than a silent skip — silent skips would hide schema-evolution bugs that
+// a future refactor introduces.
 func ReadCurrent(logFS fs.FS) (*Schema, []Commit, error) {
-	idx, err := listLog(logFS)
+	st, err := ReadTableState(logFS)
 	if err != nil {
 		return nil, nil, err
+	}
+	return st.Schema, st.Commits, nil
+}
+
+// TableState bundles everything ReadTableState resolves in one pass over a
+// `_delta_log`: the current schema, the recent commit history (newest
+// first, capped at maxCommitsScanned), and — when derivable — the table's
+// exact current row count.
+type TableState struct {
+	Schema  *Schema
+	Commits []Commit
+	// RowCount is the exact number of rows in the table at its latest
+	// version, computed from Delta snapshot state (checkpoint
+	// `add.stats.numRecords` seeded, post-checkpoint commits replayed) —
+	// NOT by summing per-commit operation metrics, so it stays correct for
+	// MERGE / append tables whose history outruns the commit window and
+	// log retention (GH #66). nil when the log doesn't pin down the live
+	// file set (no checkpoint and the surviving window doesn't reach
+	// version 0, or a version gap) or when any live file lacks readable
+	// numRecords stats (stats collection disabled, or a stats-as-struct
+	// checkpoint without the JSON stats column). Callers fall back to
+	// their own estimate in that case.
+	RowCount *int64
+}
+
+// ReadTableState loads schema + recent history + exact row count in a
+// single pass over the log. It fetches nothing beyond what ReadCurrent
+// already fetched: the window's commit files are read exactly once and
+// shared by the history projection, the schema resolver, and the row-count
+// replay (the pre-state reader used to read the post-checkpoint commits
+// twice), and the checkpoint parts are read once and shared between the
+// schema and row-count projections. The only case that reads an extra file
+// is a schema-evolution commit after the latest checkpoint, where the
+// schema alone wouldn't have needed the checkpoint but the row count does.
+func ReadTableState(logFS fs.FS) (*TableState, error) {
+	idx, err := listLog(logFS)
+	if err != nil {
+		return nil, err
 	}
 	// History needs commit files; a `_delta_log` carrying only a
 	// checkpoint with no surviving JSON commits can't produce a timeline.
@@ -167,20 +204,68 @@ func ReadCurrent(logFS fs.FS) (*Schema, []Commit, error) {
 	// versions is non-empty whenever a real table exists; the guard keeps
 	// the ErrNotDelta contract identical to the pre-checkpoint reader.
 	if len(idx.versions) == 0 {
-		return nil, nil, ErrNotDelta
+		return nil, ErrNotDelta
 	}
 
-	schema, err := resolveSchema(logFS, idx)
+	win, err := readWindow(logFS, idx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	getActions := func(v int64) ([]rawAction, error) {
+		// Serve from the pre-read window when possible; only versions
+		// below the window (no-checkpoint tables with >maxCommitsScanned
+		// commits) fall through to a filesystem read.
+		for i := len(win) - 1; i >= 0; i-- {
+			if win[i].version == v {
+				return win[i].actions, nil
+			}
+			if win[i].version < v {
+				break
+			}
+		}
+		return readCommitActions(logFS, idx.versionToFile[v])
+	}
+	loadCP := checkpointLoader(logFS, idx)
 
-	commits, err := readRecentCommits(logFS, idx.versions, idx.versionToFile)
+	schema, err := resolveSchema(idx, getActions, loadCP)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return schema, commits, nil
+	rowCount, err := rowCountFromLog(idx, win, loadCP)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TableState{
+		Schema:   schema,
+		Commits:  commitsFromWindow(logFS, win),
+		RowCount: rowCount,
+	}, nil
+}
+
+// checkpointLoader returns a memoizing loader for the latest checkpoint's
+// part bytes. Both ReadSchema and ReadTableState hand it to resolveSchema
+// (and the latter to rowCountFromLog) so a checkpoint is fetched at most
+// once per read regardless of how many projections consume it. The loader
+// returns (nil, nil) when the log has no checkpoint.
+func checkpointLoader(logFS fs.FS, ix *logIndex) func() (*checkpointData, error) {
+	var cd *checkpointData
+	return func() (*checkpointData, error) {
+		if cd != nil {
+			return cd, nil
+		}
+		_, parts, ok := ix.latestCheckpoint()
+		if !ok {
+			return nil, nil
+		}
+		loaded, err := loadCheckpoint(logFS, parts)
+		if err != nil {
+			return nil, err
+		}
+		cd = loaded
+		return cd, nil
+	}
 }
 
 // FileStats is the live-data-file summary of a Delta table at its latest
@@ -236,7 +321,11 @@ func ReadFileStats(logFS fs.FS) (*FileStats, error) {
 	live := make(map[string]int64)
 	var startAfter int64 = -1 // replay commits strictly greater than this
 	if cv, parts, ok := idx.latestCheckpoint(); ok {
-		if err := applyCheckpointFiles(logFS, parts, live); err != nil {
+		cd, err := loadCheckpoint(logFS, parts)
+		if err != nil {
+			return nil, err
+		}
+		if err := applyCheckpointFiles(cd, live); err != nil {
 			return nil, err
 		}
 		startAfter = cv
@@ -269,34 +358,51 @@ func ReadFileStats(logFS fs.FS) (*FileStats, error) {
 	return stats, nil
 }
 
-// applyCheckpointFiles seeds live with the checkpoint's file view — its
-// `add` rows become live entries (path → size) and any `remove` rows it
-// carries retire the matching path. It projects to only the `add.path`,
-// `add.size`, and `remove.path` leaf columns so a checkpoint dominated by
-// live-file rows still reads cheaply, and it deliberately uses a separate
-// projection struct from schemaFromCheckpoint's checkpointRow so the
-// schema-only readers stay untouched and never decode file columns.
-func applyCheckpointFiles(logFS fs.FS, partFiles []string, live map[string]int64) error {
+// checkpointData holds the raw bytes of every part of one checkpoint,
+// read off the filesystem exactly once. ReadTableState shares one
+// checkpointData between the schema projection and the row-count
+// projection so an S3-backed FS pays one GetObject per part, not one per
+// projection.
+type checkpointData struct {
+	names []string
+	data  [][]byte
+}
+
+// loadCheckpoint fetches every part of a checkpoint into memory. partFiles
+// come pre-sorted by part number from logIndex.latestCheckpoint.
+func loadCheckpoint(logFS fs.FS, partFiles []string) (*checkpointData, error) {
+	cd := &checkpointData{names: partFiles}
 	for _, name := range partFiles {
 		data, err := fs.ReadFile(logFS, name)
 		if err != nil {
-			return fmt.Errorf("read checkpoint part %s: %w", name, err)
+			return nil, fmt.Errorf("read checkpoint part %s: %w", name, err)
 		}
+		cd.data = append(cd.data, data)
+	}
+	return cd, nil
+}
+
+// scanCheckpoint runs one typed parquet projection over every row of every
+// checkpoint part, in part order. Row is the projection struct; parquet-go
+// decodes only the leaf columns the struct references, and zero-fills
+// fields whose columns are absent from the file (how pre-deletion-vector or
+// stats-less checkpoints degrade rather than error). visit returns false to
+// stop the scan early (the schema scan stops at the first metaData row).
+func scanCheckpoint[Row any](cd *checkpointData, visit func(Row) bool) error {
+	for i, data := range cd.data {
+		name := cd.names[i]
 		pf, err := parquetgo.OpenFile(newBytesReaderAt(data), int64(len(data)))
 		if err != nil {
 			return fmt.Errorf("open checkpoint part %s: %w", name, err)
 		}
-		reader := parquetgo.NewGenericReader[checkpointFileRow](pf)
-		buf := make([]checkpointFileRow, 64)
+		reader := parquetgo.NewGenericReader[Row](pf)
+		buf := make([]Row, 64)
 		for {
 			n, readErr := reader.Read(buf)
-			for i := 0; i < n; i++ {
-				r := buf[i]
-				if r.Add != nil && r.Add.Path != "" {
-					live[r.Add.Path] = r.Add.Size
-				}
-				if r.Remove != nil && r.Remove.Path != "" {
-					delete(live, r.Remove.Path)
+			for j := 0; j < n; j++ {
+				if !visit(buf[j]) {
+					reader.Close()
+					return nil
 				}
 			}
 			if readErr == io.EOF || n == 0 {
@@ -310,6 +416,25 @@ func applyCheckpointFiles(logFS fs.FS, partFiles []string, live map[string]int64
 		reader.Close()
 	}
 	return nil
+}
+
+// applyCheckpointFiles seeds live with the checkpoint's file view — its
+// `add` rows become live entries (path → size) and any `remove` rows it
+// carries retire the matching path. It projects to only the `add.path`,
+// `add.size`, and `remove.path` leaf columns so a checkpoint dominated by
+// live-file rows still reads cheaply, and it deliberately uses a separate
+// projection struct from schemaFromCheckpoint's checkpointRow so the
+// schema-only readers stay untouched and never decode file columns.
+func applyCheckpointFiles(cd *checkpointData, live map[string]int64) error {
+	return scanCheckpoint(cd, func(r checkpointFileRow) bool {
+		if r.Add != nil && r.Add.Path != "" {
+			live[r.Add.Path] = r.Add.Size
+		}
+		if r.Remove != nil && r.Remove.Path != "" {
+			delete(live, r.Remove.Path)
+		}
+		return true
+	})
 }
 
 // checkpointFileRow is the file-accounting projection over a Delta
@@ -434,10 +559,15 @@ func listLog(logFS fs.FS) (*logIndex, error) {
 //
 // When no checkpoint exists the table is small or new, the full backward
 // walk over every commit is cheap, and we fall back to it.
-func resolveSchema(logFS fs.FS, ix *logIndex) (*Schema, error) {
-	cv, parts, ok := ix.latestCheckpoint()
+//
+// Commit actions come through getActions (ReadTableState serves them from
+// its pre-read window; ReadSchema reads them off the filesystem) and the
+// checkpoint bytes through loadCP (memoized — see checkpointLoader) so the
+// schema and row-count projections never fetch the same file twice.
+func resolveSchema(ix *logIndex, getActions func(int64) ([]rawAction, error), loadCP func() (*checkpointData, error)) (*Schema, error) {
+	cv, _, ok := ix.latestCheckpoint()
 	if !ok {
-		return findLatestSchema(logFS, ix.versions, ix.versionToFile)
+		return findLatestSchema(ix.versions, getActions)
 	}
 	// Schema-evolution-after-checkpoint: scan only the post-checkpoint
 	// JSON commits, newest first. These are at most checkpointInterval-1
@@ -447,7 +577,7 @@ func resolveSchema(logFS fs.FS, ix *logIndex) (*Schema, error) {
 		if v <= cv {
 			break // versions is ascending; everything below is pre-checkpoint
 		}
-		actions, err := readCommitActions(logFS, ix.versionToFile[v])
+		actions, err := getActions(v)
 		if err != nil {
 			return nil, err
 		}
@@ -458,7 +588,11 @@ func resolveSchema(logFS fs.FS, ix *logIndex) (*Schema, error) {
 		}
 	}
 	// No post-checkpoint metaData: the checkpoint's snapshot is current.
-	return schemaFromCheckpoint(logFS, parts)
+	cd, err := loadCP()
+	if err != nil {
+		return nil, err
+	}
+	return schemaFromCheckpoint(cd)
 }
 
 // schemaFromActions returns the schema carried on the first metaData
@@ -485,9 +619,9 @@ func schemaFromActions(actions []rawAction, version int64) (*Schema, bool, error
 // actions only fire on schema-evolution writes. This is the no-checkpoint
 // fallback; the checkpoint-aware path in resolveSchema avoids walking
 // past the latest checkpoint version.
-func findLatestSchema(logFS fs.FS, versions []int64, files map[int64]string) (*Schema, error) {
+func findLatestSchema(versions []int64, getActions func(int64) ([]rawAction, error)) (*Schema, error) {
 	for i := len(versions) - 1; i >= 0; i-- {
-		actions, err := readCommitActions(logFS, files[versions[i]])
+		actions, err := getActions(versions[i])
 		if err != nil {
 			return nil, err
 		}
@@ -521,48 +655,32 @@ type checkpointRow struct {
 // projecting to only that leaf column so the read stays cheap regardless
 // of how many data-file `add` rows the checkpoint holds. An error is
 // returned when no part carries a metaData.
-func schemaFromCheckpoint(logFS fs.FS, partFiles []string) (*Schema, error) {
-	for _, name := range partFiles {
-		data, err := fs.ReadFile(logFS, name)
+func schemaFromCheckpoint(cd *checkpointData) (*Schema, error) {
+	var found *Schema
+	var parseErr error
+	err := scanCheckpoint(cd, func(r checkpointRow) bool {
+		md := r.MetaData
+		if md == nil || md.SchemaString == "" {
+			return true
+		}
+		sch, err := parseSchemaString(md.SchemaString)
 		if err != nil {
-			return nil, fmt.Errorf("read checkpoint part %s: %w", name, err)
+			parseErr = fmt.Errorf("parse schema_string in checkpoint: %w", err)
+			return false
 		}
-		pf, err := parquetgo.OpenFile(newBytesReaderAt(data), int64(len(data)))
-		if err != nil {
-			return nil, fmt.Errorf("open checkpoint part %s: %w", name, err)
-		}
-		reader := parquetgo.NewGenericReader[checkpointRow](pf)
-		buf := make([]checkpointRow, 64)
-		var found *Schema
-		for found == nil {
-			n, readErr := reader.Read(buf)
-			for i := 0; i < n; i++ {
-				md := buf[i].MetaData
-				if md == nil || md.SchemaString == "" {
-					continue
-				}
-				sch, err := parseSchemaString(md.SchemaString)
-				if err != nil {
-					reader.Close()
-					return nil, fmt.Errorf("parse schema_string in checkpoint %s: %w", name, err)
-				}
-				found = sch
-				break
-			}
-			if readErr == io.EOF || n == 0 {
-				break
-			}
-			if readErr != nil {
-				reader.Close()
-				return nil, fmt.Errorf("read checkpoint part %s: %w", name, readErr)
-			}
-		}
-		reader.Close()
-		if found != nil {
-			return found, nil
-		}
+		found = sch
+		return false
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("no metaData action found in checkpoint")
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	if found == nil {
+		return nil, fmt.Errorf("no metaData action found in checkpoint")
+	}
+	return found, nil
 }
 
 // bytesReaderAt wraps a []byte so it satisfies io.ReaderAt, which
@@ -588,28 +706,48 @@ func (b *bytesReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// readRecentCommits returns Commit records for the last maxCommitsScanned
-// versions, newest first. Versions with no commitInfo action (rare but
-// permitted by the protocol) get a Commit with empty Operation and
-// UserMetadata — the version + a best-effort timestamp from file mtime
-// (where available) is still surfaced so the snapshot timeline has a
-// row to render.
-func readRecentCommits(logFS fs.FS, versions []int64, files map[int64]string) ([]Commit, error) {
+// windowCommit is one recent-window commit: its version, its file name
+// (kept for the mtime timestamp fallback), and its parsed actions. The
+// window is read off the filesystem once per ReadTableState and shared by
+// the history projection, the schema resolver, and the row-count replay.
+type windowCommit struct {
+	version int64
+	file    string
+	actions []rawAction
+}
+
+// readWindow reads the last maxCommitsScanned commit files, ascending by
+// version. A malformed commit surfaces as an error, matching the
+// package-wide "no silent skips" contract.
+func readWindow(logFS fs.FS, ix *logIndex) ([]windowCommit, error) {
 	start := 0
-	if len(versions) > maxCommitsScanned {
-		start = len(versions) - maxCommitsScanned
+	if len(ix.versions) > maxCommitsScanned {
+		start = len(ix.versions) - maxCommitsScanned
 	}
-	out := make([]Commit, 0, len(versions)-start)
-	// Newest first — the snapshot timeline renders top-down.
-	for i := len(versions) - 1; i >= start; i-- {
-		v := versions[i]
-		path := files[v]
-		actions, err := readCommitActions(logFS, path)
+	out := make([]windowCommit, 0, len(ix.versions)-start)
+	for _, v := range ix.versions[start:] {
+		name := ix.versionToFile[v]
+		actions, err := readCommitActions(logFS, name)
 		if err != nil {
 			return nil, fmt.Errorf("read commit %d: %w", v, err)
 		}
-		c := Commit{Version: v}
-		for _, a := range actions {
+		out = append(out, windowCommit{version: v, file: name, actions: actions})
+	}
+	return out, nil
+}
+
+// commitsFromWindow projects the pre-read window into Commit records,
+// newest first (the snapshot timeline renders top-down). Versions with no
+// commitInfo action (rare but permitted by the protocol) get a Commit with
+// empty Operation and UserMetadata — the version + a best-effort timestamp
+// from file mtime (where available) is still surfaced so the snapshot
+// timeline has a row to render.
+func commitsFromWindow(logFS fs.FS, win []windowCommit) []Commit {
+	out := make([]Commit, 0, len(win))
+	for i := len(win) - 1; i >= 0; i-- {
+		wc := win[i]
+		c := Commit{Version: wc.version}
+		for _, a := range wc.actions {
 			if a.CommitInfo == nil {
 				continue
 			}
@@ -620,11 +758,155 @@ func readRecentCommits(logFS fs.FS, versions []int64, files map[int64]string) ([
 			break
 		}
 		if c.TimestampMs == 0 {
-			c.TimestampMs = mtimeMs(logFS, path)
+			c.TimestampMs = mtimeMs(logFS, wc.file)
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out
+}
+
+// checkpointStatsRow is the row-count projection over a checkpoint
+// parquet: each live file's path, its per-file stats JSON (numRecords
+// lives there), and its deletion vector's cardinality. Kept separate from
+// checkpointFileRow / checkpointRow so each reader decodes only the leaf
+// columns it needs. Checkpoints written without the stats or
+// deletionVector columns zero-fill (see scanCheckpoint), which
+// rowCountFromLog treats as "stats unavailable" and degrades to nil rather
+// than returning a wrong count.
+type checkpointStatsRow struct {
+	Add *struct {
+		Path           string `parquet:"path"`
+		Stats          string `parquet:"stats"`
+		DeletionVector *struct {
+			Cardinality int64 `parquet:"cardinality"`
+		} `parquet:"deletionVector"`
+	} `parquet:"add"`
+	Remove *struct {
+		Path string `parquet:"path"`
+	} `parquet:"remove"`
+}
+
+// rowCountFromLog computes the table's exact current row count from Delta
+// snapshot state: the sum of every live file's stats.numRecords, net of
+// deletion-vector cardinalities. The live set is seeded from the latest
+// checkpoint (when one exists) and the window's post-checkpoint commits
+// are replayed over it — the same protocol walk ReadFileStats does for
+// file sizes, sharing the window and checkpoint bytes ReadTableState
+// already fetched.
+//
+// It returns (nil, nil) — "not derivable" — rather than a wrong number
+// when the log doesn't pin down the live set or its row counts:
+//   - no checkpoint and the surviving window doesn't start at version 0;
+//   - a surviving commit after the checkpoint falls below the window, or
+//     the replayed versions aren't contiguous (a retention gap would hide
+//     adds/removes);
+//   - any live file lacks readable numRecords stats.
+func rowCountFromLog(ix *logIndex, win []windowCommit, loadCP func() (*checkpointData, error)) (*int64, error) {
+	anchor := int64(-1) // replay commits strictly greater than this
+	cv, _, hasCP := ix.latestCheckpoint()
+	if hasCP {
+		anchor = cv
+	} else if len(win) == 0 || win[0].version != 0 {
+		return nil, nil
+	}
+
+	// Versions below the window (truncated by maxCommitsScanned) must all
+	// be covered by the checkpoint, and the replayed tail must be
+	// contiguous — Delta versions are, so a gap means retention ate a
+	// commit we needed.
+	start := len(ix.versions) - len(win)
+	if start > 0 && ix.versions[start-1] > anchor {
+		return nil, nil
+	}
+	expected := anchor + 1
+	var replay []windowCommit
+	for _, wc := range win {
+		if wc.version <= anchor {
+			continue
+		}
+		if wc.version != expected {
+			return nil, nil
+		}
+		expected++
+		replay = append(replay, wc)
+	}
+
+	// live maps a data-file path to its row count; known=false marks a
+	// live file whose stats were unreadable (poisons the total only if the
+	// file is still live at the latest version).
+	type liveFile struct {
+		rows  int64
+		known bool
+	}
+	live := make(map[string]liveFile)
+	if hasCP {
+		cd, err := loadCP()
+		if err != nil {
+			return nil, err
+		}
+		if err := scanCheckpoint(cd, func(r checkpointStatsRow) bool {
+			if r.Add != nil && r.Add.Path != "" {
+				var card int64
+				if r.Add.DeletionVector != nil {
+					card = r.Add.DeletionVector.Cardinality
+				}
+				rows, known := liveFileRows(r.Add.Stats, card)
+				live[r.Add.Path] = liveFile{rows: rows, known: known}
+			}
+			if r.Remove != nil && r.Remove.Path != "" {
+				delete(live, r.Remove.Path)
+			}
+			return true
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for _, wc := range replay {
+		for _, a := range wc.actions {
+			if a.Add != nil && a.Add.Path != "" {
+				var card int64
+				if a.Add.DeletionVector != nil {
+					card = a.Add.DeletionVector.Cardinality
+				}
+				rows, known := liveFileRows(a.Add.Stats, card)
+				live[a.Add.Path] = liveFile{rows: rows, known: known}
+			}
+			if a.Remove != nil && a.Remove.Path != "" {
+				delete(live, a.Remove.Path)
+			}
+		}
+	}
+
+	var total int64
+	for _, lf := range live {
+		if !lf.known {
+			return nil, nil
+		}
+		total += lf.rows
+	}
+	return &total, nil
+}
+
+// liveFileRows parses an add action's stats JSON into the file's live row
+// count, netting out an attached deletion vector's cardinality (rows the
+// vector soft-deleted). known=false when the stats are absent or don't
+// carry numRecords — the writer didn't collect stats, or the checkpoint
+// stores stats as a struct column instead of JSON.
+func liveFileRows(stats string, dvCardinality int64) (rows int64, known bool) {
+	if strings.TrimSpace(stats) == "" {
+		return 0, false
+	}
+	var s struct {
+		NumRecords *int64 `json:"numRecords"`
+	}
+	if err := json.Unmarshal([]byte(stats), &s); err != nil || s.NumRecords == nil {
+		return 0, false
+	}
+	rows = *s.NumRecords - dvCardinality
+	if rows < 0 {
+		rows = 0
+	}
+	return rows, true
 }
 
 // fillRecordCounts mirrors the runner's _record_table_state mapping —
@@ -738,11 +1020,23 @@ type rawAction struct {
 	// doesn't need them, so the fields are intentionally absent.
 }
 
-// rawAdd is the `add` action's subset ReadFileStats consumes: the data
-// file's path (the live-set key) and its byte size (Delta's `add.size`).
+// rawAdd is the `add` action's subset the file-accounting readers consume:
+// the data file's path (the live-set key), its byte size (ReadFileStats),
+// and its row-count inputs (rowCountFromLog) — the per-file stats JSON
+// carrying numRecords, plus the deletion vector netting out soft-deleted
+// rows.
 type rawAdd struct {
-	Path string `json:"path"`
-	Size int64  `json:"size"`
+	Path           string             `json:"path"`
+	Size           int64              `json:"size"`
+	Stats          string             `json:"stats"`
+	DeletionVector *rawDeletionVector `json:"deletionVector"`
+}
+
+// rawDeletionVector is the `add.deletionVector` subset rowCountFromLog
+// consumes: Cardinality is the number of rows the vector marks deleted in
+// its file.
+type rawDeletionVector struct {
+	Cardinality int64 `json:"cardinality"`
 }
 
 // rawRemove is the `remove` action's subset ReadFileStats consumes: the
@@ -920,6 +1214,20 @@ func ReadCurrentFromPath(tablePath string) (*Schema, []Commit, error) {
 		return nil, nil, fmt.Errorf("stat _delta_log: %w", err)
 	}
 	return ReadCurrent(os.DirFS(logDir))
+}
+
+// ReadTableStateFromPath is the table-root convenience wrapper for
+// ReadTableState, mirroring ReadCurrentFromPath. Returns ErrNotDelta both
+// when the table directory is missing and when `_delta_log/` is absent.
+func ReadTableStateFromPath(tablePath string) (*TableState, error) {
+	logDir := filepath.Join(tablePath, "_delta_log")
+	if _, err := os.Stat(logDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotDelta
+		}
+		return nil, fmt.Errorf("stat _delta_log: %w", err)
+	}
+	return ReadTableState(os.DirFS(logDir))
 }
 
 // ReadFileStatsFromPath is the table-root convenience wrapper for

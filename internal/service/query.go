@@ -113,6 +113,13 @@ func (s *Service) Query(ctx context.Context, sql string, opts QueryOptions) (*ob
 		SQL:         sqlToRun,
 		PipelineDir: dir,
 		MaxRows:     opts.MaxRows,
+		// This is the interactive ad-hoc seam (`clavesa query`, the UI's
+		// /data/query panel). A query against a table that doesn't exist
+		// must error, not answer "0 rows, success" — the same reasoning
+		// as the undeployed-warehouse guard above. The soft missing-table
+		// path is for non-ad-hoc surfaces (dashboard-live widgets,
+		// catalog) that call prov.Query directly.
+		StrictMissing: true,
 	})
 	if err != nil {
 		return nil, err

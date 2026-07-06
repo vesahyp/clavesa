@@ -170,24 +170,13 @@ func ResolveInputData(ctx context.Context, s3c dataquery.S3Client, g *graph.Pipe
 			pr := Convert(qr)
 			rows = pr.Items
 		} else {
-			// Transform parent: prefer the already-materialized Iceberg
-			// snapshot when fresh — skips the upstream's
-			// SQL/PySpark re-execution and the source re-fetch behind
-			// it. Falls back to the full chain when the snapshot is
-			// missing, stale, or the query fails.
-			snapRows, used, err := ResolveUpstreamFromSnapshot(ctx, filepath.Dir(dir), dir, parentNode, rowCount)
+			// Transform parent: re-execute the upstream chain so computed
+			// columns are available downstream.
+			output, err := executeTransformChain(ctx, s3c, g, dir, parentNode, rowCount)
 			if err != nil {
-				return nil, fmt.Errorf("snapshot upstream %s: %w", p.fromNode, err)
+				return nil, fmt.Errorf("chain transform %s: %w", p.fromNode, err)
 			}
-			if used {
-				rows = snapRows
-			} else {
-				output, err := executeTransformChain(ctx, s3c, g, dir, parentNode, rowCount)
-				if err != nil {
-					return nil, fmt.Errorf("chain transform %s: %w", p.fromNode, err)
-				}
-				rows = output
-			}
+			rows = output
 		}
 		allRows[p.alias] = rows
 	}

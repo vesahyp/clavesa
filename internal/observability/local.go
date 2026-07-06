@@ -19,17 +19,20 @@ import (
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
-// LocalProvider satisfies Provider for compute = "local" pipelines.
+// LocalProvider satisfies Provider for workspaces on the local warehouse
+// (ADR-024: the Resolver dispatches by workspace.LoadWarehouse, never by a
+// per-pipeline attribute).
 //
 // Run history (NodeRuns/Runs/Snapshots/Table) and execution state share the
 // same response shapes as CloudProvider so the UI cannot tell which backend
 // served a request — ADR-014.
 //
-// Execution states + logs come straight from the filesystem progress channel
-// at <pipelineDir>/.clavesa/runs/<runID>/. The Iceberg-backed surfaces
-// (NodeRuns, Runs, Snapshots) reuse the runner container in CLAVESA_QUERY=1
-// mode to read against the local Hadoop catalog — same SQL surface the cloud
-// provider uses through Athena.
+// Execution states come from the warehouse `_progress/<run>/` marker tree
+// the runner + dispatch layer write (3be08e3); execution logs come from the
+// per-run `_bundle.log` under <pipelineDir>/.clavesa/runs/<runID>/. The
+// Delta-backed surfaces (NodeRuns, Runs, Snapshots) reuse the runner
+// container in CLAVESA_QUERY=1 mode to read against the local Hadoop
+// catalog — same SQL surface the cloud provider uses through Athena.
 type LocalProvider struct {
 	workspaceRoot string
 	query         QueryRunner // override for tests; nil → docker shell-out
@@ -46,14 +49,15 @@ func NewLocalProvider(workspaceRoot string) *LocalProvider {
 // ExecutionStates
 // ---------------------------------------------------------------------------
 
-// ExecutionStates reads the filesystem progress channel for one run.
+// ExecutionStates reads the warehouse `_progress` tree for one run.
 //
-// ExecutionRef is a local run-id (hex). When empty, returns the most recent
-// run for the inspected pipeline — matches how CloudProvider treats the
-// "latest in-flight execution" case via the SFN ListExecutions path.
+// ExecutionRef is an exec-ref token (see execref.go). When it carries no run
+// id, returns the most recent run in the warehouse — matches how
+// CloudProvider treats the "latest in-flight execution" case via the SFN
+// ListExecutions path.
 func (p *LocalProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQuery) (*ExecutionStatesResult, error) {
 	store := p.progressStore()
-	_, runID := splitExecRef(q.ExecutionRef)
+	_, runID := SplitExecRef(q.ExecutionRef)
 	if runID == "" {
 		// No explicit run id: inspect the newest run in the warehouse
 		// `_progress` tree. Empty when nothing has run yet — the cloud
@@ -128,48 +132,75 @@ func (p *LocalProvider) progressStore() ProgressStore {
 // ---------------------------------------------------------------------------
 
 // logsLineCap caps how many lines one /pipeline/execution/logs response
-// returns, mirroring CloudProvider's logsLimit. Captured runner stdout for
-// one node rarely exceeds a few hundred lines; the cap protects against a
+// returns, mirroring CloudProvider's logsLimit. Captured runner output for
+// one run rarely exceeds a few hundred lines; the cap protects against a
 // runaway log file (e.g. a Spark plan dump).
 const logsLineCap = 500
 
-// ExecutionLogs reads the captured stdout/stderr file for one node within
-// one run. Format on disk is `<RFC3339Nano>\t<message>` per line — written
-// by NewTimestampedLogWriter at the moment each line was emitted, so the
-// per-event Timestamp matches the cloud CloudWatch payload (ADR-014
-// parity). Lines without the timestamp prefix (older log files written
-// before the writer wrap landed) fall through with Timestamp:"" and the
-// raw line as Message — backward-compatible.
+// ExecutionLogs serves the run's `_bundle.log` — the full runner
+// stdout/stderr the bundle path tees to
+// <pipelineDir>/.clavesa/runs/<runID>/_bundle.log (GH #64).
+//
+// The bundle runner shares one container and one Spark session across every
+// node in the run, so the captured log is per-RUN, not per-step: the same
+// events are returned whichever step the caller asks about, labeled per-run
+// (FunctionName = run id, LogGroup = the on-disk path). Step is still
+// required for interface parity with the cloud provider, which windows
+// CloudWatch by step.
+//
+// Line format on disk is `<RFC3339Nano>\t<message>` (NewTimestampedLogWriter),
+// so per-event Timestamps match the cloud CloudWatch payload (ADR-014
+// parity). Lines without the prefix (pre-timestamping log files) fall
+// through with Timestamp:"" and the raw line as Message.
 func (p *LocalProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery) (*ExecutionLogsResult, error) {
 	if q.Step == "" {
 		return nil, errors.New("step is required")
 	}
-	dir, err := p.pipelineDirForQuery(q.ExecutionRef)
-	if err != nil {
-		return nil, err
-	}
-	runID, err := p.resolveRunID(dir, q.ExecutionRef)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+	dir, runID := SplitExecRef(q.ExecutionRef)
+	if runID == "" {
+		// No explicit run id — newest run in the warehouse `_progress` tree.
+		ids, err := ListProgressRunIDs(p.warehouseDir())
+		if err != nil {
+			return nil, fmt.Errorf("list local runs: %w", err)
+		}
+		if len(ids) == 0 {
 			return &ExecutionLogsResult{
 				Source:       LogSourceLocal,
 				FunctionName: q.Step,
 				Events:       []LogEvent{},
 			}, nil
 		}
-		return nil, err
+		runID = ids[0]
+	}
+	if dir == "" {
+		// Bare run-id ref (e.g. `arn=<uuid>` from the drawer): recover the
+		// owning pipeline from the run marker — pipeline name == dir basename
+		// by convention.
+		if m, ok, _ := readRunMarker(ctx, p.progressStore(), runID); ok && m != nil {
+			dir = m.Pipeline
+		}
+	}
+	if dir == "" {
+		// Can't locate a pipeline dir for this run — no log to serve.
+		// Empty events, not an error (matches CloudProvider's "not an SFN
+		// execution" fail-soft).
+		return &ExecutionLogsResult{
+			Source:       LogSourceLocal,
+			FunctionName: runID,
+			Events:       []LogEvent{},
+		}, nil
 	}
 
-	logPath := RunLogPath(dir, runID, q.Step)
+	logPath := RunBundleLogPath(pathutil.ResolveDir(p.workspaceRoot, dir), runID)
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No log file yet — step hasn't been entered, or the run never
-			// reached it. Empty events, not an error (matches CloudProvider).
+			// No bundle log yet — the run hasn't started writing, or predates
+			// the bundle runner. Empty events, not an error.
 			return &ExecutionLogsResult{
 				Source:       LogSourceLocal,
 				LogGroup:     logPath,
-				FunctionName: q.Step,
+				FunctionName: runID,
 				Events:       []LogEvent{},
 			}, nil
 		}
@@ -196,7 +227,7 @@ func (p *LocalProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 	return &ExecutionLogsResult{
 		Source:       LogSourceLocal,
 		LogGroup:     logPath,
-		FunctionName: q.Step,
+		FunctionName: runID,
 		Events:       events,
 		Truncated:    truncated,
 	}, nil
@@ -355,14 +386,12 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
 }
 
-// Runs reads the per-pipeline-execution rollup directly from the local
-// progress channel — one entry per RunDir, projected from state.json. The
-// SQL path the cloud provider uses (Athena over an Iceberg <pipeline>.runs
-// table) doesn't apply here: the local orchestrator never writes that
-// table, so a Spark-via-runner query would always come back empty even on
-// pipelines with dozens of completed runs. Reading the channel filesystem
-// gives the Run history surface the data parity ADR-014 expects without
-// the round-trip cost of spinning up a runner container per request.
+// Runs reads the per-pipeline-execution rollup directly from the warehouse
+// `_progress` tree — one entry per run directory, projected from its
+// `_run.json` run marker. The SQL path the cloud provider uses (Athena over
+// the workspace `runs` table) doesn't apply here: reading the marker
+// filesystem gives the Run history surface the data parity ADR-014 expects
+// without the round-trip cost of spinning up a runner container per request.
 //
 // SfExecutionARN is set to the run ID so the node-runs join key (cloud:
 // SFN ARN; local: run uuid) stays consistent with NodeRuns and the
@@ -923,8 +952,7 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	// `<warehouse>/<db>.db/<table>/_delta_log/`.
 	warehouse := workspace.LocalWarehouseDir(p.workspaceRoot)
 	tablePath := ResolveLocalTablePath(warehouse, q.Database, q.Table)
-	schema, commits, err := delta.ReadCurrentFromPath(tablePath)
-	_ = schema // unused — caller is asking for snapshots only
+	st, err := delta.ReadTableStateFromPath(tablePath)
 	if err != nil {
 		if errors.Is(err, delta.ErrNotDelta) {
 			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
@@ -932,9 +960,9 @@ func (p *LocalProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 		return nil, fmt.Errorf("read delta log: %w", err)
 	}
 
-	// Projection (incl. the LatestRecordCount fold) is shared with
+	// Projection (incl. the LatestRecordCount derivation) is shared with
 	// CloudProvider.Snapshots so local and cloud agree (ADR-014).
-	return snapshotsResultFromCommits(commits, q.Limit), nil
+	return snapshotsResultFromCommits(st.Commits, q.Limit, st.RowCount), nil
 }
 
 // ColumnStats reads the latest-snapshot row per column from the workspace
@@ -1136,8 +1164,9 @@ func (p *LocalProvider) Query(ctx context.Context, q QueryQuery) (*QueryResult, 
 		// Empty rather than error for missing tables — matches the
 		// SampleTable / NodeRuns convention so a dashboard widget over
 		// a fresh table renders as an empty chart instead of a stack
-		// trace.
-		if isMissingTableErr(err) {
+		// trace. StrictMissing opts out (interactive query / render
+		// smoke test), where a missing table must surface as an error.
+		if !q.StrictMissing && isMissingTableErr(err) {
 			return &QueryResult{Columns: []SampleTableColumn{}, Rows: [][]string{}, Served: servedSparkLocal()}, nil
 		}
 		return nil, err
@@ -1210,73 +1239,5 @@ func isMissingTableErr(err error) bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// pipelineDirForQuery extracts the pipeline directory from an execution
-// reference. Format: "<pipelineDir>:<runID>" or just "<pipelineDir>" (latest
-// run is implied). Falls back to a workspace-rooted relative path when the
-// caller passes only a directory hint.
-func (p *LocalProvider) pipelineDirForQuery(execRef string) (string, error) {
-	dir, _ := splitExecRef(execRef)
-	if dir == "" {
-		return "", errors.New("local provider: execution_ref must be \"<dir>\" or \"<dir>:<runID>\"")
-	}
-	return pathutil.ResolveDir(p.workspaceRoot, dir), nil
-}
-
-// resolveRunID returns the runID portion of execRef when provided, else the
-// most recent run found on disk. Empty result is treated as "no runs yet"
-// upstream rather than an error.
-func (p *LocalProvider) resolveRunID(pipelineDir, execRef string) (string, error) {
-	_, rid := splitExecRef(execRef)
-	if rid != "" {
-		return rid, nil
-	}
-	ids, err := ListRunIDs(pipelineDir)
-	if err != nil {
-		return "", err
-	}
-	if len(ids) == 0 {
-		return "", os.ErrNotExist
-	}
-	return ids[0], nil
-}
-
-// splitExecRef splits "dir:runID" into ("dir", "runID"). Strings without ':'
-// are treated as a bare directory (no runID supplied). Round-trip-safe with
-// FormatExecRef below.
-func splitExecRef(s string) (dir, runID string) {
-	if s == "" {
-		return "", ""
-	}
-	// Use the LAST colon so absolute paths with drive letters or Windows
-	// `C:\…\dir` shapes still split correctly.
-	idx := strings.LastIndex(s, ":")
-	if idx < 0 {
-		return s, ""
-	}
-	return s[:idx], s[idx+1:]
-}
-
-// FormatExecRef encodes (dir, runID) back into the on-the-wire format. The
-// HTTP handler uses this when constructing dispatch references for local
-// providers; cloud uses raw SFN ARNs for the same field.
-//
-// Cloud runs are addressed by their full SFN execution ARN (the value
-// `pipeline run` prints and the UI carries in the `run=` query param). Such
-// a runID is already self-contained: prefixing it with `dir:` would shift
-// the colon-split in StateMachineNameFromExecutionARN, so the ARN no longer
-// parses and the cloud provider returns an empty result. Pass a full
-// execution ARN through unchanged. Local run IDs are never ARN-shaped, so
-// this branch never affects the local round-trip with splitExecRef.
-func FormatExecRef(dir, runID string) string {
-	if runID == "" {
-		return dir
-	}
-	if StateMachineNameFromExecutionARN(runID) != "" {
-		return runID
-	}
-	return dir + ":" + runID
-}
+// The exec-ref encode/decode pair (FormatExecRef / SplitExecRef) lives in
+// execref.go — one pair shared by every execution endpoint (GH #78).

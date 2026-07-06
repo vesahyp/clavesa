@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vesahyp/clavesa/internal/delta"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/observability"
@@ -17,19 +18,22 @@ import (
 )
 
 // Local-mode backfill replaces Glue table tagging with a sidecar JSON file
-// next to the staging Iceberg directory. Same key/value shape as the cloud
+// next to the staging Delta directory. Same key/value shape as the cloud
 // Glue Parameters map so BackfillList reconstructs an identical BackfillRun.
 //
-// File layout:
+// The staging Delta table and its sidecar live under the pipeline's
+// namespace directory in the local warehouse. Since ADR-019 Slice 4 that is
+// the V2 nested layout:
 //
-//	<workspace>/.clavesa/warehouse/<glueDB>/<staging_table>.backfill.json
+//	<warehouse>/<catalog>/<schema>/<staging_table>/            (Delta table)
+//	<warehouse>/<catalog>/<schema>/<staging_table>.backfill.json (sidecar)
 //
-// The staging Iceberg directory lives at
-//
-//	<workspace>/.clavesa/warehouse/<glueDB>/<staging_table>/
-//
-// — same parent dir, so a single readdir scan finds both the staging
-// directories and their metadata.
+// with the legacy Hive layout (<warehouse>/<catalog>__<schema>.db/) probed
+// as a fallback for workspaces written before the migration. Either way the
+// sidecar sits beside the table dir, so a single readdir scan of the
+// namespace directory finds both the staging directories and their metadata.
+// Table-dir resolution mirrors observability.ResolveLocalTablePath, the
+// canonical local Delta-path resolver (v2 → legacy → `__default` probe).
 
 // stagingSidecar is the on-disk shape of one staging table's metadata.
 type stagingSidecar struct {
@@ -43,13 +47,33 @@ type stagingSidecar struct {
 	StoppedAt      time.Time `json:"stopped_at,omitempty"`
 }
 
+// localNamespaceDir returns the on-disk directory holding this pipeline's
+// tables (and their backfill sidecars) for the encoded `<catalog>__<schema>`
+// Glue DB. Probes the ADR-019 V2 nested layout
+// `<warehouse>/<catalog>/<schema>/` first and falls back to the legacy Hive
+// `<warehouse>/<catalog>__<schema>.db/` when V2 doesn't exist — the same
+// two-layout probe the observability catalog walker and ResolveLocalTablePath
+// use. Returns the legacy path when neither exists so a first write MkdirAll's
+// a deterministic location (the runner has already created the V2 namespace by
+// the time a sidecar is written, so in practice V2 wins).
+func (s *Service) localNamespaceDir(glueDB string) string {
+	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	if i := strings.Index(glueDB, "__"); i >= 0 {
+		catalog, schema := glueDB[:i], glueDB[i+2:]
+		v2 := filepath.Join(warehouse, catalog, schema)
+		if fi, err := os.Stat(v2); err == nil && fi.IsDir() {
+			return v2
+		}
+	}
+	return filepath.Join(warehouse, glueDB+".db")
+}
+
 // stagingSidecarPath returns the absolute path of the sidecar JSON for the
 // given staging table. glueDB is the encoded `<catalog>__<schema>` namespace;
-// stagingTable is just the table-name segment (no `clavesa.<db>.` prefix).
-// The on-disk DB dir carries the Hive `<db>.db` suffix (v2.0.0 persistent
-// metastore) — the sidecar sits beside the table dir under that same prefix.
+// stagingTable is just the table-name segment (no db prefix). The sidecar
+// sits beside the table dir in the pipeline's namespace directory.
 func (s *Service) stagingSidecarPath(glueDB, stagingTable string) string {
-	return filepath.Join(workspace.LocalWarehouseDir(s.workspace), glueDB+".db", stagingTable+".backfill.json")
+	return filepath.Join(s.localNamespaceDir(glueDB), stagingTable+".backfill.json")
 }
 
 func (s *Service) writeStagingSidecar(glueDB, stagingTable string, sc stagingSidecar) error {
@@ -85,13 +109,14 @@ func (s *Service) deleteStagingSidecar(glueDB, stagingTable string) error {
 	return nil
 }
 
-// listLocalStagingTables scans the warehouse db directory for staging Iceberg
-// table directories (`*__backfill__*`) paired with their sidecar JSON. Returns
-// (stagingTable, sidecar) pairs in directory order. A staging dir with no
-// sidecar — and a sidecar with no staging dir — are both skipped (would never
-// pair into a usable BackfillRun, so listing them just confuses the user).
+// listLocalStagingTables scans the pipeline's namespace directory for staging
+// Delta table directories (`*__backfill__*`) paired with their sidecar JSON.
+// Returns (stagingTable, sidecar) pairs in directory order. A staging dir with
+// no sidecar — and a sidecar with no staging dir — are both skipped (would
+// never pair into a usable BackfillRun, so listing them just confuses the
+// user).
 func (s *Service) listLocalStagingTables(glueDB string) ([]localStagingEntry, error) {
-	dbDir := filepath.Join(workspace.LocalWarehouseDir(s.workspace), glueDB+".db")
+	dbDir := s.localNamespaceDir(glueDB)
 	entries, err := os.ReadDir(dbDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -129,7 +154,7 @@ type localStagingEntry struct {
 // Resolves the canonical target from workspace + node config (canonicalTargetFor),
 // reads inputs from the pipeline graph (buildInputs / external_inputs), and
 // invokes the runner container with a transform event carrying the `_backfill`
-// override block. Writes a sidecar JSON next to the staging Iceberg dir so
+// override block. Writes a sidecar JSON next to the staging Delta dir so
 // BackfillList can find it later without a Glue lookup.
 func (s *Service) backfillStageLocal(
 	ctx context.Context,
@@ -143,7 +168,7 @@ func (s *Service) backfillStageLocal(
 		return nil, fmt.Errorf("resolve canonical target: %w", err)
 	}
 
-	var stagingTableID string // fully-qualified, e.g. clavesa.<db>.<node>__backfill__<id> (canonical is bare for default-only outputs; see canonicalTableSegment)
+	var stagingTableID string // two-part `<glueDB>.<node>__backfill__<id>` (canonical is bare for default-only outputs; see canonicalTableSegment)
 	if req.Direct {
 		stagingTableID = canonicalTable
 	} else {
@@ -207,7 +232,7 @@ func (s *Service) backfillStageLocal(
 	// Empty outputTarget — the `_backfill.target_outputs` override above
 	// rewires the "default" key to the staging table; the default
 	// outputTarget would never be consulted by the runner in backfill mode.
-	_, _, rerr := s.runTransform(ctx, image, pipelineDir, workdir, node, inputs, "", "", runID, catalog, schema, systemCatalog, extraEvent)
+	_, _, rerr := s.runTransform(ctx, image, pipelineDir, workdir, node, inputs, "", runID, catalog, schema, systemCatalog, extraEvent)
 	stopped := time.Now()
 
 	run := &BackfillRun{
@@ -256,99 +281,47 @@ func (s *Service) backfillStageLocal(
 	return run, nil
 }
 
-// localTableDir maps a fully-qualified table id `clavesa.<db>.<name>` to its
-// on-disk warehouse path. Returns ("", false) on a malformed id so callers
-// can render a clean error.
+// localTableDir maps a two-part local table id `<glueDB>.<table>` (the id
+// form the local backfill path produces everywhere — see canonicalTargetFor
+// and backfillListLocal) to its on-disk warehouse path. The Glue DB segment
+// is the flat `<catalog>__<schema>` encoding, which contains no `.`, and the
+// table segment (`<node>`, `<node>__<key>`, `<node>__backfill__<id>`) contains
+// no `.` either, so the first `.` is the db↔table boundary. Resolution goes
+// through observability.ResolveLocalTablePath — the canonical resolver that
+// probes the ADR-019 V2 nested layout, the legacy Hive `.db` layout, and the
+// legacy `__default` suffix, in that order. Returns ("", false) on a malformed
+// id so callers can render a clean error.
 func (s *Service) localTableDir(fullTableID string) (string, bool) {
-	parts := strings.SplitN(fullTableID, ".", 3)
-	if len(parts) != 3 {
+	i := strings.IndexByte(fullTableID, '.')
+	if i <= 0 || i >= len(fullTableID)-1 {
 		return "", false
 	}
-	return filepath.Join(workspace.LocalWarehouseDir(s.workspace), parts[1]+".db", parts[2]), true
+	db, table := fullTableID[:i], fullTableID[i+1:]
+	warehouse := workspace.LocalWarehouseDir(s.workspace)
+	return observability.ResolveLocalTablePath(warehouse, db, table), true
 }
 
-// readLocalIcebergColumns parses the latest metadata.json under tableDir and
+// readLocalDeltaColumns reads the current Delta schema under tableDir and
 // returns the column list (name + Spark-shaped type string). Same shape the
 // cloud path gets from Athena's INFORMATION_SCHEMA.columns, so BackfillDiff
-// can compare schemas across both modes with identical formatting.
+// can compare schemas across both modes with identical formatting — delta's
+// reader already renders the canonical Spark type strings (`bigint`,
+// `decimal(10,2)`, `array<string>`, `struct<a:int>`) Glue returns for cloud.
 //
-// Returns (_, false) when the dir isn't a valid Iceberg table — caller
-// distinguishes "no such table" (canonical not yet created) from "schema
-// lookup failed" (transient I/O) by walking the bool, not the error.
-func readLocalIcebergColumns(tableDir string) ([]BackfillColumnInfo, bool) {
-	metaDir := filepath.Join(tableDir, "metadata")
-	entries, err := os.ReadDir(metaDir)
-	if err != nil {
+// Returns (_, false) when the dir isn't a valid Delta table (no `_delta_log/`,
+// missing dir, malformed commit) — the caller distinguishes "no such table"
+// (canonical not yet created) from "schema lookup failed" by walking the
+// bool, not the error.
+func readLocalDeltaColumns(tableDir string) ([]BackfillColumnInfo, bool) {
+	schema, _, err := delta.ReadCurrentFromPath(tableDir)
+	if err != nil || schema == nil {
 		return nil, false
 	}
-	best := ""
-	for _, e := range entries {
-		n := e.Name()
-		if !strings.HasPrefix(n, "v") || !strings.HasSuffix(n, ".metadata.json") {
-			continue
-		}
-		if best == "" || lexLessIceberg(best, n) {
-			best = n
-		}
+	cols := make([]BackfillColumnInfo, 0, len(schema.Columns))
+	for _, c := range schema.Columns {
+		cols = append(cols, BackfillColumnInfo{Name: c.Name, Type: c.Type})
 	}
-	if best == "" {
-		return nil, false
-	}
-	body, err := os.ReadFile(filepath.Join(metaDir, best))
-	if err != nil {
-		return nil, false
-	}
-	var meta struct {
-		CurrentSchemaID int `json:"current-schema-id"`
-		Schemas         []struct {
-			SchemaID int `json:"schema-id"`
-			Fields   []struct {
-				Name string      `json:"name"`
-				Type interface{} `json:"type"`
-			} `json:"fields"`
-		} `json:"schemas"`
-	}
-	if err := json.Unmarshal(body, &meta); err != nil {
-		return nil, false
-	}
-	for _, sch := range meta.Schemas {
-		if sch.SchemaID != meta.CurrentSchemaID {
-			continue
-		}
-		cols := make([]BackfillColumnInfo, 0, len(sch.Fields))
-		for _, f := range sch.Fields {
-			cols = append(cols, BackfillColumnInfo{Name: f.Name, Type: icebergTypeString(f.Type)})
-		}
-		return cols, true
-	}
-	return nil, false
-}
-
-// lexLessIceberg compares two metadata filenames so v10 sorts after v9.
-// Strips the leading "v" and trailing ".metadata.json", parses the rest as
-// an int, and compares numerically — same algorithm catalog_local.go uses.
-func lexLessIceberg(a, b string) bool {
-	num := func(s string) int {
-		s = strings.TrimPrefix(s, "v")
-		s = strings.TrimSuffix(s, ".metadata.json")
-		var n int
-		_, _ = fmt.Sscanf(s, "%d", &n)
-		return n
-	}
-	return num(a) < num(b)
-}
-
-// icebergTypeString flattens an Iceberg type JSON value to a printable
-// Spark-shaped type string. Primitives serialize as bare strings ("long",
-// "string"); structs/lists/maps as JSON objects. We render the object form
-// as a compact JSON string — surface diffs work either way, the user only
-// needs a stable representation.
-func icebergTypeString(t interface{}) string {
-	if s, ok := t.(string); ok {
-		return s
-	}
-	b, _ := json.Marshal(t)
-	return string(b)
+	return cols, true
 }
 
 // localRowCount runs `SELECT COUNT(*) FROM <table>` through the runner's
@@ -466,7 +439,7 @@ func (s *Service) backfillDiffLocal(ctx context.Context, dir, runID string) (*Ba
 	if !ok {
 		return nil, fmt.Errorf("backfill: malformed staging table id %q", run.TargetTable)
 	}
-	if cols, ok := readLocalIcebergColumns(stagingDir); ok {
+	if cols, ok := readLocalDeltaColumns(stagingDir); ok {
 		diff.StagingColumns = cols
 	}
 
@@ -480,7 +453,7 @@ func (s *Service) backfillDiffLocal(ctx context.Context, dir, runID string) (*Ba
 	if !ok {
 		return nil, fmt.Errorf("backfill: malformed canonical table id %q", run.CanonicalTable)
 	}
-	canonicalCols, canonicalExists := readLocalIcebergColumns(canonicalDir)
+	canonicalCols, canonicalExists := readLocalDeltaColumns(canonicalDir)
 	if !canonicalExists {
 		diff.CanonicalRows = -1
 		diff.SchemaMatches = true
@@ -521,7 +494,7 @@ func (s *Service) backfillDedupCheckLocal(ctx context.Context, dir string, run *
 	if !ok {
 		return nil, fmt.Errorf("backfill: malformed staging table id %q", run.TargetTable)
 	}
-	cols, ok := readLocalIcebergColumns(stagingDir)
+	cols, ok := readLocalDeltaColumns(stagingDir)
 	if !ok {
 		return nil, fmt.Errorf("backfill: lookup staging columns for %q", run.TargetTable)
 	}
@@ -543,7 +516,7 @@ func (s *Service) backfillDedupCheckLocal(ctx context.Context, dir string, run *
 	if !ok {
 		return nil, fmt.Errorf("backfill: malformed canonical table id %q", run.CanonicalTable)
 	}
-	if _, exists := readLocalIcebergColumns(canonicalDir); !exists {
+	if _, exists := readLocalDeltaColumns(canonicalDir); !exists {
 		n, err := localRowCount(ctx, prov, abs, run.TargetTable)
 		if err != nil {
 			return nil, err

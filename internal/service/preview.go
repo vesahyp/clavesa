@@ -233,23 +233,13 @@ func (s *Service) resolveInputData(ctx context.Context, g *graph.PipelineGraph, 
 			pr := preview.Convert(qr)
 			rows = pr.Items
 		} else {
-			// Transform node: read its existing Iceberg snapshot when
-			// fresh, otherwise re-execute. The snapshot path skips both
-			// the upstream's SQL/PySpark and the source re-fetch behind
-			// it; the fallback runs the full chain as before.
-			snapRows, used, err := preview.ResolveUpstreamFromSnapshot(ctx, s.workspace, abs, parentNode, rowCount)
+			// Transform node: re-execute the upstream chain so computed
+			// columns are available downstream.
+			result, err := s.executeTransform(ctx, g, abs, parentNode, rowCount)
 			if err != nil {
-				return nil, fmt.Errorf("snapshot upstream %s: %w", p.fromNode, err)
+				return nil, fmt.Errorf("chain transform %s: %w", p.fromNode, err)
 			}
-			if used {
-				rows = snapRows
-			} else {
-				result, err := s.executeTransform(ctx, g, abs, parentNode, rowCount)
-				if err != nil {
-					return nil, fmt.Errorf("chain transform %s: %w", p.fromNode, err)
-				}
-				rows = result
-			}
+			rows = result
 		}
 		allRows[p.alias] = rows
 	}

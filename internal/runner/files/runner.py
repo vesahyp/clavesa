@@ -39,6 +39,16 @@ import threading
 import time
 import types
 import uuid
+
+# Point boto3 at a custom S3 endpoint (moto/MinIO/LocalStack) when the
+# workspace set CLAVESA_S3_ENDPOINT. Spark's S3A already honors it via
+# spark_conf, but boto3 partition discovery / object reads default to real
+# AWS otherwise (GH #87). botocore reads AWS_ENDPOINT_URL_S3 globally, so
+# exporting it here covers every boto3.client("s3") without threading
+# endpoint_url through each call site. No-op in cloud (the knob is unset).
+_s3_endpoint = os.environ.get("CLAVESA_S3_ENDPOINT")
+if _s3_endpoint and not os.environ.get("AWS_ENDPOINT_URL_S3"):
+    os.environ["AWS_ENDPOINT_URL_S3"] = _s3_endpoint
 from typing import Any, Iterable
 
 # Directory Spark writes its event log into (see spark_conf.py:

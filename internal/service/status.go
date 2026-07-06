@@ -11,9 +11,10 @@ import (
 // the pipeline at `dir` (or a specific run when `run` is non-empty). It's the
 // service-layer seam the CLI's `pipeline status` reads through, mirroring the
 // /pipeline/execution/states HTTP handler so both surfaces consume identical
-// shapes (ADR-015). Provider is picked per the inspected pipeline's compute
-// mode via the resolver (ADR-014) — local reads the filesystem progress
-// channel, cloud reads SFN history.
+// shapes (ADR-015). Provider is picked per the workspace warehouse via the
+// resolver (ADR-024) — both providers read the warehouse `_progress` marker
+// tree (local: filesystem, cloud: S3; cloud additionally consults SFN for
+// the overall status of ARN-addressed runs).
 //
 // `dir` is the pipeline directory (absolute or workspace-relative). `run` is
 // optional: empty means "the most recent run".

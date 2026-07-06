@@ -15,9 +15,10 @@ const PipelineInfo = z.object({
   dir: z.string(),
   node_count: z.number(),
   cloud: z.string().optional().default(""),
-  // ADR-014: the UI reads `compute` to choose dir-vs-ARN addressing for
-  // observability queries. Local pipelines have no SFN ARN; cloud pipelines
-  // do. Treat missing as "lambda" (the transform module default).
+  // `compute` is the transforms' deploy target (lambda/fargate/…). Display
+  // only — observability addressing follows the workspace warehouse
+  // (ADR-024, useWarehouse), never this field. Missing reads as "lambda"
+  // (the transform module default).
   compute: z.string().optional().default(""),
   // ADR-016 schema this pipeline writes into (== the pipeline; one
   // schema, one producing pipeline). Falls back to the sanitized name.
@@ -173,8 +174,11 @@ export type ExecutionStatesResponse = z.infer<typeof ExecutionStatesResponse>;
  * GET /api/pipeline/execution/states — per-step status for one execution.
  * Polled every 2s while RUNNING; the editor uses it to overlay live DAG
  * colors. Two addressing modes (ADR-014):
- *   - { arn }                        — cloud pipelines (legacy SFN path).
- *   - { dir, run? }                  — local pipelines (filesystem channel).
+ *   - { arn }      — a single exec-ref token: an SFN execution ARN, or the
+ *                    `local:<dir>#<runID>` value /pipeline/status emits in
+ *                    `execution_arn` (GH #78 — one encoding, both accepted).
+ *   - { dir, run? } — explicit params; the server routes by the workspace
+ *                    warehouse (ADR-024).
  * Pass `{}` (or empty values) to disable the query.
  */
 export function useExecutionStates(
@@ -235,12 +239,13 @@ const ExecutionLogsResponse = z.object({
 export type ExecutionLogsResponse = z.infer<typeof ExecutionLogsResponse>;
 
 /**
- * GET /api/pipeline/execution/logs — log lines for one step within one
- * execution. Cloud sources from CloudWatch FilterLogEvents; local sources
- * from <pipelineDir>/.clavesa/runs/<runID>/logs (ADR-014). Two
- * addressing modes:
- *   - { arn, step }            — cloud pipelines.
- *   - { dir, run?, step }      — local pipelines.
+ * GET /api/pipeline/execution/logs — log lines for one execution. Cloud
+ * sources from CloudWatch FilterLogEvents windowed to `step`; local sources
+ * the run's `_bundle.log` at <pipelineDir>/.clavesa/runs/<runID>/ — per-run
+ * output (the bundle runner shares one container across nodes), labeled
+ * per-run (ADR-014, GH #64). Addressing mirrors useExecutionStates:
+ *   - { arn, step }            — exec-ref token (SFN ARN or local ref).
+ *   - { dir, run?, step }      — explicit params.
  * Lazy / pull-based; only the NodeDetailDrawer fires this on demand.
  */
 export function useExecutionLogs(

@@ -251,3 +251,94 @@ func itoa(n int64) string {
 	}
 	return string(buf[i:])
 }
+
+// TestProgressRunsListsPipelineMarkers proves the run-marker listing behind
+// CloudProvider.ProgressRuns (GH #65): only `_run.json`-bearing runs appear,
+// filtered to the asked pipeline, newest-first by started_ms, capped at
+// limit; a run dir with only node markers (an SFN run, which never writes
+// the run-level marker) is invisible.
+func TestProgressRunsListsPipelineMarkers(t *testing.T) {
+	store := NewFileProgressStore(t.TempDir())
+	ctx := context.Background()
+
+	write := func(run, pipeline, status string, startedMs, endedMs int64) {
+		m := RunMarker{Status: status, Pipeline: pipeline, Trigger: "manual"}
+		if startedMs > 0 {
+			m.StartedMs = &startedMs
+		}
+		if endedMs > 0 {
+			m.EndedMs = &endedMs
+		}
+		if err := WriteRunMarker(ctx, store, run, m); err != nil {
+			t.Fatalf("WriteRunMarker(%s): %v", run, err)
+		}
+	}
+	write("local-old", "demo", "SUCCEEDED", 1000, 2000)
+	write("local-new", "demo", "FAILED", 5000, 6000)
+	write("local-other", "otherpipe", "SUCCEEDED", 9000, 9500)
+	// An SFN-style run: node markers only, no _run.json — must not appear.
+	if err := store.WriteKey(ctx, "_progress/arn-run/a.json", []byte(`{"status":"succeeded","updated_ms":1}`)); err != nil {
+		t.Fatalf("write node marker: %v", err)
+	}
+
+	runs, err := progressRuns(ctx, store, "demo", 10)
+	if err != nil {
+		t.Fatalf("progressRuns: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("len(runs) = %d, want 2 (pipeline filter + marker requirement)", len(runs))
+	}
+	if runs[0].RunID != "local-new" || runs[1].RunID != "local-old" {
+		t.Errorf("order = [%s, %s], want newest-first [local-new, local-old]", runs[0].RunID, runs[1].RunID)
+	}
+	if runs[0].Status != "FAILED" || runs[0].StartedAt == "" || runs[0].DurationMs == nil {
+		t.Errorf("row projection incomplete: %+v", runs[0])
+	}
+
+	// Limit caps the newest rows.
+	capped, err := progressRuns(ctx, store, "demo", 1)
+	if err != nil {
+		t.Fatalf("progressRuns(limit=1): %v", err)
+	}
+	if len(capped) != 1 || capped[0].RunID != "local-new" {
+		t.Errorf("capped = %+v, want just local-new", capped)
+	}
+}
+
+// TestProgressRunsNilStore — an unwired store (no S3 client / undeployed
+// workspace) yields an empty listing with nil error, so GetStatus degrades
+// to SFN-only instead of failing.
+func TestProgressRunsNilStore(t *testing.T) {
+	runs, err := progressRuns(context.Background(), nil, "demo", 10)
+	if err != nil || len(runs) != 0 {
+		t.Errorf("progressRuns(nil store) = (%v, %v), want empty + nil", runs, err)
+	}
+}
+
+// TestCloudProviderProgressRunsViaS3Stub drives the exported seam GetStatus
+// calls: the S3-backed store lists `_progress/<run>/_run.json` markers from
+// the warehouse bucket.
+func TestCloudProviderProgressRunsViaS3Stub(t *testing.T) {
+	const bucket = "demo-bucket"
+	s3stub := &stubS3Snap{
+		objects: map[string][]byte{
+			bucket + "/_progress/local-abc/_run.json": []byte(`{"status":"SUCCEEDED","pipeline":"taxi","started_ms":1700000000000,"ended_ms":1700000030000}`),
+			bucket + "/_progress/local-def/_run.json": []byte(`{"status":"RUNNING","pipeline":"weblogs","started_ms":1700000050000}`),
+		},
+	}
+	c := NewCloudProvider(nil, bucket, nil, nil).WithS3(s3stub)
+
+	runs, err := c.ProgressRuns(context.Background(), "taxi", 20)
+	if err != nil {
+		t.Fatalf("ProgressRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].RunID != "local-abc" || runs[0].Status != "SUCCEEDED" {
+		t.Errorf("ProgressRuns = %+v, want the single taxi run local-abc", runs)
+	}
+
+	// Unwired provider (no S3): empty, nil error.
+	bare := NewCloudProvider(nil, "", nil, nil)
+	if runs, err := bare.ProgressRuns(context.Background(), "taxi", 20); err != nil || len(runs) != 0 {
+		t.Errorf("ProgressRuns(unwired) = (%v, %v), want empty + nil", runs, err)
+	}
+}

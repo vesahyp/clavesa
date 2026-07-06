@@ -1,4 +1,4 @@
-.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme release-gates release-check release-public validate-examples
+.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public validate-examples
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -129,7 +129,7 @@ release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, clou
 	   echo "## verification. Document why in the release commit message."; \
 	   echo "##############################################################"; \
 	 else \
-	   for g in test verify-readme; do \
+	   for g in test verify-readme verify-cookbook; do \
 	     ./scripts/green-stamp.sh check $$g || { \
 	       echo "  run 'make release-gates' (or CLAVESA_SKIP_LOCAL_GATES=1 to bypass — document why in the release commit)"; \
 	       exit 1; \
@@ -152,6 +152,10 @@ smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/cla
 verify-readme: $(if $(SKIP_BUILD),,build) ## Walk the README quick-start literally (UI via playwright-cli) and assert the mandatory pages (CLAVESA_VERIFY_ADDR to override the :8080 UI port)
 	@./scripts/verify-readme.sh
 	@./scripts/green-stamp.sh write verify-readme
+
+verify-cookbook: $(if $(SKIP_BUILD),,build) ## Walk the cookbook recipes literally against a fresh tempdir workspace (local S3 via moto) and assert outcomes — release-gates / nightly, NOT per-commit (GH #86)
+	@./scripts/verify-cookbook.sh
+	@./scripts/green-stamp.sh write verify-cookbook
 
 release-gates: build ## Run the three release gates (test, smoke-cloud, verify-readme) concurrently; per-gate logs in .gates/, green stamps enforced by release-check
 	@mkdir -p .gates; \
@@ -178,8 +182,17 @@ release-gates: build ## Run the three release gates (test, smoke-cloud, verify-r
 	     rc=1; \
 	   fi; \
 	 done; \
+	 rm -f .gates/verify-cookbook.log; \
+	 echo "→ verify-cookbook (serial — Spark-heavy, cannot share the VM with the concurrent gates; GH #84)"; \
+	 st_cook=0; SKIP_BUILD=1 $(MAKE) verify-cookbook >.gates/verify-cookbook.log 2>&1 || st_cook=$$?; \
+	 if [ "$$st_cook" = "0" ]; then \
+	   echo "✓ verify-cookbook  (.gates/verify-cookbook.log)"; \
+	 else \
+	   echo "✗ verify-cookbook failed with exit $$st_cook  (.gates/verify-cookbook.log)"; \
+	   rc=1; \
+	 fi; \
 	 if [ "$$rc" = "0" ]; then \
-	   echo "all three release gates green — stamps written (.test-green.json, .verify-readme-green.json, .cloud-smoke-green.json)"; \
+	   echo "all release gates green — stamps written (.test-green.json, .verify-readme-green.json, .cloud-smoke-green.json, .verify-cookbook-green.json)"; \
 	 fi; \
 	 exit $$rc
 

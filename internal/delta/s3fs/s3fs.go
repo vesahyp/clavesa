@@ -6,12 +6,11 @@
 //   - ReadDir(".") — list the immediate children of the prefix
 //   - Open(name) → file with Read+Close+Stat returning mtime
 //
-// Nested directories, ReadFile, Sub-FS, Glob, and Walk are unsupported.
-// The S3 listing is paged but uses a single iteration; a `_delta_log/`
-// with more commit files than fit in one ListObjectsV2 page (1000 by
-// default) is handled. No checkpoint discovery — we read the JSON
-// commits directly; checkpoint files are skipped by delta.ReadCurrent's
-// commit-file regex.
+// Nested directories, ReadFile, Sub-FS, Glob, and Walk are unsupported
+// (fs.ReadFile falls back to Open+ReadAll, which is how the delta reader
+// fetches checkpoint parquet parts). The S3 listing is paged but uses a
+// single iteration; a `_delta_log/` with more commit files than fit in one
+// ListObjectsV2 page (1000 by default) is handled.
 package s3fs
 
 import (

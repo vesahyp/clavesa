@@ -10,9 +10,12 @@ import (
 	"time"
 )
 
-// LocalChannelDirName is the per-pipeline subdirectory the local progress
-// channel writes under. Exposed so both writer (service.RunPipeline) and
-// reader (LocalProvider) agree on the layout.
+// LocalChannelDirName is the per-pipeline subdirectory the local run
+// artifacts (bundle logs, failure logs) live under. Exposed so both writer
+// (service.RunPipeline) and reader (LocalProvider) agree on the layout.
+// Runtime STATE no longer lives here — per-node status moved to the
+// warehouse `_progress/<run>/` marker tree (3be08e3 / ADR-024); this dir
+// keeps only the captured runner output.
 const LocalChannelDirName = ".clavesa"
 
 // runsRoot returns <pipelineDir>/.clavesa/runs (the parent of every run's
@@ -27,23 +30,25 @@ func RunDir(pipelineDir, runID string) string {
 	return filepath.Join(runsRoot(pipelineDir), runID)
 }
 
-// RunStatePath returns the absolute path to one run's state.json.
-func RunStatePath(pipelineDir, runID string) string {
-	return filepath.Join(RunDir(pipelineDir, runID), "state.json")
+// RunBundleLogPath returns the absolute path of one run's `_bundle.log` —
+// the full runner stdout/stderr the bundle path tees per run (one container,
+// one Spark session, every node). Written by service.runPipelineBundle;
+// read by LocalProvider.ExecutionLogs (GH #64).
+func RunBundleLogPath(pipelineDir, runID string) string {
+	return filepath.Join(RunDir(pipelineDir, runID), "_bundle.log")
 }
 
-// RunLogDir returns <pipelineDir>/.clavesa/runs/<runID>/logs. One file per
-// node ID lives inside, capturing that step's stdout+stderr.
-func RunLogDir(pipelineDir, runID string) string {
-	return filepath.Join(RunDir(pipelineDir, runID), "logs")
-}
-
-// RunLogPath returns the absolute path to one node's captured log file.
+// RunLogPath returns the absolute path of one node's failure-log file under
+// <pipelineDir>/.clavesa/runs/<runID>/logs/. This is a durable-log LOCATION
+// only (GH #82): single-node paths (backfill replays) persist a failed
+// invocation's buffered stdout+stderr here and point the error message at
+// it. Nothing serves these files over HTTP — the run-level Logs surface
+// reads the `_bundle.log` above.
 func RunLogPath(pipelineDir, runID, nodeID string) string {
 	// nodeID is a Terraform module label (validated by the parser); it's safe
 	// against path traversal but we strip slashes defensively anyway.
 	safe := strings.ReplaceAll(nodeID, "/", "_")
-	return filepath.Join(RunLogDir(pipelineDir, runID), safe+".log")
+	return filepath.Join(RunDir(pipelineDir, runID), "logs", safe+".log")
 }
 
 // logLineSeparator separates the per-line timestamp from the message in
@@ -53,8 +58,8 @@ func RunLogPath(pipelineDir, runID, nodeID string) string {
 const logLineSeparator = "\t"
 
 // NewTimestampedLogWriter wraps w so each line written gains an ISO-8601
-// timestamp prefix at write time. Used by the local orchestrator when
-// teeing runner stdout/stderr to the per-node log file — gives the
+// timestamp prefix at write time. Used by the local bundle runner when
+// teeing runner stdout/stderr to the per-run `_bundle.log` — gives the
 // LocalProvider's ExecutionLogs surface real per-line timestamps that
 // match what cloud's CloudWatch payload carries (ADR-014 parity).
 //
@@ -149,13 +154,12 @@ func ParseLogLine(line string) (timestamp, message string) {
 }
 
 // ListProgressRunIDs returns run IDs ordered newest-first by mtime of each
-// run's `_run.json`, read from the warehouse `_progress/<run>/` tree (ADR-024
-// cloud-local) — the uniform progress channel the runner + dispatch layer
-// write under the WAREHOUSE rather than the legacy per-pipeline
-// `.clavesa/runs/<run>/state.json`. A run directory without a `_run.json`
-// (in flight, or whose marker hasn't landed yet) is skipped. A missing
-// `_progress` directory returns an empty slice without error — a fresh
-// workspace that hasn't run anything is a normal case.
+// run's `_run.json`, read from the warehouse `_progress/<run>/` tree — the
+// uniform progress channel the runner + dispatch layer write under the
+// WAREHOUSE (ADR-024). A run directory without a `_run.json` (in flight, or
+// whose marker hasn't landed yet) is skipped. A missing `_progress`
+// directory returns an empty slice without error — a fresh workspace that
+// hasn't run anything is a normal case.
 func ListProgressRunIDs(warehouseDir string) ([]string, error) {
 	root := filepath.Join(warehouseDir, "_progress")
 	entries, err := os.ReadDir(root)
@@ -178,43 +182,6 @@ func ListProgressRunIDs(warehouseDir string) ([]string, error) {
 		st, err := os.Stat(markerPath)
 		if err != nil {
 			// Run dir without a _run.json yet — in flight, or pre-marker.
-			continue
-		}
-		rows = append(rows, entry{id: e.Name(), mtime: st.ModTime().UnixNano()})
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].mtime > rows[j].mtime })
-	out := make([]string, len(rows))
-	for i, r := range rows {
-		out[i] = r.id
-	}
-	return out, nil
-}
-
-// ListRunIDs returns run IDs ordered newest-first by mtime of state.json.
-// Missing channel directory returns an empty slice without error — fresh
-// pipelines that haven't been run yet are a normal case.
-func ListRunIDs(pipelineDir string) ([]string, error) {
-	root := runsRoot(pipelineDir)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	type entry struct {
-		id    string
-		mtime int64
-	}
-	rows := make([]entry, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		stPath := RunStatePath(pipelineDir, e.Name())
-		st, err := os.Stat(stPath)
-		if err != nil {
-			// In-flight run that hasn't published state.json yet — skip.
 			continue
 		}
 		rows = append(rows, entry{id: e.Name(), mtime: st.ModTime().UnixNano()})

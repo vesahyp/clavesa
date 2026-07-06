@@ -11,20 +11,18 @@ import (
 	"github.com/vesahyp/clavesa/internal/observability"
 )
 
-// writeRunFixture lays out the per-node log file at
-// <dir>/.clavesa/runs/<runID>/logs/ that ExecutionLogs reads. Per-run state
-// no longer lives in a state.json (ADR-024 moved overall run status to the
-// warehouse `_progress/<run>/_run.json` marker); only logs stay in the
-// per-pipeline runs dir, so the fixture writes just the log.
-func writeRunFixture(t *testing.T, dir, runID, status string) {
+// writeRunFixture lays out the per-run `_bundle.log` at
+// <dir>/.clavesa/runs/<runID>/ that ExecutionLogs serves (GH #64) — the
+// production writer is service.runPipelineBundle's tee. Per-run state lives
+// in the warehouse `_progress/<run>/_run.json` marker (ADR-024), never here.
+func writeRunFixture(t *testing.T, dir, runID string) {
 	t.Helper()
-	_ = status // retained for call-site readability; status now lives in _run.json
-	logPath := observability.RunLogPath(dir, runID, "filter_complete")
+	logPath := observability.RunBundleLogPath(dir, runID)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		t.Fatalf("mkdir log dir: %v", err)
+		t.Fatalf("mkdir run dir: %v", err)
 	}
 	if err := os.WriteFile(logPath, []byte("starting filter_complete\nfiltered 4 rows\n"), 0o644); err != nil {
-		t.Fatalf("write log: %v", err)
+		t.Fatalf("write bundle log: %v", err)
 	}
 }
 
@@ -138,7 +136,7 @@ func TestLocalProviderExecutionStatesNoRuns(t *testing.T) {
 
 func TestLocalProviderExecutionLogs(t *testing.T) {
 	dir := t.TempDir()
-	writeRunFixture(t, dir, "run-1", "RUNNING")
+	writeRunFixture(t, dir, "run-1")
 
 	p := observability.NewLocalProvider(filepath.Dir(dir))
 	ref := observability.FormatExecRef(filepath.Base(dir), "run-1")
@@ -156,11 +154,42 @@ func TestLocalProviderExecutionLogs(t *testing.T) {
 	if res.Events[0].Message != "starting filter_complete" {
 		t.Errorf("first message = %q, want %q", res.Events[0].Message, "starting filter_complete")
 	}
-	if res.FunctionName != "filter_complete" {
-		t.Errorf("FunctionName = %q, want filter_complete", res.FunctionName)
+	// The bundle log is per-run (one container, every node), so the
+	// response labels itself per-run: FunctionName carries the run id.
+	if res.FunctionName != "run-1" {
+		t.Errorf("FunctionName = %q, want run-1 (per-run labeling)", res.FunctionName)
 	}
 	if res.LogGroup == "" {
 		t.Error("LogGroup should expose the on-disk path so the UI can show it")
+	}
+	if filepath.Base(res.LogGroup) != "_bundle.log" {
+		t.Errorf("LogGroup = %q, want the _bundle.log path", res.LogGroup)
+	}
+}
+
+// TestLocalProviderExecutionLogsBareRunRef — a ref that carries only a run
+// id (e.g. `arn=<uuid>` from the node drawer) resolves the owning pipeline
+// via the run marker's `pipeline` field, then serves that pipeline's bundle
+// log.
+func TestLocalProviderExecutionLogsBareRunRef(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRunFixture(t, dir, "run-9")
+	writeRunMarkerFixture(t, root, "run-9", observability.RunMarker{Status: "SUCCEEDED", Pipeline: "demo"})
+
+	p := observability.NewLocalProvider(root)
+	res, err := p.ExecutionLogs(context.Background(), observability.ExecutionLogsQuery{
+		ExecutionRef: "run-9", // bare run id — no dir half
+		Step:         "filter_complete",
+	})
+	if err != nil {
+		t.Fatalf("ExecutionLogs: %v", err)
+	}
+	if len(res.Events) != 2 {
+		t.Fatalf("Events length = %d, want 2 (marker-based dir resolution broken?)", len(res.Events))
 	}
 }
 
@@ -170,11 +199,13 @@ func TestLocalProviderExecutionLogs(t *testing.T) {
 // CloudWatch path produces (ADR-014 parity).
 func TestLocalProviderExecutionLogsTimestamped(t *testing.T) {
 	dir := t.TempDir()
-	writeRunFixture(t, dir, "run-ts", "RUNNING")
 
-	// Overwrite the log file with two timestamped lines via the writer
-	// the orchestrator uses; this is the production format on disk.
-	logPath := observability.RunLogPath(dir, "run-ts", "filter_complete")
+	// Write the bundle log with two timestamped lines via the writer the
+	// bundle runner uses; this is the production format on disk.
+	logPath := observability.RunBundleLogPath(dir, "run-ts")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatalf("mkdir run dir: %v", err)
+	}
 	f, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create log: %v", err)
@@ -224,20 +255,20 @@ func TestLocalProviderExecutionLogsTimestamped(t *testing.T) {
 
 func TestLocalProviderExecutionLogsMissingFile(t *testing.T) {
 	dir := t.TempDir()
-	writeRunFixture(t, dir, "run-1", "RUNNING")
-
+	// No bundle log written for this run — a run that predates the bundle
+	// runner, or one whose tee fell back to a temp location.
 	p := observability.NewLocalProvider(filepath.Dir(dir))
 	ref := observability.FormatExecRef(filepath.Base(dir), "run-1")
 
 	res, err := p.ExecutionLogs(context.Background(), observability.ExecutionLogsQuery{
 		ExecutionRef: ref,
-		Step:         "load_orders", // no log file written for this node
+		Step:         "load_orders",
 	})
 	if err != nil {
-		t.Fatalf("expected nil error for missing log file, got %v", err)
+		t.Fatalf("expected nil error for missing bundle log, got %v", err)
 	}
 	if len(res.Events) != 0 {
-		t.Errorf("expected empty events for missing log file, got %d", len(res.Events))
+		t.Errorf("expected empty events for missing bundle log, got %d", len(res.Events))
 	}
 }
 
@@ -594,11 +625,26 @@ func TestLocalProviderSnapshotsFromDeltaLog(t *testing.T) {
 
 // TestLocalProviderSnapshotsLatestRecordCountFromDeltaCommits exercises the
 // LatestRecordCount derivation across single-commit CTAS, multi-commit
-// append, and append-with-deletes. Delta commits carry per-commit
-// numOutputRows / numTargetRowsDeleted, never a running total — so the
-// provider has to sum across the full history.
+// append, append-with-deletes, and MERGE shapes. Since GH #66 the primary
+// source is the snapshot state itself — every live file's stats.numRecords
+// (the `add` actions below carry them, as every real Delta writer does) —
+// with the per-commit metrics fold as the fallback when stats are missing
+// (the last case).
 func TestLocalProviderSnapshotsLatestRecordCountFromDeltaCommits(t *testing.T) {
 	metaLine := `{"metaData":{"id":"00000000-0000-0000-0000-000000000000","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1715000000000}}`
+
+	// add / rm render protocol-realistic file actions: a commit whose
+	// metrics claim output rows always carries matching adds (and MERGE /
+	// overwrite commits retire the files they rewrite).
+	add := func(path string, numRecords int64) string {
+		return fmt.Sprintf(`{"add":{"path":%q,"size":100,"dataChange":true,"stats":"{\"numRecords\":%d}"}}`, path, numRecords)
+	}
+	addNoStats := func(path string) string {
+		return fmt.Sprintf(`{"add":{"path":%q,"size":100,"dataChange":true}}`, path)
+	}
+	rm := func(path string) string {
+		return fmt.Sprintf(`{"remove":{"path":%q,"dataChange":true}}`, path)
+	}
 
 	writeCommit := func(t *testing.T, logDir string, version int, body string) {
 		t.Helper()
@@ -616,56 +662,70 @@ func TestLocalProviderSnapshotsLatestRecordCountFromDeltaCommits(t *testing.T) {
 		{
 			name: "single-commit CTAS",
 			commits: []string{
-				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"16662"}}}`,
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"16662"}}}` + "\n" + add("f0", 16662),
 			},
 			want: 16662,
 		},
 		{
 			name: "multi-commit append",
 			commits: []string{
-				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}`,
-				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}`,
-				`{"commitInfo":{"timestamp":1715000002000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"30"}}}`,
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}` + "\n" + add("f0", 100),
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}` + "\n" + add("f1", 50),
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"30"}}}` + "\n" + add("f2", 30),
 			},
 			want: 180,
 		},
 		{
 			name: "append with deletes via MERGE",
 			commits: []string{
-				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}`,
-				`{"commitInfo":{"timestamp":1715000001000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"0","numTargetRowsUpdated":"0","numTargetRowsDeleted":"20"}}}`,
-				`{"commitInfo":{"timestamp":1715000002000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}`,
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}` + "\n" + add("f0", 100),
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"0","numTargetRowsUpdated":"0","numTargetRowsDeleted":"20"}}}` + "\n" + rm("f0") + "\n" + add("f1", 80),
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}` + "\n" + add("f2", 50),
 			},
 			want: 130,
 		},
 		{
 			// Merge-keyed dim table — the http-changing-source cookbook
 			// shape. First run inserts 100 rows; later runs see ~5 new IDs
-			// each plus ~95 updates of overlapping IDs. Updates don't move
-			// the row count, so the dim stays near 100 after every run.
-			// Pre-fix this rendered 500 because numTargetRowsUpdated was
-			// folded into AddedRecords and double-counted.
+			// each plus ~95 updates of overlapping IDs (MERGE rewrites the
+			// touched file). Updates don't move the row count, so the dim
+			// stays near 100 after every run. Pre-fix this rendered 500
+			// because numTargetRowsUpdated was folded into AddedRecords and
+			// double-counted.
 			name: "merge dim with mostly updates",
 			commits: []string{
-				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"CREATE TABLE","operationMetrics":{"numOutputRows":"100"}}}`,
-				`{"commitInfo":{"timestamp":1715000001000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"5","numTargetRowsUpdated":"95","numTargetRowsDeleted":"0"}}}`,
-				`{"commitInfo":{"timestamp":1715000002000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"3","numTargetRowsUpdated":"100","numTargetRowsDeleted":"0"}}}`,
-				`{"commitInfo":{"timestamp":1715000003000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"4","numTargetRowsUpdated":"100","numTargetRowsDeleted":"0"}}}`,
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"CREATE TABLE","operationMetrics":{"numOutputRows":"100"}}}` + "\n" + add("f0", 100),
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"5","numTargetRowsUpdated":"95","numTargetRowsDeleted":"0"}}}` + "\n" + rm("f0") + "\n" + add("f1", 105),
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"3","numTargetRowsUpdated":"100","numTargetRowsDeleted":"0"}}}` + "\n" + rm("f1") + "\n" + add("f2", 108),
+				`{"commitInfo":{"timestamp":1715000003000,"operation":"MERGE","operationMetrics":{"numTargetRowsInserted":"4","numTargetRowsUpdated":"100","numTargetRowsDeleted":"0"}}}` + "\n" + rm("f2") + "\n" + add("f3", 112),
 			},
 			want: 112,
 		},
 		{
-			// CREATE OR REPLACE TABLE wipes the prior state. A long-running
-			// append-mode table that gets re-bootstrapped should report the
-			// new row count, not the cumulative sum.
+			// CREATE OR REPLACE TABLE wipes the prior state (retiring every
+			// live file). A long-running append-mode table that gets
+			// re-bootstrapped should report the new row count, not the
+			// cumulative sum.
 			name: "create or replace resets total",
 			commits: []string{
-				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"1000"}}}`,
-				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"500"}}}`,
-				`{"commitInfo":{"timestamp":1715000002000,"operation":"CREATE OR REPLACE TABLE","operationMetrics":{"numOutputRows":"42"}}}`,
-				`{"commitInfo":{"timestamp":1715000003000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"8"}}}`,
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"1000"}}}` + "\n" + add("f0", 1000),
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"500"}}}` + "\n" + add("f1", 500),
+				`{"commitInfo":{"timestamp":1715000002000,"operation":"CREATE OR REPLACE TABLE","operationMetrics":{"numOutputRows":"42"}}}` + "\n" + rm("f0") + "\n" + rm("f1") + "\n" + add("f2", 42),
+				`{"commitInfo":{"timestamp":1715000003000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"8"}}}` + "\n" + add("f3", 8),
 			},
 			want: 50,
+		},
+		{
+			// Stats collection disabled: adds carry no numRecords, so the
+			// snapshot-state count is underivable and the provider falls
+			// back to folding the per-commit metrics (exact here — the
+			// window anchors at version 0).
+			name: "stats-less adds fall back to metrics fold",
+			commits: []string{
+				metaLine + "\n" + `{"commitInfo":{"timestamp":1715000000000,"operation":"WRITE","operationParameters":{"mode":"Overwrite"},"operationMetrics":{"numOutputRows":"100"}}}` + "\n" + addNoStats("f0"),
+				`{"commitInfo":{"timestamp":1715000001000,"operation":"WRITE","operationParameters":{"mode":"Append"},"operationMetrics":{"numOutputRows":"50"}}}` + "\n" + addNoStats("f1"),
+			},
+			want: 150,
 		},
 	}
 
@@ -719,42 +779,7 @@ func indexOf(s, substr string) int {
 	return -1
 }
 
-func TestSplitAndFormatExecRef(t *testing.T) {
-	cases := []struct {
-		dir, runID string
-	}{
-		{"workdir/pipelineA", ""},
-		{"/abs/dir", "abc123"},
-		{"rel", "feedface"},
-	}
-	for _, tc := range cases {
-		ref := observability.FormatExecRef(tc.dir, tc.runID)
-		// FormatExecRef is the inverse of LocalProvider's internal split, but
-		// the package-internal split function isn't exported. Smoke-check via
-		// ExecutionLogs's "Step required" failure mode — it gets past the
-		// dir-resolve step so we know FormatExecRef doesn't mangle inputs.
-		_ = ref
-	}
-}
-
-// TestFormatExecRefARNPassthrough pins the cloud dispatch contract: a runID
-// that is already a full SFN execution ARN must pass through unchanged so the
-// cloud provider can parse it, while a plain local run ID still gets the
-// "dir:runID" prefix. The bug this guards: prefixing an ARN with "dir:"
-// shifted the colon-split in StateMachineNameFromExecutionARN, so cloud live
-// progress never surfaced.
-func TestFormatExecRefARNPassthrough(t *testing.T) {
-	const arn = "arn:aws:states:eu-north-1:699166197771:execution:clavesa-bigagg:bcf294d6-dc5f-413f-a2f0-a103aefb22ff"
-	if got := observability.FormatExecRef("bigagg", arn); got != arn {
-		t.Errorf("ARN runID must pass through unchanged; got %q", got)
-	}
-	if observability.StateMachineNameFromExecutionARN(observability.FormatExecRef("bigagg", arn)) != "clavesa-bigagg" {
-		t.Errorf("formatted ARN ref must still parse to its state machine name")
-	}
-	if got := observability.FormatExecRef("bigagg", "run-1"); got != "bigagg:run-1" {
-		t.Errorf("local run ID must keep the dir prefix; got %q", got)
-	}
-}
+// The exec-ref encode/decode pair is covered in execref_test.go (GH #78).
 
 // TestLocalProviderTablesReportsFileMetrics proves the local fast-path now
 // populates FileCount / TotalBytes from the Delta log's live-file set

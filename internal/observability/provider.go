@@ -2,10 +2,12 @@ package observability
 
 import "context"
 
-// Provider is the seam between the HTTP layer and per-pipeline observability
-// backends. cloudProvider talks to Athena/SFN/CloudWatch; localProvider reads
-// filesystem-backed Iceberg metadata + a per-run progress channel. Response
-// shapes match — the UI cannot tell which backend served a request.
+// Provider is the seam between the HTTP layer and the observability
+// backends, selected per workspace warehouse (ADR-024). CloudProvider talks
+// to Athena/SFN/CloudWatch plus the S3 warehouse's `_progress` marker tree;
+// LocalProvider reads filesystem Delta transaction logs plus the local
+// warehouse's `_progress` tree. Response shapes match — the UI cannot tell
+// which backend served a request.
 //
 // Methods may return an empty result with nil error when the underlying table
 // does not exist yet (e.g. fresh pipeline that has never run). The UI renders

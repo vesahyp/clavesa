@@ -54,7 +54,7 @@ export interface NodeDetailDrawerProps {
   /** The run currently shown in detail. */
   selectedRunId: string | null;
   onSelectRun: (runId: string) => void;
-  /** Local pipeline — selects the execution-logs addressing mode. */
+  /** Local warehouse (ADR-024) — selects the execution-logs addressing mode. */
   isLocal: boolean;
   dir: string;
   /**

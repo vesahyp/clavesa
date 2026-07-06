@@ -99,7 +99,7 @@ export function RuntimeStatus() {
             <div className="text-muted-foreground">
               Powers catalog reads, table samples, and the run-detail
               drill-down. The dashboard's runs grid sources directly
-              from state.json files and doesn't need Spark.
+              from the warehouse progress markers and doesn't need Spark.
             </div>
           </div>
         </TooltipContent>
