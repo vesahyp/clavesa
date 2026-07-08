@@ -12,6 +12,17 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.17.0] — 2026-07-08
+
+### Added
+
+- File sources can read delimited text via `format = "tsv"` plus a `read_options` map (`delimiter`, `comment`, `header`, `columns`); gzip is transparent. Lets a source read CloudFront legacy standard access logs (gzipped TSV with `#`-prefixed `#Version`/`#Fields` header lines) directly — `clavesa source register logs --kind s3 --bucket b --prefix cloudfront/ --format tsv --read-option comment=# --read-option header=false` (GH #88). Preview of tsv sources isn't wired yet (GH #89); read them with `pipeline run`.
+- A transform can write its output as a **single JSON file** to an S3 (or local) path instead of a Delta table, via `output_definitions = { default = { format = "json", path = "s3://…/x.json", content_type = "application/json", cache_control = "…" } }`. The runner collects the (small, rollup-sized) frame and writes one JSON array of row objects with the given content-type/cache-control — a web-servable artifact, not a Parquet part-file directory (GH #57). Works in local `pipeline run` and cloud.
+
+### Fixed
+
+- Local `pipeline run` now forwards host AWS credentials to the runner when a node **writes** to S3 (e.g. a `format = "json"` output), not only when it reads an S3 source — previously such a write failed with `NoCredentialsError`.
+
 ## [v2.16.0] — 2026-07-06
 
 ### Fixed

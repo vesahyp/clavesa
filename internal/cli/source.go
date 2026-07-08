@@ -55,6 +55,7 @@ func newSourceRegisterCmd() *cobra.Command {
 	var partitions []string
 	var startFrom string
 	var manageNotifications bool
+	var readOptions map[string]string
 
 	cmd := &cobra.Command{
 		Use:   "register <name>",
@@ -98,6 +99,7 @@ Local runs fall back to listing (no queue), with identical results.`,
 				Partitions:                partitions,
 				StartFrom:                 startFrom,
 				ManageBucketNotifications: manageNotifications,
+				ReadOptions:               readOptions,
 			}
 			if from != "" {
 				if strings.HasPrefix(from, "s3://") {
@@ -155,7 +157,7 @@ Local runs fall back to listing (no queue), with identical results.`,
 	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3); inferred from --from when omitted")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (kind=s3)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix (kind=s3); auto-suffixed with /")
-	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json); inferred from filename if omitted")
+	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json, tsv); inferred from filename if omitted")
 	cmd.Flags().StringVar(&attach, "attach", "", "also attach to a pipeline in this workspace (pipeline dir)")
 	cmd.Flags().StringVar(&attachTo, "to", "", "transform node id (when --attach is set)")
 	cmd.Flags().StringVar(&attachAs, "as", "", "input alias (default: source name) when --attach is set")
@@ -163,6 +165,7 @@ Local runs fall back to listing (no queue), with identical results.`,
 	cmd.Flags().StringSliceVar(&partitions, "partitions", nil, "kind=s3: comma-separated Hive partition keys (e.g. year,month,day) for partition-column recovery")
 	cmd.Flags().StringVar(&startFrom, "start-from", "", `kind=s3 with --partitions: first-run seed before queue-drain takes over ("all" | "now" | "<cursor>")`)
 	cmd.Flags().BoolVar(&manageNotifications, "manage-notifications", false, "kind=s3: have terraform manage the bucket's EventBridge notification config (authoritative — replaces existing notification config). Default off; only enable when clavesa owns the source bucket")
+	cmd.Flags().StringToStringVar(&readOptions, "read-option", nil, "repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns (e.g. --read-option delimiter=$'\\t' --read-option header=false)")
 	return cmd
 }
 
@@ -184,6 +187,7 @@ func newSourceEditCmd() *cobra.Command {
 	var partitions []string
 	var startFrom string
 	var manageNotifications bool
+	var readOptions map[string]string
 
 	cmd := &cobra.Command{
 		Use:   "edit <name>",
@@ -266,6 +270,10 @@ the next run automatically.`,
 				spec.ManageBucketNotifications = manageNotifications
 				touched = true
 			}
+			if changed("read-option") {
+				spec.ReadOptions = readOptions
+				touched = true
+			}
 			if !touched {
 				return fmt.Errorf("nothing to change — pass a flag (see `clavesa source edit --help`)")
 			}
@@ -288,11 +296,12 @@ the next run automatically.`,
 	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (kind=s3)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix (kind=s3); auto-suffixed with /")
-	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json)")
+	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json, tsv)")
 	cmd.Flags().StringVar(&creds, "credentials", "", `name of a registered credential; pass "" to clear`)
 	cmd.Flags().StringSliceVar(&partitions, "partitions", nil, `kind=s3: comma-separated Hive partition keys; pass "" to clear`)
 	cmd.Flags().StringVar(&startFrom, "start-from", "", `kind=s3 with --partitions: watermark seed ("all" | "now" | "<cursor>")`)
 	cmd.Flags().BoolVar(&manageNotifications, "manage-notifications", false, "kind=s3: have terraform manage the bucket's EventBridge notification config")
+	cmd.Flags().StringToStringVar(&readOptions, "read-option", nil, "repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns")
 	return cmd
 }
 

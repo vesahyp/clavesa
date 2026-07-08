@@ -792,6 +792,9 @@ func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath,
 					if credDescriptor != nil {
 						descriptor["credentials"] = credDescriptor
 					}
+					if len(spec.ReadOptions) > 0 {
+						descriptor["read_options"] = spec.ReadOptions
+					}
 					inputs[alias] = descriptor
 				default:
 					return nil, fmt.Errorf("source %q kind %q not supported", name, spec.Kind)
@@ -1173,10 +1176,11 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 	// pipelines work against same-account S3 sources without extra
 	// configuration. No-op for transforms with no s3 inputs.
 	var awsArgs []string
-	if hasS3Input(inputs) {
+	if hasS3Input(inputs) || hasS3Output(buildLocalOutputs(node, outputTarget)) {
 		// Shared passthrough + host-resolved explicit credentials —
 		// same args every host-spawned AWS-reaching container gets,
-		// see runner.AWSEnvDockerArgs.
+		// see runner.AWSEnvDockerArgs. Also forwarded for S3-writing
+		// outputs (e.g. json_object to s3://) whose boto3 put needs creds.
 		awsArgs = runner.AWSEnvDockerArgs(ctx)
 	}
 
@@ -1399,7 +1403,7 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	// container's JVMs too).
 	var awsArgs []string
 	for _, bt := range bundle {
-		if hasS3Input(bt.Inputs) {
+		if hasS3Input(bt.Inputs) || hasS3Output(bt.Outputs) {
 			awsArgs = runner.AWSEnvDockerArgs(ctx)
 			break
 		}
@@ -1836,6 +1840,33 @@ func hasS3Input(inputs map[string]any) bool {
 	return false
 }
 
+// hasS3Output reports whether any output in the runner-event outputs map
+// writes to S3 (a bare s3:// path target, or a json_object/path descriptor
+// whose target/path is s3://). Such a node needs host AWS credentials
+// forwarded so the runner's boto3 put_object can authenticate — Spark's S3A
+// credential chain doesn't cover the boto3 write path (json_object outputs).
+func hasS3Output(outputs map[string]any) bool {
+	isS3 := func(s string) bool {
+		return strings.HasPrefix(s, "s3://") || strings.HasPrefix(s, "s3a://")
+	}
+	for _, v := range outputs {
+		switch t := v.(type) {
+		case string:
+			if isS3(t) {
+				return true
+			}
+		case map[string]any:
+			if p, _ := t["path"].(string); isS3(p) {
+				return true
+			}
+			if tgt, _ := t["target"].(string); isS3(tgt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // envVarsForCredentials walks an inputs map looking for env:-backed
 // credential references and returns the variable names. Used by the
 // docker-exec arg builder to forward only the variables that are
@@ -2034,6 +2065,32 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 		def, _ := raw.(map[string]interface{})
 		mode, _ := def["mode"].(string)
 		stats, _ := def["stats"].(bool)
+		format, _ := def["format"].(string)
+		if format == "json" {
+			path, _ := def["path"].(string)
+			if path == "" {
+				// Config error already caught by TF validate; be
+				// defensive and fall back to the auto-table shape.
+				if _, ok := out[key]; !ok {
+					out[key] = ""
+				}
+				continue
+			}
+			contentType, _ := def["content_type"].(string)
+			if contentType == "" {
+				contentType = "application/json"
+			}
+			desc := map[string]any{
+				"kind":         "json_object",
+				"path":         path,
+				"content_type": contentType,
+			}
+			if cc, _ := def["cache_control"].(string); cc != "" {
+				desc["cache_control"] = cc
+			}
+			out[key] = desc
+			continue
+		}
 		var mergeKeys []string
 		if mk, ok := def["merge_keys"].([]interface{}); ok {
 			for _, v := range mk {

@@ -157,45 +157,8 @@ verify-cookbook: $(if $(SKIP_BUILD),,build) ## Walk the cookbook recipes literal
 	@./scripts/verify-cookbook.sh
 	@./scripts/green-stamp.sh write verify-cookbook
 
-release-gates: build ## Run the three release gates (test, smoke-cloud, verify-readme) concurrently; per-gate logs in .gates/, green stamps enforced by release-check
-	@mkdir -p .gates; \
-	 rm -f .gates/test.log .gates/smoke-cloud.log .gates/verify-readme.log; \
-	 echo "→ release gates running concurrently (logs: .gates/<gate>.log)"; \
-	 echo "  verify-readme UI port: $${CLAVESA_VERIFY_ADDR:-:8089} (cloud-smoke picks a random free port; nothing on :8080 is touched)"; \
-	 SKIP_BUILD=1 $(MAKE) test            >.gates/test.log 2>&1 & p_test=$$!; \
-	 SKIP_BUILD=1 $(MAKE) smoke-cloud     >.gates/smoke-cloud.log 2>&1 & p_smoke=$$!; \
-	 SKIP_BUILD=1 CLAVESA_VERIFY_ADDR="$${CLAVESA_VERIFY_ADDR:-:8089}" $(MAKE) verify-readme >.gates/verify-readme.log 2>&1 & p_verify=$$!; \
-	 st_test=0;   wait $$p_test   || st_test=$$?; \
-	 st_smoke=0;  wait $$p_smoke  || st_smoke=$$?; \
-	 st_verify=0; wait $$p_verify || st_verify=$$?; \
-	 rc=0; \
-	 for g in test smoke-cloud verify-readme; do \
-	   case $$g in \
-	     test)          s=$$st_test;; \
-	     smoke-cloud)   s=$$st_smoke;; \
-	     verify-readme) s=$$st_verify;; \
-	   esac; \
-	   if [ "$$s" = "0" ]; then \
-	     echo "✓ $$g  (.gates/$$g.log)"; \
-	   else \
-	     echo "✗ $$g failed with exit $$s  (.gates/$$g.log)"; \
-	     rc=1; \
-	   fi; \
-	 done; \
-	 rm -f .gates/verify-cookbook.log; \
-	 echo "→ verify-cookbook (serial — Spark-heavy, cannot share the VM with the concurrent gates; GH #84)"; \
-	 st_cook=0; SKIP_BUILD=1 $(MAKE) verify-cookbook >.gates/verify-cookbook.log 2>&1 || st_cook=$$?; \
-	 if [ "$$st_cook" = "0" ]; then \
-	   echo "✓ verify-cookbook  (.gates/verify-cookbook.log)"; \
-	 else \
-	   echo "✗ verify-cookbook failed with exit $$st_cook  (.gates/verify-cookbook.log)"; \
-	   rc=1; \
-	 fi; \
-	 if [ "$$rc" = "0" ]; then \
-	   echo "all release gates green — stamps written (.test-green.json, .verify-readme-green.json, .cloud-smoke-green.json, .verify-cookbook-green.json)"; \
-	 fi; \
-	 exit $$rc
-
+release-gates: build ## Run the four release gates (memory-gated serial/concurrent) + stamps; logs in .gates/, heartbeat in .gates/progress.log (GH #84)
+	@./scripts/release-gates.sh
 smoke-cloud-setup: build ## One-time: create + deploy the persistent cloud smoke workspace (SMOKE_WS / SMOKE_PROFILE env-overridable)
 	@./scripts/cloud-smoke.sh setup
 

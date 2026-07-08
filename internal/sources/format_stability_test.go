@@ -36,6 +36,48 @@ func TestOnDiskFormatIsByteStable(t *testing.T) {
 	}
 }
 
+// TestTSVReadOptionsBytesStable pins the on-disk contract for a format=tsv
+// source carrying read_options, so the tsv format + the ReadOptions field
+// keep their serialized shape (sorted map keys, two-space indent, omitempty
+// on unset fields). tsv is accepted alongside parquet/csv/json.
+func TestTSVReadOptionsBytesStable(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	st := New(ws)
+	if err := st.Add(Spec{
+		Name: "events", Kind: "s3",
+		Bucket: "events-bucket", Prefix: "raw/", Format: "tsv",
+		ReadOptions: map[string]string{
+			"delimiter": "\t",
+			"comment":   "#",
+			"header":    "false",
+			"columns":   "a,b,c",
+		},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(ws, RelDir, "events.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	want := `{
+  "kind": "s3",
+  "bucket": "events-bucket",
+  "prefix": "raw/",
+  "format": "tsv",
+  "read_options": {
+    "columns": "a,b,c",
+    "comment": "#",
+    "delimiter": "\t",
+    "header": "false"
+  }
+}
+`
+	if string(got) != want {
+		t.Errorf("on-disk bytes changed:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
 // TestGetReadsPreRefactorFixture proves a file written by the pre-
 // consolidation code path (captured here as a literal) still loads. The
 // fixture is the byte-for-byte output of the old writeJSON for a

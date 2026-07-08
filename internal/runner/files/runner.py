@@ -1112,11 +1112,11 @@ def _is_hive_partitioned(path: str) -> bool:
         return False
 
 
-def _read_path_format(spark, path: str, fmt: str):
+def _read_path_format(spark, path: str, fmt: str, read_options=None):
     """Dispatch a Spark read by source format. Defaults match what most users
-    expect for ad-hoc CSV/JSON: header on, schema inferred. Anything more
-    specific (custom delimiters, schema enforcement) should ride the source's
-    HCL `read_options` once we thread that through — for now, sane defaults.
+    expect for ad-hoc CSV/JSON: header on, schema inferred. `read_options`
+    (dict[str,str] from the source descriptor) rides through for the delimited
+    formats: `delimiter`, `comment`, `header`, and explicit `columns`.
 
     recursiveFileLookup is on for prefix-style paths (anything ending in
     "/") so a registered s3 source pointing at e.g. `s3://b/events/`
@@ -1132,11 +1132,22 @@ def _read_path_format(spark, path: str, fmt: str):
         if recurse:
             reader = reader.option("recursiveFileLookup", "true")
         return reader.parquet(path)
-    if fmt == "csv":
-        reader = spark.read.option("header", "true").option("inferSchema", "true")
+    if fmt in ("csv", "tsv"):
+        ro = read_options or {}
+        sep = ro.get("delimiter") or ("\t" if fmt == "tsv" else ",")
+        header = str(ro.get("header", "true")).lower() == "true"
+        columns = ro.get("columns")
+        reader = spark.read.option("sep", sep).option("inferSchema", "true")
+        reader = reader.option("header", "true" if header else "false")
+        if ro.get("comment"):
+            reader = reader.option("comment", ro["comment"])
         if recurse:
             reader = reader.option("recursiveFileLookup", "true")
-        return reader.csv(path)
+        df = reader.csv(path)  # Spark's CSV reader handles TSV via sep
+        if columns:
+            names = [c.strip() for c in columns.split(",") if c.strip()]
+            df = df.toDF(*names)  # assign explicit names (rename _c0.._cN, or override header names)
+        return df
     if fmt == "json" or fmt == "ndjson":
         reader = spark.read
         if recurse:
@@ -1145,7 +1156,7 @@ def _read_path_format(spark, path: str, fmt: str):
     raise RuntimeError(f"unsupported source format {fmt!r} for path {path!r}")
 
 
-def _read_keys_format(spark, keys: list[str], fmt: str, base_path: str):
+def _read_keys_format(spark, keys: list[str], fmt: str, base_path: str, read_options=None):
     """Read an explicit list of object URIs by source format, deriving Hive
     partition columns from ``base_path`` so a flat or partitioned layout yields
     the same schema a full-prefix read would. Mirrors _read_path_format's format
@@ -1158,8 +1169,20 @@ def _read_keys_format(spark, keys: list[str], fmt: str, base_path: str):
     reader = spark.read.option("basePath", base_path)
     if fmt in ("parquet", ""):
         return reader.parquet(*keys)
-    if fmt == "csv":
-        return reader.option("header", "true").option("inferSchema", "true").csv(*keys)
+    if fmt in ("csv", "tsv"):
+        ro = read_options or {}
+        sep = ro.get("delimiter") or ("\t" if fmt == "tsv" else ",")
+        header = str(ro.get("header", "true")).lower() == "true"
+        columns = ro.get("columns")
+        reader = reader.option("sep", sep).option("inferSchema", "true")
+        reader = reader.option("header", "true" if header else "false")
+        if ro.get("comment"):
+            reader = reader.option("comment", ro["comment"])
+        df = reader.csv(*keys)  # Spark's CSV reader handles TSV via sep
+        if columns:
+            names = [c.strip() for c in columns.split(",") if c.strip()]
+            df = df.toDF(*names)  # assign explicit names (rename _c0.._cN, or override header names)
+        return df
     if fmt == "json" or fmt == "ndjson":
         return reader.json(*keys)
     raise RuntimeError(f"unsupported source format {fmt!r} for drain keys under {base_path!r}")
@@ -1236,7 +1259,7 @@ def _drain_if_configured(spark, alias: str, src: dict[str, Any], bucket: str, pr
     # to a full-prefix read, even when drained keys sit at varying depths.
     fmt = str(src.get("format") or "parquet").lower()
     base_path = f"s3://{bucket}/{prefix}"
-    df = _read_keys_format(spark, keys, fmt, base_path)
+    df = _read_keys_format(spark, keys, fmt, base_path, read_options=src.get("read_options") or {})
     return df, {"ack": {"queue_url": queue_url, "handles": handles, "region": region}}
 
 
@@ -1279,7 +1302,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         fmt = str(src.get("format") or "parquet").lower()
         headers = _resolve_http_headers(src.get("credentials"))
         local_path = _download_http_to_tmp(url, headers=headers)
-        return _read_path_format(spark, local_path, fmt), None
+        return _read_path_format(spark, local_path, fmt, read_options=src.get("read_options") or {}), None
 
     if kind == "s3":
         # ADR-017 slice 3: same-account S3 reads via Spark's S3A.
@@ -1300,7 +1323,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
 
         path = f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}/"
         fmt = str(src.get("format") or "parquet").lower()
-        return _read_path_format(spark, path, fmt), None
+        return _read_path_format(spark, path, fmt, read_options=src.get("read_options") or {}), None
 
     if kind == "path":
         # `clavesa pipeline run` emits this when the upstream source
@@ -1309,7 +1332,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         # fail at footer-read time pretending to be Parquet.
         path = src["path"]
         fmt = str(src.get("format") or "parquet").lower()
-        return _read_path_format(spark, path, fmt), None
+        return _read_path_format(spark, path, fmt, read_options=src.get("read_options") or {}), None
 
     if kind == "delta_table_cdf":
         # v2.0.0 (ADR-018): CDF-based incremental read on a Delta upstream.
@@ -1730,6 +1753,16 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
         raise TypeError(f"output {key!r}: unsupported descriptor type {type(dest).__name__}")
 
     kind = dest.get("kind", "delta_table")
+    if kind == "json_object":
+        # Single JSON file (array of row objects) to S3 or a local path.
+        # No delta/merge semantics apply; the writer collects the frame.
+        target = dest.get("path") or dest.get("target") or dest.get("table_id") or ""
+        return {
+            "kind": "json_object",
+            "target": target,
+            "content_type": dest.get("content_type") or "application/json",
+            "cache_control": dest.get("cache_control"),
+        }
     merge_keys = list(dest.get("merge_keys") or [])
     # When merge_keys is declared and mode is unset, default to merge —
     # saves users from picking the right semantics every time.
@@ -2459,6 +2492,41 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             # backfill retries rewrite the staging cleanly.
             spec = {**spec, "kind": "delta_table", "target": backfill_targets[key],
                     "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
+        if spec["kind"] == "json_object":
+            # Driver-side collect is intentional here: json_object outputs are
+            # small rollups (KB–MB) by design, written as one JSON file. Not
+            # for large frames — collect would OOM the driver.
+            rows = [r.asDict(recursive=True) for r in df.collect()]
+            body = json.dumps(rows, ensure_ascii=False, default=str).encode("utf-8")
+            target = spec["target"]
+            if target.startswith("s3://") or target.startswith("s3a://"):
+                import boto3  # noqa: PLC0415
+
+                # s3a:// isn't a boto3 scheme; normalize to s3:// for the put.
+                bucket, s3_key = _split_s3("s3://" + target.split("://", 1)[1])
+                kwargs = {
+                    "Bucket": bucket,
+                    "Key": s3_key,
+                    "Body": body,
+                    "ContentType": spec["content_type"],
+                }
+                if spec.get("cache_control"):
+                    kwargs["CacheControl"] = spec["cache_control"]
+                # Match _write_watermark: plain boto3 S3 client. CLAVESA_S3_ENDPOINT
+                # is honored globally via AWS_ENDPOINT_URL_S3 (set at import).
+                boto3.client("s3").put_object(**kwargs)
+            else:
+                local = target[len("file://"):] if target.startswith("file://") else target
+                os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
+                with open(local, "wb") as f:
+                    f.write(body)
+            print(
+                f"[clavesa] output {key!r}: wrote {len(rows)} rows as json_object → {target}",
+                file=sys.stderr,
+                flush=True,
+            )
+            written[key] = spec["target"]
+            continue
         if spec["kind"] == "path":
             df.write.mode("overwrite").parquet(spec["target"])
         else:

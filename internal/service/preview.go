@@ -507,7 +507,7 @@ func (s *Service) fetchSourceData(ctx context.Context, bucket, prefix, format, j
 		case "parquet":
 			return dataquery.ParseParquet(f, limit)
 		default:
-			return nil, fmt.Errorf("unsupported format for preview: %s", format)
+			return nil, fmt.Errorf("preview does not support format %q yet (csv, json, parquet only); tsv sources are read at `clavesa pipeline run`", format)
 		}
 	}
 
@@ -536,7 +536,7 @@ func (s *Service) fetchSourceData(ctx context.Context, bucket, prefix, format, j
 			qr, err = dataquery.ParseParquet(getOut.Body, limit)
 		default:
 			getOut.Body.Close()
-			return nil, fmt.Errorf("unsupported format for preview: %s", format)
+			return nil, fmt.Errorf("preview does not support format %q yet (csv, json, parquet only); tsv sources are read at `clavesa pipeline run`", format)
 		}
 		getOut.Body.Close()
 		if err != nil {

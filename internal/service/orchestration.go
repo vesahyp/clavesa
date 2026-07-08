@@ -406,8 +406,21 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 						alias, spec.Bucket, spec.Prefix, quoted, startFrom, queueURLRef))
 					break
 				}
-				entries = append(entries, fmt.Sprintf(`%s = { kind = "s3", bucket = %q, prefix = %q, format = %q, queue_url = %s%s }`,
-					alias, spec.Bucket, spec.Prefix, spec.Format, queueURLRef, credBlock))
+				readOptsAttr := ""
+				if len(spec.ReadOptions) > 0 {
+					keys := make([]string, 0, len(spec.ReadOptions))
+					for k := range spec.ReadOptions {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					pairs := make([]string, 0, len(keys))
+					for _, k := range keys {
+						pairs = append(pairs, fmt.Sprintf("%q = %q", k, spec.ReadOptions[k]))
+					}
+					readOptsAttr = fmt.Sprintf(", read_options = { %s }", strings.Join(pairs, ", "))
+				}
+				entries = append(entries, fmt.Sprintf(`%s = { kind = "s3", bucket = %q, prefix = %q, format = %q, queue_url = %s%s%s }`,
+					alias, spec.Bucket, spec.Prefix, spec.Format, queueURLRef, readOptsAttr, credBlock))
 			default:
 				return "", fmt.Errorf("source %q kind %q not supported", name, spec.Kind)
 			}
@@ -477,6 +490,7 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 	}
 	outputKeys := outputKeyList(nodeByID[id])
 	if len(outputKeys) == 1 && outputKeys[0] == "default" &&
+		outputFormat(nodeByID[id], "default") != "json" &&
 		outputMode(nodeByID[id], "default") == "replace" &&
 		len(outputMergeKeys(nodeByID[id], "default")) == 0 &&
 		len(outputClusterBy(nodeByID[id], "default")) == 0 &&
@@ -490,6 +504,24 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		dest := `""`
 		if key == "default" {
 			dest = defaultDest
+		}
+		// JSON-file outputs emit a json_object descriptor keyed on path,
+		// bypassing both the delta_table descriptor and the destination
+		// routing below.
+		if outputFormat(nodeByID[id], key) == "json" {
+			path := outputPath(nodeByID[id], key)
+			contentType := outputContentType(nodeByID[id], key)
+			if contentType == "" {
+				contentType = "application/json"
+			}
+			cacheAttr := ""
+			if cc := outputCacheControl(nodeByID[id], key); cc != "" {
+				cacheAttr = fmt.Sprintf(", cache_control = %q", cc)
+			}
+			entries = append(entries, fmt.Sprintf(
+				`%s = { kind = "json_object", path = %q, content_type = %q%s }`,
+				key, path, contentType, cacheAttr))
+			continue
 		}
 		mode := outputMode(nodeByID[id], key)
 		mergeKeys := outputMergeKeys(nodeByID[id], key)
@@ -771,6 +803,47 @@ func outputStats(n graph.Node, key string) bool {
 	}
 	v, _ := def["stats"].(bool)
 	return v
+}
+
+// outputStringField returns a string attribute from a transform output's
+// definition, or "" when the field (or the output/def map) is absent.
+func outputStringField(n graph.Node, key, field string) string {
+	defs, ok := n.Config["output_definitions"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	def, ok := defs[key].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	v, _ := def[field].(string)
+	return v
+}
+
+// outputFormat returns the configured output shape ("delta" default, or
+// "json" for single-file JSON output).
+func outputFormat(n graph.Node, key string) string {
+	f := outputStringField(n, key, "format")
+	if f == "" {
+		return "delta"
+	}
+	return f
+}
+
+// outputPath returns the destination path for a format="json" output.
+func outputPath(n graph.Node, key string) string {
+	return outputStringField(n, key, "path")
+}
+
+// outputContentType returns the MIME type for a format="json" output.
+func outputContentType(n graph.Node, key string) string {
+	return outputStringField(n, key, "content_type")
+}
+
+// outputCacheControl returns the Cache-Control header for a format="json"
+// output, or "" when unset.
+func outputCacheControl(n graph.Node, key string) string {
+	return outputStringField(n, key, "cache_control")
 }
 
 // outputMergeKeys returns the merge_keys list configured for an output, in

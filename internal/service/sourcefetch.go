@@ -21,6 +21,8 @@ func inferFormatFromFilename(name string) string {
 		return "parquet"
 	case strings.HasSuffix(lower, ".csv"), strings.HasSuffix(lower, ".csv.gz"):
 		return "csv"
+	case strings.HasSuffix(lower, ".tsv"), strings.HasSuffix(lower, ".tsv.gz"):
+		return "tsv"
 	case strings.HasSuffix(lower, ".json"), strings.HasSuffix(lower, ".ndjson"):
 		return "json"
 	}

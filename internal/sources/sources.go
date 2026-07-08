@@ -53,9 +53,13 @@ type Spec struct {
 	Prefix string `json:"prefix,omitempty"`
 
 	// Format is the data format the runner reads with
-	// (`spark.read.<format>`). One of: parquet, csv, json. Inferred
+	// (`spark.read.<format>`). One of: parquet, csv, json, tsv. Inferred
 	// from the URL/key filename extension when omitted at register time.
 	Format string `json:"format,omitempty"`
+
+	// ReadOptions are optional Spark read options for delimited text:
+	// delimiter, comment, header, columns. Interpreted by the runner.
+	ReadOptions map[string]string `json:"read_options,omitempty"`
 
 	// Credentials, when set, names a credential in the workspace
 	// credentials registry (slice 2). For `kind=http` it injects an
@@ -208,12 +212,12 @@ func (s Spec) validate() error {
 		return fmt.Errorf("partitioned reads require format=parquet (got %q)", s.Format)
 	}
 	if s.Format == "" {
-		return fmt.Errorf("format is required (parquet, csv, or json)")
+		return fmt.Errorf("format is required (parquet, csv, json, or tsv)")
 	}
 	switch s.Format {
-	case "parquet", "csv", "json":
+	case "parquet", "csv", "json", "tsv":
 	default:
-		return fmt.Errorf("unsupported format %q (parquet, csv, json)", s.Format)
+		return fmt.Errorf("unsupported format %q (parquet, csv, json, tsv)", s.Format)
 	}
 	return nil
 }

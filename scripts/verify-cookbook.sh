@@ -1290,7 +1290,16 @@ mkdir -p "$XDG_CONFIG_HOME"
 # The one shared cookbook workspace (see WS_NAME rationale above).
 WS="$WORK/$WS_NAME"
 
+# Per-recipe heartbeat to the release-gates progress log (GH #84 follow-up):
+# `tail -f .gates/progress.log` shows "recipe N/M: <name>" during the long
+# run. No-op when run standalone (CLAVESA_PROGRESS_LOG unset).
+_total_recipes=$(wc -w <<<"$RECIPES" | tr -d ' ')
+_recipe_i=0
 for r in $RECIPES; do
+  _recipe_i=$((_recipe_i + 1))
+  if [[ -n "${CLAVESA_PROGRESS_LOG:-}" ]]; then
+    echo "$(date -u +%H:%M:%S)  verify-cookbook: recipe $_recipe_i/$_total_recipes: $r" >>"$CLAVESA_PROGRESS_LOG"
+  fi
   case "$r" in
     multi-stage)        recipe_multi_stage ;;
     merge-cdf)          recipe_merge_cdf ;;

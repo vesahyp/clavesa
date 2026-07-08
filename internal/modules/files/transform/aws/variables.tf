@@ -234,6 +234,10 @@ variable "output_definitions" {
       too (or rely on a merge output's default clustering). Merge keys are
       themselves clustering columns and are bounded automatically; bound_by is
       only needed for the non-key clustered columns.
+    format selects the output shape: "delta" (default) writes a Delta table;
+      "json" writes a single JSON file to path. When format = "json", path is
+      required (an s3:// or local path) and content_type / cache_control set
+      the object's HTTP headers (content_type defaults to application/json).
   EOT
   type = map(object({
     schema = optional(object({
@@ -244,11 +248,15 @@ variable "output_definitions" {
       }))
       include_rescued_data = optional(bool, false)
     }))
-    mode         = optional(string, "replace")
-    merge_keys   = optional(list(string), [])
-    cluster_by   = optional(list(string), [])
-    merge_update = optional(map(string), {})
-    stats        = optional(bool, false)
+    mode          = optional(string, "replace")
+    merge_keys    = optional(list(string), [])
+    cluster_by    = optional(list(string), [])
+    merge_update  = optional(map(string), {})
+    stats         = optional(bool, false)
+    format        = optional(string, "delta")
+    path          = optional(string)
+    content_type  = optional(string, "application/json")
+    cache_control = optional(string)
   }))
 
   validation {
@@ -259,6 +267,11 @@ variable "output_definitions" {
   validation {
     condition     = alltrue([for k, v in var.output_definitions : coalesce(v.mode, "replace") != "merge" || length(coalesce(v.merge_keys, [])) > 0])
     error_message = "output_definitions[*] with mode = \"merge\" must declare a non-empty merge_keys."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.output_definitions : coalesce(v.format, "delta") != "json" || (v.path != null && v.path != "")])
+    error_message = "output_definitions[*] with format = \"json\" must declare a non-empty path."
   }
 }
 
