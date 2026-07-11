@@ -1,4 +1,4 @@
-.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public validate-examples
+.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -145,6 +145,9 @@ release-check: validate-examples ## Pre-tag guard: confirm CHANGELOG entry, clou
 
 release-public: release-check ## Snapshot the dev tree into the public clavesa repo, commit + tag, then prompt before push
 	@./scripts/release-public.sh
+
+sync-public: ## Publish docs/source updates to the public repo on main, NO version bump or tag (cookbook / README / web-tracker). No build, no gates. Version-bearing changes use release-public.
+	@./scripts/sync-public.sh
 
 smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
 	@./scripts/cloud-smoke.sh run

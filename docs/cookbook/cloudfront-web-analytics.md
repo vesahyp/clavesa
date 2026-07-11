@@ -14,26 +14,20 @@ This is the ingestion core of the analytics that runs on clavesa.dev itself (see
 
 Two one-time bits of setup, both outside clavesa (infrastructure, not part of the pipeline):
 
-**1. A beacon on your pages.** Drop this in your site's HTML. It fires a GET to a 1×1 pixel; the data rides in the query string, so CloudFront logs it and nothing else is needed — no backend, no cookies beyond a random id in `localStorage`.
+**1. Add the tracker.** Drop the ready-made [`tracker.js`](../../web-tracker/tracker.js) on your pages — a small, dependency-free file (the same one that runs clavesa.dev, tested end to end). Host it yourself and add one script tag:
 
 ```html
-<script>
-(function () {
-  var s = sessionStorage, l = localStorage;
-  var q = new URLSearchParams({
-    e:   "pageview",
-    p:   location.pathname,
-    sid: s.clv_sid || (s.clv_sid = Math.random().toString(36).slice(2)),
-    uid: l.clv_uid || (l.clv_uid = Math.random().toString(36).slice(2)),
-    ref: document.referrer,
-    t:   Date.now()
-  });
-  new Image().src = "/t.gif?" + q.toString();
-})();
-</script>
+<script src="/tracker.js" defer></script>
 ```
 
-Serve any 1×1 object at `/t.gif` (a transparent GIF is traditional; the beacon only needs the request to be *logged*, so the response body is irrelevant). clavesa.dev uses a [fuller tracker](https://github.com/vesahyp/clavesa) that also emits `session_start`, scroll depth, web vitals, and marked-element impressions — start minimal and grow it.
+Then tag the links and buttons you want to measure with `data-track`:
+
+```html
+<a href="/signup" data-track="signup">Start free</a>
+<a href="/docs"   data-track="docs">Read the docs</a>
+```
+
+The tracker keeps only a random id in `localStorage` (no cookies) and fires 1×1 pixel beacons to `/t.gif` — `session_start`, scroll depth, web vitals, and, for every `data-track` element, `view` / `displayed` / `click`. Those last three are what give you click-through rate and conversion funnels; each event rides in the query string, so CloudFront logs it and there's no backend to run. Serve any 1×1 object at `/t.gif` (a transparent GIF is traditional — the response body is irrelevant, the request just needs to be logged). See [`web-tracker/`](../../web-tracker/README.md) for the full event list and config.
 
 **2. Standard logging on the distribution.** Turn on CloudFront **standard (legacy) access logs** to an S3 bucket — Console: *Distribution → Settings → Standard logging → S3 bucket*, or Terraform:
 
@@ -190,9 +184,9 @@ This recipe stops at parsed events + a daily rollup. The clavesa.dev analytics b
 
 - **Bot filtering** — [crawlerdetect](runner-deps.md) on the user-agent plus a datacenter-IP range check (both loaded from an S3 reference file), to split humans from crawlers.
 - **Geography** — an IP→country lookup (DB-IP ranges) for a per-country breakdown / world map, keeping only the 2-letter code so no raw IP is stored.
-- **Conversion funnels + click-through rate** — mark CTAs with `data-track`, emit viewport/impression events, and roll up a `sessions → saw CTA → clicked` funnel.
+- **Conversion funnels + click-through rate** — the tracker already emits `view` / `displayed` / `click` for every `data-track` element, so this is pure aggregation: group by the `data-track` name for a per-element click-through rate, or roll up `sessions → saw a CTA → clicked` for a funnel. No extra instrumentation.
 
-Those need external reference data (DB-IP, a bot list) and a richer tracker; the [clavesa source](https://github.com/vesahyp/clavesa) has the full implementation if you want to grow into it.
+Bot filtering and geo need external reference data (DB-IP, a bot list); the funnel and CTR are just SQL over the events the tracker already sends. The [clavesa source](https://github.com/vesahyp/clavesa) has the full implementation if you want to grow into it.
 
 ## Troubleshooting
 

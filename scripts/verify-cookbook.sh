@@ -928,17 +928,19 @@ ep, bucket = sys.argv[1], sys.argv[2]
 s3 = boto3.client("s3", endpoint_url=ep)
 
 # (sid, uid, event, path, ref) — ref "" = direct (no ref param emitted).
+# Event names match what web-tracker/tracker.js actually emits (session_start,
+# view, …); each event carries the page path in `p`.
 rows = [
     ("s1", "u1", "session_start", "/",        "https://news.example.com"),
-    ("s1", "u1", "pageview",      "/docs",    ""),
-    ("s1", "u1", "pageview",      "/pricing", ""),
+    ("s1", "u1", "view",          "/docs",    ""),
+    ("s1", "u1", "view",          "/pricing", ""),
     ("s2", "u2", "session_start", "/docs",    ""),
-    ("s2", "u2", "pageview",      "/",        ""),
+    ("s2", "u2", "view",          "/",        ""),
     ("s3", "u3", "session_start", "/",        "https://news.example.com"),
-    ("s3", "u3", "pageview",      "/docs",    ""),
+    ("s3", "u3", "view",          "/docs",    ""),
     ("s4", "u1", "session_start", "/",        ""),
-    ("s4", "u1", "pageview",      "/pricing", ""),
-    ("s2", "u2", "pageview",      "/pricing", ""),
+    ("s4", "u1", "view",          "/pricing", ""),
+    ("s2", "u2", "view",          "/pricing", ""),
 ]
 # Expected (asserted by the recipe): 10 events, 4 sessions, 3 visitors,
 # 2 referred sessions, path '/' = 4.

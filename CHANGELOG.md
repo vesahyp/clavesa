@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+### Added
+- `web-tracker/` — a ready-made, dependency-free, cookieless web-analytics tracker (the same one that runs clavesa.dev, tested end to end), with a README. Drop it on a site, tag elements with `data-track`, and pair it with the cloudfront-web-analytics recipe for sessions, funnels, and click-through rate.
+
+### Changed
+- Cookbook recipe **cloudfront-web-analytics** now uses the ready-made `web-tracker/tracker.js` instead of a hand-rolled beacon snippet.
+
 ## [v2.17.1] — 2026-07-11
 
 ### Added
