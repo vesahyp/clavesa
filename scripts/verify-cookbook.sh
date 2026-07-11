@@ -77,7 +77,7 @@ BIN="$REPO_ROOT/bin/clavesa"
 # QueryQuery.StrictMissing (set on the interactive ad-hoc seam service.Query
 # and on RenderDashboard's widget queries); both recipes are back in the
 # default and green.
-RECIPES="${CLAVESA_COOKBOOK_RECIPES:-multi-stage merge-cdf query-your-data notebooks python-transform http-changing-source dashboards runner-deps s3-bulk-ingest backfill}"
+RECIPES="${CLAVESA_COOKBOOK_RECIPES:-multi-stage merge-cdf query-your-data notebooks python-transform http-changing-source dashboards runner-deps s3-bulk-ingest cloudfront-web-analytics backfill}"
 
 # All recipes share ONE workspace named `cookbook` — this is the cookbook's
 # own design (one workspace, one taxi dataset, recipes building on each
@@ -909,6 +909,218 @@ recipe_s3_bulk_ingest() {
     "$BULK_ROWS" "orders_raw row count (whole prefix bulk-read)"
 }
 
+# seed_cloudfront_logs <bucket> — write a deterministic synthetic CloudFront
+# standard-log fixture into s3://<bucket>/cloudfront/ as gzipped TSV: two log
+# objects, each led by the #Version/#Fields header lines, carrying 10 /t.gif
+# beacon hits (4 sessions, 3 visitors, 2 referred) plus one non-beacon request
+# to prove the /t.gif stem filter. The cs-uri-query field is DOUBLE URL-encoded
+# exactly like a real log (tracker layer + CloudFront layer) so the recipe's
+# parse_qs+unquote decode is exercised for real. For cloudfront-web-analytics.
+seed_cloudfront_logs() {
+  local bucket="$1"
+  banner "seed s3://$bucket/cloudfront/ (2 gzipped TSV log objects, 10 beacon hits)"
+  python3 - "$MOTO_HOST_ENDPOINT" "$bucket" <<'PY' || die "cloudfront log seed failed"
+import gzip, io, sys
+from urllib.parse import urlencode, quote
+import boto3
+
+ep, bucket = sys.argv[1], sys.argv[2]
+s3 = boto3.client("s3", endpoint_url=ep)
+
+# (sid, uid, event, path, ref) — ref "" = direct (no ref param emitted).
+rows = [
+    ("s1", "u1", "session_start", "/",        "https://news.example.com"),
+    ("s1", "u1", "pageview",      "/docs",    ""),
+    ("s1", "u1", "pageview",      "/pricing", ""),
+    ("s2", "u2", "session_start", "/docs",    ""),
+    ("s2", "u2", "pageview",      "/",        ""),
+    ("s3", "u3", "session_start", "/",        "https://news.example.com"),
+    ("s3", "u3", "pageview",      "/docs",    ""),
+    ("s4", "u1", "session_start", "/",        ""),
+    ("s4", "u1", "pageview",      "/pricing", ""),
+    ("s2", "u2", "pageview",      "/pricing", ""),
+]
+# Expected (asserted by the recipe): 10 events, 4 sessions, 3 visitors,
+# 2 referred sessions, path '/' = 4.
+
+def cf_query(sid, uid, event, path, ref):
+    params = {"e": event, "uid": uid, "sid": sid, "p": path, "t": "1717243200000"}
+    if ref:
+        params["ref"] = ref
+    inner = urlencode(params)        # tracker layer (URLSearchParams-style)
+    return quote(inner, safe="=&")   # CloudFront layer: re-encode, keep = and &
+
+HEADER = ("#Version: 1.0\n"
+          "#Fields: date time x-edge-location sc-bytes c-ip cs-method "
+          "cs(Host) cs-uri-stem sc-status cs(Referer) cs(User-Agent) cs-uri-query\n")
+
+def line(stem, query):
+    # 12 tab-separated fields = _c0.._c11 (real logs have more; we read these).
+    return "\t".join(["2026-06-01", "12:00:00", "HEL50-C1", "35",
+                      "203.0.113.10", "GET", "example.com", stem, "200",
+                      "-", "Mozilla/5.0", query])
+
+def gzip_object(row_slice, with_noise):
+    body = HEADER
+    if with_noise:
+        body += line("/index.html", "-") + "\n"   # non-beacon: must be filtered
+    for r in row_slice:
+        body += line("/t.gif", cf_query(*r)) + "\n"
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        gz.write(body.encode("utf-8"))
+    return buf.getvalue()
+
+s3.put_object(Bucket=bucket, Key="cloudfront/E.2026-06-01-12.aaaa.gz",
+              Body=gzip_object(rows[:6], True))
+s3.put_object(Bucket=bucket, Key="cloudfront/E.2026-06-01-13.bbbb.gz",
+              Body=gzip_object(rows[6:], False))
+print("  put 2 gzip log objects (10 beacon hits + 1 non-beacon line)")
+PY
+  local n
+  n="$(python3 - "$MOTO_HOST_ENDPOINT" "$bucket" <<'PY'
+import sys, boto3
+ep, bucket = sys.argv[1], sys.argv[2]
+s3 = boto3.client("s3", endpoint_url=ep)
+objs = s3.list_objects_v2(Bucket=bucket, Prefix="cloudfront/").get("Contents", [])
+print(len([o for o in objs if o["Key"].endswith(".gz")]))
+PY
+)"
+  if [[ "$n" == "2" ]]; then
+    pass "seed present: 2 gzipped CloudFront log objects"
+  else
+    fail "seed: expected 2 log objects, found $n"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Recipe: cloudfront-web-analytics.md
+# ---------------------------------------------------------------------------
+# CloudFront access logs (gzipped TSV) -> parsed /t.gif beacon events -> daily
+# rollup. Needs moto (the tsv source reads gzipped log objects over S3A). The
+# reader-facing recipe is bring-your-own-bucket, so its deterministic counts
+# live only here, asserted against the synthetic log fixture seeded above.
+recipe_cloudfront_analytics() {
+  CURRENT_RECIPE="cloudfront-web-analytics"
+  BUCKET="cookbook-cflogs"
+
+  setup_moto
+  seed_cloudfront_logs "$BUCKET"
+  ensure_workspace
+
+  if [[ ! -d "$WS/analytics" ]]; then
+    banner "build analytics (cloudfront-web-analytics.md): cflogs source + events + daily"
+    clv source register cflogs \
+      --from "s3://$BUCKET/cloudfront/" \
+      --format tsv \
+      --read-option header=false \
+      --read-option comment=# || die "source register cflogs failed"
+
+    clv pipeline create analytics || die "pipeline create analytics failed"
+    clv node add analytics --type transform --name events || die "node add events failed"
+
+    mkdir -p "$WS/analytics/transforms"
+    cat >"$WS/analytics/transforms/parse_beacon.py" <<'PY'
+"""
+parse_beacon — turn CloudFront /t.gif beacon hits into typed event rows.
+
+The runner hands this transform the raw CloudFront access logs as headerless,
+tab-separated columns (_c0.._cN — a standard v1.0 log has 30+ fields; we read
+only the few we need). We keep the /t.gif requests and pull the analytics
+fields out of the query string.
+
+That query string is DOUBLE URL-encoded: the tracker URL-encodes each value,
+then CloudFront URL-encodes the whole query field again when it writes the log.
+parse_qs peels CloudFront's layer; unquote peels the tracker's.
+
+Positional columns we use (0-indexed) in a CloudFront standard log:
+  _c7  cs-uri-stem    (keep == /t.gif)
+  _c11 cs-uri-query   (the beacon params — includes the client timestamp t)
+"""
+
+from urllib.parse import parse_qs, unquote
+
+from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.types import MapType, StringType
+
+
+def _parse_qs(query):
+    """cs-uri-query -> {beacon field: fully-decoded value}."""
+    out = {}
+    if not query or query == "-":
+        return out
+    for key, vals in parse_qs(query, keep_blank_values=True).items():
+        if vals:
+            out[key] = unquote(vals[0])   # unquote peels the tracker's layer
+    return out
+
+
+def transform(spark, inputs: dict[str, DataFrame]) -> dict[str, DataFrame]:
+    parse_udf = F.udf(_parse_qs, MapType(StringType(), StringType()))
+
+    beacons = (
+        inputs["logs"]
+        .where(F.col("_c7") == "/t.gif")
+        .where(F.col("_c11").isNotNull() & (F.col("_c11") != "") & (F.col("_c11") != "-"))
+        .withColumn("q", parse_udf(F.col("_c11")))
+    )
+
+    events = beacons.select(
+        F.col("q")["e"].alias("event"),
+        F.col("q")["sid"].alias("session_id"),
+        F.col("q")["uid"].alias("visitor_id"),
+        F.col("q")["p"].alias("path"),
+        F.col("q")["ref"].alias("referrer"),
+        # The beacon carries its own millisecond timestamp (t); TRY_CAST so a
+        # malformed value becomes NULL instead of failing the read.
+        F.expr("timestamp_millis(TRY_CAST(q['t'] AS BIGINT))").alias("event_ts"),
+        F.expr("to_date(timestamp_millis(TRY_CAST(q['t'] AS BIGINT)))").alias("day"),
+    ).where(F.col("event").isNotNull() & (F.col("event") != ""))
+
+    return {"default": events}
+PY
+
+    clv node edit analytics events \
+      --set "language=python" \
+      --set "python=file(transforms/parse_beacon.py)" || die "node edit events failed"
+    clv source attach analytics cflogs --to events --as logs || die "source attach cflogs failed"
+
+    clv node add analytics --type transform --name daily || die "node add daily failed"
+    clv node edit analytics daily --set "sql=
+      SELECT
+        day,
+        COUNT(DISTINCT session_id) AS sessions,
+        COUNT(DISTINCT visitor_id) AS visitors,
+        COUNT(*)                   AS events,
+        COUNT(DISTINCT CASE WHEN referrer IS NOT NULL AND referrer <> ''
+                            THEN session_id END) AS referred_sessions
+      FROM events
+      GROUP BY day
+      ORDER BY day" || die "node edit daily failed"
+    clv node connect analytics --from events --to daily --input events || die "connect events->daily failed"
+  else
+    pass "analytics pipeline already built"
+  fi
+
+  run_pipeline analytics
+
+  # events: one row per /t.gif beacon hit — headers + the non-beacon line dropped.
+  assert_count "SELECT COUNT(*) FROM clavesa_cookbook__analytics.events" \
+    10 "events row count (10 beacon hits; /t.gif filter applied)"
+  # double-decode worked: 4 hits landed on path '/'.
+  assert_count "SELECT COUNT(*) FROM clavesa_cookbook__analytics.events WHERE path = '/'" \
+    4 "events on path '/' (double URL-decode worked)"
+  # daily rollup scalars.
+  assert_count "SELECT sessions FROM clavesa_cookbook__analytics.daily" \
+    4 "daily distinct sessions"
+  assert_count "SELECT visitors FROM clavesa_cookbook__analytics.daily" \
+    3 "daily distinct visitors"
+  assert_count "SELECT events FROM clavesa_cookbook__analytics.daily" \
+    10 "daily total events"
+  assert_count "SELECT referred_sessions FROM clavesa_cookbook__analytics.daily" \
+    2 "daily referred sessions"
+}
+
 # build_daily — the merge-cdf base table daily_revenue (January, keyed on
 # trip_date). Dashboards charts it. Idempotent; skips when merge-cdf already
 # built the daily pipeline in this run.
@@ -1308,6 +1520,7 @@ for r in $RECIPES; do
     python-transform)   recipe_python_transform ;;
     http-changing-source) recipe_http_changing_source ;;
     s3-bulk-ingest)     recipe_s3_bulk_ingest ;;
+    cloudfront-web-analytics) recipe_cloudfront_analytics ;;
     dashboards)         recipe_dashboards ;;
     runner-deps)        recipe_runner_deps ;;
     backfill)           recipe_backfill ;;

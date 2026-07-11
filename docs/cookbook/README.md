@@ -16,6 +16,7 @@ Five recipes that build on each other, top to bottom — one `cookbook` workspac
 
 How data actually gets in — each standalone, swap in your own source.
 
+- **[cloudfront-web-analytics](cloudfront-web-analytics.md)** — cookieless, EU-hosted web analytics: a tracking pixel writes to CloudFront's access logs, and clavesa turns the gzipped-TSV logs into sessions / pageviews / referrers. GA-style insight that never leaves your account.
 - **[s3-bulk-ingest](s3-bulk-ingest.md)** — read an entire S3 bucket into a Delta table in one shot. Static archives, vendor dumps, anything you mirror as-is.
 - **[s3-trigger](s3-trigger.md)** — event-driven processing where new S3 files trigger runs automatically. EventBridge → SQS → poller → Step Functions per partition.
 - **[http-changing-source](http-changing-source.md)** — a public HTTP API whose data keeps moving (feeds, leaderboards). Full re-fetch + merge to dedupe; + append to capture the change history the API never exposes.

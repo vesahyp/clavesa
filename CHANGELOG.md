@@ -12,6 +12,11 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.17.1] — 2026-07-11
+
+### Added
+- Cookbook recipe **cloudfront-web-analytics** — cookieless web analytics from CloudFront access logs (tracking pixel → gzipped-TSV logs → a clavesa pipeline → daily rollups), with a deterministic `verify-cookbook` gate.
+
 ## [v2.17.0] — 2026-07-08
 
 ### Added

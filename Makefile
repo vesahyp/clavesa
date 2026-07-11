@@ -32,7 +32,7 @@ push-runner: ## Push runner image to your ECR (requires ECR_REPO=<account>.dkr.e
 	docker push $(ECR_REPO):$(RUNNER_VERSION)
 	docker push $(ECR_REPO):latest
 
-build-bin: sync-modules ## Build binary only → bin/clavesa (embeds modules)
+build-bin: sync-modules sync-runner ## Build binary only → bin/clavesa (embeds modules + runner files)
 	go build -o bin/clavesa ./cmd/clavesa
 
 ui/node_modules: ui/package.json ui/package-lock.json
