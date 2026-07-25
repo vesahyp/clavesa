@@ -1112,6 +1112,45 @@ def _is_hive_partitioned(path: str) -> bool:
         return False
 
 
+def _string_safe_schema(schema):
+    """Return a copy of ``schema`` with every date/time-family field demoted to
+    a nullable string, or None when nothing needs demoting. Spark's lenient
+    parsers rewrite date/time text during inference — a time-only value like
+    ``07:36:42`` comes back as a TIMESTAMP anchored to the *read* date — so
+    inference may keep numeric typing but must never rewrite a value; typing
+    date/time columns is the transform's explicit job."""
+    from pyspark.sql.types import StringType, StructField, StructType  # noqa: PLC0415
+
+    demote = {"date", "timestamp", "timestamp_ntz", "time"}
+    changed = False
+    fields = []
+    for f in schema.fields:
+        if f.dataType.typeName() in demote:
+            fields.append(StructField(f.name, StringType(), True))
+            changed = True
+        else:
+            fields.append(f)
+    return StructType(fields) if changed else None
+
+
+def _read_delimited_two_pass(reader_factory, read_options):
+    """CSV/TSV read with schema inference minus its date/time rewriting.
+    ``reader_factory(schema)`` returns the DataFrame — schema=None means read
+    with inferSchema, otherwise apply the explicit schema. First pass infers;
+    if any column came back date/time-typed, re-read with those columns pinned
+    to string (_string_safe_schema). The `columns` rename applies after the
+    final read."""
+    df = reader_factory(None)
+    safe = _string_safe_schema(df.schema)
+    if safe is not None:
+        df = reader_factory(safe)
+    columns = (read_options or {}).get("columns")
+    if columns:
+        names = [c.strip() for c in columns.split(",") if c.strip()]
+        df = df.toDF(*names)  # assign explicit names (rename _c0.._cN, or override header names)
+    return df
+
+
 def _read_path_format(spark, path: str, fmt: str, read_options=None):
     """Dispatch a Spark read by source format. Defaults match what most users
     expect for ad-hoc CSV/JSON: header on, schema inferred. `read_options`
@@ -1136,18 +1175,18 @@ def _read_path_format(spark, path: str, fmt: str, read_options=None):
         ro = read_options or {}
         sep = ro.get("delimiter") or ("\t" if fmt == "tsv" else ",")
         header = str(ro.get("header", "true")).lower() == "true"
-        columns = ro.get("columns")
-        reader = spark.read.option("sep", sep).option("inferSchema", "true")
-        reader = reader.option("header", "true" if header else "false")
-        if ro.get("comment"):
-            reader = reader.option("comment", ro["comment"])
-        if recurse:
-            reader = reader.option("recursiveFileLookup", "true")
-        df = reader.csv(path)  # Spark's CSV reader handles TSV via sep
-        if columns:
-            names = [c.strip() for c in columns.split(",") if c.strip()]
-            df = df.toDF(*names)  # assign explicit names (rename _c0.._cN, or override header names)
-        return df
+
+        def _reader(schema):
+            r = spark.read.option("sep", sep)
+            r = r.option("header", "true" if header else "false")
+            if ro.get("comment"):
+                r = r.option("comment", ro["comment"])
+            if recurse:
+                r = r.option("recursiveFileLookup", "true")
+            r = r.option("inferSchema", "true") if schema is None else r.schema(schema)
+            return r.csv(path)  # Spark's CSV reader handles TSV via sep
+
+        return _read_delimited_two_pass(_reader, ro)
     if fmt == "json" or fmt == "ndjson":
         reader = spark.read
         if recurse:
@@ -1173,16 +1212,16 @@ def _read_keys_format(spark, keys: list[str], fmt: str, base_path: str, read_opt
         ro = read_options or {}
         sep = ro.get("delimiter") or ("\t" if fmt == "tsv" else ",")
         header = str(ro.get("header", "true")).lower() == "true"
-        columns = ro.get("columns")
-        reader = reader.option("sep", sep).option("inferSchema", "true")
-        reader = reader.option("header", "true" if header else "false")
-        if ro.get("comment"):
-            reader = reader.option("comment", ro["comment"])
-        df = reader.csv(*keys)  # Spark's CSV reader handles TSV via sep
-        if columns:
-            names = [c.strip() for c in columns.split(",") if c.strip()]
-            df = df.toDF(*names)  # assign explicit names (rename _c0.._cN, or override header names)
-        return df
+
+        def _reader(schema):
+            r = spark.read.option("basePath", base_path).option("sep", sep)
+            r = r.option("header", "true" if header else "false")
+            if ro.get("comment"):
+                r = r.option("comment", ro["comment"])
+            r = r.option("inferSchema", "true") if schema is None else r.schema(schema)
+            return r.csv(*keys)  # Spark's CSV reader handles TSV via sep
+
+        return _read_delimited_two_pass(_reader, ro)
     if fmt == "json" or fmt == "ndjson":
         return reader.json(*keys)
     raise RuntimeError(f"unsupported source format {fmt!r} for drain keys under {base_path!r}")

@@ -10,13 +10,16 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
-## [Unreleased]
+## [v2.18.0] — 2026-07-25
 
 ### Added
 - `web-tracker/` — a ready-made, dependency-free, cookieless web-analytics tracker (the same one that runs clavesa.dev, tested end to end), with a README. Drop it on a site, tag elements with `data-track`, and pair it with the cloudfront-web-analytics recipe for sessions, funnels, and click-through rate.
 
 ### Changed
 - Cookbook recipe **cloudfront-web-analytics** now uses the ready-made `web-tracker/tracker.js` instead of a hand-rolled beacon snippet.
+
+### Fixed
+- csv/tsv sources no longer let schema inference rewrite date/time-like text — a time-only column (e.g. CloudFront's `07:36:42`) was inferred as a timestamp anchored to the run date; date/time-looking columns now arrive as strings (cast explicitly in transforms). Append-mode tables with a previously inferred date/timestamp column need a one-time rebuild.
 
 ## [v2.17.1] — 2026-07-11
 

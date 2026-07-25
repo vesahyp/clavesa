@@ -225,6 +225,9 @@ type handlerResult struct {
 		Outputs map[string]string `json:"outputs"`
 	} `json:"result"`
 	Rows []map[string]any `json:"rows"`
+	// Schema (column name → Spark typeName) is emitted only by drivers that
+	// assert on output typing; absent elsewhere.
+	Schema map[string]string `json:"schema"`
 }
 
 // runDriver mounts a temp dir, writes the driver script, runs the container,
@@ -305,6 +308,82 @@ def transform(spark, inputs):
 		if got := r["big"].(bool); got != expectedBig {
 			t.Errorf("amount=%v big=%v, expected %v", amount, got, expectedBig)
 		}
+	}
+}
+
+// TestRunner_HandlerTSVKeepsTimeText guards the csv/tsv inference contract:
+// inference may keep numeric typing but must never rewrite a value. Spark 4's
+// lenient timestamp inference turns a time-only column ("07:36:42", the
+// CloudFront access-log shape) into a TIMESTAMP anchored to the read date —
+// silently rewriting data. The runner demotes inferred date/time-family
+// columns to string on a second read pass; this drives a headerless TSV
+// through a path-kind source descriptor (_read_path_format) and asserts the
+// time text survives verbatim while the integer column stays numeric.
+func TestRunner_HandlerTSVKeepsTimeText(t *testing.T) {
+	script := `
+import json, os, sys, shutil
+shutil.rmtree("/work/inputs", ignore_errors=True)
+shutil.rmtree("/work/outputs", ignore_errors=True)
+os.makedirs("/work/inputs/events", exist_ok=True)
+
+sys.path.insert(0, "/var/task")
+os.environ["CLAVESA_LOGIC_S3_PATH"] = "/work/logic.txt"
+os.environ["CLAVESA_LANGUAGE"] = "sql"
+
+from runner import _spark, handler
+
+spark = _spark()
+
+with open("/work/inputs/events/part-0.tsv", "w") as f:
+    f.write("2026-07-11\t07:36:42\tARN54-C1\t599\n")
+    f.write("2026-07-12\t23:59:59\tARN54-C2\t1234\n")
+
+with open("/work/logic.txt", "w") as f:
+    f.write("SELECT * FROM events")
+
+event = {
+    "inputs": {"events": {
+        "kind": "path",
+        "path": "/work/inputs/events/",
+        "format": "tsv",
+        "read_options": {"header": "false", "columns": "day,tm,edge,bytes"},
+    }},
+    "outputs": {"default": "/work/outputs/default"},
+}
+result = handler(event, None)
+
+out = spark.read.parquet("/work/outputs/default")
+schema = {f.name: f.dataType.typeName() for f in out.schema.fields}
+rows = sorted((r.asDict() for r in out.collect()), key=lambda r: str(r["day"]))
+print("RESULT_LINE:" + json.dumps({"result": result, "schema": schema, "rows": rows}, default=str))
+`
+	r := runDriver(t, script)
+
+	if r.Result.Status != "ok" {
+		t.Fatalf("handler status: want ok, got %q", r.Result.Status)
+	}
+	if len(r.Rows) != 2 {
+		t.Fatalf("want 2 rows, got %d: %v", len(r.Rows), r.Rows)
+	}
+	// Date/time-looking columns must arrive as string — never rewritten.
+	if got := r.Schema["day"]; got != "string" {
+		t.Errorf("day type: want string, got %q", got)
+	}
+	if got := r.Schema["tm"]; got != "string" {
+		t.Errorf("tm type: want string, got %q", got)
+	}
+	// Numeric inference is kept.
+	if got := r.Schema["bytes"]; got != "integer" {
+		t.Errorf("bytes type: want integer, got %q", got)
+	}
+	if got := r.Rows[0]["tm"]; got != "07:36:42" {
+		t.Errorf("tm: want the file's exact text %q, got %v (timestamp inference anchored it to the run date?)", "07:36:42", got)
+	}
+	if got := r.Rows[0]["day"]; got != "2026-07-11" {
+		t.Errorf("day: want %q, got %v", "2026-07-11", got)
+	}
+	if got := r.Rows[0]["bytes"]; got != float64(599) {
+		t.Errorf("bytes: want 599, got %v", got)
 	}
 }
 
