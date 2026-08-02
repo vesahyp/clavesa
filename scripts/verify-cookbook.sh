@@ -196,8 +196,15 @@ PY
 # clv <args...> — the built binary, always scoped to the throwaway
 # workspace and carrying the container-visible S3 endpoint so every
 # runner the CLI spawns reaches host moto.
+#
+# CLAVESA_SOURCE_MIRROR=off: the ADR-026 local source mirror syncs s3
+# sources HOST-side, and the host can't reach the host.docker.internal
+# moto endpoint these recipes export — and the s3 recipes exist to
+# exercise the runner's direct S3A read anyway, so the direct-S3
+# descriptor is the behavior under test.
 clv() {
   CLAVESA_S3_ENDPOINT="$MOTO_CONTAINER_ENDPOINT" \
+  CLAVESA_SOURCE_MIRROR=off \
     "$BIN" "$@" --workspace "$WS"
 }
 

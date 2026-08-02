@@ -58,15 +58,29 @@ func hasEnvArg(args []string, kv string) bool {
 	return false
 }
 
+// hasLabelArg reports whether args contains the docker label pair
+// ["--label", "<kv>"]. Exact-match on the kv string.
+func hasLabelArg(args []string, kv string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--label" && args[i+1] == kv {
+			return true
+		}
+	}
+	return false
+}
+
 // TestWarmWorkerRunArgsLocal — local warehouse: bind-mount, Derby
 // metastore network args, no AWS passthrough.
 func TestWarmWorkerRunArgsLocal(t *testing.T) {
 	wh := "/ws/.clavesa/warehouse"
-	args := warmWorkerRunArgs("clavesa.warm-worker=/ws", wh, "img:latest",
+	args := warmWorkerRunArgs("clavesa.warm-worker=/ws", "clavesa.workspace=/ws", wh, "img:latest",
 		"cat", "syscat", "clavesa-metastore-net", "metastore:1527", nil)
 
 	if !hasEnvArg(args, "CLAVESA_WAREHOUSE="+wh) {
 		t.Errorf("missing CLAVESA_WAREHOUSE: %v", args)
+	}
+	if !hasLabelArg(args, "clavesa.warm-worker=/ws") || !hasLabelArg(args, "clavesa.workspace=/ws") {
+		t.Errorf("worker must carry both the warm-worker and workspace labels: %v", args)
 	}
 	if !slices.Contains(args, "-v") || !slices.Contains(args, wh+":"+wh) {
 		t.Errorf("local warehouse must be bind-mounted: %v", args)
@@ -98,11 +112,14 @@ func TestWarmWorkerRunArgsLocal(t *testing.T) {
 func TestWarmWorkerRunArgsS3(t *testing.T) {
 	awsArgs := []string{"-e", "AWS_ACCESS_KEY_ID=AKIATEST", "-e", "AWS_REGION=eu-north-1"}
 	wh := "s3://bkt/_workspace/_warehouse/"
-	args := warmWorkerRunArgs("clavesa.warm-worker=/ws", wh, "img:latest",
+	args := warmWorkerRunArgs("clavesa.warm-worker=/ws", "clavesa.workspace=/ws", wh, "img:latest",
 		"cat", "syscat", "should-be-ignored-net", "ignored:1527", awsArgs)
 
 	if !hasEnvArg(args, "CLAVESA_WAREHOUSE="+wh) {
 		t.Errorf("CLAVESA_WAREHOUSE must pass verbatim: %v", args)
+	}
+	if !hasLabelArg(args, "clavesa.workspace=/ws") {
+		t.Errorf("s3 worker must carry the workspace label: %v", args)
 	}
 	if slices.Contains(args, "-v") && slices.Contains(args, wh+":"+wh) {
 		t.Errorf("s3 warehouse must not be bind-mounted: %v", args)

@@ -10,6 +10,16 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [Unreleased]
+
+## [v2.19.0] — 2026-08-02
+
+### Added
+- Local-warehouse `pipeline run` now mirrors non-partitioned s3 sources into `<workspace>/.clavesa/cache/sources/<name>/` and reads the mirror — one S3 listing plus the new files per run instead of re-downloading the full prefix on every Spark scan (ADR-026, #91). The run log shows what each sync did; `CLAVESA_SOURCE_MIRROR=off` restores direct-S3 reads. Partitioned and credentialed sources are unchanged.
+
+### Fixed
+- Helper containers (metastore, warm query worker, transpile sidecar) now carry a `clavesa.workspace` label, and orphans belonging to deleted workspaces are removed automatically at startup, at most once an hour (#59).
+
 ## [v2.18.0] — 2026-07-25
 
 ### Added

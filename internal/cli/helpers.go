@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -302,6 +303,11 @@ type serviceDeps struct {
 	resolver  *observability.Resolver
 }
 
+// reapOrphansOnce gates the GH #59 orphan reaper to once per process —
+// newServiceDeps is the funnel every command passes through, and some
+// commands construct it more than once.
+var reapOrphansOnce sync.Once
+
 // newServiceDeps is the single CLI service constructor (2026-07-02 session
 // I P2-1; GH #76). Every command-side service.Service is built here with
 // the FULL option set — resolver, SQL parser, transpiler, metastore
@@ -323,6 +329,15 @@ func newServiceDeps(cmd *cobra.Command) (*serviceDeps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace: %w", err)
 	}
+	// Reap helper containers orphaned by DELETED workspaces (GH #59) — the
+	// per-root sweeps above/in ui.go only see the current workspace, so
+	// metastores and warm workers from removed tempdir workspaces leaked
+	// forever. Once per process, best-effort: docker absent / daemon down is
+	// the normal quiet case, and each docker call inside is short-timeout so
+	// a wedged daemon can't hang command startup.
+	reapOrphansOnce.Do(func() {
+		_, _ = observability.ReapOrphanContainers(cmd.Context())
+	})
 	clients := loadAWSClients(cmd.Context(), workspace)
 	cloud := clients.cloudProvider()
 	warm := observability.NewPersistentQueryRunner(workspace)

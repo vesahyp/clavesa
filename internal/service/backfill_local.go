@@ -217,7 +217,7 @@ func (s *Service) backfillStageLocal(
 	// into req.Node, which breaks single-node backfills on multi-stage DAGs.
 	outputPath, outputFormat := seedUpstreamPathsForBackfill(g, req.Node, catalog, schema)
 
-	inputs, ierr := s.buildInputs(g, req.Node, outputPath, outputFormat, catalog)
+	inputs, ierr := s.buildInputs(ctx, g, req.Node, outputPath, outputFormat, catalog)
 	if ierr != nil {
 		return nil, fmt.Errorf("resolve inputs: %w", ierr)
 	}

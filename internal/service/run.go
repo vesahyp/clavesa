@@ -493,7 +493,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			continue
 		}
 		tableID := outputPath[nodeID]
-		inputs, ierr := s.buildInputs(&g, nodeID, outputPath, outputFormat, catalog)
+		inputs, ierr := s.buildInputs(ctx, &g, nodeID, outputPath, outputFormat, catalog)
 		if ierr != nil {
 			status := NodeRunStatus{NodeID: nodeID, Type: node.Type, Status: "failed", Note: ierr.Error()}
 			outcome.markFailed(nodeID, "input_error", ierr.Error())
@@ -703,7 +703,7 @@ func localSourcePath(node *graph.Node) (string, error) {
 // translation the cloud orchestration emitter applies, shared via
 // identutil.EncodeExternalTableRef so the two surfaces can't drift. `catalog`
 // is the workspace catalog identifier.
-func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath, outputFormat map[string]string, catalog string) (map[string]any, error) {
+func (s *Service) buildInputs(ctx context.Context, g *graph.PipelineGraph, nodeID string, outputPath, outputFormat map[string]string, catalog string) (map[string]any, error) {
 	inputs := map[string]any{}
 	// Workspace-source references first.
 	for _, n := range g.Nodes {
@@ -776,7 +776,29 @@ func (s *Service) buildInputs(g *graph.PipelineGraph, nodeID string, outputPath,
 						}
 						break
 					}
-					// Listing read. Deliberately no `queue_url`: SQS
+					// Listing read. ADR-026 (GH #91): buildInputs only feeds
+					// the local-warehouse run paths (the bundle walk in
+					// executeRun and the local backfill's runTransform —
+					// cloud dispatch and cloud-warehouse `--compute local`
+					// read their post-apply descriptors from the deployed
+					// SFN definition), so mirror the source into the
+					// workspace cache and hand the runner a kind=path
+					// descriptor instead of a full bucket/prefix scan over
+					// the network per Spark action. Credentialed sources
+					// stay direct-S3 (cross-account mirror creds are out of
+					// scope), as does CLAVESA_SOURCE_MIRROR=off. A sync
+					// failure fails the run, loudly — no stale-mirror
+					// fallback.
+					if credDescriptor == nil && sourceMirrorEnabled() {
+						descriptor, merr := s.mirrorSourceDescriptor(ctx, spec)
+						if merr != nil {
+							return nil, fmt.Errorf("source %q: %w", name, merr)
+						}
+						inputs[alias] = descriptor
+						break
+					}
+					// Direct-S3 descriptor (mirror opt-out / credentialed
+					// source). Deliberately no `queue_url`: SQS
 					// notification-drain is a cloud-only cost optimization
 					// the orchestration emitter stamps onto the cloud
 					// descriptor. Local has no SQS, so the runner falls

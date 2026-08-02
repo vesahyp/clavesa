@@ -205,6 +205,12 @@ type Service struct {
 	sqlParser  SQLParser
 	transpiler Transpiler
 
+	// mirrorS3 overrides the S3 client the ADR-026 local source mirror
+	// syncs through. nil in production — mirrorClient then resolves the
+	// shared lazy s3Client via ensureS3Client; tests inject a fake here
+	// so the descriptor swap can be exercised without AWS.
+	mirrorS3 mirrorS3Client
+
 	// runsInFlight tracks pipelines with an async StartRun executing,
 	// keyed by absolute dir. Guards against a double-dispatch the
 	// synchronous RunPipeline used to prevent by blocking. runsMu

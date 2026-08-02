@@ -208,6 +208,10 @@ func EnsureMetastore(ctx context.Context, workspaceRoot, workspaceName string) (
 	args := []string{
 		"run", "-d",
 		"--name", name,
+		// Shared workspace label so the global orphan reaper (GH #59) can
+		// remove this container once its workspace directory is deleted;
+		// the per-root SweepMetastores keyed by name stays as-is.
+		"--label", workspaceLabelKV(workspaceRoot),
 		"--network", net,
 		// Stable in-network alias so clients can dial a known name even
 		// if the container name convention ever shifts. The container

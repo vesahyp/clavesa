@@ -134,6 +134,11 @@ func (t *transpileSidecar) spawn(ctx context.Context) (string, int, error) {
 	}
 	args := []string{
 		"run", "-d", "--rm",
+		// Shared workspace label so the global orphan reaper (GH #59) can
+		// remove this container once its workspace directory is deleted —
+		// the sidecar has no name and no per-root sweep, so a SIGKILL'd
+		// session (which skips Close) would otherwise leak it forever.
+		"--label", workspaceLabelKV(t.workspaceRoot),
 		// Bind only to loopback with an ephemeral host port — the Go side
 		// always dials 127.0.0.1 and the server has no business on the LAN.
 		"-p", "127.0.0.1::" + transpileServerPort + "/tcp",

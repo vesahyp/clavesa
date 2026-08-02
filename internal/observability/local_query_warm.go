@@ -45,6 +45,7 @@ type PersistentQueryRunner struct {
 	// would fail with "docker: invalid reference format".
 	workspaceRoot string
 	labelKV       string // e.g. clavesa.warm-worker=/abs/workspace/path
+	wsLabelKV     string // shared clavesa.workspace=<abs root> label (GH #59 reaper)
 	httpC         *http.Client
 	healthCtx     time.Duration // how long to wait for /healthz before giving up
 
@@ -102,6 +103,7 @@ func NewPersistentQueryRunner(workspaceRoot string) *PersistentQueryRunner {
 	return &PersistentQueryRunner{
 		workspaceRoot: workspaceRoot,
 		labelKV:       warmWorkerLabel + "=" + workspaceRoot,
+		wsLabelKV:     workspaceLabelKV(workspaceRoot),
 		httpC:         &http.Client{Timeout: 10 * time.Minute},
 		healthCtx:     90 * time.Second,
 		workers:       make(map[string]*warmWorker),
@@ -448,7 +450,7 @@ func (p *PersistentQueryRunner) spawn(ctx context.Context, warehouse string) (st
 	if isS3 {
 		awsArgs = runner.AWSEnvDockerArgs(ctx)
 	}
-	args := warmWorkerRunArgs(p.labelKV, warehouse, p.resolveImage(), catalog, systemCatalog, metastoreNetwork, metastoreAddr, awsArgs)
+	args := warmWorkerRunArgs(p.labelKV, p.wsLabelKV, warehouse, p.resolveImage(), catalog, systemCatalog, metastoreNetwork, metastoreAddr, awsArgs)
 
 	// Docker Desktop intermittently accepts a `-p` publish request but never
 	// wires up the host-side forwarding: the container runs fine, Spark boots,
@@ -512,10 +514,15 @@ func (p *PersistentQueryRunner) spawn(ctx context.Context, warehouse string) (st
 // the metastore); awsArgs carries the host-resolved AWS credential
 // env/mounts (runner.AWSEnvDockerArgs — resolved by spawn() so this
 // function stays pure).
-func warmWorkerRunArgs(labelKV, warehouse, image, catalog, systemCatalog, metastoreNetwork, metastoreAddr string, awsArgs []string) []string {
+func warmWorkerRunArgs(labelKV, wsLabelKV, warehouse, image, catalog, systemCatalog, metastoreNetwork, metastoreAddr string, awsArgs []string) []string {
 	args := []string{
 		"run", "-d", "--rm",
+		// Two labels: the legacy per-root warm-worker label (raw root —
+		// SweepWarmWorkers filters on exact equality, so its value must not
+		// change) plus the shared Abs-normalized workspace label the global
+		// orphan reaper keys on (GH #59).
 		"--label", labelKV,
+		"--label", wsLabelKV,
 		// Bind only to loopback (the Go side always dials 127.0.0.1, and the
 		// warm Spark worker has no business being reachable from the LAN) and
 		// request an ephemeral host port via the empty-host-port form
