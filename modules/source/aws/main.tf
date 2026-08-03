@@ -7,8 +7,8 @@ locals {
 
   # Glue catalog naming kept for downstream object shape compatibility (the
   # transform module's `inputs` variable accepts {table_path, catalog_db,
-  # catalog_table, schema}). Both fields are unused today (we write plain
-  # Parquet, not Iceberg). Will become real when Iceberg lands per ADR-007.
+  # catalog_table, schema}). Both fields are unused — sources are plain
+  # paths, never catalog-registered Delta tables.
   catalog_db    = "clavesa_${replace(var.pipeline_name, "-", "_")}"
   catalog_table = "${replace(var.name, "-", "_")}__${local.output_name}"
 

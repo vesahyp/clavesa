@@ -2,7 +2,7 @@
 # Shape matches the TF-MODULE-SCHEMA Output Map Convention (Sub-artifact A).
 # Downstream modules reference these as: module.<name>.outputs["<key>"]
 output "outputs" {
-  description = "Named output map. Each entry is a materialized Iceberg table reference."
+  description = "Named output map. Each entry is a materialized Delta table reference."
   value = {
     for k, v in var.output_definitions : k => {
       table_path    = "s3://${var.bucket}/${var.pipeline_name}/${var.name}/${k}/"

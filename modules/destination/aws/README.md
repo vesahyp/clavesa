@@ -77,12 +77,12 @@ emitter, and the runner does the actual write at execution time.
 
 ## Notes
 
-- **Destination overrides land at `target_path`, not in the Iceberg
+- **Destination overrides land at `target_path`, not in the Delta
   warehouse.** Use destinations when the consumer of the data is *not*
   another Clavesa transform (e.g. an analytics warehouse, an external
   vendor's bucket, a hand-off to a non-Clavesa downstream system).
   When the consumer *is* another transform, leave the upstream's outputs
-  pointing at the warehouse — Iceberg auto-tables are the cheaper path.
+  pointing at the warehouse — Delta auto-tables are the cheaper path.
 - **Cross-account targets.** The upstream transform's runner role needs
   write access to the target bucket. For cross-account, add a bucket
   policy on the target granting write access to that role's ARN

@@ -5,7 +5,7 @@ Terraform module for an S3 source node.
 Sources are **pass-through path declarations**, not data movers. The module
 publishes the user-configured S3 location as `outputs["default"].table_path`
 so downstream transforms can read directly with `spark.read.<format>`. No
-staging, no Glue Job, no Iceberg registration on the source side. An SQS
+staging, no Glue Job, no catalog registration on the source side. An SQS
 queue + EventBridge rule are created for orchestration triggering on new-
 data events; pass `trigger_queue_arn` to the orchestration module's
 `trigger_queue_arns`.

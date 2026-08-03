@@ -16,7 +16,7 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 - **CLI reference docs** under `docs/reference/cli/`, one page per `clavesa` command with its flags and usage, plus an index. Generated from the command tree with `make docs-cli`; a Go unit test fails the build if the committed reference drifts from the CLI, so it stays in sync automatically. This is the [Diátaxis](https://diataxis.fr) *reference* quadrant — the first consolidated place to look up every command and flag.
 
 ### Fixed
-- CLI help text no longer describes output tables as "Iceberg" — the table format is Delta (ADR-018). Affected `workspace tables`, `pipeline backfill stage`, `node rename`, `node edit --incremental-input`, and the destroy commands (#92).
+- CLI help text and module docs no longer describe output tables as "Iceberg" — the table format is Delta (ADR-018). Affected `workspace tables`, `pipeline backfill stage`, `node rename`, `node edit --incremental-input`, the destroy commands, and the transform/source/destination/workspace module READMEs and variable descriptions (which also cited the superseded ADR-013) (#92).
 
 ## [v2.19.0] — 2026-08-02
 

@@ -58,7 +58,7 @@ variable "system_catalog" {
 # --- Transform-specific variables ---
 
 variable "bucket" {
-  description = "S3 bucket for output Iceberg tables. Output paths follow s3://<bucket>/<pipeline_name>/<name>/<output_name>/."
+  description = "S3 bucket for output Delta tables. Output paths follow s3://<bucket>/<pipeline_name>/<name>/<output_name>/."
   type        = string
 }
 
@@ -192,13 +192,13 @@ variable "output_definitions" {
   description = <<-EOT
     Named output declarations. Each key becomes an entry in the module's outputs map.
     Single-output transforms use "default" by convention.
-    schema is optional; omitting it produces a schema-less Iceberg output.
+    schema is optional; omitting it produces a schema-less Delta output.
     mode controls write semantics (v0.12+):
-      - "replace" (default): overwrite the Iceberg table on each run. Correct
+      - "replace" (default): overwrite the Delta table on each run. Correct
         for full-recompute aggregations; wrong for monotonically-growing facts.
-      - "append":            append rows to the Iceberg table on each run.
+      - "append":            append rows to the Delta table on each run.
         Pair with a partitioned source so the runner only reads new partitions.
-      - "merge":             MERGE rows into the Iceberg table keyed on
+      - "merge":             MERGE rows into the Delta table keyed on
         merge_keys — matched rows update in place, new rows insert. The
         idempotent shape for dimension tables and backfill promotes.
     merge_keys lists the columns that uniquely identify a row; required when

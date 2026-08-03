@@ -3,7 +3,7 @@
 # Sources are pass-through path declarations — the module creates an SQS
 # queue + EventBridge rule for orchestration triggering and exposes the
 # user-configured S3 location as outputs[*].table_path. No staging,
-# no Glue Job, no Iceberg registration on the source side.
+# no Glue Job, no catalog registration on the source side.
 
 terraform {
   required_version = ">= 1.3"

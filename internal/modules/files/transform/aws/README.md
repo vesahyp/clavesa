@@ -4,13 +4,13 @@ Terraform module for a transform node.
 
 Transforms run **PySpark on Lambda** (the Clavesa runner container) by
 default. Inputs are read with `spark.read` from upstream sources or
-Iceberg tables; outputs land as **Iceberg tables in the Glue Data Catalog**
+Delta tables; outputs land as **Delta tables in the Glue Data Catalog**
 under `<catalog>.<schema>.<node>__<output>`, queryable from Athena with
 no DDL. The transform body is either SparkSQL (`language = "sql"`) or
 PySpark (`language = "python"`) — the same code runs unchanged on local,
 Lambda, and (planned) Fargate / EMR Serverless.
 
-See ADR-012 (PySpark everywhere) and ADR-013 (Iceberg as the table format)
+See ADR-012 (PySpark everywhere) and ADR-018 (Delta as the table format)
 for the architectural reasoning.
 
 ## Usage
@@ -107,7 +107,7 @@ output_definitions = {
 |----------------------|-----------------|-------------|
 | `pipeline_name`      | `string`        | Pipeline-level namespace. |
 | `name`               | `string`        | Unique node identifier within the pipeline. |
-| `bucket`             | `string`        | Pipeline output bucket (Iceberg warehouse + per-node intermediates). |
+| `bucket`             | `string`        | Pipeline output bucket (Delta warehouse + per-node intermediates). |
 | `catalog`            | `string`        | Workspace catalog identifier (ADR-016). |
 | `schema`             | `string`        | Pipeline schema identifier (ADR-016). |
 | `inputs`             | `any`           | Named input map; keys become SQL table aliases. Values are upstream module-output objects, cross-pipeline strings (`"<schema>.<table>"`), or registered-source strings (`"sources.<name>"`). |

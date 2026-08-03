@@ -13,7 +13,7 @@ variable "force_destroy" {
   description = <<-EOT
     Allow `terraform destroy` to delete the workspace bucket even when it
     contains objects. Defaults to false because the bucket holds the entire
-    workspace's Iceberg warehouse, run-history tables, and Athena results —
+    workspace's Delta warehouse, run-history tables, and Athena results —
     losing them is unrecoverable. Set to true only for ephemeral test
     workspaces that are intended to be torn down.
   EOT
