@@ -1,4 +1,4 @@
-.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples
+.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -75,6 +75,9 @@ test-runner-py: ## Pure-Python runner unit tests (stdlib only, no docker, no Spa
 	  echo "→ $$f"; \
 	  python3 $$f || exit $$?; \
 	done
+
+docs-cli: ## Regenerate the CLI reference (docs/reference/cli/) from the Cobra tree; test-go fails if it drifts
+	go run ./cmd/docsgen docs/reference/cli
 
 validate-examples: ## terraform validate every modules/*/aws/examples/* (catches example drift before tagging)
 	@set -e; \

@@ -779,7 +779,7 @@ Examples:
 			if s3Client != nil {
 				catalogHandler = catalogHandler.WithS3(s3Client)
 			}
-			// Dashboards: CRUD against the `dashboards` system Iceberg table
+			// Dashboards: CRUD against the `dashboards` system Delta table
 			// via the service layer. The widget-SQL query route rides the
 			// same Service.Query seam as /data/query and `clavesa query`
 			// (ADR-015/ADR-023): warehouse dispatch plus the Spark→Trino

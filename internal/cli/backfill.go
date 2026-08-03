@@ -21,7 +21,7 @@ func newPipelineBackfillCmd() *cobra.Command {
 		Long: `Backfill a transform's output over a historical partition window.
 
 Default shape — stage → review → promote — gives you a parallel
-Iceberg staging table to inspect before anything lands in the canonical
+Delta staging table to inspect before anything lands in the canonical
 target:
 
   clavesa pipeline backfill stage <dir> --node <n> --from <c> --to <c>
@@ -52,8 +52,8 @@ func newBackfillStageCmd() *cobra.Command {
 	var direct, jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "stage [pipeline-dir]",
-		Short: "Stage a backfill into a parallel Iceberg table",
-		Long: "Stage a backfill into a parallel Iceberg table.\n\n" + pipelineDirHelp + `
+		Short: "Stage a backfill into a parallel Delta table",
+		Long: "Stage a backfill into a parallel Delta table.\n\n" + pipelineDirHelp + `
 
 --compute local runs the heavy Spark staging job in a local docker
 container on this machine against the cloud warehouse — the workaround

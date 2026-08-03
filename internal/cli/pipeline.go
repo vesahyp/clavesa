@@ -403,7 +403,7 @@ func newPipelineDestroyCmd() *cobra.Command {
 		Long: `Run terraform destroy after deleting Glue tables that the runner created
 at execution time. Without the sweep, terraform destroy refuses on
 ` + "`aws_glue_catalog_database.pipeline`" + ` with "database is not empty"
-because runner-created Iceberg tables aren't in terraform state.
+because runner-created Delta tables aren't in terraform state.
 
 The sweep targets the pipeline's own Glue DB (default:
 <workspace_catalog>__sanitize(<pipeline_name>)). Pass --glue-db <name>
@@ -411,7 +411,7 @@ if the pipeline's var.schema was overridden from its default.
 
 Workspace system-DB row cleanup (runs / node_runs / tables rows where
 pipeline = <this pipeline>) is not done here — those rows live inside
-shared Iceberg tables and need an Athena DELETE through the workspace
+shared Delta tables and need an Athena DELETE through the workspace
 workgroup. They stay around after destroy as historical context.
 
 --skip-sweep skips the sweep step (faster when you know the DB is already

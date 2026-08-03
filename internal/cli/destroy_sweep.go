@@ -23,7 +23,7 @@ import (
 // human-facing noun used in the prompt ("pipeline" / "workspace") so
 // the user sees which scope they're confirming. Missing DB → no-op.
 //
-// Runner / runs_writer-created Iceberg tables aren't in terraform state,
+// Runner / runs_writer-created Delta tables aren't in terraform state,
 // so without this step `terraform destroy` refuses on the corresponding
 // `aws_glue_catalog_database` with "database is not empty" and the user
 // has to drop into the AWS console or run `aws glue delete-table` by
@@ -99,7 +99,7 @@ func sweepGlueDB(ctx context.Context, glueDB, label string, out io.Writer, in io
 //
 // System-DB row cleanup (deleting runs / node_runs / tables rows where
 // pipeline = <this pipeline>) is NOT done here — those rows live inside
-// shared Iceberg tables and need an Athena DELETE through the workspace
+// shared Delta tables and need an Athena DELETE through the workspace
 // workgroup. Filed as a follow-up.
 func sweepPipelineGlueTables(ctx context.Context, workspaceRoot, pipelineName, glueDBOverride string, out io.Writer, in io.Reader) error {
 	var glueDB string

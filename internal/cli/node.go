@@ -445,14 +445,14 @@ Examples:
 	cmd.Flags().BoolVar(&outputStats, "output-stats", false, `opt this transform's outputs into per-column stats (null %, distinct, top-K, percentiles); pass --output-stats=false to turn off`)
 	cmd.Flags().StringSliceVar(&addOutputs, "add-output", nil, "declare an additional output key on a multi-output transform (repeatable). Seeded with mode=replace; tune via direct .tf edit")
 	cmd.Flags().StringSliceVar(&removeOutputs, "remove-output", nil, "remove a non-default output key from output_definitions (repeatable)")
-	cmd.Flags().StringSliceVar(&addIncrementalInputs, "incremental-input", nil, "read this input alias incrementally (Iceberg snapshot range, watermark-tracked). Repeatable. Per-input opt-in; transforms full-read by default")
+	cmd.Flags().StringSliceVar(&addIncrementalInputs, "incremental-input", nil, "read this input alias incrementally (Delta CDF version range, watermark-tracked). Repeatable. Per-input opt-in; transforms full-read by default")
 	cmd.Flags().StringSliceVar(&removeIncrementalInputs, "non-incremental-input", nil, "drop an alias from incremental_inputs so it reverts to full-read on every run (repeatable)")
 
 	return cmd
 }
 
 // validateOutputKey enforces a minimal identifier rule on output-key
-// names: must match Iceberg table-suffix conventions (the runner writes
+// names: must match Delta table-suffix conventions (the runner writes
 // `<node>__<key>`) which is the same `[A-Za-z_][A-Za-z0-9_]*` Glue
 // allows. Reject up-front so a typo doesn't land in .tf and surface as
 // an opaque terraform error.
@@ -608,7 +608,7 @@ func newNodeRenameCmd() *cobra.Command {
 		Long: "Rename a node — the module block, every downstream edge that\n" +
 			"reads it, and its SQL/PySpark script files all move to the new\n" +
 			"name.\n\n" +
-			"Note: a node's id is also the stem of its Iceberg output table\n" +
+			"Note: a node's id is also the stem of its Delta output table\n" +
 			"(<node>__default), so a rename changes that table's name. Data\n" +
 			"already written under the old name is not moved.\n\n" +
 			pipelineDirHelp,

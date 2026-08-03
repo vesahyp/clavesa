@@ -60,6 +60,10 @@ Quick start:
 	return root
 }
 
+// NewRootCmd returns a fresh command tree for tooling that needs to inspect the
+// CLI surface without executing it (e.g. the docs generator in cmd/docsgen).
+func NewRootCmd() *cobra.Command { return newRootCmd() }
+
 // requireSubcommand returns a RunE that prints help and returns an error,
 // used for parent commands that should not be invoked without a subcommand.
 func requireSubcommand() func(*cobra.Command, []string) error {

@@ -337,7 +337,7 @@ Run with no arguments to print the current workspace, warehouse, and AWS profile
 	return cmd
 }
 
-// newWorkspaceTablesCmd lists every Iceberg table the workspace catalog
+// newWorkspaceTablesCmd lists every Delta table the workspace catalog
 // owns — the CLI counterpart of the Catalog page (ADR-015 parity). Uses
 // the same api.CatalogHandler.Tables core the UI's GET /workspace/tables
 // route does, so both surfaces report an identical list. Cloud (Glue)
@@ -349,8 +349,8 @@ func newWorkspaceTablesCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "tables",
-		Short: "List Iceberg tables in the workspace catalog",
-		Long: `List every Iceberg table the workspace catalog owns.
+		Short: "List Delta tables in the workspace catalog",
+		Long: `List every Delta table the workspace catalog owns.
 
 Filter to one catalog or schema (ADR-016 three-level namespace) — the
 CLI twin of the Catalog page's ?catalog=&schema= view:
@@ -653,7 +653,7 @@ func newWorkspaceDestroyCmd() *cobra.Command {
 		Long: `Run terraform destroy after deleting Glue tables that the runner + the
 runs_writer Lambda created at runtime against the workspace-wide system
 catalog. The system DB holds runs / node_runs / tables — workspace-shared
-Iceberg tables, multi-writer across every pipeline in the workspace
+Delta tables, multi-writer across every pipeline in the workspace
 (ADR-016 v0.20.0). They aren't in terraform state, so without the sweep,
 ` + "`aws_glue_catalog_database.system_pipelines`" + ` refuses to destroy
 with "database is not empty".
