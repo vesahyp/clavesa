@@ -34,6 +34,22 @@ type fakeProvider struct {
 	// assert the wiring.
 	tables  []observability.TableInfo
 	tablesQ observability.TablesQuery
+
+	// runs is returned by Runs when set (tests that exercise the runs
+	// service wrapper). runsQ records the last query.
+	runs    *observability.RunsResult
+	runsErr error
+	runsQ   observability.RunsQuery
+
+	// execLogs is returned by ExecutionLogs when set (tests that exercise
+	// the execution-logs service wrapper). execLogsQ records the last
+	// query and execLogsCalled distinguishes "never called" from "called
+	// with a zero-value query" — the wrapper's cloud no-step error path
+	// must never reach the provider at all.
+	execLogs       *observability.ExecutionLogsResult
+	execLogsErr    error
+	execLogsQ      observability.ExecutionLogsQuery
+	execLogsCalled bool
 }
 
 func (f *fakeProvider) Query(_ context.Context, q observability.QueryQuery) (*observability.QueryResult, error) {
@@ -54,8 +70,15 @@ func (f *fakeProvider) NodeRuns(_ context.Context, q observability.NodeRunsQuery
 	f.nodeRunsQ = q
 	return &observability.NodeRunsResult{Rows: f.nodeRuns}, nil
 }
-func (f *fakeProvider) Runs(context.Context, observability.RunsQuery) (*observability.RunsResult, error) {
-	panic("unused")
+func (f *fakeProvider) Runs(_ context.Context, q observability.RunsQuery) (*observability.RunsResult, error) {
+	f.runsQ = q
+	if f.runsErr != nil {
+		return nil, f.runsErr
+	}
+	if f.runs != nil {
+		return f.runs, nil
+	}
+	return &observability.RunsResult{Rows: []observability.Run{}}, nil
 }
 func (f *fakeProvider) Tables(_ context.Context, q observability.TablesQuery) (*observability.TablesResult, error) {
 	f.tablesQ = q
@@ -73,8 +96,16 @@ func (f *fakeProvider) SampleTable(context.Context, observability.SampleTableQue
 func (f *fakeProvider) ExecutionStates(context.Context, observability.ExecutionStatesQuery) (*observability.ExecutionStatesResult, error) {
 	panic("unused")
 }
-func (f *fakeProvider) ExecutionLogs(context.Context, observability.ExecutionLogsQuery) (*observability.ExecutionLogsResult, error) {
-	panic("unused")
+func (f *fakeProvider) ExecutionLogs(_ context.Context, q observability.ExecutionLogsQuery) (*observability.ExecutionLogsResult, error) {
+	f.execLogsCalled = true
+	f.execLogsQ = q
+	if f.execLogsErr != nil {
+		return nil, f.execLogsErr
+	}
+	if f.execLogs != nil {
+		return f.execLogs, nil
+	}
+	return &observability.ExecutionLogsResult{Events: []observability.LogEvent{}}, nil
 }
 
 // dashService builds a Service rooted at a fresh temp workspace, wired to

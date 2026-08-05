@@ -452,6 +452,11 @@ type StateStatus struct {
 	TasksTotal      *int64 `json:"tasks_total,omitempty"`
 	TasksCompleted  *int64 `json:"tasks_completed,omitempty"`
 	TasksFailed     *int64 `json:"tasks_failed,omitempty"`
+	// ErrorMsg carries the per-node marker's failure message for a FAILED
+	// node, mirrored from progressSnapshot.Error by the shared progressStates
+	// helper. Empty for every other status — a node that never failed has
+	// nothing to report here.
+	ErrorMsg string `json:"error_msg,omitempty"`
 }
 
 // ExecutionStatesResult is the body of GET /pipeline/execution/states.
@@ -475,6 +480,10 @@ type ExecutionStatesResult struct {
 type ExecutionLogsQuery struct {
 	ExecutionRef string
 	Step         string
+	// MaxLines caps how many log events the provider returns. <=0 keeps
+	// each provider's existing default cap (local: logsLineCap, cloud:
+	// logsLimit) so callers that don't set it are byte-identical to today.
+	MaxLines int
 }
 
 // LogEvent is one log line surfaced by the provider.

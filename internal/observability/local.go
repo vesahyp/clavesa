@@ -208,17 +208,33 @@ func (p *LocalProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 	}
 	defer f.Close()
 
+	// Two capping modes. MaxLines set (the CLI's --tail): keep the LAST N
+	// lines via a ring window — on a failed run the stack trace lives at the
+	// end, so head-capping would return only Spark boot noise. MaxLines
+	// unset: the pre-existing head cap (logsLineCap), byte-preserved for the
+	// UI Logs drawer.
 	events := make([]LogEvent, 0, 64)
 	truncated := false
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		if len(events) >= logsLineCap {
-			truncated = true
-			break
+	if q.MaxLines > 0 {
+		for scanner.Scan() {
+			ts, msg := ParseLogLine(scanner.Text())
+			if len(events) >= q.MaxLines {
+				events = events[1:]
+				truncated = true
+			}
+			events = append(events, LogEvent{Timestamp: ts, Message: msg})
 		}
-		ts, msg := ParseLogLine(scanner.Text())
-		events = append(events, LogEvent{Timestamp: ts, Message: msg})
+	} else {
+		for scanner.Scan() {
+			if len(events) >= logsLineCap {
+				truncated = true
+				break
+			}
+			ts, msg := ParseLogLine(scanner.Text())
+			events = append(events, LogEvent{Timestamp: ts, Message: msg})
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read log file: %w", err)

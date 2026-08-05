@@ -25,6 +25,7 @@ How data actually gets in — each standalone, swap in your own source.
 ## Operations & languages
 
 - **[scheduled-rollup](scheduled-rollup.md)** — a cron-triggered transform reading an existing Delta table and writing a daily summary. The dbt-on-Airflow nightly-aggregation pattern.
+- **[debugging-runs](debugging-runs.md)** — a scheduled run fails overnight; `pipeline runs`, `pipeline status`, and `pipeline logs` find which run, which node, and the full Spark stack trace, all from the terminal.
 - **[python-transform](python-transform.md)** — when SQL isn't enough. Swap `language = "sql"` for `language = "python"` and ship a `transform(spark, inputs) -> dict[str, DataFrame]`.
 - **[runner-deps](runner-deps.md)** — add third-party Python packages (pyasn, crawlerdetect, …) to the runner image for your UDFs, via `clavesa runner requirements` or the `/runner` UI.
 
@@ -40,6 +41,7 @@ The recipes double as a feature-test sweep. Walk them in order against a fresh b
 | 3 | [query-your-data](query-your-data.md) | `query` count = 2964624; `sql lint` exits 0 (good) / 1 (bad); missing-table query exits 1 |
 | 4 | [notebooks](notebooks.md) | `notebook run` → cells `ok`; `graduate` registers a transform node |
 | 5 | [dashboards](dashboards.md) | `dashboards render` exits 0 (and non-zero on a broken widget); UI `/dashboards/<slug>` renders all widgets, 0 console errors |
+| 6 | [debugging-runs](debugging-runs.md) | broken SQL → `pipeline runs` shows the FAILED row + failed step; `pipeline logs --tail` surfaces the Spark stack trace; restored SQL runs clean |
 
 Counts are deterministic for the `yellow_tripdata_2024-01` / `2024-02` TLC files.
 

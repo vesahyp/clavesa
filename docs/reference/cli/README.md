@@ -56,6 +56,7 @@ Visual ETL for Terraform pipelines
 | &nbsp;&nbsp;[`clavesa pipeline destroy`](clavesa_pipeline_destroy.md) | terraform destroy on a pipeline (sweeping runtime-created Glue tables first) |
 | &nbsp;&nbsp;[`clavesa pipeline lineage`](clavesa_pipeline_lineage.md) | Show the data-lineage graph for a pipeline |
 | &nbsp;&nbsp;[`clavesa pipeline list`](clavesa_pipeline_list.md) | List pipelines in the workspace |
+| &nbsp;&nbsp;[`clavesa pipeline logs`](clavesa_pipeline_logs.md) | Print the captured log for a run |
 | &nbsp;&nbsp;[`clavesa pipeline optimize`](clavesa_pipeline_optimize.md) | Compact, re-cluster, and vacuum a pipeline's Delta output tables |
 | &nbsp;&nbsp;[`clavesa pipeline orchestration`](clavesa_pipeline_orchestration.md) | Manage pipeline orchestration |
 | &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa pipeline orchestration sync`](clavesa_pipeline_orchestration_sync.md) | Generate orchestration.tf for a pipeline |
@@ -63,6 +64,7 @@ Visual ETL for Terraform pipelines
 | &nbsp;&nbsp;[`clavesa pipeline reset`](clavesa_pipeline_reset.md) | Drop a pipeline's output tables and watermarks so the next run rebuilds from scratch |
 | &nbsp;&nbsp;[`clavesa pipeline rightsize`](clavesa_pipeline_rightsize.md) | Recommend per-node Lambda memory from recent run history |
 | &nbsp;&nbsp;[`clavesa pipeline run`](clavesa_pipeline_run.md) | Execute the pipeline (local: runner container; cloud: SFN StartExecution) |
+| &nbsp;&nbsp;[`clavesa pipeline runs`](clavesa_pipeline_runs.md) | List recent runs of a pipeline |
 | &nbsp;&nbsp;[`clavesa pipeline show`](clavesa_pipeline_show.md) | Show pipeline details |
 | &nbsp;&nbsp;[`clavesa pipeline status`](clavesa_pipeline_status.md) | Show per-node status for the latest (or a given) run |
 | &nbsp;&nbsp;[`clavesa pipeline upgrade`](clavesa_pipeline_upgrade.md) | Upgrade module versions in a pipeline |

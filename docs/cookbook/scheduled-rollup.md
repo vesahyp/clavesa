@@ -136,3 +136,4 @@ See [merge-cdf](merge-cdf.md) for the deeper version of this pattern.
 
 - [multi-stage-pipeline](multi-stage-pipeline.md) — for chaining a bronze ingest and the rollup in one pipeline rather than two.
 - [merge-cdf](merge-cdf.md) — for the idempotent-upsert variant of this pattern.
+- [debugging-runs](debugging-runs.md) — when a scheduled run fails: `pipeline runs`, `pipeline status`, and `pipeline logs` find which run, which node, and why.

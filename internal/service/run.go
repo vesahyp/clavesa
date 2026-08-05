@@ -572,6 +572,17 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 			}
 		}
 		if berr != nil {
+			// The bundle error names the failed node only inside its text.
+			// Record it structurally (first failed transform in topo order)
+			// so the `_run.json` marker carries failed_step and the runner's
+			// concise error instead of the stderr tail — the marker feeds
+			// `pipeline runs` and the dashboard's Runs grid.
+			for _, bt := range bundle {
+				if bs, ok := transformResults[bt.NodeID]; ok && bs.Status == "failed" {
+					outcome.markFailed(bs.NodeID, "transform_error", bs.Note)
+					break
+				}
+			}
 			finalErr = berr
 			goto done
 		}

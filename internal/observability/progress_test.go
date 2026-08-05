@@ -133,6 +133,37 @@ func TestProgressStatesSkipsRunMarkerAndStale(t *testing.T) {
 	}
 }
 
+// TestProgressStatesFailedCarriesErrorMsg proves the shared helper copies
+// the per-node marker's error onto StateStatus.ErrorMsg for a FAILED node,
+// and only for a FAILED node — a running or succeeded marker with a
+// leftover/irrelevant "error" field must not leak it onto the payload.
+func TestProgressStatesFailedCarriesErrorMsg(t *testing.T) {
+	store := NewFileProgressStore(t.TempDir())
+	ctx := context.Background()
+	now := int64(1_000_000_000)
+
+	write := func(node, body string) {
+		if err := store.WriteKey(ctx, "_progress/run-1/"+node+".json", []byte(body)); err != nil {
+			t.Fatalf("WriteKey %s: %v", node, err)
+		}
+	}
+	write("failed_node", `{"status":"failed","error":"boom: table locked","updated_ms":`+itoa(now)+`}`)
+	write("succeeded_node", `{"status":"succeeded","error":"","updated_ms":`+itoa(now)+`}`)
+	write("running_node", `{"status":"running","updated_ms":`+itoa(now)+`}`)
+
+	states := progressStates(ctx, store, "run-1", now)
+
+	if got := states["failed_node"].ErrorMsg; got != "boom: table locked" {
+		t.Errorf("failed_node ErrorMsg = %q, want %q", got, "boom: table locked")
+	}
+	if got := states["succeeded_node"].ErrorMsg; got != "" {
+		t.Errorf("succeeded_node ErrorMsg = %q, want empty (only FAILED carries it)", got)
+	}
+	if got := states["running_node"].ErrorMsg; got != "" {
+		t.Errorf("running_node ErrorMsg = %q, want empty", got)
+	}
+}
+
 // TestProgressStatesNilStore is a safety check: a nil store yields an empty,
 // non-nil map without panicking (the cloud provider passes nil when no S3 /
 // bucket is wired).

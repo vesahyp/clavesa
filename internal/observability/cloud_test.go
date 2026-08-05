@@ -649,3 +649,28 @@ func TestExecutionStatesRunningVsTerminal(t *testing.T) {
 		}
 	})
 }
+
+// TestFilterLogEventsLimit pins the ExecutionLogs MaxLines → CloudWatch
+// FilterLogEvents Limit mapping: <=0 keeps today's logsLimit default, a
+// positive value passes through, and anything above the API's hard cap
+// (10,000) is clamped rather than sent unchecked.
+func TestFilterLogEventsLimit(t *testing.T) {
+	cases := []struct {
+		name     string
+		maxLines int
+		want     int32
+	}{
+		{"zero keeps default", 0, logsLimit},
+		{"negative keeps default", -5, logsLimit},
+		{"positive passes through", 2, 2},
+		{"at the API cap passes through", cloudwatchFilterLogEventsMaxLimit, cloudwatchFilterLogEventsMaxLimit},
+		{"above the API cap clamps", cloudwatchFilterLogEventsMaxLimit + 1, cloudwatchFilterLogEventsMaxLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := filterLogEventsLimit(tc.maxLines); got != tc.want {
+				t.Errorf("filterLogEventsLimit(%d) = %d, want %d", tc.maxLines, got, tc.want)
+			}
+		})
+	}
+}

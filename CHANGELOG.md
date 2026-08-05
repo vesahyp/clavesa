@@ -10,12 +10,18 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
-## [Unreleased]
+## [v2.20.0] — 2026-08-05
 
 ### Added
+- **`clavesa pipeline runs`** lists a pipeline's recent runs (id, status, trigger, start time, duration, failed step, error summary) with `--json`, `--limit`, and `--status` filtering. Works local and cloud (#94).
+- **`clavesa pipeline logs`** prints the captured log for a run (latest by default, `--run` to pick one; `--tail` caps lines). Local reads the run's bundle log; cloud reads CloudWatch via `--node` (#94).
+- `pipeline status` now prints the run id and overall status, plus the error message for failed nodes (#94).
+- Successful local `pipeline run` output now includes the run id, so `pipeline logs --run <id>` is addressable (#94).
+- Cookbook recipe **debugging-runs**: finding which scheduled run failed, which node broke, and the full Spark stack trace from the terminal.
 - **CLI reference docs** under `docs/reference/cli/`, one page per `clavesa` command with its flags and usage, plus an index. Generated from the command tree with `make docs-cli`; a Go unit test fails the build if the committed reference drifts from the CLI, so it stays in sync automatically. This is the [Diátaxis](https://diataxis.fr) *reference* quadrant — the first consolidated place to look up every command and flag.
 
 ### Fixed
+- Failed local runs now record the failed node and the runner's concise error in the run marker, so `pipeline runs` and the dashboard's run detail show "failed at <node>" with the real Spark error instead of a generic message with a stderr tail (#94).
 - CLI help text and module docs no longer describe output tables as "Iceberg" — the table format is Delta (ADR-018). Affected `workspace tables`, `pipeline backfill stage`, `node rename`, `node edit --incremental-input`, the destroy commands, and the transform/source/destination/workspace module READMEs and variable descriptions (which also cited the superseded ADR-013) (#92).
 
 ## [v2.19.0] — 2026-08-02

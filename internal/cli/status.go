@@ -50,6 +50,11 @@ inspect a specific run id instead of the latest.
 				fmt.Println("No runs yet — run the pipeline first.")
 				return nil
 			}
+			if res.RunID != "" {
+				fmt.Printf("Run: %s (%s)\n", res.RunID, res.Status)
+			} else {
+				fmt.Printf("Status: %s\n", res.Status)
+			}
 			nodes := make([]string, 0, len(res.States))
 			for n := range res.States {
 				nodes = append(nodes, n)
@@ -61,6 +66,12 @@ inspect a specific run id instead of the latest.
 				table[i] = []string{n, st.Status, progressCell(st)}
 			}
 			printTable(os.Stdout, []string{"NODE", "STATUS", "PROGRESS"}, table)
+			for _, n := range nodes {
+				st := res.States[n]
+				if st.Status == "FAILED" && st.ErrorMsg != "" {
+					fmt.Printf("%s: %s\n", n, st.ErrorMsg)
+				}
+			}
 			return nil
 		},
 	}

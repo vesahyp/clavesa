@@ -394,7 +394,7 @@ func progressStates(ctx context.Context, store ProgressStore, run string, nowMs 
 		default:
 			status = "RUNNING"
 		}
-		states[name] = StateStatus{
+		st := StateStatus{
 			Status:          status,
 			StagesTotal:     snap.StagesTotal,
 			StagesCompleted: snap.StagesCompleted,
@@ -402,6 +402,10 @@ func progressStates(ctx context.Context, store ProgressStore, run string, nowMs 
 			TasksCompleted:  snap.TasksCompleted,
 			TasksFailed:     snap.TasksFailed,
 		}
+		if status == "FAILED" {
+			st.ErrorMsg = snap.Error
+		}
+		states[name] = st
 	}
 	return states
 }

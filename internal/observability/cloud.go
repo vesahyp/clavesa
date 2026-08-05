@@ -152,6 +152,10 @@ const (
 	// next poll, long enough to collapse the repeated per-page cold-starts.
 	athenaResultReuseMinutes = 5
 	logsLimit                = 500
+	// cloudwatchFilterLogEventsMaxLimit is the FilterLogEvents API's hard
+	// per-call cap (AWS-imposed, not ours) — a caller-supplied MaxLines
+	// above this is clamped rather than rejected.
+	cloudwatchFilterLogEventsMaxLimit = 10_000
 )
 
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -1016,6 +1020,20 @@ func (c *CloudProvider) liveProgressStates(ctx context.Context, execARN string, 
 // ExecutionLogs
 // ---------------------------------------------------------------------------
 
+// filterLogEventsLimit resolves the CloudWatch FilterLogEvents `Limit`
+// value for a query's MaxLines: <=0 keeps the existing logsLimit default,
+// a positive value is clamped into the API's hard per-call cap
+// (cloudwatchFilterLogEventsMaxLimit) rather than passed through unchecked.
+func filterLogEventsLimit(maxLines int) int32 {
+	if maxLines <= 0 {
+		return logsLimit
+	}
+	if maxLines > cloudwatchFilterLogEventsMaxLimit {
+		return cloudwatchFilterLogEventsMaxLimit
+	}
+	return int32(maxLines)
+}
+
 func (c *CloudProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery) (*ExecutionLogsResult, error) {
 	if c.sfn == nil {
 		return nil, fmt.Errorf("cloud: sfn client not configured")
@@ -1065,7 +1083,7 @@ func (c *CloudProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 		LogGroupName: aws.String(logGroup),
 		StartTime:    aws.Int64(startMs),
 		EndTime:      aws.Int64(endMs),
-		Limit:        aws.Int32(logsLimit),
+		Limit:        aws.Int32(filterLogEventsLimit(q.MaxLines)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("filter log events: %w", err)

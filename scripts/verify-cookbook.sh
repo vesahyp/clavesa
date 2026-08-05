@@ -77,7 +77,7 @@ BIN="$REPO_ROOT/bin/clavesa"
 # QueryQuery.StrictMissing (set on the interactive ad-hoc seam service.Query
 # and on RenderDashboard's widget queries); both recipes are back in the
 # default and green.
-RECIPES="${CLAVESA_COOKBOOK_RECIPES:-multi-stage merge-cdf query-your-data notebooks python-transform http-changing-source dashboards runner-deps s3-bulk-ingest cloudfront-web-analytics backfill}"
+RECIPES="${CLAVESA_COOKBOOK_RECIPES:-multi-stage merge-cdf query-your-data debugging-runs notebooks python-transform http-changing-source dashboards runner-deps s3-bulk-ingest cloudfront-web-analytics backfill}"
 
 # All recipes share ONE workspace named `cookbook` — this is the cookbook's
 # own design (one workspace, one taxi dataset, recipes building on each
@@ -629,6 +629,155 @@ recipe_query_your_data() {
   else
     pass "missing-table query exits non-zero"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Recipe: debugging-runs.md
+# ---------------------------------------------------------------------------
+# GH #94's CLI run-inspection trio (pipeline runs / pipeline status /
+# pipeline logs), walked exactly as the recipe does: a run that succeeds, a
+# run broken by selecting a nonexistent column, then the trio finding the
+# failed run / failed node / stack trace, then the SQL restored and a final
+# clean run. Own pipeline (`nightly`) so the deliberate break doesn't
+# disturb `demo`'s tables, which other recipes assert on.
+recipe_debugging_runs() {
+  CURRENT_RECIPE="debugging-runs"
+  ensure_workspace
+  ensure_source src_trips "$TAXI_JAN_URL"
+
+  local GOOD_SQL='SELECT VendorID, tpep_pickup_datetime, payment_type, total_amount FROM src_trips'
+  local BAD_SQL='SELECT nonexistent_column FROM src_trips'
+
+  if [[ ! -d "$WS/nightly" ]]; then
+    banner "build nightly (debugging-runs.md): trips transform"
+    clv pipeline create nightly || die "pipeline create nightly failed"
+    clv node add nightly --type transform --name trips || die "node add trips failed"
+    clv source attach nightly src_trips --to trips --as src_trips || die "source attach nightly failed"
+    clv node edit nightly trips --set "sql=$GOOD_SQL" || die "node edit trips (initial sql) failed"
+  else
+    pass "nightly pipeline already built"
+    clv node edit nightly trips --set "sql=$GOOD_SQL" || die "node edit trips (restore good sql) failed"
+  fi
+
+  banner "recipe debugging-runs: a run that succeeds — Run: <id>, exit 0"
+  local good_out good_rc
+  good_out="$(clv pipeline run nightly 2>&1)" && good_rc=0 || good_rc=$?
+  if [[ "$good_rc" == 0 ]] && grep -q "Run: " <<<"$good_out"; then
+    pass "good run exits 0 and prints Run: <id>"
+  else
+    fail "good run: rc=$good_rc, expected 0 with a 'Run: ' line — out: $(head -c 300 <<<"$good_out")"
+  fi
+
+  banner "recipe debugging-runs: break the SQL (nonexistent column), run again"
+  clv node edit nightly trips --set "sql=$BAD_SQL" || die "node edit trips (bad sql) failed"
+  local bad_out bad_rc
+  bad_out="$(clv pipeline run nightly 2>&1)" && bad_rc=0 || bad_rc=$?
+  if [[ "$bad_rc" != 0 ]]; then
+    pass "broken run exits non-zero"
+  else
+    fail "broken run exited 0 (expected non-zero) — out: $(head -c 300 <<<"$bad_out")"
+  fi
+
+  banner "recipe debugging-runs: pipeline runs --json — newest row is FAILED"
+  local runs_json newest_status newest_step newest_err
+  runs_json="$(clv pipeline runs nightly --json 2>"$WORK/runs.err" || true)"
+  newest_status="$(jq -r '.rows[0].status // empty' <<<"$runs_json" 2>/dev/null || true)"
+  newest_step="$(jq -r '.rows[0].failed_step // empty' <<<"$runs_json" 2>/dev/null || true)"
+  newest_err="$(jq -r '.rows[0].error_msg // empty' <<<"$runs_json" 2>/dev/null || true)"
+  if [[ "$newest_status" == "FAILED" ]]; then
+    pass "pipeline runs: newest row status=FAILED"
+  else
+    fail "pipeline runs: newest row status='$newest_status' (expected FAILED) — $(head -c 300 <<<"$runs_json")"
+  fi
+  if [[ -n "$newest_step" ]]; then
+    pass "pipeline runs: newest row failed_step='$newest_step' (non-empty)"
+  else
+    fail "pipeline runs: newest row failed_step is empty"
+  fi
+  if grep -q "nonexistent_column" <<<"$newest_err"; then
+    pass "pipeline runs: newest row error_msg names nonexistent_column"
+  else
+    fail "pipeline runs: newest row error_msg does not mention nonexistent_column — got: $(head -c 200 <<<"$newest_err")"
+  fi
+
+  banner "recipe debugging-runs: pipeline runs --status failed --json — only FAILED rows"
+  local failed_json statuses
+  failed_json="$(clv pipeline runs nightly --status failed --json 2>/dev/null || true)"
+  statuses="$(jq -r '[.rows[].status] | unique | join(",")' <<<"$failed_json" 2>/dev/null || true)"
+  if [[ "$statuses" == "FAILED" ]]; then
+    pass "pipeline runs --status failed: only FAILED rows ($(jq -r '.rows | length' <<<"$failed_json" 2>/dev/null) row(s))"
+  else
+    fail "pipeline runs --status failed returned non-FAILED statuses: $statuses"
+  fi
+
+  banner "recipe debugging-runs: pipeline logs --json — bundle log, local, non-empty"
+  local logs_json
+  logs_json="$(clv pipeline logs nightly --json 2>"$WORK/logs.err" || true)"
+  if jq -e '.source == "local"' <<<"$logs_json" >/dev/null 2>&1; then
+    pass "pipeline logs: source=local"
+  else
+    fail "pipeline logs: source != local — $(head -c 200 <<<"$logs_json")"
+  fi
+  if jq -e '.log_group | endswith("_bundle.log")' <<<"$logs_json" >/dev/null 2>&1; then
+    pass "pipeline logs: log_group ends with _bundle.log"
+  else
+    fail "pipeline logs: log_group does not end with _bundle.log — $(jq -r '.log_group // empty' <<<"$logs_json" 2>/dev/null)"
+  fi
+  if jq -e '(.events | length) > 0' <<<"$logs_json" >/dev/null 2>&1; then
+    pass "pipeline logs: events non-empty"
+  else
+    fail "pipeline logs: events empty"
+  fi
+
+  banner "recipe debugging-runs: pipeline logs --run <id> — same run, addressed explicitly"
+  local run_id_for_logs run_logs_json
+  run_id_for_logs="$(jq -r '.rows[0].run_id // empty' <<<"$runs_json" 2>/dev/null || true)"
+  if [[ -n "$run_id_for_logs" ]]; then
+    run_logs_json="$(clv pipeline logs nightly --run "$run_id_for_logs" --json 2>/dev/null || true)"
+    if jq -e '(.events | length) > 0' <<<"$run_logs_json" >/dev/null 2>&1; then
+      pass "pipeline logs --run $run_id_for_logs: events non-empty"
+    else
+      fail "pipeline logs --run $run_id_for_logs: events empty — $(head -c 200 <<<"$run_logs_json")"
+    fi
+  else
+    fail "pipeline logs --run: no run_id available from pipeline runs to address"
+  fi
+
+  banner "recipe debugging-runs: pipeline logs --tail 3 --json — capped + truncated"
+  local tail_json n_events truncated
+  tail_json="$(clv pipeline logs nightly --tail 3 --json 2>/dev/null || true)"
+  n_events="$(jq -r '.events | length' <<<"$tail_json" 2>/dev/null || echo -1)"
+  truncated="$(jq -r '.truncated' <<<"$tail_json" 2>/dev/null || echo false)"
+  if [[ "$n_events" -le 3 ]] && [[ "$n_events" -gt 0 ]]; then
+    pass "pipeline logs --tail 3: $n_events event(s) (<=3)"
+  else
+    fail "pipeline logs --tail 3: got $n_events events (expected 1-3)"
+  fi
+  if [[ "$truncated" == "true" ]]; then
+    pass "pipeline logs --tail 3: truncated=true"
+  else
+    fail "pipeline logs --tail 3: truncated=$truncated (expected true)"
+  fi
+
+  banner "recipe debugging-runs: pipeline status --json — trips FAILED with error_msg"
+  local status_json node_status node_err
+  status_json="$(clv pipeline status nightly --json 2>"$WORK/status.err" || true)"
+  node_status="$(jq -r '.states.trips.status // empty' <<<"$status_json" 2>/dev/null || true)"
+  node_err="$(jq -r '.states.trips.error_msg // empty' <<<"$status_json" 2>/dev/null || true)"
+  if [[ "$node_status" == "FAILED" ]]; then
+    pass "pipeline status: trips status=FAILED"
+  else
+    fail "pipeline status: trips status='$node_status' (expected FAILED) — $(head -c 300 <<<"$status_json")"
+  fi
+  if [[ -n "$node_err" ]]; then
+    pass "pipeline status: trips error_msg non-empty"
+  else
+    fail "pipeline status: trips error_msg is empty"
+  fi
+
+  banner "recipe debugging-runs: restore the SQL, final run succeeds"
+  clv node edit nightly trips --set "sql=$GOOD_SQL" || die "node edit trips (restore) failed"
+  run_pipeline nightly
 }
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1674,7 @@ for r in $RECIPES; do
     multi-stage)        recipe_multi_stage ;;
     merge-cdf)          recipe_merge_cdf ;;
     query-your-data)    recipe_query_your_data ;;
+    debugging-runs)     recipe_debugging_runs ;;
     notebooks)          recipe_notebooks ;;
     python-transform)   recipe_python_transform ;;
     http-changing-source) recipe_http_changing_source ;;

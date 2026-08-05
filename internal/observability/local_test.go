@@ -272,6 +272,98 @@ func TestLocalProviderExecutionLogsMissingFile(t *testing.T) {
 	}
 }
 
+// writeRunFixtureLines writes a bundle log with n numbered lines — used to
+// exercise the MaxLines cap without depending on writeRunFixture's fixed
+// two-line body.
+func writeRunFixtureLines(t *testing.T, dir, runID string, n int) {
+	t.Helper()
+	logPath := observability.RunBundleLogPath(dir, runID)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatalf("mkdir run dir: %v", err)
+	}
+	body := ""
+	for i := 0; i < n; i++ {
+		body += fmt.Sprintf("line %d\n", i)
+	}
+	if err := os.WriteFile(logPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write bundle log: %v", err)
+	}
+}
+
+// TestLocalProviderExecutionLogsMaxLines proves a positive MaxLines caps
+// the response below the default logsLineCap (500), truncating and
+// reporting Truncated=true — and that the cap keeps the LAST lines of the
+// file (tail semantics): on a failed run the stack trace is at the end, so
+// a head cap would return only Spark boot noise.
+func TestLocalProviderExecutionLogsMaxLines(t *testing.T) {
+	dir := t.TempDir()
+	writeRunFixtureLines(t, dir, "run-cap", 5)
+
+	p := observability.NewLocalProvider(filepath.Dir(dir))
+	ref := observability.FormatExecRef(filepath.Base(dir), "run-cap")
+
+	res, err := p.ExecutionLogs(context.Background(), observability.ExecutionLogsQuery{
+		ExecutionRef: ref,
+		Step:         "any",
+		MaxLines:     2,
+	})
+	if err != nil {
+		t.Fatalf("ExecutionLogs: %v", err)
+	}
+	if len(res.Events) != 2 {
+		t.Fatalf("Events length = %d, want 2 (MaxLines=2 not honored)", len(res.Events))
+	}
+	if !res.Truncated {
+		t.Error("expected Truncated=true when MaxLines caps below the file length")
+	}
+	if res.Events[0].Message != "line 3" || res.Events[1].Message != "line 4" {
+		t.Errorf("MaxLines must keep the last lines, got [%q, %q], want [\"line 3\", \"line 4\"]",
+			res.Events[0].Message, res.Events[1].Message)
+	}
+}
+
+// TestLocalProviderExecutionLogsMaxLinesZeroPreservesDefault proves
+// MaxLines<=0 is byte-identical to today: the response still caps at
+// logsLineCap (500), not some other value.
+func TestLocalProviderExecutionLogsMaxLinesZeroPreservesDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeRunFixtureLines(t, dir, "run-default", 501)
+
+	p := observability.NewLocalProvider(filepath.Dir(dir))
+	ref := observability.FormatExecRef(filepath.Base(dir), "run-default")
+
+	res, err := p.ExecutionLogs(context.Background(), observability.ExecutionLogsQuery{
+		ExecutionRef: ref,
+		Step:         "any",
+	})
+	if err != nil {
+		t.Fatalf("ExecutionLogs: %v", err)
+	}
+	if len(res.Events) != 500 {
+		t.Fatalf("Events length = %d, want 500 (default logsLineCap regressed)", len(res.Events))
+	}
+	if !res.Truncated {
+		t.Error("expected Truncated=true past the default 500-line cap")
+	}
+
+	// A MaxLines above the file length disables truncation entirely,
+	// proving the cap is genuinely overridable rather than a coincidence.
+	res2, err := p.ExecutionLogs(context.Background(), observability.ExecutionLogsQuery{
+		ExecutionRef: ref,
+		Step:         "any",
+		MaxLines:     600,
+	})
+	if err != nil {
+		t.Fatalf("ExecutionLogs: %v", err)
+	}
+	if len(res2.Events) != 501 {
+		t.Fatalf("Events length = %d, want 501 with MaxLines=600", len(res2.Events))
+	}
+	if res2.Truncated {
+		t.Error("expected Truncated=false when MaxLines exceeds the file length")
+	}
+}
+
 func TestLocalProviderExecutionLogsRequiresStep(t *testing.T) {
 	p := observability.NewLocalProvider(t.TempDir())
 	_, err := p.ExecutionLogs(context.Background(), observability.ExecutionLogsQuery{

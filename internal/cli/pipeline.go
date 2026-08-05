@@ -59,6 +59,8 @@ Examples:
 		newPipelineResetCmd(),
 		newPipelineRunCmd(),
 		newPipelineStatusCmd(),
+		newPipelineRunsCmd(),
+		newPipelineLogsCmd(),
 		newPipelineRightsizeCmd(),
 		newPipelineCostCmd(),
 		newPipelineOptimizeCmd(),
@@ -782,6 +784,9 @@ func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut, force bool, force
 		return printJSON(os.Stdout, result)
 	}
 	fmt.Printf("Workdir: %s\n", result.Workdir)
+	if result.RunID != "" {
+		fmt.Printf("Run: %s\n", result.RunID)
+	}
 	rows := make([][]string, len(result.Nodes))
 	for i, n := range result.Nodes {
 		rows[i] = []string{n.NodeID, n.Type, n.Status, n.Output}
