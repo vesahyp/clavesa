@@ -13,11 +13,18 @@
     endpoint: "/t.gif",
     sessionTimeout: 30 * 60 * 1000, // 30 min sliding session
     maxStringLength: 200,
+    // Optional function(value) -> value, applied to every field the site
+    // itself controls. Default null: no site needs it until one does.
+    sanitize: null,
     debug: false
   };
   if (window.TRACKER_CONFIG) {
     for (var k in window.TRACKER_CONFIG) config[k] = window.TRACKER_CONFIG[k];
   }
+
+  // The signed-in identity, when the site hands one over (see setAuthId). Null
+  // for every visit that never signs in, which is most of them.
+  var authId = null;
 
   var UID_KEY = "clv_uid";
   var SID_KEY = "clv_sid";
@@ -71,6 +78,17 @@
     }
   }
 
+  // Site-supplied last line of defence over the values the site controls: the
+  // path and the per-event fields. Error text is the one that carries whatever
+  // the page happened to be holding, so a site with something it must never
+  // emit (a coordinate, an order number) installs a scrubber here rather than
+  // forking this file. Identity fields and the timestamp skip it on purpose —
+  // a scrubber written for digits would mangle a UUID.
+  function scrub(v) {
+    if (!config.sanitize) return v;
+    try { return config.sanitize(String(v)); } catch (e) { return ""; }
+  }
+
   function track(event, data) {
     try {
       var session = getSession();
@@ -78,9 +96,12 @@
       params.set("e", event);
       params.set("uid", getUserId());
       params.set("sid", session.id);
-      params.set("p", location.pathname);
+      params.set("p", scrub(location.pathname));
       params.set("t", String(Date.now()));
-      if (data) for (var key in data) if (data[key] != null) params.set(key, data[key]);
+      // An identity field, so it skips scrub() for the same reason uid and sid
+      // do: a scrubber written for digits would mangle it.
+      if (authId) params.set("aid", authId);
+      if (data) for (var key in data) if (data[key] != null) params.set(key, scrub(data[key]));
 
       var url = config.endpoint + "?" + params.toString();
       log("track", event, data || {});
@@ -101,6 +122,22 @@
       // Last-ditch: never let tracking throw into the page.
       if (config.debug) console.warn("[clv] track failed", e);
     }
+  }
+
+  // Set or clear the signed-in identity. The site calls this from wherever its
+  // auth state lives, and every beacon after it carries aid, so the pipeline can
+  // join one person's sessions across their devices. uid stays what it was: it
+  // answers "same browser", which is a different question.
+  //
+  // One auth event marks the transition, so a session can be counted as signed
+  // in without scanning every beacon in it for an aid. Sign-out clears the id
+  // and sends nothing: the absence of aid on later beacons is the signal, and an
+  // event there would be a second way to say the same thing.
+  function setAuthId(id) {
+    var next = id ? String(id) : null;
+    if (next === authId) return;
+    authId = next;
+    if (authId) track("auth", {});
   }
 
   // Elements already marked "viewed" this session (sel -> true). Lightest
@@ -164,6 +201,34 @@
       });
     }
 
+    // pageview — every load, not once per session.
+    //
+    // session_start answers "where did the visit begin", which is a different
+    // question from "which pages were read", and it was doing duty for both.
+    // The second page of a visit sent nothing at all unless it happened to
+    // carry a [data-track] element that scrolled into view, so a short page
+    // read start to finish was invisible. Every beacon already carries the
+    // path, so this needs no field of its own: the event is the signal.
+    track("pageview", {});
+
+    // Campaign attribution. A mail or an ad that links in with ?em=<campaign>,
+    // and optionally ?emc=<which link in it>, gets one event here at init: an
+    // app commonly strips its own query params right after mount, and once they
+    // are gone nothing later in the visit can report the click-through. The
+    // landing path is already on every beacon, so where the link led needs no
+    // field of its own.
+    try {
+      var qs = new URLSearchParams(location.search);
+      var campaign = qs.get("em");
+      if (campaign) {
+        var mail = { em: trunc(campaign, 30) };
+        if (qs.get("emc")) mail.emc = trunc(qs.get("emc"), 30);
+        track("email_click", mail);
+      }
+    } catch (err) {
+      track("tracker_error", { src: "email_landing", msg: err.message });
+    }
+
     // Clicks — one delegated capture-phase listener so app handlers that call
     // stopPropagation can't swallow them. Only elements explicitly opted in
     // via data-track are tracked; everything else is a silent no-op.
@@ -221,11 +286,16 @@
     var milestones = [25, 50, 75, 100];
     var hit = {};
     var maxDepth = 0;
+    // How far down the page is right now, where a page with nothing to
+    // scroll counts as fully read.
+    function depthNow() {
+      var doc = document.documentElement;
+      var scrollable = doc.scrollHeight - doc.clientHeight;
+      return scrollable > 0 ? Math.round((doc.scrollTop / scrollable) * 100) : 100;
+    }
     function onScroll() {
       try {
-        var doc = document.documentElement;
-        var scrollable = doc.scrollHeight - doc.clientHeight;
-        var pct = scrollable > 0 ? Math.round((doc.scrollTop / scrollable) * 100) : 100;
+        var pct = depthNow();
         if (pct > maxDepth) maxDepth = pct;
         for (var i = 0; i < milestones.length; i++) {
           var m = milestones[i];
@@ -255,8 +325,42 @@
       track("tracker_error", { src: "perf_observer", msg: err.message });
     }
 
-    // JS errors.
+    // INP (Interaction to Next Paint), the vital that replaced FID in March
+    // 2024. FID measured how long the page took to START handling the first
+    // interaction, which said nothing about the ones that actually felt slow.
+    // INP measures how long it took to paint after an interaction, and reports
+    // the worst one.
+    //
+    // Its own observer in its own try: "event" with durationThreshold is the
+    // newest entry type here, and a browser that rejects it must not take LCP
+    // and CLS down with it.
+    //
+    // The worst interaction is the INP for any visit with under 50 of them,
+    // which is nearly every visit. The full definition discards one outlier per
+    // 50 interactions, and that bookkeeping is not worth the bytes here.
+    // Threshold 40ms rather than the 104ms default, so an interaction that is
+    // sluggish without being broken still registers.
+    var inp = 0;
+    try {
+      if (window.PerformanceObserver) {
+        new PerformanceObserver(function (list) {
+          list.getEntries().forEach(function (entry) {
+            if (entry.interactionId && entry.duration > inp) inp = entry.duration;
+          });
+        }).observe({ type: "event", buffered: true, durationThreshold: 40 });
+      }
+    } catch (err) {
+      track("tracker_error", { src: "inp_observer", msg: err.message });
+    }
+
+    // JS errors. Extension-injected scripts throw on pages they ride
+    // along to ("Invalid call to runtime.sendMessage()" et al., found on
+    // keitos 2026-08-21); those are the visitor's browser, not the site,
+    // so they never reach the board.
+    var EXT_ERROR = /extension|runtime\.sendMessage|runtime\.connect/i;
     window.addEventListener("error", function (e) {
+      if (e.filename && /^(chrome|moz|safari)-extension:/.test(e.filename)) return;
+      if (e.message && EXT_ERROR.test(e.message)) return;
       track("error", {
         msg: trunc(e.message, config.maxStringLength),
         file: trunc(e.filename, 50),
@@ -277,8 +381,17 @@
       ended = true;
       if (lcp != null) track("lcp", { v: Math.round(lcp) });
       track("cls", { v: Math.round(cls * 1000) / 1000 });
+      // A visit that never interacted has no INP, and 0 would read as instant.
+      if (inp > 0) track("inp", { v: Math.round(inp) });
       track("session_end", {
-        scroll: maxDepth,
+        // A page that fits on the screen fires no scroll event ever, so
+        // maxDepth stays 0 and the visit reads as "saw nothing" when the
+        // truth is "saw all of it". Falling back to the depth right now
+        // separates the two: unscrollable answers 100, scrollable but
+        // untouched still answers 0, which is correct. Evaluated here rather
+        // than at init because images and fonts change the page height after
+        // load, and by page-hide the layout has settled.
+        scroll: maxDepth || depthNow(),
         dur: Math.round((Date.now() - started) / 1000)
       });
     }
@@ -288,7 +401,7 @@
     });
   }
 
-  window.__clvtracker = { track: track };
+  window.__clvtracker = { track: track, setAuthId: setAuthId };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
