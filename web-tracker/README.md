@@ -46,7 +46,8 @@ sliding session id in `sessionStorage`) — no cookies, no fingerprinting.
   (`view`) and was seen for ≥3s (`displayed`). Once per session per element.
 - `click` — a click on a `[data-track]` element. A click also back-fills
   `view` + `displayed`, so **clicks ⊆ displayed ⊆ view** and click-through rate
-  is always ≤ 100%.
+  is always ≤ 100%. Set `clicks: "all"` to report every click with where it
+  landed: see [Click maps](#click-maps).
 - `scroll` — 25/50/75/100% depth milestones, once each per session.
 - `lcp` / `cls` / `inp` — Largest Contentful Paint, Cumulative Layout Shift,
   and Interaction to Next Paint (the worst interaction of the visit, in ms).
@@ -73,6 +74,8 @@ Set `window.TRACKER_CONFIG` before the script loads:
     endpoint: "/t.gif",              // where beacons go (must be CDN-logged)
     sessionTimeout: 30 * 60 * 1000,  // sliding session window, ms
     sanitize: null,                  // function(value) -> value, see below
+    clicks: "tagged",                // or "all", see Click maps below
+    clickData: null,                 // function(element) -> object, see below
     debug: false                     // console.log every event
   };
 </script>
@@ -98,6 +101,39 @@ window.TRACKER_CONFIG = {
 
 The visitor id, session id, and timestamp skip it, so a scrubber aimed at
 digits is safe to write: it will never see a UUID.
+
+## Click maps
+
+`clicks: "all"` reports every click, not only the ones on a `[data-track]`
+element, and adds where the click landed:
+
+| field | what it is |
+|-------|-----------|
+| `sel` | the `data-track` name when the click was inside one, else `#id`, else `tag.class` |
+| `txt` | the element's text, cut at 30 characters |
+| `x`, `y` | pixels from the top left of the viewport |
+| `px`, `py` | the same as percentages, so one visitor's 1440px screen lays over another's phone |
+| `vw`, `vh` | the viewport it was measured in |
+
+Tagged elements read the same in both modes, so click-through rate still joins
+to their impressions. An untagged click gets no `view` or `displayed`, because
+nothing measured it entering the viewport, and inventing one would put
+elements in the CTR denominator that were never counted.
+
+`clickData` adds fields of your own to a click. It receives the clicked
+element, so your markup stays your business:
+
+```js
+window.TRACKER_CONFIG = {
+  clicks: "all",
+  clickData: function (el) {
+    var card = el.closest("[data-product]");
+    return card ? { product: card.dataset.product } : null;
+  }
+};
+```
+
+It runs in both modes, and a `null` return adds nothing.
 
 ## Campaign links
 

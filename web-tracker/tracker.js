@@ -16,6 +16,14 @@
     // Optional function(value) -> value, applied to every field the site
     // itself controls. Default null: no site needs it until one does.
     sanitize: null,
+    // "tagged": only [data-track] elements report a click, which is what a
+    // marketing site wants. "all": every click reports, with a selector and
+    // where on the screen it landed, which is what a click map needs.
+    clicks: "tagged",
+    // Optional function(element) -> object, merged into a click event. The
+    // element is the one clicked, so a site reads its own markup here (a card's
+    // id, a row's product) without this file knowing anything about it.
+    clickData: null,
     debug: false
   };
   if (window.TRACKER_CONFIG) {
@@ -140,6 +148,29 @@
     if (authId) track("auth", {});
   }
 
+  // What to call the thing that was clicked, in "all" mode. A [data-track] name
+  // when the click landed inside one, so a tagged element reads the same in both
+  // modes and CTR still joins to its impressions. Otherwise an id, or tag plus
+  // first class, which is enough to tell one region of a page from another
+  // without becoming a brittle full-path selector.
+  function selectorFor(el) {
+    try {
+      if (el && el.nodeType === 3) el = el.parentElement; // a text node
+      if (!el) return "";
+      var tagged = el.closest && el.closest("[data-track]");
+      if (tagged) return tagged.getAttribute("data-track");
+      if (el.id) return "#" + el.id;
+      var tag = el.tagName ? el.tagName.toLowerCase() : "unknown";
+      // className is an SVGAnimatedString on SVG elements, not a string.
+      if (el.className && typeof el.className === "string" && el.className.trim()) {
+        return tag + "." + el.className.trim().split(/\s+/)[0];
+      }
+      return tag;
+    } catch (e) {
+      return "unknown";
+    }
+  }
+
   // Elements already marked "viewed" this session (sel -> true). Lightest
   // impression tier: the element entered the viewport at all, no dwell
   // required. Fires at most once per sel per session.
@@ -236,13 +267,42 @@
       try {
         var el = e.target;
         var tracked = el && el.closest && el.closest("[data-track]");
-        if (!tracked) return;
-        var sel = tracked.getAttribute("data-track");
-        // A click implies the element was seen — count it toward CTR's
-        // denominator even if the impression observer hasn't fired yet.
-        // markDisplayed also backfills the view tier (view ⊇ displayed).
-        markDisplayed(sel);
-        track("click", { sel: sel });
+        if (!tracked && config.clicks !== "all") return;
+
+        var data;
+        if (tracked) {
+          var sel = tracked.getAttribute("data-track");
+          // A click implies the element was seen, so count it toward CTR's
+          // denominator even if the impression observer has not fired yet.
+          // markDisplayed also backfills the view tier (view ⊇ displayed).
+          markDisplayed(sel);
+          data = { sel: sel };
+        } else {
+          // An untagged element has no impression to join to, so it gets no
+          // markDisplayed: a view tier invented here would put elements in the
+          // CTR denominator that were never measured entering the viewport.
+          data = { sel: selectorFor(el) };
+        }
+
+        if (config.clicks === "all") {
+          var vw = window.innerWidth, vh = window.innerHeight;
+          data.txt = trunc(el && el.textContent ? el.textContent.trim() : "", 30);
+          data.x = e.clientX;
+          data.y = e.clientY;
+          // Percentages as well as pixels, because a click map has to lay one
+          // visitor's 1440px screen over another's phone.
+          data.px = Math.round((e.clientX / vw) * 100);
+          data.py = Math.round((e.clientY / vh) * 100);
+          data.vw = vw;
+          data.vh = vh;
+        }
+
+        if (config.clickData) {
+          var extra = config.clickData(el);
+          if (extra) for (var f in extra) if (extra[f] != null) data[f] = extra[f];
+        }
+
+        track("click", data);
       } catch (err) {
         track("tracker_error", { src: "click_handler", msg: err.message });
       }
