@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/vesahyp/clavesa/internal/modules"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // githubSourceRE captures the repo path and current ref from a GitHub
@@ -209,6 +210,17 @@ func (s *Service) UpgradePipeline(dir, targetRef string) (currentRef, finalRef s
 	if updated > 0 || migrated > 0 {
 		if syncErr := s.SyncOrchestration(dir, ""); syncErr != nil {
 			return currentRef, finalRef, updated, migrated, fmt.Errorf("sync orchestration.tf: %w", syncErr)
+		}
+	}
+
+	// ADR-025: refresh an existing backend.tf from the manifest,
+	// independent of whether any module source or compute line changed
+	// above, since a bucket/region/key_prefix edit alone must still reach
+	// it on the next upgrade. A stack with no backend.tf (local state, or
+	// not yet migrated) is left alone.
+	if ws, wsErr := workspace.Load(s.workspace); wsErr == nil {
+		if err := workspace.RefreshBackendTF(s.workspace, abs, ws); err != nil {
+			return currentRef, finalRef, updated, migrated, fmt.Errorf("write backend.tf: %w", err)
 		}
 	}
 	return currentRef, finalRef, updated, migrated, nil

@@ -39,5 +39,5 @@ Each ADR follows this structure:
 | [022](022-interactive-read-engine.md) | Interactive read engine and serving-vs-authoring SQL | Accepted (partially superseded by 023) |
 | [023](023-single-serving-dialect-spark-transpile.md) | Author serving SQL in Spark, transpile to Trino | Accepted |
 | [024](024-warehouse-compute-split.md) | Split environment mode into warehouse and compute | Accepted |
-| [025](025-remote-terraform-backend.md) | Remote Terraform backend for shared cloud deploys | Proposed |
+| [025](025-remote-terraform-backend.md) | Remote Terraform backend for shared cloud deploys | Accepted |
 | [026](026-local-source-mirror.md) | Mirror s3 sources locally for local-warehouse runs | Accepted |

@@ -25,6 +25,10 @@ SMOKE_PIPELINE="${SMOKE_PIPELINE:-taxi}"
 SMOKE_NODES="${SMOKE_NODES:-trips,revenue_by_payment}"
 SMOKE_STATS_NODE="${SMOKE_STATS_NODE:-trips}"
 SMOKE_PROFILE="${SMOKE_PROFILE:-personal}"
+# Remote state (ADR-025). Setup creates this bucket when it is missing;
+# empty means clavesa-smoke-tfstate-<account id>.
+SMOKE_STATE_BUCKET="${SMOKE_STATE_BUCKET:-}"
+SMOKE_STATE_PREFIX="${SMOKE_STATE_PREFIX:-tfstate/clavesa-smoke/}"
 # Day 1 of the seed layout — never consumed by normal runs because setup
 # registers the source with --start-from at day 2, so the backfill leg has
 # a clean partition to stage (dodges GH #36: staging a window the canonical
@@ -189,6 +193,30 @@ cmd_run() {
     || die "workspace upgrade failed"
   pass "workspace + pipelines upgraded"
 
+  # ----- 1b. remote state (ADR-025) ------------------------------------------
+  # The gate's workspace keeps its state in S3, so every leg below runs the
+  # remote read path (pipeline bucket, state machine ARN) and deploy runs
+  # the split-brain guard. migrate-state on an already-migrated workspace
+  # must be a clean no-op: every stack already-migrated, nothing failed.
+  banner "remote state: backend configured, migrate-state is a no-op"
+  local backend_json state_bucket
+  backend_json="$("$BIN" workspace backend --json --workspace "$SMOKE_WS")" \
+    || die "workspace backend failed"
+  [[ "$(echo "$backend_json" | jq -r .configured)" == "true" ]] \
+    || die "smoke workspace has no remote backend — the gate needs one (ADR-025); run: $BIN workspace set-backend ... && $BIN workspace migrate-state"
+  state_bucket="$(echo "$backend_json" | jq -r .bucket)"
+  local migrate_json not_done
+  migrate_json="$("$BIN" workspace migrate-state --json --workspace "$SMOKE_WS" 2>/dev/null)" \
+    || die "workspace migrate-state failed on an already-migrated workspace: $migrate_json"
+  not_done="$(echo "$migrate_json" | jq -r '[.stacks[] | select(.status != "already-migrated") | .dir] | join(",")')"
+  [[ -z "$not_done" ]] || die "migrate-state re-run did not report every stack already-migrated: $not_done"
+  local stray
+  # .terraform/terraform.tfstate is terraform's cached backend config, not
+  # state, so .terraform is skipped along with .clavesa.
+  stray="$(find "$SMOKE_WS" -maxdepth 2 -name terraform.tfstate -size +0 -not -path '*/.clavesa/*' -not -path '*/.terraform/*' | tr '\n' ' ')"
+  [[ -z "$stray" ]] || die "non-empty local terraform.tfstate on a remote-backed workspace: $stray"
+  pass "backend s3://$state_bucket, $(echo "$migrate_json" | jq '.stacks | length') stack(s) already migrated, no local state"
+
   # ----- 2. deploy everything -----------------------------------------------
   # `clavesa deploy` = workspace infra + runner image push + every pipeline,
   # re-syncing each pipeline's orchestration.tf from THIS binary's emitter
@@ -200,6 +228,12 @@ cmd_run() {
   "$BIN" deploy --yes --workspace "$SMOKE_WS" \
     || die "clavesa deploy failed"
   pass "workspace + pipelines deployed"
+  local key
+  for key in $(echo "$migrate_json" | jq -r '.stacks[].key'); do
+    aws s3api head-object --bucket "$state_bucket" --key "$key" >/dev/null 2>&1 \
+      || die "state object s3://$state_bucket/$key missing after deploy"
+  done
+  pass "deploy wrote state to s3://$state_bucket (every stack key present)"
 
   # ----- 3. runner Lambda config --------------------------------------------
   # Assert the deployed function config matches what the current emitter
@@ -879,6 +913,35 @@ cmd_setup() {
   banner "workspace deploy (bucket + ECR + system Glue DB + runner image)"
   "$BIN" workspace deploy --yes --workspace "$SMOKE_WS" \
     || die "workspace deploy failed"
+
+  # ----- move the shell's state to S3 (ADR-025) ---------------------------
+  # Deployed on local state first, then migrated: a re-setup runs a real
+  # local-to-S3 migration against live resources, the path users take.
+  local state_bucket="$SMOKE_STATE_BUCKET"
+  if [[ -z "$state_bucket" ]]; then
+    state_bucket="clavesa-smoke-tfstate-$(aws sts get-caller-identity --query Account --output text)"
+  fi
+  banner "state bucket s3://$state_bucket (versioned, encrypted, private)"
+  if ! aws s3api head-bucket --bucket "$state_bucket" >/dev/null 2>&1; then
+    aws s3api create-bucket --bucket "$state_bucket" \
+      --create-bucket-configuration "LocationConstraint=$AWS_REGION" >/dev/null \
+      || die "create-bucket $state_bucket failed"
+  fi
+  aws s3api put-bucket-versioning --bucket "$state_bucket" --versioning-configuration Status=Enabled \
+    || die "put-bucket-versioning $state_bucket failed"
+  aws s3api put-bucket-encryption --bucket "$state_bucket" \
+    --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
+    || die "put-bucket-encryption $state_bucket failed"
+  aws s3api put-public-access-block --bucket "$state_bucket" \
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
+    || die "put-public-access-block $state_bucket failed"
+
+  banner "set-backend + migrate-state"
+  "$BIN" workspace set-backend --backend s3 --state-bucket "$state_bucket" \
+    --state-region "$AWS_REGION" --state-key-prefix "$SMOKE_STATE_PREFIX" --workspace "$SMOKE_WS" \
+    || die "workspace set-backend failed"
+  "$BIN" workspace migrate-state --workspace "$SMOKE_WS" \
+    || die "workspace migrate-state failed"
 
   local bucket
   bucket="$(terraform -chdir="$SMOKE_WS" output -raw pipeline_bucket)" \

@@ -37,7 +37,7 @@ type resetResult struct {
 // half of reset is exercised, not just the table drops. Needs Docker
 // (runner container), same as TestPipelineRunEndToEnd.
 func TestPipelineResetEndToEnd(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "resetdemo", "--workspace", ws)
@@ -137,7 +137,7 @@ func TestPipelineResetEndToEnd(t *testing.T) {
 // TestPipelineResetUnknownNode: --node naming a nonexistent transform is a
 // clear non-zero-exit error, not a silent no-op.
 func TestPipelineResetUnknownNode(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "demo", "--workspace", ws)
 	addNode(t, ws, "demo", "transform")
@@ -155,7 +155,7 @@ func TestPipelineResetUnknownNode(t *testing.T) {
 // TestPipelineResetJSONRequiresYes: --json is non-interactive by contract;
 // without --yes there is nowhere to confirm, so it must refuse up front.
 func TestPipelineResetJSONRequiresYes(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "demo", "--workspace", ws)
 	addNode(t, ws, "demo", "transform")
@@ -173,7 +173,7 @@ func TestPipelineResetJSONRequiresYes(t *testing.T) {
 // TestPipelineResetNothingToReset: a pipeline with no transform nodes has
 // nothing to drop — plain mode says so and exits 0.
 func TestPipelineResetNothingToReset(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "empty", "--workspace", ws)
 

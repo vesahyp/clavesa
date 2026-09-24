@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -54,9 +55,17 @@ func TestParseWorkspaceLabels(t *testing.T) {
 	}
 }
 
+// noAge is a containerAge stub for tests that never expect the age branch
+// to fire (every candidate is resolved by the stat-based existence check).
+func noAge(id string) (time.Duration, error) {
+	return 0, fmt.Errorf("age should not be consulted for %s", id)
+}
+
 // TestOrphanContainerIDs — remove only on a definitive does-not-exist;
 // an existing root or an ambiguous stat error (permission, I/O) keeps the
-// container. Output is sorted for determinism.
+// container. Output is sorted for determinism. None of these roots sit
+// under the tempDir passed in, so the GH #93 age branch never fires here —
+// that's covered by TestOrphanContainerIDsTestTempDirAge below.
 func TestOrphanContainerIDs(t *testing.T) {
 	byID := map[string]string{
 		"id-gone-b":   "/gone/b",
@@ -74,8 +83,71 @@ func TestOrphanContainerIDs(t *testing.T) {
 			return fs.ErrNotExist
 		}
 	}
-	got := orphanContainerIDs(byID, stat)
+	got := orphanContainerIDs(byID, stat, "/tmp/unrelated", noAge)
 	want := []string{"id-gone-a", "id-gone-b"}
+	if !slices.Equal(got, want) {
+		t.Errorf("orphanContainerIDs = %v, want %v", got, want)
+	}
+}
+
+// TestIsGoTestTempDirWorkspace — the pure GH #93 path-shape check: a
+// workspace is a Go test temp dir only when it sits directly inside a
+// "Test..." segment right under tempDir.
+func TestIsGoTestTempDirWorkspace(t *testing.T) {
+	const tempDir = "/tmp"
+	cases := []struct {
+		name string
+		root string
+		want bool
+	}{
+		{"top-level test dir", "/tmp/TestFoo1234567890", true},
+		{"nested numbered subdir", "/tmp/TestFoo1234567890/001", true},
+		{"deeper nesting", "/tmp/TestFoo1234567890/001/.clavesa/warehouse", true},
+		{"non-test dir under tempDir", "/tmp/some-real-workspace", false},
+		{"lowercase test prefix", "/tmp/testFoo123", false},
+		{"tempDir itself", "/tmp", false},
+		{"outside tempDir entirely", "/Users/vesa/Repositories/foo/analytics/clavesa", false},
+	}
+	for _, tc := range cases {
+		if got := isGoTestTempDirWorkspace(tc.root, tempDir); got != tc.want {
+			t.Errorf("isGoTestTempDirWorkspace(%q, %q) = %v, want %v", tc.root, tempDir, got, tc.want)
+		}
+	}
+}
+
+// TestOrphanContainerIDsTestTempDirAge — GH #93: a container whose
+// workspace still exists is nonetheless orphaned once it is both (a)
+// inside a Go test temp dir under tempDir and (b) at least
+// testTempDirMaxAge old. Neither condition alone is enough, and a
+// non-test-dir root is never reaped on age regardless of how old it is.
+func TestOrphanContainerIDsTestTempDirAge(t *testing.T) {
+	const tempDir = "/tmp"
+	// Every root in this test "exists" (stat returns nil) — the point is
+	// to prove the age-based path fires independent of the GH #59
+	// existence check.
+	statAllExist := func(string) error { return nil }
+
+	byID := map[string]string{
+		"id-old-testdir":   "/tmp/TestKilledRun1234567890/001",
+		"id-fresh-testdir": "/tmp/TestFreshRun9876543210/001",
+		"id-old-real-ws":   "/Users/vesa/Repositories/foo/analytics/clavesa",
+		"id-age-unknown":   "/tmp/TestAgeUnknown0000000000/001",
+	}
+	age := func(id string) (time.Duration, error) {
+		switch id {
+		case "id-old-testdir":
+			return testTempDirMaxAge + time.Hour, nil
+		case "id-fresh-testdir":
+			return time.Hour, nil
+		case "id-age-unknown":
+			return 0, fmt.Errorf("docker inspect: no such container")
+		default:
+			return 0, fmt.Errorf("age should not be consulted for %s", id)
+		}
+	}
+
+	got := orphanContainerIDs(byID, statAllExist, tempDir, age)
+	want := []string{"id-old-testdir"}
 	if !slices.Equal(got, want) {
 		t.Errorf("orphanContainerIDs = %v, want %v", got, want)
 	}

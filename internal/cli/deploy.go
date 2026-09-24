@@ -55,6 +55,13 @@ type deployFlow struct {
 	In  io.Reader
 	Out io.Writer
 	Err io.Writer
+
+	// CheckTerraformVersion overrides the ADR-025 Terraform-floor check
+	// the backend guard runs (see checkBackendGuard). Nil uses
+	// workspace.TerraformVersionOK (execs `terraform version`); tests
+	// inject a stub so the guard is exercised without a terraform
+	// binary on PATH.
+	CheckTerraformVersion func(ctx context.Context) error
 }
 
 // planFilename is the saved-plan file written by `plan` and consumed by
@@ -153,6 +160,10 @@ func (d deployFlow) preflight() error {
 		return fmt.Errorf("read clavesa.json: %w", err)
 	}
 
+	if err := d.checkBackendGuard(); err != nil {
+		return err
+	}
+
 	if err := d.verifyAWSCredentials(); err != nil {
 		return err
 	}
@@ -166,6 +177,43 @@ func (d deployFlow) preflight() error {
 	// Cheap when nothing changed.
 	if _, err := workspace.EnsureLocalRunnerImage(d.WorkspaceRoot); err != nil {
 		return fmt.Errorf("build runner image before deploy: %w", err)
+	}
+	return nil
+}
+
+// checkBackendGuard is the ADR-025 "No split-brain" guard: once a
+// workspace's manifest names a remote backend, deploy refuses to run
+// against a stack that hasn't been migrated (no backend.tf) or that
+// still has its pre-migration local state sitting next to it. Without
+// this, a developer who pulled the manifest's `backend` field but not
+// the migrated .tf files could apply against stale local state and
+// diverge from the shared remote state. A workspace with no backend
+// configured is untouched — this whole check is a no-op for it, exactly
+// as before ADR-025.
+func (d deployFlow) checkBackendGuard() error {
+	m, err := workspace.Load(d.WorkspaceRoot)
+	if err != nil {
+		return fmt.Errorf("load clavesa.json: %w", err)
+	}
+	if m == nil || m.Backend == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	checkVersion := d.CheckTerraformVersion
+	if checkVersion == nil {
+		checkVersion = workspace.TerraformVersionOK
+	}
+	if err := checkVersion(ctx); err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(filepath.Join(d.TfDir, "backend.tf")); err != nil {
+		return fmt.Errorf("%s has no backend.tf but the workspace manifest names a remote backend — run `clavesa workspace migrate-state` first", d.TfDir)
+	}
+	if info, err := os.Stat(filepath.Join(d.TfDir, "terraform.tfstate")); err == nil && info.Size() > 0 {
+		return fmt.Errorf("%s still has a non-empty local terraform.tfstate even though the workspace manifest names a remote backend — run `clavesa workspace migrate-state` first", d.TfDir)
 	}
 	return nil
 }

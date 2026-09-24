@@ -189,6 +189,7 @@ AWS_PROFILE=my-account clavesa deploy --workspace $WS
 
 - **[docs/reference/](docs/reference/)** is the look-up material: the full **[CLI reference](docs/reference/cli/README.md)** (every command and flag, generated from the binary), plus per-module input/output docs.
 - **[docs/cookbook/](docs/cookbook/README.md)** holds task-oriented recipes — how to solve a specific problem end to end.
+- **[docs/remote-state.md](docs/remote-state.md)** covers moving a workspace's Terraform state to a shared S3 backend so more than one developer can deploy against it ([ADR-025](docs/decisions/025-remote-terraform-backend.md)).
 - **[CHANGELOG.md](CHANGELOG.md)** lists what shipped in each release, in user-facing terms.
 - **[docs/architecture.md](docs/architecture.md)** covers system layers and the data model.
 - **[docs/decisions/](docs/decisions/)** holds the ADRs. ADR-012 (PySpark engine), ADR-018 (Delta table format), and ADR-014 (local-cloud parity) are the current architectural anchors.

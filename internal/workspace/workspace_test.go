@@ -1,6 +1,7 @@
 package workspace_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,7 @@ import (
 func TestInitAndLoad(t *testing.T) {
 	dir := t.TempDir()
 
-	if err := workspace.Init(dir, "my-test", "aws", "", "v0.5.0"); err != nil {
+	if err := workspace.Init(dir, "my-test", "aws", "", "v0.5.0", nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
@@ -130,7 +131,7 @@ func TestInitCreatesMissingDir(t *testing.T) {
 	parent := t.TempDir()
 	target := filepath.Join(parent, "not-yet-created")
 
-	if err := workspace.Init(target, "fresh-ws", "aws", "", "v0.5.0"); err != nil {
+	if err := workspace.Init(target, "fresh-ws", "aws", "", "v0.5.0", nil); err != nil {
 		t.Fatalf("Init against non-existent dir: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(target, "clavesa.json")); err != nil {
@@ -153,7 +154,7 @@ func TestLoadMissing(t *testing.T) {
 func TestInitDefaultCloud(t *testing.T) {
 	dir := t.TempDir()
 
-	if err := workspace.Init(dir, "test-ws", "", "", "v0.5.0"); err != nil {
+	if err := workspace.Init(dir, "test-ws", "", "", "v0.5.0", nil); err != nil {
 		t.Fatalf("Init with empty cloud: %v", err)
 	}
 
@@ -221,7 +222,7 @@ func TestDefaultCatalog(t *testing.T) {
 
 func TestInitWithExplicitCatalog(t *testing.T) {
 	dir := t.TempDir()
-	if err := workspace.Init(dir, "demo-ws", "aws", "clavesa", "v0.5.0"); err != nil {
+	if err := workspace.Init(dir, "demo-ws", "aws", "clavesa", "v0.5.0", nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	m, err := workspace.Load(dir)
@@ -242,7 +243,7 @@ func TestInitWithExplicitCatalog(t *testing.T) {
 func TestInitManifestContents(t *testing.T) {
 	dir := t.TempDir()
 
-	if err := workspace.Init(dir, "my-analytics", "aws", "", "v0.5.0"); err != nil {
+	if err := workspace.Init(dir, "my-analytics", "aws", "", "v0.5.0", nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
@@ -260,6 +261,120 @@ func TestInitManifestContents(t *testing.T) {
 	}
 }
 
+// TestWorkspaceMainTFBackendAware pins ADR-025's "Emit" contract at the
+// render-function level, ahead of Init growing a --backend flag (slice 5):
+// a nil Backend keeps `backend "local" {}` byte-for-byte; a non-nil one
+// omits the backend argument entirely, leaving the rest of the workspace
+// module block untouched.
+func TestWorkspaceMainTFBackendAware(t *testing.T) {
+	noBackend := workspace.WorkspaceMainTF(&workspace.Manifest{Name: "demo"}, "v1.2.3")
+	if !strings.Contains(noBackend, "  backend \"local\" {}\n") {
+		t.Errorf("main.tf without a backend must keep backend \"local\" {}:\n%s", noBackend)
+	}
+
+	withBackend := workspace.WorkspaceMainTF(&workspace.Manifest{
+		Name:    "demo",
+		Backend: &workspace.Backend{Type: "s3", Bucket: "b", Region: "eu-north-1"},
+	}, "v1.2.3")
+	if strings.Contains(withBackend, "backend \"local\"") {
+		t.Errorf("main.tf with a backend must not carry backend \"local\" {}:\n%s", withBackend)
+	}
+	if !strings.Contains(withBackend, `module "workspace"`) || !strings.Contains(withBackend, "v1.2.3") {
+		t.Errorf("main.tf with a backend lost the workspace module block:\n%s", withBackend)
+	}
+	// The two renders must be identical apart from the single backend line
+	// — no other part of the template shifts.
+	noBackendMinusLine := strings.Replace(noBackend, "  backend \"local\" {}\n", "", 1)
+	if noBackendMinusLine != withBackend {
+		t.Errorf("backend-aware render differs by more than the backend line.\nno-backend (line stripped):\n%s\nwith-backend:\n%s", noBackendMinusLine, withBackend)
+	}
+}
+
+// TestUpgradeRefreshesBackendTF is the workspace-shell regen path (ADR-025
+// "Regen keeps the backend"): a remote-backed workspace's backend.tf is
+// (re)written from the current manifest on every Upgrade, and a bucket
+// edit to clavesa.json reaches backend.tf on the very next run. A
+// no-backend workspace (exercised by every other Upgrade test in this
+// file) gets no backend.tf and no local-backend rewrite — Upgrade never
+// touches the backend/terraform_remote_state lines of main.tf either way.
+func TestUpgradeRefreshesBackendTF(t *testing.T) {
+	dir := t.TempDir()
+	m := workspace.Manifest{
+		Name: "up", Cloud: "aws", Version: 1,
+		Catalog: "clavesa_up", SystemCatalog: "clavesa_up_system",
+		Backend: &workspace.Backend{Type: "s3", Bucket: "up-tfstate", Region: "eu-north-1"},
+	}
+	writeManifestJSON(t, dir, m)
+	mainTF := "terraform { required_providers { aws = { source = \"hashicorp/aws\" } } }\n\nmodule \"workspace\" {\n  source         = \"./.clavesa/modules/v0.1.0/workspace/aws\"\n  workspace_name = var.workspace_name\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(mainTF), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unmigrated: the manifest names a backend but there is no
+	// backend.tf yet. Upgrade must not create one (ADR-025, "Regen keeps
+	// the backend": regen refreshes, create and migrate-state create).
+	if _, _, err := workspace.Upgrade(dir, "v2.0.0"); err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "backend.tf")); !os.IsNotExist(err) {
+		t.Fatalf("Upgrade created backend.tf in an unmigrated workspace (stat err %v)", err)
+	}
+
+	// Migrated: backend.tf exists, so Upgrade rewrites it from the manifest.
+	if err := os.WriteFile(filepath.Join(dir, "backend.tf"), []byte("# stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := workspace.Upgrade(dir, "v2.0.0"); err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	backendTF, err := os.ReadFile(filepath.Join(dir, "backend.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(backendTF), `bucket       = "up-tfstate"`) {
+		t.Errorf("backend.tf missing the manifest's bucket:\n%s", backendTF)
+	}
+	if !strings.Contains(string(backendTF), `key          = "clavesa/up/workspace.tfstate"`) {
+		t.Errorf("backend.tf missing the workspace state key:\n%s", backendTF)
+	}
+
+	// A bucket edit must reach backend.tf on the next Upgrade.
+	m.Backend.Bucket = "up-tfstate-v2"
+	writeManifestJSON(t, dir, m)
+	if _, _, err := workspace.Upgrade(dir, "v2.0.0"); err != nil {
+		t.Fatalf("second Upgrade: %v", err)
+	}
+	refreshed, err := os.ReadFile(filepath.Join(dir, "backend.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(refreshed), `bucket       = "up-tfstate-v2"`) {
+		t.Errorf("backend.tf not refreshed after a manifest bucket change:\n%s", refreshed)
+	}
+	if strings.Contains(string(refreshed), `"up-tfstate"`) {
+		t.Errorf("backend.tf still references the stale bucket:\n%s", refreshed)
+	}
+
+	main, err := os.ReadFile(filepath.Join(dir, "main.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(main), `backend "local"`) {
+		t.Errorf("Upgrade wrote a local backend into main.tf of a backend-configured workspace:\n%s", main)
+	}
+}
+
+func writeManifestJSON(t *testing.T, dir string, m workspace.Manifest) {
+	t.Helper()
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "clavesa.json"), append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLocalRunnerImageTag(t *testing.T) {
 	// No manifest: falls back to the empty-workspace-name image.
 	if got := workspace.LocalRunnerImageTag(t.TempDir()); got != "clavesa//transform-runner:latest" {
@@ -267,7 +382,7 @@ func TestLocalRunnerImageTag(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	if err := workspace.Init(dir, "my-test", "aws", "", "v0.5.0"); err != nil {
+	if err := workspace.Init(dir, "my-test", "aws", "", "v0.5.0", nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	if got := workspace.LocalRunnerImageTag(dir); got != "clavesa/my-test/transform-runner:latest" {

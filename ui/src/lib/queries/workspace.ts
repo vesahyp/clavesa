@@ -176,6 +176,106 @@ export async function waitForServerReady(timeoutMs = 30_000): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Terraform backend (ADR-025) — the workspace's remote Terraform state
+// ---------------------------------------------------------------------------
+
+const BackendInfo = z.object({
+  configured: z.boolean(),
+  type: z.string().optional().default(""),
+  bucket: z.string().optional().default(""),
+  region: z.string().optional().default(""),
+  key_prefix: z.string().optional().default(""),
+});
+export type BackendInfo = z.infer<typeof BackendInfo>;
+
+/**
+ * GET /api/workspace/backend — the workspace's configured remote
+ * Terraform backend, or `configured: false` for local state (ADR-025).
+ */
+export function useBackend() {
+  return useQuery({
+    queryKey: ["workspace", "backend"],
+    queryFn: async () =>
+      BackendInfo.parse(await request("/workspace/backend")),
+  });
+}
+
+export interface SetBackendInput {
+  bucket: string;
+  region: string;
+  keyPrefix?: string;
+}
+
+/**
+ * PUT /api/workspace/backend — configure the remote backend. The CLI
+ * twin is `clavesa workspace set-backend`; both write clavesa.json only
+ * — moving state is the separate migrateBackend call (ADR-015).
+ */
+export async function setBackend(input: SetBackendInput): Promise<BackendInfo> {
+  return requestParsed("/workspace/backend", BackendInfo, {
+    method: "PUT",
+    body: JSON.stringify({
+      type: "s3",
+      bucket: input.bucket,
+      region: input.region,
+      key_prefix: input.keyPrefix || undefined,
+    }),
+    errorLabel: "PUT /workspace/backend",
+  });
+}
+
+/**
+ * PUT /api/workspace/backend with a `null` body — clear the configured
+ * backend. Refused (409) once any stack has already migrated; the CLI's
+ * `workspace set-backend --clear` hits the identical refusal.
+ */
+export async function clearBackend(): Promise<BackendInfo> {
+  return requestParsed("/workspace/backend", BackendInfo, {
+    method: "PUT",
+    body: "null",
+    errorLabel: "PUT /workspace/backend (clear)",
+  });
+}
+
+const MigrateStackResult = z.object({
+  dir: z.string(),
+  key: z.string(),
+  status: z.enum([
+    "migrated",
+    "already-migrated",
+    "skipped-no-state",
+    "failed",
+  ]),
+  plan: z.string().optional().default(""),
+  err: z.string().optional().default(""),
+});
+export type MigrateStackResult = z.infer<typeof MigrateStackResult>;
+
+const MigrateResult = z.object({
+  // A run that fails a precondition has no rows; accept null as empty.
+  stacks: z.array(MigrateStackResult).nullish().transform((v) => v ?? []),
+  error: z.string().optional().default(""),
+});
+export type MigrateResult = z.infer<typeof MigrateResult>;
+
+/**
+ * POST /api/workspace/backend/migrate — move the workspace's Terraform
+ * state onto the configured backend (ADR-025 "Migration, not
+ * recreate"). The CLI twin is `clavesa workspace migrate-state`; both
+ * call Service.MigrateState. Parses the body on every status (not just
+ * 2xx) because a failed run still carries the per-stack rows the caller
+ * renders — `result.error` is what signals the overall outcome, not the
+ * HTTP status.
+ */
+export async function migrateBackend(): Promise<MigrateResult> {
+  const res = await fetch(`${BASE_URL}/workspace/backend/migrate`, {
+    method: "POST",
+  });
+  const body: unknown = await res.json().catch(() => ({}));
+  return MigrateResult.parse(body);
+}
+
+// ---------------------------------------------------------------------------
 // Runner requirements — extra Python pip deps baked into the runner image
 // ---------------------------------------------------------------------------
 

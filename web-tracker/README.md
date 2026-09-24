@@ -71,6 +71,7 @@ Set `window.TRACKER_CONFIG` before the script loads:
 ```html
 <script>
   window.TRACKER_CONFIG = {
+    enabled: true,                   // false = measure nothing, see below
     endpoint: "/t.gif",              // where beacons go (must be CDN-logged)
     sessionTimeout: 30 * 60 * 1000,  // sliding session window, ms
     sanitize: null,                  // function(value) -> value, see below
@@ -80,6 +81,22 @@ Set `window.TRACKER_CONFIG` before the script loads:
   };
 </script>
 <script src="/tracker.js" defer></script>
+```
+
+### `enabled`
+
+`enabled: false` turns the tracker off completely: no beacon, no listener, no
+`localStorage`. The API stays published, so `__clvtracker.setAuthId()` and
+`__clvtracker.track()` are safe to call and do nothing.
+
+Use it when the site loads itself in a headless browser. A nightly prerender, a
+screenshot script or an end-to-end suite walks every page and otherwise reports
+one full session per page, from a residential IP with an ordinary user agent,
+which no crawler test can catch. ecarbrowser's prerender sets
+`window.__PRERENDER__` before any page script runs, so the site configures:
+
+```js
+window.TRACKER_CONFIG = { enabled: !window.__PRERENDER__ };
 ```
 
 ### `sanitize`

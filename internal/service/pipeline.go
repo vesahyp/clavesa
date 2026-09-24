@@ -51,7 +51,20 @@ func (s *Service) CreatePipeline(name, schema string) (string, error) {
 	ws, _ := workspace.Load(s.workspace) // nil on legacy workspaces
 
 	var mainTF string
-	if ws != nil {
+	switch {
+	case ws != nil && ws.Backend != nil:
+		// ADR-025: backend.tf (written below) carries both this
+		// pipeline's own "s3" backend and the terraform_remote_state
+		// read of the workspace's remote state, so main.tf carries
+		// neither.
+		mainTF = `# clavesa pipeline
+terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws" }
+  }
+}
+`
+	case ws != nil:
 		mainTF = `# clavesa pipeline
 terraform {
   required_providers {
@@ -64,7 +77,7 @@ data "terraform_remote_state" "workspace" {
   config  = { path = "${path.module}/../terraform.tfstate" }
 }
 `
-	} else {
+	default:
 		mainTF = fmt.Sprintf(`# clavesa pipeline
 terraform {
   required_providers {
@@ -113,6 +126,15 @@ variable "trigger_batch_window" {
 	if _, err := os.Stat(varsPath); os.IsNotExist(err) {
 		if err := os.WriteFile(varsPath, []byte(variablesTF), 0o644); err != nil {
 			return "", fmt.Errorf("write variables.tf: %w", err)
+		}
+	}
+
+	// ADR-025: a remote-backed workspace gets a clavesa-owned backend.tf
+	// alongside the new pipeline's main.tf (which carries neither a
+	// backend nor a terraform_remote_state block — see the switch above).
+	if ws != nil && ws.Backend != nil {
+		if err := workspace.WritePipelineBackendTF(abs, ws); err != nil {
+			return "", fmt.Errorf("write backend.tf: %w", err)
 		}
 	}
 

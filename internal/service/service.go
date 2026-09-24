@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"sync"
 
@@ -16,6 +17,9 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/modules"
 	"github.com/vesahyp/clavesa/internal/observability"
+	// Aliased: New's `workspace string` parameter shadows the bare
+	// package name for the rest of this file.
+	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // PipelineGraph is an alias for graph.PipelineGraph used in method signatures.
@@ -256,6 +260,35 @@ type Service struct {
 	// New, stubbed by tests so the backfill-stage --compute local routing
 	// can be exercised without Docker. See cloudlocal.go.
 	cloudLocalDispatch func(ctx context.Context, env, perNodeEnv map[string]string, event any, onEvent func(map[string]any)) (*cloudLocalResult, error)
+
+	// checkTerraformVersion gates MigrateState on the ADR-025 Terraform
+	// floor (1.10, required for S3-native locking). Defaults to
+	// workspace.TerraformVersionOK (execs `terraform version`); tests
+	// stub it so the precondition logic runs without a terraform binary
+	// on PATH. See backend.go.
+	checkTerraformVersion func(ctx context.Context) error
+
+	// checkStateBucket verifies the ADR-025 state-bucket preconditions
+	// (exists, versioning Enabled, default encryption) before
+	// MigrateState touches anything. Defaults to a real S3
+	// GetBucketVersioning/GetBucketEncryption check; tests stub it so
+	// the precondition logic runs without AWS credentials. See backend.go.
+	checkStateBucket func(ctx context.Context, bucket, region string) error
+
+	// stateObjectStatus reports whether an S3 object exists and its
+	// size — used both to refuse migrating over an already-occupied key
+	// and, after a migrate-state init, to confirm the object landed
+	// non-empty before any local cleanup. Defaults to a real S3
+	// HeadObject; tests stub it. See backend.go.
+	stateObjectStatus func(ctx context.Context, bucket, region, key string) (exists bool, size int64, err error)
+
+	// runTerraform execs `terraform` with args in dir. exitCode is
+	// terraform's own exit status (0 success; with -detailed-exitcode,
+	// 2 means "changes"); err is non-nil only when the binary itself
+	// couldn't be run. Defaults to a real exec.Command; tests stub it so
+	// MigrateState is exercised without a terraform binary on PATH or
+	// any real Terraform state. See backend.go.
+	runTerraform func(ctx context.Context, dir string, stdout, stderr io.Writer, args ...string) (exitCode int, err error)
 }
 
 // Ref wraps a bare HCL expression (e.g. file("path"), var.x) as a reference
@@ -275,6 +308,11 @@ func New(workspace string) *Service {
 		// WithMetastoreEnsurer; empty results mean embedded fallback.
 		metastoreEnsure: func(context.Context, string, string) (string, string) { return "", "" },
 		recordRun:       recordLocalRun,
+
+		checkTerraformVersion: wspkg.TerraformVersionOK,
+		checkStateBucket:      checkStateBucketS3,
+		stateObjectStatus:     stateObjectStatusS3,
+		runTerraform:          runTerraformExec,
 	}
 	s.cloudLocalDispatch = s.runCloudLocalEvent
 	return s

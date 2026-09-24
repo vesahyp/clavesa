@@ -47,6 +47,9 @@ Examples:
 		newWorkspacePlanCmd(),
 		newWorkspaceDeployCmd(),
 		newWorkspaceDestroyCmd(),
+		newWorkspaceBackendCmd(),
+		newWorkspaceSetBackendCmd(),
+		newWorkspaceMigrateStateCmd(),
 	)
 
 	return cmd
@@ -159,13 +162,31 @@ swapping the binary).`,
 func newWorkspaceInitCmd() *cobra.Command {
 	var cloud string
 	var catalog string
+	var backendType, stateBucket, stateRegion, stateKeyPrefix string
 
 	cmd := &cobra.Command{
 		Use:   "init <name>",
 		Short: "Initialize a new workspace",
-		Args:  cobra.ExactArgs(1),
+		Long: `Initialize a new workspace.
+
+Pass --backend s3 --state-bucket <b> --state-region <r> to start the
+workspace on a remote Terraform backend (ADR-025) instead of local
+state: the manifest records the backend, main.tf carries no local
+backend block, and a clavesa-owned backend.tf is written alongside it.
+Omit the flags and the workspace is created exactly as before —
+local state, no backend.tf.
+
+The bucket must already exist, with versioning and default encryption
+enabled — see docs/remote-state.md. For an existing local-state
+workspace, use ` + "`clavesa workspace set-backend`" + ` followed by
+` + "`clavesa workspace migrate-state`" + ` instead.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
+			backend, err := parseBackendFlags(backendType, stateBucket, stateRegion, stateKeyPrefix)
+			if err != nil {
+				return err
+			}
 			// workspace init uses the simpler --workspace-or-cwd resolution
 			// rather than the env-var/state-file chain — a remembered
 			// workspace from a previous session shouldn't redirect a
@@ -179,7 +200,7 @@ func newWorkspaceInitCmd() *cobra.Command {
 			if _, statErr := os.Stat(filepath.Join(root, "clavesa.json")); statErr == nil {
 				return fmt.Errorf("workspace init: %s is already a clavesa workspace (clavesa.json exists)", root)
 			}
-			if err := workspace.Init(root, name, cloud, catalog, tuiservice.ModuleVersion); err != nil {
+			if err := workspace.Init(root, name, cloud, catalog, tuiservice.ModuleVersion, backend); err != nil {
 				return fmt.Errorf("workspace init: %w", err)
 			}
 			// Remember the new workspace so subsequent commands don't need
@@ -192,6 +213,9 @@ func newWorkspaceInitCmd() *cobra.Command {
 			fmt.Printf("Initialized workspace %q at %s\n", name, root)
 			if stateNote != "" {
 				fmt.Print(stateNote)
+			}
+			if backend != nil {
+				fmt.Printf("Remote backend: s3://%s/%s (region %s)\n", backend.Bucket, backend.KeyPrefixOrDefault(), backend.Region)
 			}
 			fmt.Println()
 			fmt.Println("Next steps:")
@@ -208,8 +232,35 @@ func newWorkspaceInitCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&cloud, "cloud", "aws", "cloud provider (aws)")
 	cmd.Flags().StringVar(&catalog, "catalog", "", "three-level-namespace catalog identifier (default: clavesa_<sanitize(name)>)")
+	cmd.Flags().StringVar(&backendType, "backend", "", `remote Terraform backend type (ADR-025; only "s3" is supported)`)
+	cmd.Flags().StringVar(&stateBucket, "state-bucket", "", "S3 bucket the backend stores state in (required with --backend)")
+	cmd.Flags().StringVar(&stateRegion, "state-region", "", "AWS region of the state bucket (required with --backend)")
+	cmd.Flags().StringVar(&stateKeyPrefix, "state-key-prefix", "", `key prefix inside the bucket (default "clavesa/")`)
 
 	return cmd
+}
+
+// parseBackendFlags builds a *workspace.Backend from the --backend /
+// --state-* flags shared by `workspace init` and `workspace
+// set-backend`, or returns (nil, nil) when --backend is not set. Both
+// commands validate here so a malformed flag combination is rejected
+// with a clear CLI error instead of a confusing failure three layers
+// down in Terraform or the manifest.
+func parseBackendFlags(backendType, bucket, region, keyPrefix string) (*workspace.Backend, error) {
+	if backendType == "" {
+		if bucket != "" || region != "" || keyPrefix != "" {
+			return nil, fmt.Errorf("--state-bucket/--state-region/--state-key-prefix require --backend")
+		}
+		return nil, nil
+	}
+	if bucket == "" || region == "" {
+		return nil, fmt.Errorf("--backend requires --state-bucket and --state-region")
+	}
+	b := &workspace.Backend{Type: backendType, Bucket: bucket, Region: region, KeyPrefix: keyPrefix}
+	if err := b.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid backend config: %w", err)
+	}
+	return b, nil
 }
 
 // resolveWorkspaceForInit only consults --workspace and cwd. Skips the env-
@@ -334,6 +385,234 @@ Run with no arguments to print the current workspace, warehouse, and AWS profile
 	cmd.PreRun = func(cmd *cobra.Command, _ []string) {
 		profileSet = cmd.Flags().Changed("profile")
 	}
+	return cmd
+}
+
+// newWorkspaceBackendCmd shows the workspace's configured remote
+// Terraform backend (ADR-025), or "local" when none is set. There is no
+// general `workspace info` command today (see `workspace use` with no
+// arguments for warehouse/profile), so this stands on its own — the CLI
+// counterpart of GET /workspace/backend (ADR-015).
+func newWorkspaceBackendCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "backend",
+		Short: "Show the workspace's configured Terraform backend",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := resolveWorkspace(cmd)
+			if err != nil {
+				return err
+			}
+			m, err := workspace.Load(root)
+			if err != nil {
+				return fmt.Errorf("load manifest: %w", err)
+			}
+			if m == nil {
+				return fmt.Errorf("%s is not a clavesa workspace (no clavesa.json)", root)
+			}
+			if jsonOut {
+				return printJSON(os.Stdout, api.BackendResponseFrom(m.Backend))
+			}
+			if m.Backend == nil {
+				fmt.Println("local")
+				return nil
+			}
+			fmt.Printf("s3://%s/%s (region %s)\n", m.Backend.Bucket, m.Backend.KeyPrefixOrDefault(), m.Backend.Region)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	return cmd
+}
+
+// newWorkspaceSetBackendCmd records (or clears) the ADR-025 remote
+// Terraform backend in clavesa.json. It never touches Terraform state —
+// that's `clavesa workspace migrate-state`, run separately so the
+// manifest change can be reviewed (e.g. committed and reviewed by a
+// teammate) before any state moves. Delegates to Service.SetBackend so
+// the CLI and the UI's PUT /workspace/backend apply the identical
+// validation and clear-refusal rules (ADR-015).
+func newWorkspaceSetBackendCmd() *cobra.Command {
+	var backendType, stateBucket, stateRegion, stateKeyPrefix string
+	var clear bool
+	cmd := &cobra.Command{
+		Use:   "set-backend",
+		Short: "Configure (or clear) the workspace's remote Terraform backend",
+		Long: `Record the ADR-025 remote Terraform backend in clavesa.json:
+
+  clavesa workspace set-backend --backend s3 --state-bucket <b> --state-region <r>
+
+--state-key-prefix is optional (default "clavesa/"). The bucket must
+already exist with versioning and default encryption enabled — see
+docs/remote-state.md for the aws s3api commands to create one.
+
+This only writes the manifest. Nothing is deployed and no Terraform
+state moves — run ` + "`clavesa workspace migrate-state`" + ` next to move
+every stack's state onto the new backend.
+
+--clear removes the backend from the manifest, restoring local state.
+It refuses once any stack has a backend.tf (i.e. has already migrated):
+moving a migrated stack back to local state is a state operation this
+command deliberately doesn't perform.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := resolveWorkspace(cmd)
+			if err != nil {
+				return err
+			}
+			svc, _, err := newService(cmd)
+			if err != nil {
+				return err
+			}
+
+			if clear {
+				if backendType != "" || stateBucket != "" || stateRegion != "" || stateKeyPrefix != "" {
+					return fmt.Errorf("--clear cannot be combined with --backend/--state-bucket/--state-region/--state-key-prefix")
+				}
+				if err := svc.SetBackend(nil); err != nil {
+					return fmt.Errorf("workspace set-backend --clear: %w", err)
+				}
+				fmt.Printf("Cleared the remote backend for workspace at %s; state is local again.\n", root)
+				return nil
+			}
+
+			backend, err := parseBackendFlags(backendType, stateBucket, stateRegion, stateKeyPrefix)
+			if err != nil {
+				return err
+			}
+			if backend == nil {
+				return fmt.Errorf("set-backend requires --backend (with --state-bucket and --state-region), or --clear")
+			}
+			if err := svc.SetBackend(backend); err != nil {
+				return fmt.Errorf("workspace set-backend: %w", err)
+			}
+			fmt.Printf("Recorded remote backend for workspace at %s: s3://%s/%s (region %s)\n",
+				root, backend.Bucket, backend.KeyPrefixOrDefault(), backend.Region)
+			fmt.Println()
+			fmt.Println("Next: clavesa workspace migrate-state")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&backendType, "backend", "", `remote Terraform backend type (only "s3" is supported)`)
+	cmd.Flags().StringVar(&stateBucket, "state-bucket", "", "S3 bucket the backend stores state in")
+	cmd.Flags().StringVar(&stateRegion, "state-region", "", "AWS region of the state bucket")
+	cmd.Flags().StringVar(&stateKeyPrefix, "state-key-prefix", "", `key prefix inside the bucket (default "clavesa/")`)
+	cmd.Flags().BoolVar(&clear, "clear", false, "clear the configured backend (refused once any stack has migrated)")
+	return cmd
+}
+
+// migrateResultFailed reports whether res carries a failed stack or a
+// post-migration plan error — the CLI's and the API's shared definition
+// of "this run needs attention" (ADR-025 step "f": migrate-state never
+// applies, so a reported "changes" plan is not itself a failure, but a
+// plan the run couldn't even evaluate is).
+func migrateResultFailed(res tuiservice.MigrateResult) (n int) {
+	for _, s := range res.Stacks {
+		if s.Status == tuiservice.MigrateStatusFailed || s.Plan == tuiservice.PlanError {
+			n++
+		}
+	}
+	return n
+}
+
+// migrateSummaryLine renders the one-line status-count summary that
+// follows the per-stack table.
+func migrateSummaryLine(res tuiservice.MigrateResult) string {
+	var migrated, already, skipped, failed int
+	for _, s := range res.Stacks {
+		switch s.Status {
+		case tuiservice.MigrateStatusMigrated:
+			migrated++
+		case tuiservice.MigrateStatusAlreadyMigrated:
+			already++
+		case tuiservice.MigrateStatusSkippedNoState:
+			skipped++
+		case tuiservice.MigrateStatusFailed:
+			failed++
+		}
+	}
+	return fmt.Sprintf("%d migrated, %d already migrated, %d skipped (no state), %d failed", migrated, already, skipped, failed)
+}
+
+// printMigrateResultTable renders one row per stack: dir, S3 key,
+// status, and the post-migration plan outcome. Any per-stack error
+// detail is printed below the table, one line per affected stack.
+func printMigrateResultTable(w io.Writer, res tuiservice.MigrateResult) {
+	rows := make([][]string, len(res.Stacks))
+	for i, s := range res.Stacks {
+		plan := s.Plan
+		if plan == "" {
+			plan = "—"
+		}
+		rows[i] = []string{s.Dir, s.Key, string(s.Status), plan}
+	}
+	printTable(w, []string{"DIR", "KEY", "STATUS", "PLAN"}, rows)
+	for _, s := range res.Stacks {
+		if s.Err != "" {
+			fmt.Fprintf(w, "  %s: %s\n", s.Dir, s.Err)
+		}
+	}
+}
+
+// newWorkspaceMigrateStateCmd moves the workspace's Terraform state onto
+// the backend recorded by `workspace set-backend` (ADR-025 "Migration,
+// not recreate"). Delegates to Service.MigrateState — the identical
+// call the UI's "Migrate state" action makes (ADR-015) — streaming
+// terraform's own init/plan output to stderr so a long migration isn't
+// silent.
+func newWorkspaceMigrateStateCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "migrate-state",
+		Short: "Move the workspace's Terraform state onto the configured remote backend",
+		Long: `Move every stack's Terraform state (the workspace root, then each
+pipeline) from local files onto the S3 backend recorded by
+` + "`clavesa workspace set-backend`" + `. Nothing is destroyed or recreated:
+each stack runs ` + "`terraform init -migrate-state -force-copy`" + `, and the
+pre-migration local state is kept on disk as terraform.tfstate.pre-migrate
+so a botched run can be recovered by hand.
+
+Resumable: a stack already migrated on a previous run is reported
+"already-migrated" and skipped. Every stack the run reaches is planned
+(never applied) afterward and reported "no changes" / "changes" / "error".
+
+Exits non-zero if any stack failed or its post-migration plan errored.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, err := resolveWorkspace(cmd)
+			if err != nil {
+				return err
+			}
+			svc, _, err := newService(cmd)
+			if err != nil {
+				return err
+			}
+			printTargetContext("workspace migrate-state", root, "")
+
+			res, runErr := svc.MigrateState(cmd.Context(), tuiservice.MigrateStateOptions{Out: os.Stderr, Err: os.Stderr})
+
+			if jsonOut {
+				if jerr := printJSON(os.Stdout, res); jerr != nil {
+					return jerr
+				}
+			} else {
+				fmt.Println()
+				printMigrateResultTable(os.Stdout, res)
+				fmt.Println()
+				fmt.Println(migrateSummaryLine(res))
+			}
+
+			if runErr != nil {
+				return runErr
+			}
+			if n := migrateResultFailed(res); n > 0 {
+				return fmt.Errorf("migrate-state: %d stack(s) failed or reported a plan error", n)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output the migration result as JSON")
 	return cmd
 }
 

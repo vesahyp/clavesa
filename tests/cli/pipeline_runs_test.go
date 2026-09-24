@@ -34,7 +34,7 @@ import (
 //     empty state
 //   - `pipeline status --json` reporting the failed run's per-node error
 func TestPipelineRunsAndLogs(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "orders", "--workspace", ws)

@@ -10,6 +10,12 @@
   "use strict";
 
   var config = {
+    // false turns the tracker off completely: no beacon leaves the page, no
+    // listener is attached, and nothing is written to localStorage. A site that
+    // renders itself with a headless browser (a prerender, a screenshot run, an
+    // end-to-end test) sets this from whatever marks that run, and its own
+    // traffic stops arriving as visits.
+    enabled: true,
     endpoint: "/t.gif",
     sessionTimeout: 30 * 60 * 1000, // 30 min sliding session
     maxStringLength: 200,
@@ -98,6 +104,7 @@
   }
 
   function track(event, data) {
+    if (!config.enabled) return;
     try {
       var session = getSession();
       var params = new URLSearchParams();
@@ -461,11 +468,15 @@
     });
   }
 
+  // The API is published either way, so a site that calls setAuthId on login
+  // does not have to know whether tracking is on; track() is the no-op.
   window.__clvtracker = { track: track, setAuthId: setAuthId };
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
+  if (config.enabled) {
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", init);
+    } else {
+      init();
+    }
   }
 })();

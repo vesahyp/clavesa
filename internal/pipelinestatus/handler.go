@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/pathutil"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // RunOpts mirrors service.RunOpts at this package boundary. Force /
@@ -288,7 +288,7 @@ func (h *Handler) GetStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stateARN, err := readStateMachineARN(abs)
+	stateARN, err := readStateMachineARN(r.Context(), h.root, abs)
 	if err != nil || stateARN == "" {
 		httputil.WriteJSON(w, http.StatusOK, statusResponse{Deployed: false, Executions: []executionInfo{}})
 		return
@@ -335,16 +335,19 @@ func (h *Handler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// readStateMachineARN reads terraform.tfstate from dir and extracts the ARN
-// of the aws_sfn_state_machine.pipeline resource. Returns "" if absent or
-// the resource is not found.
-func readStateMachineARN(dir string) (string, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "terraform.tfstate"))
-	if os.IsNotExist(err) {
-		return "", nil
-	}
+// readStateMachineARN reads the pipeline stack's state at dir (via
+// workspace.ReadStackState, ADR-025 — local file or S3 object depending on
+// the workspace's manifest) and extracts the ARN of the
+// aws_sfn_state_machine.pipeline resource. Returns "" if state is absent
+// or the resource is not found — same contract as before this read went
+// through the shared function.
+func readStateMachineARN(ctx context.Context, workspaceRoot, dir string) (string, error) {
+	data, err := workspace.ReadStackState(ctx, workspaceRoot, dir)
 	if err != nil {
 		return "", err
+	}
+	if data == nil {
+		return "", nil
 	}
 
 	var state struct {
@@ -752,9 +755,9 @@ func (h *Handler) RunPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stateARN, err := readStateMachineARN(abs)
+	stateARN, err := readStateMachineARN(r.Context(), h.root, abs)
 	if err != nil || stateARN == "" {
-		httputil.WriteError(w, http.StatusBadRequest, "pipeline not deployed (no terraform.tfstate or state machine ARN not found)")
+		httputil.WriteError(w, http.StatusBadRequest, "pipeline not deployed (no workspace state found)")
 		return
 	}
 

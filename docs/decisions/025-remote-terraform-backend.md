@@ -1,109 +1,159 @@
 # ADR 025: Remote Terraform backend for shared cloud deploys
 
-**Status**: Proposed (2026-06-14).
+**Status**: Accepted (2026-09-23). Proposed 2026-06-14; revised before implementation, see "Revision" at the end.
 
 ## Context
 
-Every workspace and pipeline clavesa generates carries a hard-coded `backend "local" {}`, and each pipeline reads the workspace outputs through `data.terraform_remote_state "workspace" { backend = "local" }` pointing at a sibling `terraform.tfstate` on the deployer's disk. The workspace stack writes `pipeline_bucket` and `runner_image` outputs; each pipeline stack reads them through that local-state data source. The cross-stack channel is therefore bound to a file in one developer's working tree.
+Every workspace clavesa generates carries a hard-coded `backend "local" {}`. Each pipeline has no backend block, so its state is also a local file, and it reads the workspace outputs through `data.terraform_remote_state "workspace" { backend = "local" }` pointing at the sibling `../terraform.tfstate`. The workspace stack writes `pipeline_bucket` and `runner_image` outputs; each pipeline stack reads them through that data source. All of the cloud deployment's state is therefore files in one developer's working tree.
 
 The consequences are the blocker for multi-developer cloud deploy:
 
-- **Single point of truth, single point of loss.** The live stack's state lives in one gitignored `terraform.tfstate`. Lose the laptop or the directory and the deployed AWS resources are orphaned: no clean `destroy`, no incremental `apply`, only manual console teardown.
-- **A second developer cannot `clavesa deploy`.** A fresh clone has no state, so terraform plans to recreate every resource from scratch and collides with the running stack.
+- **Single point of truth, single point of loss.** The live stack's state lives in gitignored `terraform.tfstate` files. Lose the laptop or the directory and the deployed AWS resources are orphaned: no clean `destroy`, no incremental `apply`, only manual console teardown or a resource-by-resource import.
+- **A second developer cannot `clavesa deploy`.** A fresh clone has no state, so terraform plans to recreate every resource and collides with the running stack.
 - **No locking.** Local state has no lock; two concurrent applies corrupt it.
 
-This is the *only* surface gated on shared state. Clone the workspace and `clavesa ui`, `workspace tables`, `dashboards render`, and ad-hoc Athena already work for any developer against the deployed stack, because they read the cloud catalog, not terraform state. Deploy is the lone exception, and it fails for everyone but the one developer holding the state file.
+Deploy is the only command that writes state. But several read paths also open `terraform.tfstate` straight from disk, and they break the moment the file moves:
 
-The pipeline-to-workspace wiring is local-state-bound, not just the workspace root. Moving the backend means moving both halves together: the workspace's own backend block, and every pipeline's `terraform_remote_state` data source that resolves the workspace outputs.
+- `workspace.PipelineBucket` (`internal/workspace/tfstate.go`), which feeds the cloud warehouse resolution (`ErrWarehouseUndeployed`), Athena defaults in `internal/cli/helpers.go`, and `internal/observability/cloud.go`.
+- `readStateMachineARN` (`internal/pipelinestatus/handler.go`), which reads a *resource* attribute, not an output, from the pipeline state.
+- `deploy_all` (`internal/cli/deploy_all.go`), which uses an empty `pipeline_bucket` to decide the workspace is undeployed.
 
-The regen paths make this load-bearing. `CreatePipeline`, `SyncOrchestration`, `UpgradePipeline`, and `UpgradeWorkspace` all rewrite `.tf` by template and regex. Any one of them re-emitting a `backend "local" {}` over a configured remote backend silently reverts the workspace to broken-for-the-team on the next `deploy` or `upgrade`.
+So moving the backend is three write-side pieces (the workspace backend, each pipeline's backend, each pipeline's `terraform_remote_state`) and one read-side piece (every reader above).
 
 ## Decision
 
-**The terraform backend becomes a clavesa-configured, manifest-driven workspace property. Remote state is the supported path for any workspace more than one developer deploys.** Absent configuration, the backend stays local and nothing changes; the existing single-developer flow is untouched and fully backward-compatible.
+**The terraform backend becomes a manifest-driven workspace property. Remote state is the supported path for any workspace whose deployed stack matters.** Absent configuration the backend stays local and nothing changes: the single-developer flow is untouched and backward-compatible.
 
 ### Manifest field
 
-`clavesa.json` gains an optional `backend` field on the `Manifest` struct:
+`clavesa.json` gains an optional `backend` field:
 
 ```json
 {
   "name": "analytics",
-  "cloud": true,
+  "cloud": "aws",
   "backend": {
     "type": "s3",
     "bucket": "analytics-tfstate",
     "region": "eu-north-1",
-    "dynamodb_table": "analytics-tfstate-lock",
     "key_prefix": "clavesa/"
   }
 }
 ```
 
-`dynamodb_table` and `use_lockfile` are mutually exclusive: one names a DynamoDB lock table, the other opts into S3-native conditional-write locking. Locking is not optional; one of the two must be set.
+`type` is `s3`, the only remote type. `bucket` and `region` are required. `key_prefix` is optional and defaults to `clavesa/`.
 
-Absent `backend`, the workspace is local-state, exactly as today. `Load()` already backfills missing manifest fields (`Catalog`, `SystemCatalog`) on read; it backfills `backend` as absent by the same mechanism, so old manifests parse unchanged and no migration runs for local-only users. The manifest is the *shared* configuration (committed); local-only settings (warehouse choice, AWS profile) stay in gitignored `.clavesa/*.json` and never touch the backend.
+Absent `backend`, the workspace is local-state, exactly as today. `Load()` leaves it nil for old manifests; no migration runs for local-only users. The manifest is the shared, committed configuration. The AWS profile is per-developer and is never written into the backend config: terraform inherits `AWS_PROFILE` / `AWS_REGION` from the environment, the same credential chain deploy already uses.
 
-### Emit, both halves
+### State keys
 
-When `backend` is set, generation emits both ends of the wiring from the manifest:
+One key per stack, namespaced by workspace so two workspaces sharing a bucket cannot collide:
 
-1. **Workspace `main.tf`** gets `backend "s3" {}` as partial config. The bucket, key, region, and lock settings are supplied at `init` time (a `-backend-config` file clavesa writes) rather than inlined, so secrets and per-environment values stay out of the committed `.tf`.
-2. **Each pipeline's `data "terraform_remote_state" "workspace"`** is rewritten to `backend = "s3"` with the matching `config` (bucket, key for the workspace state, region). The pipeline now resolves `pipeline_bucket` and `runner_image` from remote state, not `${path.module}/../terraform.tfstate`.
+- workspace: `<key_prefix><workspace name>/workspace.tfstate`
+- pipeline: `<key_prefix><workspace name>/pipelines/<pipeline dir>.tfstate`
 
-Both halves move together or not at all. A pipeline still reading local state while the workspace writes remote state resolves stale or absent outputs.
+### Locking
 
-### Backend-aware regen
+**S3-native locking (`use_lockfile = true`) only.** It needs Terraform 1.10 or newer and no second resource. DynamoDB locking is not offered: Terraform 1.11 deprecated it, and supporting it would add a config field, a validation branch, and a resource the user must create, for no benefit. Terraform versions below 1.10 are rejected when a backend is configured, at config time and again before deploy.
 
-`CreatePipeline`, `SyncOrchestration`, `UpgradePipeline`, and `UpgradeWorkspace` read the manifest `backend` and emit the configured backend, never a literal `backend "local" {}`. Regen preserving the backend is the invariant: `deploy` and `upgrade` must be safe to run repeatedly on a remote-backed workspace without reverting it.
+### Emit: one clavesa-owned `backend.tf`
+
+When `backend` is set, clavesa writes a `backend.tf` file in the workspace root and in every pipeline directory, with the full config inline. It is regenerated from the manifest, never edited by hand, and carries a header saying so.
+
+Workspace `backend.tf`:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "analytics-tfstate"
+    key          = "clavesa/analytics/workspace.tfstate"
+    region       = "eu-north-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+Pipeline `backend.tf` holds the pipeline's own `backend "s3"` block with its pipeline key, plus the `data "terraform_remote_state" "workspace"` block with `backend = "s3"` and the workspace key.
+
+Inline config, not partial config with `-backend-config` files: bucket, key and region are not secrets, and inline config means a plain `terraform plan` in the directory works without clavesa. The workspace `main.tf` loses its `backend "local" {}` line and the pipeline `main.tf` loses its `terraform_remote_state` block, because both now live in `backend.tf`. A local-backend workspace is emitted exactly as today, with no `backend.tf`.
+
+### Regen keeps the backend
+
+`CreatePipeline` and workspace init emit `backend.tf` from the manifest. `UpgradePipeline`, `UpgradeWorkspace` and `SyncOrchestration` rewrite `backend.tf` from the manifest and never write a backend or a `terraform_remote_state` block into any other file. Running `deploy` and `upgrade` repeatedly on a remote-backed workspace must never revert it; a test asserts this for each regen path.
+
+### Read side: one function
+
+All state reads go through one function in `internal/workspace` that returns a stack's state JSON: from the local file when the backend is local, from S3 `GetObject` on the stack's key when it is remote. A direct read is used, not `terraform state pull`, because it needs no `terraform init` and runs in milliseconds, and the key layout is clavesa's own. `PipelineBucket`, `readStateMachineARN` and the `deploy_all` check move onto it. "Not deployed" keeps its current meaning: no state object found.
 
 ### Migration, not recreate
 
-An existing local-state deployment moves to S3 without destroying anything. `clavesa workspace migrate-state` (equivalently `deploy --migrate-state`) runs `terraform init -migrate-state` against the workspace root and each pipeline in turn, copying the local state into the configured backend. **Ordering is fixed: the workspace root migrates first, then the pipelines**, because each pipeline's remote-state data source reads the workspace's now-remote state. Migration is a one-time operation; after it, `terraform.tfstate` files are dead and gitignored.
+An existing local-state deployment moves to S3 without destroying anything. `clavesa workspace migrate-state` does, in order:
+
+1. Check preconditions: `backend` set in the manifest, the bucket exists and has versioning and default encryption, terraform is 1.10 or newer, and no state object exists yet at any target key (refuse rather than overwrite).
+2. Write `backend.tf` in the workspace root and strip the local backend line from `main.tf`, then `terraform init -migrate-state -force-copy` in the root.
+3. For each pipeline: write its `backend.tf`, strip its local `terraform_remote_state` block, `terraform init -migrate-state -force-copy`.
+4. Run `terraform plan` in every stack and report any stack that is not "No changes".
+
+**The workspace root migrates first**, because each pipeline's remote-state data source reads the workspace's now-remote state. The local `terraform.tfstate` files are left in place, renamed to `terraform.tfstate.pre-migrate`, so a failed migration can be recovered by hand.
 
 ### Safety
 
-- **Locking is required.** A backend with neither `dynamodb_table` nor `use_lockfile` is rejected at config time. Concurrent applies must serialize.
-- **Server-side encryption on the state bucket.** State carries resource attributes and occasionally secrets; the bucket must have SSE enabled. clavesa asserts this at preflight.
-- **No split-brain.** Once `backend` is declared in the manifest, `deploy` refuses to run from a local `terraform.tfstate`. A developer who has not migrated cannot apply against local state and diverge from the shared remote state.
+- **Encryption and versioning on the state bucket are checked** before migrate-state. State carries resource attributes and can carry secrets; versioning is the undo for a bad apply. Deploy does not repeat the S3 calls: the bucket settings were checked when the state moved in, and deploy checks the Terraform floor and the split-brain rule below.
+- **No split-brain.** Once `backend` is set, `deploy` refuses to run in any stack that still has a local `terraform.tfstate` and no `backend.tf`. A developer who has not pulled the migration cannot apply against local state and diverge from the shared state.
 
 ### Where the state bucket lives
 
-The state bucket exists before `terraform init` runs, which is a chicken-and-egg with the workspace bucket terraform itself creates. Two options:
+The state bucket must exist before `terraform init`, and the workspace bucket is created by terraform itself. **The user provides the bucket**, created once with versioning, encryption and a public-access block, and records it with `workspace set-backend` (CLI) or the same action in the UI. A bootstrap stack that creates the bucket would need somewhere to keep its own state, which is the same problem one level down. A separate bucket from the workspace bucket is recommended, because a workspace `destroy` then cannot take the state with it.
 
-- **User-provided bucket.** The user (or a one-line `aws s3 mb`) creates the state bucket; clavesa records it in the manifest. Simplest, no bootstrap resource, the user owns the lifecycle.
-- **Separate bootstrap step.** A tiny `clavesa workspace bootstrap-state` applies a minimal local-state stack that creates the encrypted, locked state bucket, then the main workspace migrates into it.
+### Surfaces (ADR-015)
 
-The user-provided bucket is the default: it sidesteps the bootstrap's own where-does-*its*-state-live regress, and a state bucket is a once-per-workspace artifact a team creates deliberately. The state bucket may be the workspace bucket or a separate one; a separate bucket is cleaner (its lifecycle is independent of any pipeline `destroy`), and is recommended but not required.
+CLI and UI get the same capability in the same slice:
+
+- `clavesa workspace init --backend s3 --state-bucket <b> --state-region <r> [--state-key-prefix <p>]` for a new workspace.
+- `clavesa workspace set-backend …` with the same flags for an existing one, then `clavesa workspace migrate-state`.
+- The UI shows the backend beside the workspace warehouse and offers the same set and migrate actions, through the same service calls. There is no workspace settings page today; slice 5 decides where the controls go.
 
 ## Consequences
 
 **Positive:**
 
-- **Multi-developer cloud deploy works.** A clone plus the manifest's `backend` config is enough to `deploy`, `upgrade`, and `destroy` against the shared stack. The state file stops being a single developer's private artifact.
-- **Locking removes the concurrent-apply corruption hazard.** DynamoDB or S3-native lock serializes applies across developers and machines.
-- **Losing a laptop is recoverable.** State lives in S3, not a working tree. Any developer reconstructs the deploy capability from a clone.
-- **Honors clavesa's "never hand-run terraform" grain.** Remote state becomes a first-class clavesa-configured property instead of forcing the manual `.tf` edit the tool otherwise forbids. The user configures a backend through clavesa; clavesa owns the emit and the migration.
+- **Multi-developer cloud deploy works.** A clone plus the manifest's `backend` is enough to `deploy`, `upgrade`, and `destroy` against the shared stack.
+- **Losing a laptop is recoverable.** State lives in a versioned bucket, not a working tree.
+- **Locking removes the concurrent-apply corruption hazard**, with no extra resource.
+- **A plain `terraform plan` works in any stack directory**, because the backend config is inline.
 
 **Negative:**
 
-- **A state bucket is a prerequisite the user provisions.** The chicken-and-egg is real; the default pushes it onto the user (one `aws s3 mb` with SSE), which is honest but is one more setup step than local state.
-- **Migration is a state operation with a blast radius.** `terraform init -migrate-state` is safe but irreversible-in-place; a botched migration ordering (pipelines before the root) leaves pipelines reading the wrong state. The fixed ordering and the local-state refusal guard against this.
+- **The user provisions the state bucket.** One more setup step than local state.
+- **Terraform 1.10 is the floor for remote-backed workspaces.** Local-backend workspaces keep today's floor.
+- **Migration is a state operation with a blast radius.** The fixed ordering, the refuse-to-overwrite check, the kept `.pre-migrate` files and the post-migration plan guard it.
 
-**Follow-up implementation slices (ordered):**
+## Implementation slices (ordered)
 
-1. Manifest `Backend` field plus `Load()` backfill (absent = local, no behavior change).
-2. Workspace `main.tf` backend emit from the manifest.
-3. Pipeline `terraform_remote_state` emit from the manifest (the second half of the wiring).
-4. `clavesa workspace migrate-state` (and `deploy --migrate-state`), workspace-root-first ordering.
-5. Backend-awareness in `UpgradePipeline` / `UpgradeWorkspace` / `SyncOrchestration` so regen never clobbers the backend.
-6. CLI flags: `workspace init --backend s3 --state-bucket … --state-region … --state-lock …` (and the split-brain refusal in `deploy`).
-7. Tests across the emit, migrate, and regen paths.
+Each slice carries its own tests; there is no separate test slice.
 
-**Interim stopgap (and its limits):** until the slices land, one designated cloud deployer holds the local `terraform.tfstate` and backs it up to S3 by hand; every other developer inspects and runs-local only, never deploys. This is a stopgap, not a fix. It carries none of the locking and keeps the single-point-of-loss: a manual backup is not a shared backend, and two deployers still cannot coordinate.
+1. Manifest `backend` field, validation (type, required fields, terraform version), and `Load()` compatibility. No behavior change.
+2. The state-read function, and the readers moved onto it. Local behavior unchanged.
+3. `backend.tf` emit for workspace init and `CreatePipeline`, plus backend-aware `UpgradePipeline` / `UpgradeWorkspace` / `SyncOrchestration`. These land together: emit without regen protection is a window where the next upgrade reverts the backend.
+4. The service layer for set-backend and migrate-state (resumable, `_maintenance` included), and the split-brain refusal in `deploy`.
+5. The CLI and the UI for all of it at once: `workspace init` flags, `workspace set-backend`, `workspace migrate-state`, and the UI controls. One slice, because ADR-015 forbids shipping one surface first.
+6. Move the cloud smoke workspace to a remote backend and add a migrate leg to `make smoke-cloud`, so the path stays gated.
 
 ## Relationships
 
-- **ADR-005** (deployment model): all cloud resources live in the user's AWS account and the local CLI is the only trust boundary. Remote state stays inside that boundary; the state bucket is the user's, applied with the user's credentials. No hosted control plane is introduced.
-- **ADR-014** (local/cloud parity): the backend is a deploy-path concern only. It changes nothing about the response shapes the UI consumes, nor about the warehouse/compute resolution. A remote-backed workspace and a local-backed one serve identical reads.
-- **ADR-024** (warehouse/compute split): the warehouse already centralizes where *data* state lives (Glue + S3 vs local catalog). This ADR centralizes where *terraform* state lives, analogously. The two are independent axes: a cloud warehouse can still run on a local terraform backend (the single-developer case), and the backend choice does not touch warehouse or compute resolution.
+- **ADR-005** (deployment model): state stays inside the user's AWS account, applied with the user's credentials. No hosted control plane.
+- **ADR-014** (local/cloud parity): the backend is a deploy-path concern. It changes no response shape the UI consumes.
+- **ADR-015** (CLI/UI parity): set-backend and migrate-state ship on both surfaces.
+- **ADR-024** (warehouse/compute split): independent axis. A cloud warehouse can run on a local backend, and the backend choice does not touch warehouse or compute resolution.
+- **GH #97** (pipeline resources carry no workspace name): the state keys here are namespaced by workspace, so state does not collide even while #97's resource names still do.
+
+## Revision (2026-09-23)
+
+The 2026-06-14 draft was revised before any code landed:
+
+- **Read side added.** The draft covered only the write side; the readers of the local state file would have reported a migrated workspace as undeployed.
+- **Pipeline backend made explicit.** Pipelines have no backend block today, so their own state is local too, not only their read of the workspace state.
+- **DynamoDB locking dropped** in favor of `use_lockfile` only, with Terraform 1.10 as the floor.
+- **Inline config in a clavesa-owned `backend.tf`** replaced partial config and edits inside `main.tf`.
+- **Emit and regen protection merged into one slice**, tests moved into every slice, and the UI surface added for ADR-015.

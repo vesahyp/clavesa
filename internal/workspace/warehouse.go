@@ -89,7 +89,7 @@ func LoadWarehouse(root string) Warehouse {
 // hasn't been deployed: there is no pipeline bucket to point Spark at.
 // Callers test with errors.Is to map it to a user-actionable failure
 // (HTTP 409, CLI error) rather than a generic 500.
-var ErrWarehouseUndeployed = errors.New(`workspace warehouse is "cloud" but the workspace shell isn't deployed (no pipeline bucket in terraform.tfstate)`)
+var ErrWarehouseUndeployed = errors.New(`workspace warehouse is "cloud" but the workspace shell isn't deployed (no workspace state found)`)
 
 // WarehouseURI returns the warehouse location the interactive Spark
 // surfaces (preview, notebooks, the warm query worker) should target,

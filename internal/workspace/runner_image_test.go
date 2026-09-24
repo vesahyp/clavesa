@@ -45,7 +45,7 @@ func TestEnsureLocalRunnerImageRestoresVersionTag(t *testing.T) {
 	latest := localTag + ":latest"
 
 	// Init builds the image, tagging both :latest and :<version>.
-	if err := Init(dir, name, "aws", "", ver); err != nil {
+	if err := Init(dir, name, "aws", "", ver, nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	t.Cleanup(func() {
@@ -106,7 +106,7 @@ func TestRunnerRequirementsReachImage(t *testing.T) {
 	// Init builds the image with only the seeded comment-only requirements
 	// (no extra packages). A pure-stdlib import that is NOT in the base image
 	// is the negative control.
-	if err := Init(dir, name, "aws", "", ver); err != nil {
+	if err := Init(dir, name, "aws", "", ver, nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	t.Cleanup(func() {

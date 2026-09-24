@@ -10,6 +10,17 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.21.0] — 2026-09-24
+
+### Added
+- **Remote Terraform state in S3** (ADR-025, #55). `clavesa workspace set-backend --backend s3 --state-bucket <b> --state-region <r>` records a state bucket in `clavesa.json`, and `clavesa workspace migrate-state` moves the workspace and every pipeline, `_maintenance` included, onto it with `use_lockfile` locking, then plans each stack to confirm nothing changed. A failed run rolls the stack back and can be run again. `workspace init --backend s3 ...` starts a new workspace on S3, and `clavesa workspace backend` shows the current one. The UI header has the same controls under **Terraform state**. Once a backend is set, `deploy` refuses a stack that still has local state. Needs Terraform 1.10 or newer. See [docs/remote-state.md](docs/remote-state.md).
+
+### Fixed
+- Helper containers (metastore, warm worker, transpile sidecar) started for a Go test temp-dir workspace are now removed by the orphan reaper once they are 24 hours old, even if a killed test left the directory behind (#93).
+
+### Changed
+- "Not deployed" errors from the cloud warehouse check and from running a pipeline in the UI now say "no workspace state found" in place of naming a local `terraform.tfstate` file, since state can also live in S3 (ADR-025, #55).
+
 ## [v2.20.0] — 2026-08-05
 
 ### Added

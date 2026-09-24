@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -12,7 +13,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/vesahyp/clavesa/internal/observability"
 )
 
 var binPath string
@@ -24,7 +29,67 @@ func TestMain(m *testing.M) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Fatalf("build failed: %v\n%s", err, out)
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	reapTestWorkspaceContainers()
+	os.Exit(code)
+}
+
+// testWorkspaces records every workspace root newWorkspace hands out in
+// this process, so reapTestWorkspaceContainers can clean up exactly the
+// helper containers this binary spawned — never a concurrent session's or
+// a real deployed workspace's (GH #93).
+var (
+	testWorkspacesMu sync.Mutex
+	testWorkspaces   []string
+)
+
+// newWorkspace is t.TempDir(), plus recording the path for end-of-run
+// container cleanup. Every test in this package that needs a workspace
+// root calls this instead of t.TempDir() directly.
+//
+// GH #93: a clean `make test-cli` pass still left metastore / warm-worker
+// / transpile-sidecar containers running after the process exited, because
+// nothing ever told them to stop — t.TempDir()'s own os.RemoveAll succeeds
+// even while a container has the directory bind-mounted (Docker Desktop's
+// virtiofs/gRPC-FUSE sharing doesn't hold the host directory busy the way a
+// real bind mount would), so the workspace disappearing is not the
+// container's cue to exit. The per-process orphan reaper
+// (observability.ReapOrphanContainers, GH #59) doesn't fill that gap
+// either: it only runs from inside a `clavesa` CLI invocation, and it's
+// throttled to once per hour across the whole machine, so at most the
+// first test-cli subprocess in a run gets a real reap — every workspace
+// deleted after that point is never revisited.
+func newWorkspace(t *testing.T) string {
+	t.Helper()
+	ws := t.TempDir()
+	testWorkspacesMu.Lock()
+	testWorkspaces = append(testWorkspaces, ws)
+	testWorkspacesMu.Unlock()
+	return ws
+}
+
+// reapTestWorkspaceContainers force-removes every helper container
+// labeled with one of this process's own workspace roots, pass or fail,
+// once every test in the binary has finished. Best-effort: a failure here
+// (docker absent, daemon down) is logged, not fatal — it must never mask
+// the tests' own exit code.
+func reapTestWorkspaceContainers() {
+	testWorkspacesMu.Lock()
+	roots := append([]string(nil), testWorkspaces...)
+	testWorkspacesMu.Unlock()
+	if len(roots) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	removed, err := observability.ReapWorkspaceContainers(ctx, roots)
+	if err != nil {
+		log.Printf("test-cli teardown: reap workspace containers: %v", err)
+		return
+	}
+	if len(removed) > 0 {
+		log.Printf("test-cli teardown: removed %d helper container(s): %v", len(removed), removed)
+	}
 }
 
 func repoRoot() string {
@@ -70,7 +135,7 @@ func runIn(t *testing.T, dir string, args ...string) string {
 // a pipeline directory and confirms commands resolve the pipeline from
 // the current directory when the <pipeline-dir> argument is omitted.
 func TestPipelineCommandInfersDirFromCwd(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "demo", "--workspace", ws)
 	transformID := addNode(t, ws, "demo", "transform")
@@ -140,7 +205,7 @@ func addRegistrySourceFromTestdata(t *testing.T, ws, name, file, format string) 
 // TestPipelineCreateAndList verifies workspace init, pipeline create, node add,
 // node connect, and pipeline list.
 func TestPipelineCreateAndList(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 
@@ -188,7 +253,7 @@ func TestPipelineCreateAndList(t *testing.T) {
 // schema-ownership guard through the built binary: two pipelines may not
 // write into the same <catalog>.<schema>.
 func TestPipelineCreateRefusesDuplicateSchema(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "alpha", "--schema", "shared", "--workspace", ws)
 
@@ -209,7 +274,7 @@ func TestPipelineCreateRefusesDuplicateSchema(t *testing.T) {
 // TestTransformPreviewCorrectness builds a pipeline with two transforms and
 // asserts that preview output matches expected row counts.
 func TestTransformPreviewCorrectness(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 	testdataDir := filepath.Join(repoRoot(), "testdata")
 
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)

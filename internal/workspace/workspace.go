@@ -62,6 +62,76 @@ type Manifest struct {
 	// distinguished by the `pipeline` column — the slice 4 schema
 	// ownership validator exempts this catalog.
 	SystemCatalog string `json:"system_catalog"`
+	// Backend is the remote Terraform backend for this workspace (ADR-025).
+	// Nil means local state, exactly as today — the field is opt-in and
+	// absent from every manifest written before this slice. Load leaves it
+	// nil for manifests without a `backend` key; no migration runs and
+	// nothing is rewritten to disk because of it.
+	Backend *Backend `json:"backend,omitempty"`
+}
+
+// Backend is the manifest's remote Terraform backend configuration
+// (ADR-025, "Manifest field"). The only supported Type is "s3".
+type Backend struct {
+	Type   string `json:"type"`
+	Bucket string `json:"bucket"`
+	Region string `json:"region"`
+	// KeyPrefix namespaces state keys so two workspaces sharing a bucket
+	// don't collide. Empty means the default — see KeyPrefixOrDefault.
+	KeyPrefix string `json:"key_prefix,omitempty"`
+}
+
+// Validate checks the backend config is well-formed (ADR-025, "Manifest
+// field"). Called from Load whenever a manifest carries a backend, and
+// again before deploy/migrate-state so a hand-edited clavesa.json is
+// caught early with a field-named error rather than a confusing
+// Terraform failure downstream.
+func (b *Backend) Validate() error {
+	if b.Type != "s3" {
+		return fmt.Errorf("backend.type must be \"s3\", got %q", b.Type)
+	}
+	if b.Bucket == "" {
+		return fmt.Errorf("backend.bucket is required")
+	}
+	if b.Region == "" {
+		return fmt.Errorf("backend.region is required")
+	}
+	if b.KeyPrefix != "" {
+		if strings.HasPrefix(b.KeyPrefix, "/") {
+			return fmt.Errorf("backend.key_prefix must not start with \"/\", got %q", b.KeyPrefix)
+		}
+		if !strings.HasSuffix(b.KeyPrefix, "/") {
+			return fmt.Errorf("backend.key_prefix must end with \"/\", got %q", b.KeyPrefix)
+		}
+	}
+	return nil
+}
+
+// defaultKeyPrefix is used when the manifest sets no key_prefix (ADR-025,
+// "Manifest field").
+const defaultKeyPrefix = "clavesa/"
+
+// KeyPrefixOrDefault returns the backend's key_prefix, or defaultKeyPrefix
+// when unset.
+func (b *Backend) KeyPrefixOrDefault() string {
+	if b.KeyPrefix == "" {
+		return defaultKeyPrefix
+	}
+	return b.KeyPrefix
+}
+
+// WorkspaceStateKey returns the S3 key for the workspace stack's state
+// (ADR-025, "State keys"): `<prefix><workspace>/workspace.tfstate`.
+func (b *Backend) WorkspaceStateKey(workspaceName string) string {
+	return b.KeyPrefixOrDefault() + workspaceName + "/workspace.tfstate"
+}
+
+// PipelineStateKey returns the S3 key for one pipeline stack's state
+// (ADR-025, "State keys"): `<prefix><workspace>/pipelines/<pipeline
+// dir>.tfstate`. pipelineDir is the pipeline directory's base name, not a
+// full path — callers pass filepath.Base(dir) if they hold a path.
+func (b *Backend) PipelineStateKey(workspaceName, pipelineDir string) string {
+	return b.KeyPrefixOrDefault() + workspaceName + "/pipelines/" + filepath.Base(pipelineDir) + ".tfstate"
 }
 
 // CatalogIdentifier returns the workspace's catalog name. Always
@@ -94,46 +164,24 @@ func DefaultSystemCatalog(catalog string) string {
 	return catalog + "_system"
 }
 
-// Init initializes a new workspace in root, writing clavesa.json,
-// creating _workspace/ with Terraform files, extracting the runner source,
-// and building the local Docker image for preview.
-//
-// catalog is the three-level-namespace catalog identifier (ADR-016).
-// Empty falls back to DefaultCatalog(name); pass an explicit value when
-// the user wants display name = identifier (e.g., `--catalog clavesa`
-// for the legacy default, or a custom org-prefix scheme).
-func Init(root, name, cloud, catalog, moduleVersion string) error {
-	if cloud == "" {
-		cloud = "aws"
+// WorkspaceMainTF renders the workspace root's main.tf. Extracted from
+// Init so the ADR-025 backend-aware emit is directly testable ahead of
+// Init itself growing a backend parameter (slice 5): a nil m.Backend
+// renders `backend "local" {}` exactly as every workspace before this
+// slice — byte-identical output is the point. A non-nil m.Backend omits
+// the backend argument entirely; the config lives in the sibling
+// backend.tf instead (ADR-025 "Emit: one clavesa-owned backend.tf").
+func WorkspaceMainTF(m *Manifest, moduleVersion string) string {
+	backendLine := `  backend "local" {}
+`
+	if m.Backend != nil {
+		backendLine = ""
 	}
-	if catalog == "" {
-		catalog = DefaultCatalog(name)
-	}
-	systemCatalog := DefaultSystemCatalog(catalog)
-
-	// `init` is the workspace-creation command — making the user mkdir the
-	// directory first turns every cookbook into "and don't forget mkdir -p".
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return fmt.Errorf("create workspace dir: %w", err)
-	}
-
-	// Write clavesa.json
-	m := Manifest{Name: name, Cloud: cloud, Version: manifestVersion, Catalog: catalog, SystemCatalog: systemCatalog}
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, manifestFile), append(data, '\n'), 0o644); err != nil {
-		return fmt.Errorf("write clavesa.json: %w", err)
-	}
-
-	// Write main.tf
-	mainTF := fmt.Sprintf(`terraform {
+	return fmt.Sprintf(`terraform {
   required_providers {
     aws = { source = "hashicorp/aws" }
   }
-  backend "local" {}
-}
+%s}
 
 provider "aws" {
   # Workspace-wide default tags. Every AWS resource created by every
@@ -164,9 +212,68 @@ resource "aws_ecr_repository" "runner" {
   force_delete = true
   tags         = { "clavesa:workspace" = var.workspace_name }
 }
-`, moduleVersion)
+`, backendLine, moduleVersion)
+}
+
+// Init initializes a new workspace in root, writing clavesa.json,
+// creating _workspace/ with Terraform files, extracting the runner source,
+// and building the local Docker image for preview.
+//
+// catalog is the three-level-namespace catalog identifier (ADR-016).
+// Empty falls back to DefaultCatalog(name); pass an explicit value when
+// the user wants display name = identifier (e.g., `--catalog clavesa`
+// for the legacy default, or a custom org-prefix scheme).
+//
+// backend is the ADR-025 remote Terraform backend to record on the new
+// workspace, or nil for local state — the byte-identical, unchanged
+// default. A non-nil backend must already be Validate()'d by the
+// caller; Init validates it again defensively before writing anything,
+// so a malformed manifest is never created.
+func Init(root, name, cloud, catalog, moduleVersion string, backend *Backend) error {
+	if cloud == "" {
+		cloud = "aws"
+	}
+	if catalog == "" {
+		catalog = DefaultCatalog(name)
+	}
+	if backend != nil {
+		if err := backend.Validate(); err != nil {
+			return fmt.Errorf("invalid backend: %w", err)
+		}
+	}
+	systemCatalog := DefaultSystemCatalog(catalog)
+
+	// `init` is the workspace-creation command — making the user mkdir the
+	// directory first turns every cookbook into "and don't forget mkdir -p".
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return fmt.Errorf("create workspace dir: %w", err)
+	}
+
+	// Write clavesa.json
+	m := Manifest{Name: name, Cloud: cloud, Version: manifestVersion, Catalog: catalog, SystemCatalog: systemCatalog, Backend: backend}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, manifestFile), append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write clavesa.json: %w", err)
+	}
+
+	// Write main.tf
+	mainTF := WorkspaceMainTF(&m, moduleVersion)
 	if err := os.WriteFile(filepath.Join(root, "main.tf"), []byte(mainTF), 0o644); err != nil {
 		return fmt.Errorf("write main.tf: %w", err)
+	}
+
+	// ADR-025: a manifest carrying a backend gets a clavesa-owned
+	// backend.tf alongside main.tf (slice 5's `--backend` flag). A nil
+	// backend — every workspace before this slice, and every one created
+	// without the flag — skips this entirely, so init's output stays
+	// byte-identical to pre-ADR-025 behavior.
+	if m.Backend != nil {
+		if err := WriteWorkspaceBackendTF(root, &m); err != nil {
+			return fmt.Errorf("write backend.tf: %w", err)
+		}
 	}
 
 	// Write variables.tf
@@ -276,7 +383,7 @@ output "system_catalog" {
 	// Delta `_delta_log` stays bounded. Written to disk, not deployed; the
 	// user opts in by deploying it (or deletes the directory). Needs the
 	// extracted modules above for its `source` reference to resolve.
-	if err := scaffoldMaintenancePipeline(root, catalog, systemCatalog, moduleVersion); err != nil {
+	if err := scaffoldMaintenancePipeline(root, &m, moduleVersion); err != nil {
 		return fmt.Errorf("scaffold maintenance pipeline: %w", err)
 	}
 
@@ -386,6 +493,18 @@ func Upgrade(root, targetVersion string) (prevVersion string, rewritten int, err
 				return prevVersion, rewritten, fmt.Errorf("write variables.tf: %w", err)
 			}
 			rewritten++
+		}
+	}
+
+	// Step 4 (ADR-025): refresh backend.tf from the manifest. Independent
+	// of whether any main.tf/variables.tf line changed above — a bucket
+	// or key_prefix edit to clavesa.json's `backend` field must reach
+	// backend.tf on the very next upgrade. Only an existing backend.tf is
+	// refreshed: a local-state workspace, or one whose manifest names a
+	// backend but has not been migrated, is left exactly as it was.
+	if m, loadErr := Load(root); loadErr == nil {
+		if err := RefreshBackendTF(root, root, m); err != nil {
+			return prevVersion, rewritten, fmt.Errorf("write backend.tf: %w", err)
 		}
 	}
 
@@ -499,6 +618,20 @@ func extractRunnerFiles(dest string) error {
 	})
 }
 
+// SaveManifest writes m to clavesa.json at root, in the same shape Init
+// and Load's auto-migrate path write it: two-space indent, trailing
+// newline, 0o644. Callers that mutate an already-loaded Manifest (e.g.
+// Service.SetBackend, ADR-025 slice 4) use this instead of hand-rolling
+// json.MarshalIndent, so every field Load didn't touch round-trips
+// unchanged and the on-disk formatting never drifts between call sites.
+func SaveManifest(root string, m *Manifest) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	return os.WriteFile(filepath.Join(root, manifestFile), append(data, '\n'), 0o644)
+}
+
 // Load reads the workspace manifest from root. Returns nil, nil if
 // clavesa.json does not exist (backward-compatible: directory is a
 // legacy workspace without metadata).
@@ -521,6 +654,11 @@ func Load(root string) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse clavesa.json: %w", err)
+	}
+	if m.Backend != nil {
+		if err := m.Backend.Validate(); err != nil {
+			return nil, fmt.Errorf("clavesa.json: %w", err)
+		}
 	}
 	dirty := false
 	if m.Catalog == "" {

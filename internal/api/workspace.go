@@ -2,11 +2,13 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/pathutil"
@@ -24,6 +26,10 @@ type WorkspaceHandler struct {
 	// without the user restarting the server by hand — the AWS SDK
 	// clients are built once at startup and can't be hot-swapped.
 	restart func()
+	// migrating is held for the length of a POST /workspace/backend/migrate
+	// so a second request (a double click, a second tab) is refused
+	// instead of running a second state migration beside the first.
+	migrating sync.Mutex
 }
 
 // NewWorkspaceHandler returns a handler rooted at root.
@@ -73,6 +79,9 @@ func (wh *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /workspace/environment", wh.SetEnvironment)
 	mux.HandleFunc("GET /workspace/aws-profile", wh.GetAWSProfile)
 	mux.HandleFunc("PUT /workspace/aws-profile", wh.SetAWSProfile)
+	mux.HandleFunc("GET /workspace/backend", wh.GetBackendConfig)
+	mux.HandleFunc("PUT /workspace/backend", wh.SetBackendConfig)
+	mux.HandleFunc("POST /workspace/backend/migrate", wh.MigrateBackend)
 	mux.HandleFunc("GET /pipelines", wh.ListPipelines)
 	mux.HandleFunc("POST /pipelines", wh.CreatePipeline)
 	mux.HandleFunc("DELETE /pipelines", wh.DeletePipeline)
@@ -236,6 +245,140 @@ func (wh *WorkspaceHandler) SetAWSProfile(w http.ResponseWriter, r *http.Request
 }
 
 // ---------------------------------------------------------------------------
+// GET / PUT /workspace/backend, POST /workspace/backend/migrate
+// ---------------------------------------------------------------------------
+
+// BackendResponse carries the workspace's configured remote Terraform
+// backend (ADR-025). Configured is false — every other field omitted —
+// for a workspace on local state, exactly as `workspace backend` on the
+// CLI reports "local". Exported so the CLI's `workspace backend --json`
+// renders the identical shape (ADR-015).
+type BackendResponse struct {
+	Configured bool   `json:"configured"`
+	Type       string `json:"type,omitempty"`
+	Bucket     string `json:"bucket,omitempty"`
+	Region     string `json:"region,omitempty"`
+	KeyPrefix  string `json:"key_prefix,omitempty"`
+}
+
+// BackendResponseFrom builds the wire shape from a manifest's Backend
+// field (nil meaning local state).
+func BackendResponseFrom(b *workspace.Backend) BackendResponse {
+	if b == nil {
+		return BackendResponse{Configured: false}
+	}
+	return BackendResponse{
+		Configured: true,
+		Type:       b.Type,
+		Bucket:     b.Bucket,
+		Region:     b.Region,
+		KeyPrefix:  b.KeyPrefixOrDefault(),
+	}
+}
+
+// backendRequest is the PUT /workspace/backend body. Decoded as a
+// pointer (see SetBackendConfig) so a JSON `null` body — the documented
+// way to clear the backend — is distinguishable from a zero-value struct.
+type backendRequest struct {
+	Type      string `json:"type"`
+	Bucket    string `json:"bucket"`
+	Region    string `json:"region"`
+	KeyPrefix string `json:"key_prefix,omitempty"`
+}
+
+// GetBackendConfig returns the workspace's configured remote Terraform
+// backend, or Configured:false for local state.
+func (wh *WorkspaceHandler) GetBackendConfig(w http.ResponseWriter, _ *http.Request) {
+	m, err := workspace.Load(wh.root)
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, "load workspace: "+err.Error())
+		return
+	}
+	if m == nil {
+		httputil.WriteError(w, http.StatusBadRequest, fmt.Sprintf("%s is not a clavesa workspace (no clavesa.json)", wh.root))
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, BackendResponseFrom(m.Backend))
+}
+
+// SetBackendConfig persists (or, on a `null` body, clears) the
+// workspace's remote Terraform backend. Mirrors `clavesa workspace
+// set-backend` / `--clear` (ADR-015) — both call Service.SetBackend, so
+// validation and the clear-refusal rule are identical on both surfaces.
+// This only writes clavesa.json; no Terraform state moves here (that's
+// POST /workspace/backend/migrate).
+func (wh *WorkspaceHandler) SetBackendConfig(w http.ResponseWriter, r *http.Request) {
+	req, ok := httputil.DecodeJSON[*backendRequest](w, r)
+	if !ok {
+		return
+	}
+	var backend *workspace.Backend
+	if req != nil {
+		backend = &workspace.Backend{Type: req.Type, Bucket: req.Bucket, Region: req.Region, KeyPrefix: req.KeyPrefix}
+	}
+	if err := wh.service().SetBackend(backend); err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case strings.Contains(err.Error(), "cannot clear backend"):
+			// Refusal: some stack already migrated (ADR-025 "No
+			// split-brain" — the same shape as a resource-in-use conflict).
+			status = http.StatusConflict
+		case strings.Contains(err.Error(), "backend.") || strings.Contains(err.Error(), "is not a clavesa workspace"):
+			// Validate() field errors ("backend.bucket is required", ...)
+			// and a missing manifest are caller-fixable input.
+			status = http.StatusBadRequest
+		}
+		httputil.WriteError(w, status, err.Error())
+		return
+	}
+	m, err := workspace.Load(wh.root)
+	if err != nil || m == nil {
+		httputil.WriteError(w, http.StatusInternalServerError, "backend updated but manifest unreadable")
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, BackendResponseFrom(m.Backend))
+}
+
+// migrateBackendResponse wraps service.MigrateResult with an optional
+// top-level error so the UI still gets every per-stack row even when
+// MigrateState fails partway (ADR-025's own MigrateResult doc: a
+// mid-run failure returns a non-nil error alongside the partial result
+// built so far).
+type migrateBackendResponse struct {
+	service.MigrateResult
+	Error string `json:"error,omitempty"`
+}
+
+// MigrateBackend runs Service.MigrateState — the identical call
+// `clavesa workspace migrate-state` makes (ADR-015) — and returns the
+// full per-stack result. The CLI streams terraform's own init/plan
+// output to stderr as it runs; over HTTP there is no equivalent
+// streaming channel, so the UI simply waits for the completed result.
+//
+// The migration runs detached from the request context: a closed tab or
+// an aborted fetch must not kill `terraform init -migrate-state` halfway
+// through moving live state. The run finishes either way.
+func (wh *WorkspaceHandler) MigrateBackend(w http.ResponseWriter, r *http.Request) {
+	if !wh.migrating.TryLock() {
+		httputil.WriteError(w, http.StatusConflict, "a state migration is already running for this workspace")
+		return
+	}
+	defer wh.migrating.Unlock()
+	res, err := wh.service().MigrateState(context.WithoutCancel(r.Context()), service.MigrateStateOptions{})
+	resp := migrateBackendResponse{MigrateResult: res}
+	if err != nil {
+		resp.Error = err.Error()
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "no backend configured") || strings.Contains(err.Error(), "invalid backend") {
+			status = http.StatusBadRequest
+		}
+		httputil.WriteJSON(w, status, resp)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, resp)
+}
+
+// ---------------------------------------------------------------------------
 // POST /workspace/init
 // ---------------------------------------------------------------------------
 
@@ -268,7 +411,7 @@ func (wh *WorkspaceHandler) InitWorkspace(w http.ResponseWriter, r *http.Request
 	if !httputil.RequireFields(w, map[string]string{"name": req.Name}) {
 		return
 	}
-	if err := workspace.Init(wh.root, req.Name, "aws", req.Catalog, service.ModuleVersion); err != nil {
+	if err := workspace.Init(wh.root, req.Name, "aws", req.Catalog, service.ModuleVersion, nil); err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "workspace init: "+err.Error())
 		return
 	}

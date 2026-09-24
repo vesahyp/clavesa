@@ -280,6 +280,18 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		return fmt.Errorf("orchestration: materialise sidecar: %w", err)
 	}
 
+	// ADR-025: refresh backend.tf from the manifest so a remote-backed
+	// pipeline's state key and workspace remote-state config track any
+	// bucket/region/key_prefix edit. No-op when the pipeline has no
+	// backend.tf (local state, or not yet migrated). SyncOrchestration never writes a backend or terraform_remote_state
+	// block anywhere; that lives in main.tf (local) or backend.tf
+	// (remote), neither of which this function touches otherwise.
+	if ws != nil {
+		if err := workspace.RefreshBackendTF(s.workspace, abs, ws); err != nil {
+			return fmt.Errorf("orchestration: write backend.tf: %w", err)
+		}
+	}
+
 	header := `# clavesa orchestration — managed by clavesa, do not edit by hand.
 # Re-generated automatically when nodes or edges change.
 #

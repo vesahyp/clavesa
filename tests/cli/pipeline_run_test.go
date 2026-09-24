@@ -24,7 +24,7 @@ import (
 // `make test-cli`. Like TestTransformPreviewCorrectness it implicitly
 // requires Docker to be running (the runner container is the compute).
 func TestPipelineRunEndToEnd(t *testing.T) {
-	ws := t.TempDir()
+	ws := newWorkspace(t)
 
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "orders", "--workspace", ws)

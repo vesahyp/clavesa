@@ -99,7 +99,15 @@ def transform(spark, inputs):
 // — the user opts in with `clavesa pipeline deploy _maintenance` (a daily
 // schedule), or deletes the directory. Idempotent: each file is written only
 // when absent, so re-running init preserves a user's edits.
-func scaffoldMaintenancePipeline(root, catalog, systemCatalog, moduleVersion string) error {
+//
+// m is the workspace manifest Init just built — only Catalog, SystemCatalog
+// and Backend are read. When m.Backend is set, main.tf omits the local
+// `data "terraform_remote_state" "workspace"` block (ADR-025) and a
+// clavesa-owned backend.tf carries both the pipeline's own "s3" backend and
+// that same data source instead. _maintenance is never touched by any
+// upgrade path (scanPipelines skips `_`-prefixed dirs), so this is the one
+// and only place its backend.tf is ever written.
+func scaffoldMaintenancePipeline(root string, m *Manifest, moduleVersion string) error {
 	dir := filepath.Join(root, MaintenancePipelineDir)
 	if err := os.MkdirAll(filepath.Join(dir, "transforms"), 0o755); err != nil {
 		return fmt.Errorf("create _maintenance dir: %w", err)
@@ -108,6 +116,16 @@ func scaffoldMaintenancePipeline(root, catalog, systemCatalog, moduleVersion str
 	moduleSrc, err := modules.RelativeSource(dir, root, moduleVersion, "transform/aws")
 	if err != nil {
 		return fmt.Errorf("resolve _maintenance module source: %w", err)
+	}
+
+	remoteStateBlock := `data "terraform_remote_state" "workspace" {
+  backend = "local"
+  config  = { path = "${path.module}/../terraform.tfstate" }
+}
+
+`
+	if m.Backend != nil {
+		remoteStateBlock = ""
 	}
 
 	mainTF := fmt.Sprintf(`# clavesa maintenance pipeline (opt-in, GH #53).
@@ -128,12 +146,7 @@ terraform {
   }
 }
 
-data "terraform_remote_state" "workspace" {
-  backend = "local"
-  config  = { path = "${path.module}/../terraform.tfstate" }
-}
-
-module "compact" {
+%smodule "compact" {
   source         = %q
   pipeline_name  = var.pipeline_name
   name           = "compact"
@@ -147,7 +160,7 @@ module "compact" {
   inputs             = {}
   output_definitions = {}
 }
-`, moduleSrc, catalog, systemCatalog)
+`, remoteStateBlock, moduleSrc, m.Catalog, m.SystemCatalog)
 
 	variablesTF := `variable "pipeline_name" {
   description = "Human-readable name for this pipeline."
@@ -190,6 +203,16 @@ tfplan
 		}
 		if err := os.WriteFile(f.path, []byte(f.content), 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(f.path), err)
+		}
+	}
+
+	// ADR-025: a remote-backed workspace gets a clavesa-owned backend.tf
+	// here too — unconditional, not gated by the never-clobber loop above,
+	// because backend.tf is always machine-generated and this is the only
+	// site that ever writes it for _maintenance.
+	if m.Backend != nil {
+		if err := WritePipelineBackendTF(dir, m); err != nil {
+			return fmt.Errorf("write backend.tf: %w", err)
 		}
 	}
 	return nil

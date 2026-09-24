@@ -91,10 +91,13 @@ Visual ETL for Terraform pipelines
 | [`clavesa ui`](clavesa_ui.md) | Start the visual editor in your browser |
 | [`clavesa version`](clavesa_version.md) | Print the clavesa version |
 | [`clavesa workspace`](clavesa_workspace.md) | Manage workspaces |
+| &nbsp;&nbsp;[`clavesa workspace backend`](clavesa_workspace_backend.md) | Show the workspace's configured Terraform backend |
 | &nbsp;&nbsp;[`clavesa workspace deploy`](clavesa_workspace_deploy.md) | terraform init -upgrade → plan -out=tfplan → apply tfplan, with preflight |
 | &nbsp;&nbsp;[`clavesa workspace destroy`](clavesa_workspace_destroy.md) | terraform destroy on the workspace (sweeping system-catalog Glue tables first) |
 | &nbsp;&nbsp;[`clavesa workspace init`](clavesa_workspace_init.md) | Initialize a new workspace |
+| &nbsp;&nbsp;[`clavesa workspace migrate-state`](clavesa_workspace_migrate-state.md) | Move the workspace's Terraform state onto the configured remote backend |
 | &nbsp;&nbsp;[`clavesa workspace plan`](clavesa_workspace_plan.md) | Run terraform plan on the workspace |
+| &nbsp;&nbsp;[`clavesa workspace set-backend`](clavesa_workspace_set-backend.md) | Configure (or clear) the workspace's remote Terraform backend |
 | &nbsp;&nbsp;[`clavesa workspace tables`](clavesa_workspace_tables.md) | List Delta tables in the workspace catalog |
 | &nbsp;&nbsp;[`clavesa workspace upgrade`](clavesa_workspace_upgrade.md) | Upgrade the workspace shell and every pipeline to the binary's module version |
 | &nbsp;&nbsp;[`clavesa workspace use`](clavesa_workspace_use.md) | Switch the current workspace, or set its warehouse / AWS profile |

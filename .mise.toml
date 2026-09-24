@@ -1,0 +1,6 @@
+# Terraform is pinned here, not installed globally. The state in S3 needs
+# 1.10 or newer for use_lockfile, and brew's terraform is a different
+# version, so an unpinned shell writes state with whatever it finds first.
+# `mise install` in this directory is the whole setup.
+[tools]
+terraform = "1.14.5"
