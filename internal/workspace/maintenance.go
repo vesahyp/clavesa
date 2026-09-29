@@ -186,6 +186,7 @@ variable "trigger_schedule" {
 .terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.backup
+terraform.tfstate.pre-migrate
 tfplan
 `
 

@@ -339,7 +339,7 @@ data "terraform_remote_state" "workspace" {
 // miss this; the brace-counting stripper doesn't care about the path
 // value at all.
 func TestStripLocalRemoteStateBlockOldWorkspaceSubdirShape(t *testing.T) {
-	src := `# astrophage pipeline
+	src := `# clavesa pipeline
 terraform {
   required_providers {
     aws = { source = "hashicorp/aws" }
@@ -1065,5 +1065,23 @@ func TestMigrateStatePlanInitFailureIsPlanError(t *testing.T) {
 		if row.Plan != PlanError || !strings.Contains(row.Err, "init before plan") {
 			t.Errorf("row %s = %+v, want plan error naming the init", row.Dir, row)
 		}
+	}
+}
+
+// TestMigrateStateEnsuresGitignore: a workspace from before ADR-025 has no
+// .gitignore entry for terraform.tfstate.pre-migrate, the full state copy a
+// migration leaves. MigrateState adds it before moving any stack.
+func TestMigrateStateEnsuresGitignore(t *testing.T) {
+	ws, m, svc, store, _, _ := migrateOneDeployedPipeline(t)
+	wireBackendSeams(svc, store, 0, defaultFakeInit(store, &m, ws))
+	if _, err := svc.MigrateState(context.Background(), MigrateStateOptions{}); err != nil {
+		t.Fatalf("MigrateState: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(ws, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "terraform.tfstate.pre-migrate") {
+		t.Errorf(".gitignore after MigrateState has no pre-migrate entry:\n%s", data)
 	}
 }

@@ -4,9 +4,12 @@ package integration
 
 import (
 	"encoding/json"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/vesahyp/clavesa/internal/observability"
 )
 
 // TestPipelineRunEndToEnd builds a tiny local-FS pipeline and runs it end
@@ -110,4 +113,32 @@ func TestPipelineRunEndToEnd(t *testing.T) {
 	if !strings.Contains(wantWarehouse, transformID) {
 		t.Errorf("internal sanity: expected warehouse path to mention transform id, got %q", wantWarehouse)
 	}
+
+	// GH #99: the run started the workspace's shared metastore container
+	// and nothing else was using it, so the command must have removed it
+	// on exit. Before the fix every one-shot command left it running.
+	metastore := observability.MetastoreContainerName(ws)
+	if ids := dockerOutput(t, "ps", "-aq", "--filter", "name=^/"+metastore+"$"); ids != "" {
+		t.Errorf("metastore container %s still exists after pipeline run (ids %q); one-shot commands must release it (#99)", metastore, ids)
+	}
+
+	// With --keep-metastore the container is left warm for the next
+	// command. TestMain's teardown reaps it with the workspace's other
+	// helper containers.
+	run(t, "pipeline", "run", "orders", "--workspace", ws, "--json", "--keep-metastore")
+	if running := dockerOutput(t, "inspect", "-f", "{{.State.Running}}", metastore); running != "true" {
+		t.Errorf("metastore container %s after pipeline run --keep-metastore: running=%q, want true (#99)", metastore, running)
+	}
+}
+
+// dockerOutput runs one docker CLI query and returns its trimmed stdout,
+// failing the test on error (the tests in this file already require a
+// reachable daemon: the runner container is the compute).
+func dockerOutput(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }

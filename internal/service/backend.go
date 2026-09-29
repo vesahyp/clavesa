@@ -167,6 +167,13 @@ func (s *Service) MigrateState(ctx context.Context, opts MigrateStateOptions) (M
 		return result, fmt.Errorf("state bucket precondition failed: %w", err)
 	}
 
+	// Before any stack moves: each migrated stack leaves a full copy of its
+	// state as terraform.tfstate.pre-migrate, and older workspaces'
+	// .gitignore does not cover it.
+	if err := workspace.EnsureGitignore(s.workspace); err != nil {
+		return result, err
+	}
+
 	stacks, err := discoverStacks(s.workspace)
 	if err != nil {
 		return result, fmt.Errorf("discover stacks: %w", err)

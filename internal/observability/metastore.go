@@ -236,6 +236,13 @@ func EnsureMetastore(ctx context.Context, workspaceRoot, workspaceName string) (
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("docker run metastore: %w\nstderr: %s", err, stderr.String())
 	}
+	// This process started the container, so it is this process's to
+	// release at exit (GH #99). Recorded before the readiness wait: a
+	// container that never becomes ready is still ours, and the readiness
+	// error below already carries the log tail. The reuse branch above
+	// records nothing, so a container another process owns is never
+	// removed by this one.
+	recordCreatedMetastore(name, stdout.String(), workspaceRoot)
 
 	if err := waitMetastoreReady(ctx, name, metastoreReadyTimeout); err != nil {
 		logs := dockerTailLogs(name, 30)

@@ -37,6 +37,7 @@ Quick start:
 	root.SetVersionTemplate("{{.Version}}\n")
 
 	root.PersistentFlags().String("workspace", "", "workspace root directory (default: current directory)")
+	root.PersistentFlags().Bool("keep-metastore", false, "leave the workspace's shared metastore container running after this command exits (env CLAVESA_KEEP_METASTORE=1)")
 
 	root.CompletionOptions.DisableDefaultCmd = true
 
@@ -82,6 +83,11 @@ func Execute() error {
 	// runs, even on error — leaking a ~1GB container on every failed
 	// `clavesa node edit` would shred Docker Desktop's memory budget.
 	runCloseables()
+	// Then the metastore this command may have started (GH #99). After
+	// runCloseables on purpose: the release check looks for other running
+	// containers of the workspace, and our own warm workers must be gone
+	// by then or they would count as "someone else is using it".
+	releaseMetastores(cmd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "clavesa: %v\n", err)
 		os.Exit(1)
@@ -96,5 +102,6 @@ func Run(args []string) error {
 	cmd.SetArgs(args)
 	err := cmd.Execute()
 	runCloseables()
+	releaseMetastores(cmd)
 	return err
 }

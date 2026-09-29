@@ -217,3 +217,30 @@ func TestBackendKeyHelpers(t *testing.T) {
 		t.Errorf("PipelineStateKey() = %q, want %q", got, want)
 	}
 }
+
+// TestEnsureGitignoreAddsStateEntriesOnce: the ADR-025 state entry goes
+// into an existing, user-owned .gitignore (with no trailing newline), keeps
+// the user's lines, and a second run changes nothing.
+func TestEnsureGitignoreAddsStateEntriesOnce(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".gitignore")
+	if err := os.WriteFile(path, []byte("node_modules/"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.EnsureGitignore(root); err != nil {
+		t.Fatalf("EnsureGitignore: %v", err)
+	}
+	first, _ := os.ReadFile(path)
+	for _, want := range []string{"node_modules/\n", "\nterraform.tfstate\n", "\nterraform.tfstate.backup\n", "\nterraform.tfstate.pre-migrate\n", ".clavesa/credentials/*.secret"} {
+		if !strings.Contains(string(first), want) {
+			t.Errorf(".gitignore missing %q:\n%s", want, first)
+		}
+	}
+	if err := workspace.EnsureGitignore(root); err != nil {
+		t.Fatalf("second EnsureGitignore: %v", err)
+	}
+	second, _ := os.ReadFile(path)
+	if string(second) != string(first) {
+		t.Errorf("second run changed .gitignore:\n%s", second)
+	}
+}

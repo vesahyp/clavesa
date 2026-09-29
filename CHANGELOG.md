@@ -10,6 +10,12 @@ git tag workspace `.tf` pins against.
 annotated tag pushed to origin, and green tests + `terraform validate`. See
 `CLAUDE.md` "Releasing a new module version".
 
+## [v2.21.1] — 2026-09-28
+
+### Fixed
+- A workspace's `.gitignore` now ignores Terraform state: `terraform.tfstate`, `.backup`, and `terraform.tfstate.pre-migrate`, the full copy `workspace migrate-state` keeps after moving a stack to S3. `workspace init` writes the lines for a new workspace, and `migrate-state` adds them to an existing one before it moves anything. Before this, a fresh workspace's root state was not ignored, and a migrated workspace's `.pre-migrate` files showed up as untracked, ready to be committed (ADR-025).
+- One-shot CLI commands (`pipeline run`, `backfill`, `query`, `node preview`, and the rest) now remove the workspace's shared metastore container on exit when the command started it and nothing else is using it. Before this the container stayed running until a `clavesa ui` session or the orphan reaper took it down. `clavesa ui` keeps owning its own container as before. Pass `--keep-metastore` or set `CLAVESA_KEEP_METASTORE=1` to leave the container warm for the next command (#99).
+
 ## [v2.21.0] — 2026-09-24
 
 ### Added

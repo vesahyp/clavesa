@@ -316,39 +316,8 @@ output "system_catalog" {
 		return fmt.Errorf("write outputs.tf: %w", err)
 	}
 
-	// clavesa's workspace init contributes three .gitignore entries —
-	// the rest of the file is the user's. (1) ADR-017 slice 2:
-	// file:-backed credential payloads live next to the registry as
-	// plaintext and must never be committed (the credential JSON spec
-	// itself is fine to commit; only the .secret payload is ignored).
-	// (2) the per-developer warehouse file (environment.json). (3) the
-	// per-developer AWS-profile selection.
-	// Each line is appended only if absent, so re-running init — or
-	// running it on a workspace created by an older clavesa — stays
-	// idempotent and never duplicates a line.
-	gitignoreEntries := []struct{ marker, snippet string }{
-		{".clavesa/credentials/*.secret", "# clavesa: never commit file:-backend credential payloads\n.clavesa/credentials/*.secret\n"},
-		{".clavesa/environment.json", "# clavesa: per-developer warehouse selection (local/cloud)\n.clavesa/environment.json\n"},
-		{".clavesa/aws-profile.json", "# clavesa: per-developer AWS profile selection\n.clavesa/aws-profile.json\n"},
-	}
-	gitignorePath := filepath.Join(root, ".gitignore")
-	existing, _ := os.ReadFile(gitignorePath)
-	merged := string(existing)
-	changed := false
-	for _, e := range gitignoreEntries {
-		if strings.Contains(merged, e.marker) {
-			continue
-		}
-		if merged != "" && !strings.HasSuffix(merged, "\n") {
-			merged += "\n"
-		}
-		merged += e.snippet
-		changed = true
-	}
-	if changed {
-		if err := os.WriteFile(gitignorePath, []byte(merged), 0o644); err != nil {
-			return fmt.Errorf("write .gitignore: %w", err)
-		}
+	if err := EnsureGitignore(root); err != nil {
+		return err
 	}
 
 	// Extract runner source to runner/
@@ -747,4 +716,53 @@ func migrateLocalWarehouses(root string) {
 			_ = os.WriteFile(marker, []byte("local Iceberg warehouse relocated to the workspace-shared path\n"), 0o644)
 		}
 	}
+}
+
+// gitignoreEntries are the lines clavesa owns in a workspace's root
+// .gitignore; the rest of the file is the user's. Each is appended only if
+// its marker is absent, so running this again, or on a workspace made by an
+// older clavesa, never duplicates a line.
+//
+//  1. ADR-017 slice 2: file:-backed credential payloads live next to the
+//     registry as plaintext and must never be committed (the credential
+//     JSON spec itself is fine to commit; only the .secret payload is
+//     ignored).
+//  2. The per-developer warehouse file (environment.json).
+//  3. The per-developer AWS-profile selection.
+//  4. ADR-025: Terraform state, including terraform.tfstate.pre-migrate,
+//     the full copy migrate-state keeps after moving a stack to S3. No
+//     slash, so the patterns cover the root and every pipeline directory.
+var gitignoreEntries = []struct{ marker, snippet string }{
+	{".clavesa/credentials/*.secret", "# clavesa: never commit file:-backend credential payloads\n.clavesa/credentials/*.secret\n"},
+	{".clavesa/environment.json", "# clavesa: per-developer warehouse selection (local/cloud)\n.clavesa/environment.json\n"},
+	{".clavesa/aws-profile.json", "# clavesa: per-developer AWS profile selection\n.clavesa/aws-profile.json\n"},
+	{"terraform.tfstate.pre-migrate", "# clavesa: local Terraform state, and the copy migrate-state keeps (full state, never commit)\nterraform.tfstate\nterraform.tfstate.backup\nterraform.tfstate.pre-migrate\n"},
+}
+
+// EnsureGitignore appends clavesa's entries to root/.gitignore where they
+// are missing. workspace init calls it for a new workspace, and
+// migrate-state calls it before writing any .pre-migrate file, which is how
+// an existing workspace gets entry 4.
+func EnsureGitignore(root string) error {
+	gitignorePath := filepath.Join(root, ".gitignore")
+	existing, _ := os.ReadFile(gitignorePath)
+	merged := string(existing)
+	changed := false
+	for _, e := range gitignoreEntries {
+		if strings.Contains(merged, e.marker) {
+			continue
+		}
+		if merged != "" && !strings.HasSuffix(merged, "\n") {
+			merged += "\n"
+		}
+		merged += e.snippet
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := os.WriteFile(gitignorePath, []byte(merged), 0o644); err != nil {
+		return fmt.Errorf("write .gitignore: %w", err)
+	}
+	return nil
 }

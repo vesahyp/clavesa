@@ -151,6 +151,7 @@ variable "trigger_batch_window" {
 .terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.backup
+terraform.tfstate.pre-migrate
 `
 		_ = os.WriteFile(gitignorePath, []byte(gitignore), 0o644)
 	}

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -226,6 +227,54 @@ func runCloseables() {
 		fn()
 	}
 	cliCloseables = nil
+}
+
+// keepMetastoreEnv is the environment variable that keeps the workspace's
+// shared metastore container running after a one-shot command, the same
+// as the `--keep-metastore` persistent flag. For cron and CI wrappers that
+// run many commands back to back and want the warm metastore without
+// editing every invocation (GH #99).
+const keepMetastoreEnv = "CLAVESA_KEEP_METASTORE"
+
+// metastoreReleaseTimeout bounds the whole post-command metastore release
+// (a handful of short docker calls per container). Command exit must stay
+// prompt even when the daemon is wedged; the release is best-effort.
+const metastoreReleaseTimeout = 20 * time.Second
+
+// keepMetastoreRequested decides whether the metastore this command
+// started should be left running: the flag wins when set, otherwise the
+// environment variable counts as set unless it is empty or one of the
+// usual "off" spellings ("0", "false", "off", "no", any case). Pure so
+// the precedence and the spellings are unit-testable.
+func keepMetastoreRequested(flag bool, env string) bool {
+	if flag {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "", "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
+// releaseMetastores is the post-command hook that takes down the shared
+// metastore container when this process started it and nothing else is
+// using it (GH #99; the decision rules are in
+// observability.ReleaseCreatedMetastores). Runs after runCloseables from
+// Execute and Run. Quiet on every path: this runs under cron, where any
+// output becomes mail, and the release is best-effort by contract. With
+// `--keep-metastore` or CLAVESA_KEEP_METASTORE set the container is left
+// warm for the next command. `clavesa ui` needs no special case: its own
+// shutdown already removed the container it owns, so the ownership check
+// inside the release finds nothing to do.
+func releaseMetastores(cmd *cobra.Command) {
+	keep, _ := cmd.PersistentFlags().GetBool("keep-metastore")
+	if keepMetastoreRequested(keep, os.Getenv(keepMetastoreEnv)) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), metastoreReleaseTimeout)
+	defer cancel()
+	_ = observability.ReleaseCreatedMetastores(ctx)
 }
 
 // awsClients bundles the AWS SDK clients (and the derived Athena output

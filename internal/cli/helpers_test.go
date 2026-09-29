@@ -204,3 +204,35 @@ func TestResolveWorkspaceRoot_EnvBeatsCwdWalkAndStateFile(t *testing.T) {
 		t.Fatalf("resolved = %q, want $CLAVESA_WORKSPACE value %q", gotR, want)
 	}
 }
+
+// TestKeepMetastoreRequested pins the `--keep-metastore` /
+// CLAVESA_KEEP_METASTORE precedence (GH #99): the flag alone keeps, the
+// env var keeps for any value except empty and the usual "off" spellings,
+// and the spellings are case-insensitive.
+func TestKeepMetastoreRequested(t *testing.T) {
+	cases := []struct {
+		flag bool
+		env  string
+		want bool
+	}{
+		{false, "", false},
+		{true, "", true},
+		{true, "0", true},
+		{false, "1", true},
+		{false, "true", true},
+		{false, "yes", true},
+		{false, "anything", true},
+		{false, "0", false},
+		{false, "false", false},
+		{false, "FALSE", false},
+		{false, "off", false},
+		{false, "Off", false},
+		{false, "no", false},
+		{false, " no ", false},
+	}
+	for _, tc := range cases {
+		if got := keepMetastoreRequested(tc.flag, tc.env); got != tc.want {
+			t.Errorf("keepMetastoreRequested(%v, %q) = %v, want %v", tc.flag, tc.env, got, tc.want)
+		}
+	}
+}
