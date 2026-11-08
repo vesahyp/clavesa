@@ -1,7 +1,22 @@
-.PHONY: dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
+
+# What a fresh clone needs before the other targets (and, in clavesa-dev,
+# the nightly site/analytics job) work. Safe to rerun: each step runs only when its
+# marker is missing. bin/clavesa is git-ignored and the nightly job puts it
+# first on PATH, so a clone without it runs the Homebrew clavesa instead.
+setup: ## After a fresh clone: mise tools, Go modules, npm packages, bin/clavesa, site infra init
+	mise install
+	go mod download
+	@test -d ui/node_modules || $(MAKE) ui/node_modules
+	@test -x bin/clavesa || $(MAKE) build
+	@# site/ is private: the public clavesa snapshot has no site/.
+	@if [ -d site ]; then \
+	  test -d site/web/node_modules || (cd site/web && npm ci --no-fund --no-audit); \
+	  $(MAKE) -s -C site infra/.terraform; \
+	fi
 
 dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
