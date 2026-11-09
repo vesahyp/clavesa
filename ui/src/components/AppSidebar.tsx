@@ -16,6 +16,7 @@ import {
   LayoutDashboard,
   PanelLeftClose,
   PanelLeftOpen,
+  Share2,
   Terminal,
   Workflow,
 } from "lucide-react";
@@ -52,6 +53,7 @@ const NAV: NavItem[] = [
   { to: "/query", label: "Query", icon: Terminal, match: (p) => p.startsWith("/query") },
   { to: "/sources", label: "Sources", icon: FileInput, match: (p) => p.startsWith("/sources") },
   { to: "/credentials", label: "Credentials", icon: KeyRound, match: (p) => p.startsWith("/credentials") },
+  { to: "/unity-catalog", label: "Unity Catalog", icon: Share2, match: (p) => p.startsWith("/unity-catalog") },
   { to: "/runner", label: "Runner", icon: Boxes, match: (p) => p.startsWith("/runner") },
 ];
 

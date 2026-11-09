@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -82,6 +83,16 @@ func (wh *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /workspace/backend", wh.GetBackendConfig)
 	mux.HandleFunc("PUT /workspace/backend", wh.SetBackendConfig)
 	mux.HandleFunc("POST /workspace/backend/migrate", wh.MigrateBackend)
+	mux.HandleFunc("GET /workspace/databricks", wh.GetDatabricks)
+	mux.HandleFunc("PUT /workspace/databricks", wh.ConnectDatabricks)
+	mux.HandleFunc("POST /workspace/databricks/check", wh.CheckDatabricks)
+	mux.HandleFunc("DELETE /workspace/databricks", wh.DisconnectDatabricks)
+	mux.HandleFunc("GET /workspace/databricks/tables", wh.DatabricksTables)
+	mux.HandleFunc("GET /pipeline/databricks-jobs", wh.GetDatabricksJobs)
+	mux.HandleFunc("PUT /pipeline/databricks-jobs", wh.SetDatabricksJobs)
+	mux.HandleFunc("GET /pipeline/databricks-run", wh.GetDatabricksRun)
+	mux.HandleFunc("POST /pipeline/databricks-compare", wh.CompareDatabricksTables)
+	mux.HandleFunc("POST /databricks/preflight", wh.DatabricksPreflight)
 	mux.HandleFunc("GET /pipelines", wh.ListPipelines)
 	mux.HandleFunc("POST /pipelines", wh.CreatePipeline)
 	mux.HandleFunc("DELETE /pipelines", wh.DeletePipeline)
@@ -242,6 +253,163 @@ func (wh *WorkspaceHandler) SetAWSProfile(w http.ResponseWriter, r *http.Request
 	if restarting {
 		go wh.restart()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// /workspace/databricks — the Unity Catalog connection (ADR-027)
+// ---------------------------------------------------------------------------
+
+// GetDatabricks returns the recorded connection without reaching
+// Databricks. The CLI twin is `clavesa workspace databricks --json`.
+func (wh *WorkspaceHandler) GetDatabricks(w http.ResponseWriter, _ *http.Request) {
+	st, err := wh.service().GetDatabricks()
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, st)
+}
+
+// ConnectDatabricks runs the admin checks and records the connection when
+// none fails: the twin of `clavesa workspace connect databricks`. A failed
+// check is a normal answer, not a request error: 200 with saved=false and
+// every check and its fix, so the UI renders the same list the CLI prints.
+func (wh *WorkspaceHandler) ConnectDatabricks(w http.ResponseWriter, r *http.Request) {
+	in, ok := httputil.DecodeJSON[service.DatabricksConnectInput](w, r)
+	if !ok {
+		return
+	}
+	st, err := wh.service().ConnectDatabricks(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, service.ErrDatabricksChecksFailed) {
+			httputil.WriteJSON(w, http.StatusOK, st)
+			return
+		}
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, st)
+}
+
+// CheckDatabricks re-runs the checks against the recorded connection:
+// the twin of `clavesa workspace databricks --check`.
+func (wh *WorkspaceHandler) CheckDatabricks(w http.ResponseWriter, r *http.Request) {
+	st, err := wh.service().CheckDatabricks(r.Context())
+	if err != nil {
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, st)
+}
+
+// DisconnectDatabricks removes the connection from clavesa.json: the twin
+// of `clavesa workspace disconnect databricks`.
+func (wh *WorkspaceHandler) DisconnectDatabricks(w http.ResponseWriter, r *http.Request) {
+	released, err := wh.service().DisconnectDatabricks(r.Context())
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	st, err := wh.service().GetDatabricks()
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	st.Released = released
+	httputil.WriteJSON(w, http.StatusOK, st)
+}
+
+// DatabricksTables lists each pipeline's tables in Unity Catalog: the
+// twin of `clavesa workspace databricks tables`.
+func (wh *WorkspaceHandler) DatabricksTables(w http.ResponseWriter, r *http.Request) {
+	rows, err := wh.service().DatabricksTables(r.Context())
+	if err != nil {
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, map[string]any{"pipelines": rows})
+}
+
+type databricksJobsBody struct {
+	Pipeline string  `json:"pipeline"`
+	Jobs     []int64 `json:"jobs"`
+}
+
+// GetDatabricksJobs: the twin of `clavesa pipeline databricks-jobs <p>`.
+func (wh *WorkspaceHandler) GetDatabricksJobs(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	jobs, err := wh.service().GetDatabricksJobs(dir)
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, databricksJobsBody{Pipeline: dir, Jobs: jobs})
+}
+
+// SetDatabricksJobs: the twin of `clavesa pipeline databricks-jobs <p>
+// --set …` / `--clear` (an empty list).
+func (wh *WorkspaceHandler) SetDatabricksJobs(w http.ResponseWriter, r *http.Request) {
+	in, ok := httputil.DecodeJSON[databricksJobsBody](w, r)
+	if !ok {
+		return
+	}
+	if err := wh.service().SetDatabricksJobs(in.Pipeline, in.Jobs); err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	jobs, err := wh.service().GetDatabricksJobs(in.Pipeline)
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, databricksJobsBody{Pipeline: in.Pipeline, Jobs: jobs})
+}
+
+// databricksCompareBody is POST /pipeline/databricks-compare's body.
+type databricksCompareBody struct {
+	Pipeline string `json:"pipeline"`
+	service.DatabricksCompareInput
+}
+
+// CompareDatabricksTables: the twin of `clavesa pipeline
+// databricks-compare <p>`. A failed comparison is a 200 with pass=false;
+// only a comparison that could not run is an error.
+func (wh *WorkspaceHandler) CompareDatabricksTables(w http.ResponseWriter, r *http.Request) {
+	in, ok := httputil.DecodeJSON[databricksCompareBody](w, r)
+	if !ok {
+		return
+	}
+	res, err := wh.service().CompareDatabricksTables(r.Context(), in.Pipeline, in.DatabricksCompareInput)
+	if err != nil {
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, res)
+}
+
+// DatabricksPreflight: the twin of `clavesa workspace databricks
+// preflight`. Read-only; a not-ready result is a 200 with ready=false.
+func (wh *WorkspaceHandler) DatabricksPreflight(w http.ResponseWriter, r *http.Request) {
+	in, ok := httputil.DecodeJSON[service.PreflightInput](w, r)
+	if !ok {
+		return
+	}
+	res, err := wh.service().Preflight(r.Context(), in)
+	if err != nil {
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, res)
+}
+
+// GetDatabricksRun: the twin of `clavesa pipeline databricks-run <run>`.
+func (wh *WorkspaceHandler) GetDatabricksRun(w http.ResponseWriter, r *http.Request) {
+	run, err := wh.service().GetDatabricksRun(r.Context(), r.URL.Query().Get("dir"), r.URL.Query().Get("run"))
+	if err != nil {
+		httputil.WriteServiceError(w, err, http.StatusBadGateway)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, run)
 }
 
 // ---------------------------------------------------------------------------

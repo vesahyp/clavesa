@@ -167,6 +167,29 @@ func TestCloudLocalDockerArgs(t *testing.T) {
 	}
 }
 
+// ADR-027: a laptop run against the cloud warehouse publishes like the
+// Lambda, so the Unity Catalog env is forwarded; the secret only as an ARN.
+func TestCloudLocalDockerArgsUnityCatalog(t *testing.T) {
+	env := map[string]string{
+		"CLAVESA_WAREHOUSE":         "s3://b/p/_warehouse/",
+		"CLAVESA_DATABRICKS_HOST":   "https://dbc-1.cloud.databricks.com",
+		"CLAVESA_DATABRICKS_SECRET": "arn:aws:secretsmanager:us-east-2:1:secret:x",
+		"CLAVESA_UC_CATALOG":        "cat",
+		"CLAVESA_DATABRICKS_JOBS":   "[1]",
+	}
+	args := cloudLocalDockerArgs("img", env, nil, nil, nil)
+	for _, want := range []string{
+		"CLAVESA_DATABRICKS_HOST=https://dbc-1.cloud.databricks.com",
+		"CLAVESA_DATABRICKS_SECRET=arn:aws:secretsmanager:us-east-2:1:secret:x",
+		"CLAVESA_UC_CATALOG=cat",
+		"CLAVESA_DATABRICKS_JOBS=[1]",
+	} {
+		if !contains(args, want) {
+			t.Errorf("missing %s; args=%v", want, args)
+		}
+	}
+}
+
 func TestCloudLocalDockerArgsHeapAbsentWhenNil(t *testing.T) {
 	// With nil heapArgs the pure assembler emits no heap flag — the caller
 	// passes nil when neither an explicit override nor a Docker-VM size is

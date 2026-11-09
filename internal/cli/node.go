@@ -212,6 +212,10 @@ func newNodeEditCmd() *cobra.Command {
 	var outputBoundBy []string
 	var outputMergeUpdate map[string]string
 	var outputStats bool
+	var outputPartitionBy []string
+	var outputUCTable string
+	var outputUCLocation string
+	var outputReplacesJob int64
 	var addOutputs []string
 	var removeOutputs []string
 	var addIncrementalInputs []string
@@ -238,6 +242,16 @@ to clear. --output-merge-update sets per-column merge expressions (col=spec
 pairs) so CDF-incremental aggregates accumulate on a mode=merge output
 instead of being overwritten; does not change mode. Pass with no value to
 clear.
+--output-partition-by Hive-partitions the output on the given columns and is
+required for --output-mode replace_partitions (dynamic partition overwrite:
+each run replaces only the partitions in the batch); it cannot be combined
+with --output-cluster-by. --output-unity-catalog-table names the Unity
+Catalog table the output writes, --output-unity-catalog-location is the
+s3:// path where a new Unity Catalog table is created, and
+--output-replaces-databricks-job gives the ID of the Databricks job whose
+step this output replaces (the runner refuses to write while that job is
+unpaused). Pass partition-by, the table or the location with no value, or the
+job with 0, to clear.
 
 Examples:
   clavesa node edit my-pipeline source1 --set bucket=my-data
@@ -247,6 +261,8 @@ Examples:
   clavesa node edit my-pipeline daily_revenue --output-cluster-by region,day
   clavesa node edit my-pipeline daily_counts --output-merge-update event_count=additive,last_seen=max
   clavesa node edit my-pipeline orders --output-mode append
+  clavesa node edit my-pipeline events --output-mode replace_partitions --output-partition-by event_date
+  clavesa node edit my-pipeline events --output-unity-catalog-table main.analytics.events --output-replaces-databricks-job 123456789
   clavesa node edit my-pipeline enrich --add-output outliers
   clavesa node edit my-pipeline source1    # show settable keys
 
@@ -268,9 +284,19 @@ Examples:
 			boundChanged := cmd.Flags().Changed("output-bound-by")
 			mergeUpdateChanged := cmd.Flags().Changed("output-merge-update")
 			statsChanged := cmd.Flags().Changed("output-stats")
+			ucEdit := ucOutputEdit{
+				partitionChanged: cmd.Flags().Changed("output-partition-by"),
+				partitionBy:      outputPartitionBy,
+				tableChanged:     cmd.Flags().Changed("output-unity-catalog-table"),
+				table:            outputUCTable,
+				locationChanged:  cmd.Flags().Changed("output-unity-catalog-location"),
+				location:         outputUCLocation,
+				jobChanged:       cmd.Flags().Changed("output-replaces-databricks-job"),
+				job:              outputReplacesJob,
+			}
 			outputsChanged := len(addOutputs) > 0 || len(removeOutputs) > 0
 			incrementalsChanged := len(addIncrementalInputs) > 0 || len(removeIncrementalInputs) > 0
-			if len(sets) == 0 && !modeChanged && !keysChanged && !clusterChanged && !boundChanged && !mergeUpdateChanged && !statsChanged && !outputsChanged && !incrementalsChanged {
+			if len(sets) == 0 && !modeChanged && !keysChanged && !clusterChanged && !boundChanged && !mergeUpdateChanged && !statsChanged && !ucEdit.any() && !outputsChanged && !incrementalsChanged {
 				g, err := svc.GetPipeline(dir)
 				if err != nil {
 					return fmt.Errorf("get pipeline: %w", err)
@@ -331,6 +357,22 @@ Examples:
 							}
 							parts = append(parts, "merge_update="+joinComma(ps))
 						}
+						if pk, ok := def["partition_by"].([]interface{}); ok && len(pk) > 0 {
+							ks := make([]string, len(pk))
+							for i, v := range pk {
+								ks[i] = fmt.Sprint(v)
+							}
+							parts = append(parts, "partition_by="+joinComma(ks))
+						}
+						if v, _ := def["unity_catalog_table"].(string); v != "" {
+							parts = append(parts, "unity_catalog_table="+v)
+						}
+						if v, _ := def["unity_catalog_location"].(string); v != "" {
+							parts = append(parts, "unity_catalog_location="+v)
+						}
+						if v, ok := def["replaces_databricks_job"]; ok && v != nil {
+							parts = append(parts, fmt.Sprintf("replaces_databricks_job=%v", v))
+						}
 						if stats, _ := def["stats"].(bool); stats {
 							parts = append(parts, "stats=true")
 						}
@@ -340,7 +382,7 @@ Examples:
 				return nil
 			}
 			attrs := map[string]interface{}(sets)
-			if modeChanged || keysChanged || clusterChanged || boundChanged || mergeUpdateChanged || statsChanged || outputsChanged {
+			if modeChanged || keysChanged || clusterChanged || boundChanged || mergeUpdateChanged || statsChanged || ucEdit.any() || outputsChanged {
 				g, err := svc.GetPipeline(dir)
 				if err != nil {
 					return fmt.Errorf("get pipeline: %w", err)
@@ -351,6 +393,9 @@ Examples:
 				}
 				existing, _ := n.Config["output_definitions"].(map[string]interface{})
 				updated := updateOutputDefault(existing, modeChanged, outputMode, keysChanged, outputMergeKeys, clusterChanged, outputClusterBy, boundChanged, outputBoundBy, mergeUpdateChanged, outputMergeUpdate)
+				if err := applyUCOutputEdit(updated, ucEdit); err != nil {
+					return err
+				}
 				for _, key := range removeOutputs {
 					if key == "default" {
 						return fmt.Errorf("cannot remove the 'default' output (every transform has one)")
@@ -437,12 +482,16 @@ Examples:
 	}
 
 	cmd.Flags().Var(sets, "set", "set key=value (repeatable)")
-	cmd.Flags().StringVar(&outputMode, "output-mode", "", `default-output mode: "replace" (default; full overwrite), "append", or "merge"`)
+	cmd.Flags().StringVar(&outputMode, "output-mode", "", `default-output mode: "replace" (default; full overwrite), "append", "merge", or "replace_partitions" (dynamic partition overwrite; needs --output-partition-by)`)
 	cmd.Flags().StringSliceVar(&outputMergeKeys, "output-merge-keys", nil, `comma-separated columns forming the natural key; sets mode=merge implicitly`)
 	cmd.Flags().StringSliceVar(&outputClusterBy, "output-cluster-by", nil, `comma-separated columns to liquid-cluster the output Delta table on (replace/append outputs); does not change mode. Pass with no value to clear`)
 	cmd.Flags().StringSliceVar(&outputBoundBy, "output-bound-by", nil, `comma-separated columns to statically bound a merge output's target scan on (must be functionally determined by merge_keys); pass with no value to clear`)
 	cmd.Flags().StringToStringVar(&outputMergeUpdate, "output-merge-update", nil, `col=spec pairs giving per-column merge expressions for mode=merge outputs (e.g. event_count=additive,last_seen=max). Spec is a keyword (additive, min, max, sketch) or a raw SparkSQL expression. Does not change mode. Pass with no value to clear`)
 	cmd.Flags().BoolVar(&outputStats, "output-stats", false, `opt this transform's outputs into per-column stats (null %, distinct, top-K, percentiles); pass --output-stats=false to turn off`)
+	cmd.Flags().StringSliceVar(&outputPartitionBy, "output-partition-by", nil, `comma-separated columns to Hive-partition the output Delta table on; required for --output-mode replace_partitions, cannot be combined with --output-cluster-by. Pass with no value to clear`)
+	cmd.Flags().StringVar(&outputUCTable, "output-unity-catalog-table", "", `Unity Catalog table the output writes (catalog.schema.table, schema.table or table). Pass "" to clear`)
+	cmd.Flags().StringVar(&outputUCLocation, "output-unity-catalog-location", "", `s3:// path where a new Unity Catalog table is created. Pass "" to clear`)
+	cmd.Flags().Int64Var(&outputReplacesJob, "output-replaces-databricks-job", 0, `ID of the Databricks job whose step this output replaces; the runner refuses to write while that job is unpaused. Pass 0 to clear`)
 	cmd.Flags().StringSliceVar(&addOutputs, "add-output", nil, "declare an additional output key on a multi-output transform (repeatable). Seeded with mode=replace; tune via direct .tf edit")
 	cmd.Flags().StringSliceVar(&removeOutputs, "remove-output", nil, "remove a non-default output key from output_definitions (repeatable)")
 	cmd.Flags().StringSliceVar(&addIncrementalInputs, "incremental-input", nil, "read this input alias incrementally (Delta CDF version range, watermark-tracked). Repeatable. Per-input opt-in; transforms full-read by default")
@@ -562,6 +611,75 @@ func updateOutputDefault(existing map[string]interface{}, modeChanged bool, mode
 	}
 	out["default"] = def
 	return out
+}
+
+// ucOutputEdit carries the partition_by and Unity Catalog flags of
+// `node edit`. Each field is applied only when its Changed flag is set.
+type ucOutputEdit struct {
+	partitionChanged bool
+	partitionBy      []string
+	tableChanged     bool
+	table            string
+	locationChanged  bool
+	location         string
+	jobChanged       bool
+	job              int64
+}
+
+func (e ucOutputEdit) any() bool {
+	return e.partitionChanged || e.tableChanged || e.locationChanged || e.jobChanged
+}
+
+// applyUCOutputEdit writes the partition_by and Unity Catalog attributes
+// onto the "default" entry of an output_definitions map (already a fresh
+// copy from updateOutputDefault) and rejects partition_by combined with
+// cluster_by. An empty value clears the attribute.
+func applyUCOutputEdit(defs map[string]interface{}, e ucOutputEdit) error {
+	def, _ := defs["default"].(map[string]interface{})
+	if def == nil {
+		def = map[string]interface{}{}
+		defs["default"] = def
+	}
+	if e.partitionChanged {
+		if len(e.partitionBy) == 0 {
+			delete(def, "partition_by")
+		} else {
+			items := make([]interface{}, len(e.partitionBy))
+			for i, k := range e.partitionBy {
+				items[i] = k
+			}
+			def["partition_by"] = items
+		}
+	}
+	setOrClear := func(key, val string) {
+		if val == "" {
+			delete(def, key)
+		} else {
+			def[key] = val
+		}
+	}
+	if e.tableChanged {
+		setOrClear("unity_catalog_table", e.table)
+	}
+	if e.locationChanged {
+		setOrClear("unity_catalog_location", e.location)
+	}
+	if e.jobChanged {
+		if e.job <= 0 {
+			delete(def, "replaces_databricks_job")
+		} else {
+			def["replaces_databricks_job"] = e.job
+		}
+	}
+	pk, _ := def["partition_by"].([]interface{})
+	ck, _ := def["cluster_by"].([]interface{})
+	if len(pk) > 0 && len(ck) > 0 {
+		return fmt.Errorf("an output cannot set both partition_by and cluster_by; clear one (--output-cluster-by with no value, or --output-partition-by with no value)")
+	}
+	if mode, _ := def["mode"].(string); mode == "replace_partitions" && len(pk) == 0 {
+		return fmt.Errorf("--output-mode replace_partitions needs --output-partition-by")
+	}
+	return nil
 }
 
 // applyOutputStats writes the stats flag onto every output_definitions

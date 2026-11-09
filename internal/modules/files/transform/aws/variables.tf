@@ -76,8 +76,8 @@ variable "inputs" {
     explicit object shape — the runtime validation happens in the Go parser
     and orchestration emitter, not at `terraform validate`.
   EOT
-  type    = any
-  default = {}
+  type        = any
+  default     = {}
 }
 
 variable "enabled" {
@@ -89,8 +89,8 @@ variable "enabled" {
     by a view) without deleting it. The module body doesn't consume this; the
     emitter reads it from the parsed HCL. Default true.
   EOT
-  type    = bool
-  default = true
+  type        = bool
+  default     = true
 }
 
 variable "incremental_inputs" {
@@ -107,8 +107,8 @@ variable "incremental_inputs" {
     declared here only so `terraform validate` accepts the argument; restoring
     it (dropped after v0.19.0) is what makes incremental reads authorable again.
   EOT
-  type    = list(string)
-  default = []
+  type        = list(string)
+  default     = []
 }
 
 # Registered-source attachments (ADR-017 v0.22.0). Separate variable from
@@ -154,8 +154,8 @@ variable "sql" {
       string sql  → exactly one output_definitions key
       map sql     → sql keys == output_definitions keys (bijection)
   EOT
-  type    = any
-  default = null
+  type        = any
+  default     = null
 }
 
 variable "python" {
@@ -165,8 +165,8 @@ variable "python" {
     and must return a dict mapping each output_definitions key to a pandas DataFrame.
     Use file("transforms/myscript.py") to load from a file.
   EOT
-  type    = string
-  default = null
+  type        = string
+  default     = null
 }
 
 variable "compute" {
@@ -175,12 +175,15 @@ variable "compute" {
     that matches the workload size and cost shape:
     - lambda: Clavesa runner container on Lambda. Cheapest cloud option;
               pay-per-ms with scale-to-zero. Suits batches under ~15 min.
-    - fargate: (planned) ECS Fargate task. Long-running medium jobs.
-    - emr-serverless: (planned) Distributed Spark for large jobs;
-              vCPU-second billing, ~5x cheaper than Glue at the same scale.
+    - fargate: one ECS Fargate task runs the whole pipeline run (any
+              transform with fargate moves the pipeline's runs there); no
+              15 min cap. Size: fargate_cpu / fargate_memory_gb pipeline
+              variables (default 16 vCPU, 32 GB).
+    - emr-serverless: (planned, refused at deploy) Distributed Spark for
+              large jobs.
   EOT
-  type    = string
-  default = "lambda"
+  type        = string
+  default     = "lambda"
 
   validation {
     condition     = contains(["lambda", "fargate", "emr-serverless"], var.compute)
@@ -201,11 +204,26 @@ variable "output_definitions" {
       - "merge":             MERGE rows into the Delta table keyed on
         merge_keys — matched rows update in place, new rows insert. The
         idempotent shape for dimension tables and backfill promotes.
+      - "replace_partitions": dynamic partition overwrite. Each run replaces
+        only the partitions present in the batch and leaves the others
+        untouched. Requires partition_by.
     merge_keys lists the columns that uniquely identify a row; required when
     mode is "merge", and usable on "append" outputs so a later backfill can
     promote via MERGE instead of refusing.
     cluster_by lists columns to liquid-cluster the output Delta table on,
     for prune-friendly reads; merge outputs already cluster by merge_keys.
+    partition_by lists columns to Hive-partition the output Delta table on.
+      Required for mode "replace_partitions". Cannot be combined with
+      cluster_by (a table is partitioned or liquid-clustered, not both).
+    unity_catalog_table names the Unity Catalog table this output writes
+      (catalog.schema.table, schema.table or table). Set it when the output
+      replaces a table that Databricks already owns.
+    unity_catalog_location is the s3:// path where a NEW Unity Catalog table
+      is created. Used only when the table named by unity_catalog_table does
+      not exist yet.
+    replaces_databricks_job is the ID of the Databricks job whose step this
+      output replaces. The runner refuses to write while that job is
+      unpaused, so two writers never touch the table at once.
     merge_update gives per-column merge expressions for mode=merge outputs so
       CDF-incremental aggregates accumulate instead of being overwritten: a
       column maps to a keyword (additive, min, max, sketch) or a raw SparkSQL
@@ -248,25 +266,39 @@ variable "output_definitions" {
       }))
       include_rescued_data = optional(bool, false)
     }))
-    mode          = optional(string, "replace")
-    merge_keys    = optional(list(string), [])
-    cluster_by    = optional(list(string), [])
-    merge_update  = optional(map(string), {})
-    stats         = optional(bool, false)
-    format        = optional(string, "delta")
-    path          = optional(string)
-    content_type  = optional(string, "application/json")
-    cache_control = optional(string)
+    mode                    = optional(string, "replace")
+    merge_keys              = optional(list(string), [])
+    cluster_by              = optional(list(string), [])
+    partition_by            = optional(list(string), [])
+    merge_update            = optional(map(string), {})
+    stats                   = optional(bool, false)
+    unity_catalog_table     = optional(string)
+    unity_catalog_location  = optional(string)
+    replaces_databricks_job = optional(number)
+    format                  = optional(string, "delta")
+    path                    = optional(string)
+    content_type            = optional(string, "application/json")
+    cache_control           = optional(string)
   }))
 
   validation {
-    condition     = alltrue([for k, v in var.output_definitions : contains(["replace", "append", "merge"], coalesce(v.mode, "replace"))])
-    error_message = "output_definitions[*].mode must be one of: replace, append, merge."
+    condition     = alltrue([for k, v in var.output_definitions : contains(["replace", "append", "merge", "replace_partitions"], coalesce(v.mode, "replace"))])
+    error_message = "output_definitions[*].mode must be one of: replace, append, merge, replace_partitions."
   }
 
   validation {
     condition     = alltrue([for k, v in var.output_definitions : coalesce(v.mode, "replace") != "merge" || length(coalesce(v.merge_keys, [])) > 0])
     error_message = "output_definitions[*] with mode = \"merge\" must declare a non-empty merge_keys."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.output_definitions : coalesce(v.mode, "replace") != "replace_partitions" || length(coalesce(v.partition_by, [])) > 0])
+    error_message = "output_definitions[*] with mode = \"replace_partitions\" must declare a non-empty partition_by."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.output_definitions : length(coalesce(v.partition_by, [])) == 0 || length(coalesce(v.cluster_by, [])) == 0])
+    error_message = "output_definitions[*] cannot set both partition_by and cluster_by."
   }
 
   validation {

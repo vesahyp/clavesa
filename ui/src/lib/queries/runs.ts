@@ -55,6 +55,9 @@ const NodeRun = z.object({
   executor_cpu_time_ms: z.number().nullish(),
   executor_run_time_ms: z.number().nullish(),
   max_task_duration_ms: z.number().nullish(),
+  // JSON text of the node's phase timing (spark_session, transform, write...).
+  // Optional: older runners and rows predate the column.
+  timing: z.string().nullish(),
 });
 export type NodeRun = z.infer<typeof NodeRun>;
 
@@ -153,6 +156,58 @@ export function usePipelineCost(dir: string) {
       const params = new URLSearchParams({ dir });
       return requestParsed(`/data/pipeline-cost?${params.toString()}`, PipelineCostSchema, {
         errorLabel: "GET pipeline-cost",
+      });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// run-timings — where the time goes, per run
+// ---------------------------------------------------------------------------
+
+const RunTimingNode = z.object({
+  node: z.string(),
+  status: z.string().optional(),
+  started_ms: z.number().optional(),
+  ended_ms: z.number().optional(),
+  duration_ms: z.number().nullish(),
+  output_rows: z.number().nullish(),
+  // Narrowed by parseNodeTiming() in lib/runTiming.ts.
+  timing: z.unknown().nullable().optional(),
+});
+
+const RunTimingRecord = z.object({
+  run_id: z.string(),
+  pipeline: z.string().optional(),
+  status: z.string(),
+  trigger: z.string().optional(),
+  compute: z.string().optional(),
+  started_at: z.string(),
+  ended_at: z.string().optional(),
+  total_ms: z.number(),
+  phases: z.record(z.string(), z.number()),
+  nodes: z.array(RunTimingNode).default([]),
+});
+export type RunTimingRecord = z.infer<typeof RunTimingRecord>;
+
+const RunTimingsResult = z.object({
+  generated_at: z.string().optional(),
+  history_dir: z.string().optional(),
+  runs: z.array(RunTimingRecord),
+});
+export type RunTimingsResult = z.infer<typeof RunTimingsResult>;
+
+/** GET /api/data/run-timings?dir=…&limit=… — ascending by started_at. */
+export function useRunTimings(dir: string, limit = 20) {
+  return useQuery({
+    queryKey: ["run-timings", dir, limit],
+    enabled: Boolean(dir),
+    retry: false,
+    staleTime: 30_000,
+    queryFn: () => {
+      const params = new URLSearchParams({ dir, limit: String(limit) });
+      return requestParsed(`/data/run-timings?${params.toString()}`, RunTimingsResult, {
+        errorLabel: "GET run-timings",
       });
     },
   });

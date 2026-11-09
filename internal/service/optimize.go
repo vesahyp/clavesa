@@ -151,7 +151,7 @@ func (s *Service) OptimizeTable(ctx context.Context, req OptimizeRequest) ([]Opt
 			return nil, fmt.Errorf("load AWS config: %w", err)
 		}
 		lc := lambda.NewFromConfig(cfg)
-		functionName := pipelineRunnerLambdaName(pipelineName)
+		functionName := pipelineRunnerLambdaName(s.awsName(pipelineName))
 		dispatch = func(ctx context.Context, op map[string]any) error {
 			body, mErr := json.Marshal(op)
 			if mErr != nil {

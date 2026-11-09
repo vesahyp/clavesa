@@ -182,6 +182,34 @@ func TestSyncOrchestrationMaterialisesS3SourceModule(t *testing.T) {
 	}
 }
 
+// TestSyncOrchestrationNoTriggerSource: a no_trigger s3 source keeps its
+// queue in the runner's SQSDrain IAM but out of the poller; with only
+// no-trigger sources there is no poller at all.
+func TestSyncOrchestrationNoTriggerSource(t *testing.T) {
+	t.Parallel()
+	ws, dir := pipelineForAttachTest(t)
+	svc := New(ws)
+	if _, err := svc.AddSource(SourceSpec{
+		Name: "events", Kind: "s3", Bucket: "raw-bucket", Prefix: "ev/",
+		Format: "parquet", NoTrigger: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AttachSource(dir, "events", "t1", "raw"); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(filepath.Join(ws, dir, "orchestration.tf"))
+	got := string(body)
+	for _, want := range []string{`Sid = "SQSDrain"`, `module.src_events.trigger_queue_arn`, `queue_url = module.src_events.trigger_queue_url`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("orchestration.tf missing %q\ngot:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `_poller_queue_arns`) || strings.Contains(got, `aws_lambda_function" "poller"`) {
+		t.Errorf("orchestration.tf emitted a poller for only no_trigger sources:\n%s", got)
+	}
+}
+
 // TestSyncOrchestrationOmitsSourceModuleForHTTP covers the negative
 // case: kind=http registered sources have no S3 bucket and don't need
 // SQS / EventBridge wiring, so the emitter must not materialise a
@@ -357,6 +385,38 @@ func TestSyncOrchestrationEmitsBoundBy(t *testing.T) {
 	s := mustRead(t, filepath.Join(ws, "silver", "orchestration.tf"))
 	if !strings.Contains(s, `bound_by = ["event_date"]`) {
 		t.Errorf("orchestration.tf missing bound_by attr:\n%s", s)
+	}
+}
+
+// TestSyncOrchestrationEmitsUnityCatalogAttrs covers partition_by and the
+// Unity Catalog attributes: a replace_partitions output surfaces
+// partition_by, uc_table, uc_location and replaces_job on the delta_table
+// descriptor, and the bare-string shortcut does not apply.
+func TestSyncOrchestrationEmitsUnityCatalogAttrs(t *testing.T) {
+	t.Parallel()
+	ws := xpipeWorkspace(t)
+	writePipelineMain(t, ws, "silver", `module "events" {
+  source = "github.com/vesahyp/clavesa//modules/transform/aws?ref=v2.6.0"
+  name   = "events"
+  sql    = "SELECT 1 AS id, current_date AS event_date"
+  output_definitions = { default = { mode = "replace_partitions", partition_by = ["event_date"], unity_catalog_table = "main.analytics.events", unity_catalog_location = "s3://b/events", replaces_databricks_job = 123456789 } }
+}
+`)
+	svc := New(ws)
+	if err := svc.SyncOrchestration("silver", ""); err != nil {
+		t.Fatalf("SyncOrchestration: %v", err)
+	}
+	s := mustRead(t, filepath.Join(ws, "silver", "orchestration.tf"))
+	for _, want := range []string{
+		`mode = "replace_partitions"`,
+		`partition_by = ["event_date"]`,
+		`uc_table = "main.analytics.events"`,
+		`uc_location = "s3://b/events"`,
+		`replaces_job = 123456789`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("orchestration.tf missing %q:\n%s", want, s)
+		}
 	}
 }
 

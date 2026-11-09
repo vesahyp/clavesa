@@ -36,6 +36,9 @@ func encodeAttributeValue(body *hclwrite.Body, name string, value AttributeValue
 	case float64:
 		body.SetAttributeRaw(name, numTokens(v))
 
+	case int64:
+		body.SetAttributeRaw(name, numTokens(float64(v)))
+
 	case bool:
 		body.SetAttributeValue(name, cty.BoolVal(v))
 
@@ -172,6 +175,10 @@ func scalarHCL(v interface{}) (string, error) {
 	switch val := v.(type) {
 	case string:
 		return strconv.Quote(val), nil
+	case int64:
+		return strconv.FormatInt(val, 10), nil
+	case int:
+		return strconv.Itoa(val), nil
 	case float64:
 		if val == float64(int64(val)) {
 			return strconv.FormatInt(int64(val), 10), nil

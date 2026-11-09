@@ -424,6 +424,9 @@ require_tools
 port_free "$PORT" || die "port $PORT is already in use — stop whatever is on it, or set CLAVESA_VERIFY_ADDR=:<port> for a parallel run"
 
 WORK="$(mktemp -d /tmp/clavesa-verify-readme.XXXX)"
+# Timing records of the walkthrough runs stay with the tempdir, out of the
+# developer's real run history (~/.local/state/clavesa/runs).
+export CLAVESA_RUN_HISTORY_DIR="$WORK/run-history"
 # Snapshot the binary into the workdir and run THAT copy: anything rewriting
 # bin/clavesa mid-walkthrough (e.g. the parallel test-cli gate under
 # `make release-gates` running build-bin) must not yank the binary out from
@@ -733,6 +736,11 @@ check_text "\b$PIPELINE\b" 30 "pipeline dashboard renders"
 # health verdict, last-run / success-rate stats).
 check_testid "deployment-status" 30 "deployment-status row renders"
 ui_do "open the Runs tab" click '[role=tab]:has-text("Runs")'
+# "Where the time goes" (Runs tab): the stacked bar per run of time per phase. The
+# card stamps its run count on the chart container (data-point-count), so
+# the assertion does not count recharts SVG internals.
+check_testid "run-timings-card" 60 "Where the time goes card renders"
+check_eval "() => { const el = document.querySelector('[data-testid=run-timings-chart]'); return !!el && Number(el.dataset.pointCount) >= $RUNS_WANTED; }" 120 "Where the time goes shows a bar per run (≥ $RUNS_WANTED)" 3
 # Run columns are buttons labeled "Run <id> · <status> · <duration>".
 check_text '"Run [^"]+ · ' 60 "Runs tab shows run history columns" 3
 check_text "\b$NODE1\b" 15 "Runs grid lists $NODE1"
@@ -766,7 +774,9 @@ if [[ -n "$RUN_ID" ]]; then
   else
     fail "triage strip: module version missing from the sheet (snapshot: $(dump_snapshot "$sheet"))"
   fi
-  if grep -q "Runner" <<<"$sheet" && grep -Eq 'code( \[[^]]*\])?: [0-9a-f]{12} *$' <<<"$sheet"; then
+  # The snapshot YAML quotes a prefix that is all digits ("843375344096"),
+  # so the quotes are optional: about 1 build in 250 has such a digest.
+  if grep -q "Runner" <<<"$sheet" && grep -Eq 'code( \[[^]]*\])?: "?[0-9a-f]{12}"? *$' <<<"$sheet"; then
     pass "triage strip shows the runner-image digest"
   else
     fail "triage strip: runner-image digest missing from the sheet (snapshot: $(dump_snapshot "$sheet"))"
@@ -784,10 +794,31 @@ if [[ -n "$RUN_ID" ]]; then
   # transforms must carry succeeded. Scoped to the sheet so the dashboard
   # canvas behind it can't satisfy the check.
   check_eval "() => [\"$NODE1\", \"$NODE2\"].every((n) => document.querySelector('[data-testid=run-detail-sheet] [data-testid=dag-node][data-node=\"' + n + '\"]')?.dataset.status === \"succeeded\")" 120 "run-detail DAG colors both transforms by status (succeeded)" 3
+  # Each per-node row carries a phase bar (inputs, transform, write, stats,
+  # other) built from the node_runs timing column.
+  check_eval "() => document.querySelectorAll('[data-testid=run-detail-sheet] [data-testid=node-phase-bar]').length >= 2" 120 "per-node breakdown shows a phase bar per transform" 3
 else
   fail "run-detail sheet: no run_id available from /api/data/runs"
 fi
 check_console "/pipelines/dashboard?dir=$PIPELINE (Runs tab + sheet)"
+
+# ---------------------------------------------------------------------------
+# Assertion 10: `pipeline timings` — the README's history command. One
+# record per run, every transform with its per-phase timing.
+# ---------------------------------------------------------------------------
+banner "assert: pipeline timings $PIPELINE --json"
+timings="$("$BIN" pipeline timings "$PIPELINE" --json --workspace "$WS" 2>&1)" || true
+nrec="$(jq -r '.runs | length' <<<"$timings" 2>/dev/null || echo 0)"
+if [[ "${nrec:-0}" -ge "$RUNS_WANTED" ]]; then
+  pass "pipeline timings lists $nrec runs (≥ $RUNS_WANTED)"
+else
+  fail "pipeline timings: expected ≥ $RUNS_WANTED runs, got ${nrec:-0}: $(head -c 400 <<<"$timings")"
+fi
+if jq -e '[.runs[-1].nodes[] | select(.timing != null and (.timing.phases | has("write")))] | length >= 2' <<<"$timings" >/dev/null 2>&1; then
+  pass "latest run carries per-phase timing for both transforms"
+else
+  fail "pipeline timings: latest run lacks per-node timing: $(jq -c '.runs[-1].nodes' <<<"$timings" 2>/dev/null | head -c 400)"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -41,3 +41,4 @@ Each ADR follows this structure:
 | [024](024-warehouse-compute-split.md) | Split environment mode into warehouse and compute | Accepted |
 | [025](025-remote-terraform-backend.md) | Remote Terraform backend for shared cloud deploys | Accepted |
 | [026](026-local-source-mirror.md) | Mirror s3 sources locally for local-warehouse runs | Accepted |
+| [027](027-unity-catalog-publish.md) | Clavesa replaces steps in existing Databricks pipelines, writing their existing Unity Catalog tables | Accepted (decision 6 and the work size open) |

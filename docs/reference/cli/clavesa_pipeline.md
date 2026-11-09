@@ -36,6 +36,9 @@ clavesa pipeline
 - [clavesa pipeline backfill](clavesa_pipeline_backfill.md) — Replay a transform over a historical partition window
 - [clavesa pipeline cost](clavesa_pipeline_cost.md) — Report cost per billion records — clavesa's north-star metric
 - [clavesa pipeline create](clavesa_pipeline_create.md) — Create a new pipeline
+- [clavesa pipeline databricks-compare](clavesa_pipeline_databricks-compare.md) — Compare the replaced Databricks step's table with clavesa's shadow table, per partition
+- [clavesa pipeline databricks-jobs](clavesa_pipeline_databricks-jobs.md) — Show or set the Databricks jobs started after every successful run
+- [clavesa pipeline databricks-run](clavesa_pipeline_databricks-run.md) — Show the Unity Catalog tables a run wrote and the Databricks jobs it started
 - [clavesa pipeline delete](clavesa_pipeline_delete.md) — Delete a pipeline
 - [clavesa pipeline deploy](clavesa_pipeline_deploy.md) — terraform init -upgrade → plan -out=tfplan → apply tfplan for a pipeline
 - [clavesa pipeline destroy](clavesa_pipeline_destroy.md) — terraform destroy on a pipeline (sweeping runtime-created Glue tables first)
@@ -51,6 +54,7 @@ clavesa pipeline
 - [clavesa pipeline runs](clavesa_pipeline_runs.md) — List recent runs of a pipeline
 - [clavesa pipeline show](clavesa_pipeline_show.md) — Show pipeline details
 - [clavesa pipeline status](clavesa_pipeline_status.md) — Show per-node status for the latest (or a given) run
+- [clavesa pipeline timings](clavesa_pipeline_timings.md) — Show where the time of recent runs went, phase by phase
 - [clavesa pipeline upgrade](clavesa_pipeline_upgrade.md) — Upgrade module versions in a pipeline
 
 ## See also

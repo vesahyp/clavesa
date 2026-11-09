@@ -122,7 +122,7 @@ function RegistrySourceBody({ name }: { name: string }) {
   const preview = useQuery({
     queryKey: ["source-preview", name],
     queryFn: () => getRegistrySourcePreview(name, 0, 1),
-    enabled: !!name && !!spec && !spec.credentials,
+    enabled: !!name && !!spec && !spec.credentials && spec.kind !== "unity-catalog",
     staleTime: 60_000,
     retry: 0,
   });
@@ -150,14 +150,16 @@ function RegistrySourceBody({ name }: { name: string }) {
 
   const location = spec.kind === "s3"
     ? `s3://${spec.bucket ?? ""}/${spec.prefix ?? ""}`
-    : (spec.url ?? "—");
+    : spec.kind === "unity-catalog"
+      ? (spec.table ?? "—")
+      : (spec.url ?? "—");
 
   return (
     <>
       <Section label="Source">
         <Field label="Kind" value={spec.kind} />
         <Field label="Format" value={spec.format || "—"} />
-        <Field label="Location" value={<span className="truncate">{location}</span>} />
+        <Field label="Location" value={<span className="truncate" data-testid="source-inspector-location">{location}</span>} />
         {spec.credentials && (
           <Field label="Credential" value={spec.credentials} />
         )}
@@ -167,7 +169,15 @@ function RegistrySourceBody({ name }: { name: string }) {
       </Section>
 
       <Section label={`Columns${columns.length > 0 ? ` · ${columns.length}` : ""}`}>
-        {spec.credentials ? (
+        {spec.kind === "unity-catalog" ? (
+          <span
+            className="text-xs text-muted-foreground"
+            data-testid="source-inspector-uc-note"
+          >
+            Preview is unavailable for Unity Catalog tables. Columns resolve
+            when the pipeline runs in the cloud.
+          </span>
+        ) : spec.credentials ? (
           <span className="text-xs text-muted-foreground">
             Preview is unavailable for credential-backed sources. Columns
             resolve at run time.

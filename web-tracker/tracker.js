@@ -30,6 +30,11 @@
     // element is the one clicked, so a site reads its own markup here (a card's
     // id, a row's product) without this file knowing anything about it.
     clickData: null,
+    // true for a single-page app: a path change made with history.pushState, or
+    // by Back/Forward, sends a pageview as a load does. replaceState does not
+    // (apps use it to mirror their own state into the URL, which is not a new
+    // page), and neither does a change of query or hash alone.
+    spa: false,
     debug: false
   };
   if (window.TRACKER_CONFIG) {
@@ -249,6 +254,28 @@
     // path, so this needs no field of its own: the event is the signal.
     track("pageview", {});
 
+    // In-app navigation, for a single-page app (config.spa). Without it a visit
+    // that loads once and then moves between pages reports one page read.
+    if (config.spa && window.history && history.pushState) {
+      var lastPath = location.pathname;
+      var onNav = function () {
+        try {
+          if (location.pathname === lastPath) return;
+          lastPath = location.pathname;
+          track("pageview", {});
+        } catch (err) {
+          track("tracker_error", { src: "spa_pageview", msg: err.message });
+        }
+      };
+      var push = history.pushState;
+      history.pushState = function () {
+        var out = push.apply(this, arguments);
+        onNav();
+        return out;
+      };
+      window.addEventListener("popstate", onNav);
+    }
+
     // Campaign attribution. A mail or an ad that links in with ?em=<campaign>,
     // and optionally ?emc=<which link in it>, gets one event here at init: an
     // app commonly strips its own query params right after mount, and once they
@@ -344,6 +371,23 @@
         }, { threshold: [0, 0.5] });
         var trackedEls = document.querySelectorAll("[data-track]");
         for (var ti = 0; ti < trackedEls.length; ti++) io.observe(trackedEls[ti]);
+        // Elements added after load (an app rendering a new view, a dialog, a
+        // lazy section) get observed too; otherwise nothing they show is ever
+        // counted as seen. Observing an element twice is a no-op.
+        if (window.MutationObserver) {
+          new MutationObserver(function (records) {
+            for (var ri = 0; ri < records.length; ri++) {
+              var added = records[ri].addedNodes;
+              for (var ai = 0; ai < added.length; ai++) {
+                var node = added[ai];
+                if (node.nodeType !== 1) continue;
+                if (node.hasAttribute("data-track")) io.observe(node);
+                var inner = node.querySelectorAll("[data-track]");
+                for (var ii = 0; ii < inner.length; ii++) io.observe(inner[ii]);
+              }
+            }
+          }).observe(document.body, { childList: true, subtree: true });
+        }
       } catch (err) {
         track("tracker_error", { src: "impression_observer", msg: err.message });
       }

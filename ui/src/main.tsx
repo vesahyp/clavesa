@@ -24,6 +24,7 @@ import { RunDetail } from "@/pages/RunDetail";
 import { BackfillDetail } from "@/pages/BackfillDetail";
 import { Sources } from "@/pages/Sources";
 import { Credentials } from "@/pages/Credentials";
+import { UnityCatalog } from "@/pages/UnityCatalog";
 import { Runner } from "@/pages/Runner";
 import { Notebooks } from "@/pages/Notebooks";
 import { Notebook } from "@/pages/Notebook";
@@ -89,6 +90,7 @@ createRoot(root).render(
                   />
                   <Route path="/sources" element={<Sources />} />
                   <Route path="/credentials" element={<Credentials />} />
+                  <Route path="/unity-catalog" element={<UnityCatalog />} />
                   <Route path="/runner" element={<Runner />} />
                   <Route path="/notebooks" element={<Notebooks />} />
                   <Route path="/notebooks/:name" element={<Notebook />} />

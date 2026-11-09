@@ -168,6 +168,60 @@ def test_download_injects_header_into_request():
             os.remove(path)
 
 
+def _serve_status(status: int, payload: bytes):
+    seen_headers: list[dict] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_headers.append({k: v for k, v in self.headers.items()})
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_a, **_k):
+            pass
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen_headers
+
+
+def test_download_sends_clavesa_user_agent():
+    # The NYC TLC CDN answered Python-urllib's default UA with 202 and an
+    # empty body (2026-11); every fetch now names clavesa.
+    runner = _load_runner()
+    server, seen = _serve_status(200, b"PAR1ua-bytes")
+    host, port = server.server_address
+    path = ""
+    try:
+        path = runner._download_http_to_tmp(f"http://{host}:{port}/ua-test.parquet")
+        ua = seen[0].get("User-Agent", "")
+        assert ua.startswith("clavesa/"), ua
+    finally:
+        server.shutdown()
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+def test_download_refuses_empty_or_non_200_body():
+    runner = _load_runner()
+    for status, body, url_name in ((202, b"", "accepted.parquet"), (200, b"", "empty.parquet")):
+        server, _ = _serve_status(status, body)
+        host, port = server.server_address
+        try:
+            try:
+                runner._download_http_to_tmp(f"http://{host}:{port}/{url_name}")
+            except RuntimeError as e:
+                assert "HTTP 202" in str(e) or "empty" in str(e), e
+            else:
+                raise AssertionError(f"status {status} with {len(body)} bytes must fail")
+            leftovers = [f for f in os.listdir("/tmp") if f.endswith(url_name) or f.endswith(url_name + ".part")]
+            assert not leftovers, leftovers
+        finally:
+            server.shutdown()
+
+
 if __name__ == "__main__":
     test_env_backend_resolves_value()
     test_file_backend_strips_trailing_newline()
@@ -176,4 +230,6 @@ if __name__ == "__main__":
     test_resolve_http_headers_assembles_bearer_token()
     test_resolve_http_headers_none_returns_none()
     test_download_injects_header_into_request()
+    test_download_sends_clavesa_user_agent()
+    test_download_refuses_empty_or_non_200_body()
     print("ok")

@@ -24,8 +24,10 @@ import (
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/procstart"
 	"github.com/vesahyp/clavesa/internal/runlock"
 	"github.com/vesahyp/clavesa/internal/runner"
+	"github.com/vesahyp/clavesa/internal/runtiming"
 	"github.com/vesahyp/clavesa/internal/sources"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -35,6 +37,10 @@ type RunResult struct {
 	Workdir string          `json:"workdir"`
 	RunID   string          `json:"run_id"`
 	Nodes   []NodeRunStatus `json:"nodes"`
+	// Timing is the run's timing record (also written to
+	// `_progress/<run>/_timing.json` and the run history dir). Nil when the
+	// run never reached its terminal block.
+	Timing *runtiming.Record `json:"timing,omitempty"`
 }
 
 // NodeRunStatus is the per-node outcome of RunPipeline.
@@ -97,6 +103,9 @@ type runPrep struct {
 	// lease release.
 	onTerminal   func()
 	terminalOnce sync.Once
+	// clock accumulates the run-level phase timings the `_timing.json`
+	// record is built from. Never nil after prepareRunWith.
+	clock *runClock
 }
 
 // releaseTerminal frees the run's concurrency guards — the warehouse lease
@@ -160,12 +169,35 @@ func (s *Service) RunPipeline(ctx context.Context, dir string) (*RunResult, erro
 type RunOpts struct {
 	Force      bool
 	ForceNodes []string
+	// Trigger labels the run in the `_run.json` marker, the runs row, the
+	// bundle event and the timing record. Empty means "manual". The CLI
+	// fills it from CLAVESA_TRIGGER (see TriggerFromEnv).
+	Trigger string
+}
+
+// TriggerFromEnv returns $CLAVESA_TRIGGER, or "manual" when it is unset or
+// empty. Any non-empty string is accepted (cron, ci, ...).
+func TriggerFromEnv() string {
+	if t := strings.TrimSpace(os.Getenv("CLAVESA_TRIGGER")); t != "" {
+		return t
+	}
+	return "manual"
+}
+
+func (o RunOpts) trigger() string {
+	if t := strings.TrimSpace(o.Trigger); t != "" {
+		return t
+	}
+	return "manual"
 }
 
 // RunPipelineWithOpts is RunPipeline with operator-controlled bypass
 // switches. Used by `clavesa pipeline run --force / --force-node`.
 func (s *Service) RunPipelineWithOpts(ctx context.Context, dir string, opts RunOpts) (*RunResult, error) {
-	prep, err := s.prepareRun(dir)
+	// The synchronous path is the CLI's: the run's total starts at process
+	// start, so the `startup` phase covers CLI boot + flag parsing.
+	entry := time.Now()
+	prep, err := s.prepareRunWith(dir, opts.trigger(), procstart.At, entry)
 	if err != nil {
 		return nil, err
 	}
@@ -196,6 +228,9 @@ func (s *Service) StartRun(dir string) (string, error) {
 // Run button passes through the force-checkbox / force-nodes input —
 // keeps CLI and UI calling the same execution-input shape (ADR-015).
 func (s *Service) StartRunWithOpts(dir string, opts RunOpts) (string, error) {
+	// The UI server is long-lived; process start says nothing about this
+	// run, so the total starts here and `startup` is 0.
+	entry := time.Now()
 	abs := s.resolveDir(dir)
 	s.runsMu.Lock()
 	if s.runsInFlight[abs] {
@@ -212,7 +247,7 @@ func (s *Service) StartRunWithOpts(dir string, opts RunOpts) (string, error) {
 		s.runsMu.Unlock()
 	}
 
-	prep, err := s.prepareRun(dir)
+	prep, err := s.prepareRunWith(dir, opts.trigger(), entry, entry)
 	if err != nil {
 		clear()
 		return "", err
@@ -241,6 +276,17 @@ func (s *Service) StartRunWithOpts(dir string, opts RunOpts) (string, error) {
 // channel. After it returns, GET /pipeline/execution/states reports the
 // run as RUNNING with every node PENDING.
 func (s *Service) prepareRun(dir string) (*runPrep, error) {
+	now := time.Now()
+	return s.prepareRunWith(dir, "manual", now, now)
+}
+
+// prepareRunWith is prepareRun with the run's trigger and the two clock
+// anchors: start (where the run's total begins) and entry (the run service
+// call; entry - start is the `startup` phase).
+func (s *Service) prepareRunWith(dir, trigger string, start, entry time.Time) (*runPrep, error) {
+	clock := &runClock{start: start}
+	clock.phases.Startup = msBetween(start, entry)
+	defer func() { clock.phases.Prepare = clock.prepareRemainder(entry) }()
 	abs := s.resolveDir(dir)
 	g, err := hclparser.Parse(abs)
 	if err != nil {
@@ -271,6 +317,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	workspaceRoot := filepath.Dir(abs)
 	runID := newRunID()
 	hostname, _ := os.Hostname()
+	lockStart := time.Now()
 	locker, err := runlock.New(workspace.LocalWarehouseDir(workspaceRoot), pipelineName)
 	if err != nil {
 		return nil, fmt.Errorf("run lock: %w", err)
@@ -290,6 +337,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 		}
 		return nil, fmt.Errorf("acquire run lock: %w", err)
 	}
+	clock.phases.Lock = msSince(lockStart)
 	// Renew every 30s so the 120s TTL survives long runs; a setup failure
 	// below must release so the next dispatch isn't locked out for a TTL.
 	lease.StartHeartbeat()
@@ -314,7 +362,9 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	// stashed (network, addr). Best-effort: the injected ensurer logs and
 	// returns both empty on failure so the containers fall back to
 	// embedded Derby (the no-op default in unit tests returns empty too).
+	metastoreStart := time.Now()
 	metastoreNetwork, metastoreAddr := s.metastoreEnsure(context.Background(), s.workspace, s.workspaceName())
+	clock.phases.Metastore = msSince(metastoreStart)
 
 	workdir, err := os.MkdirTemp("", "clavesa-run-")
 	if err != nil {
@@ -336,7 +386,9 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 		// Auto-refresh the workspace runner image if a CLI upgrade
 		// shipped new runner code — bypasses the silent-stale-image
 		// trap users would otherwise hit after `brew upgrade`.
+		imageStart := time.Now()
 		ensured, err := workspace.EnsureLocalRunnerImage(workspaceRoot)
+		clock.phases.Image = msSince(imageStart)
 		if err != nil {
 			return failPrep(fmt.Errorf("ensure runner image: %w", err))
 		}
@@ -352,7 +404,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 	// renders an in-flight column the instant StartRun returns, before the
 	// bundle container has produced any per-node marker.
 	store := observability.NewFileProgressStore(workspace.LocalWarehouseDir(workspaceRoot))
-	outcome := newRunOutcome(runID, pipelineName, "manual")
+	outcome := newRunOutcome(runID, pipelineName, trigger)
 	writeRunMarker(context.Background(), store, outcome)
 
 	return &runPrep{
@@ -360,7 +412,7 @@ func (s *Service) prepareRun(dir string) (*runPrep, error) {
 		image: image, catalog: catalog, systemCatalog: systemCatalog,
 		schema: schema, runID: runID, store: store, outcome: outcome,
 		metastoreNetwork: metastoreNetwork, metastoreAddr: metastoreAddr,
-		lease: lease,
+		lease: lease, clock: clock,
 	}, nil
 }
 
@@ -372,7 +424,6 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	workdir := prep.workdir
 	image := prep.image
 	catalog := prep.catalog
-	systemCatalog := prep.systemCatalog
 	schema := prep.schema
 	runID := prep.runID
 	store := prep.store
@@ -449,6 +500,7 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	var bundle []bundleTransformConfig
 	transformResults := map[string]NodeRunStatus{}
 
+	prep.clock.inputsStart = time.Now()
 	// First pass — sources, pre-compute transform tableIDs/outputs so
 	// downstream buildInputs sees every upstream-transform's tableID
 	// before the bundle runs.
@@ -550,8 +602,14 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	// scanner inside runPipelineBundle dispatches them to the channel
 	// in real time. Returns the per-transform terminal statuses for
 	// the destination-pass loop below.
+	prep.clock.markInputsDone()
 	if len(bundle) > 0 {
-		bundleStatuses, berr := s.runPipelineBundle(ctx, image, abs, workdir, bundle, runID, catalog, schema, systemCatalog, prep.force, prep.forceNodes, prep.metastoreNetwork, prep.metastoreAddr)
+		br, berr := s.runBundle(ctx, prep, bundle)
+		var bundleStatuses []NodeRunStatus
+		if br != nil {
+			bundleStatuses = br.Statuses
+			prep.clock.absorbBundle(br)
+		}
 		// Even on bundle error, walk whatever per-node results we got
 		// before the failure so result.Nodes carries the partial picture
 		// (the UI uses this for the per-node breakdown).
@@ -620,8 +678,14 @@ done:
 	// → runs-writer Lambda that does the same write through Athena). Best-effort:
 	// a failure here logs to stderr but doesn't change the run's outcome — the
 	// data the user cares about already landed via runTransform.
+	prep.clock.markInputsDone() // no-op unless an input/source error jumped here
+	recordStart := time.Now()
 	s.recordRun(ctx, image, abs, outcome, cascadeSkipped, s.metastoreEnsure)
+	prep.clock.phases.Record = msSince(recordStart)
 	terminalFired = true
+	// Timing record: `_progress/<run>/_timing.json` + the history mirror.
+	// Best effort; a write failure logs and never changes the run outcome.
+	result.Timing = s.writeRunTiming(ctx, prep, result)
 	if finalErr != nil {
 		return result, finalErr
 	}
@@ -765,6 +829,11 @@ func (s *Service) buildInputs(ctx context.Context, g *graph.PipelineGraph, nodeI
 						descriptor["credentials"] = credDescriptor
 					}
 					inputs[alias] = descriptor
+				case sources.KindUnityCatalog:
+					inputs[alias] = map[string]any{
+						"kind":  "uc_table",
+						"table": spec.Table,
+					}
 				case "s3":
 					if len(spec.Partitions) > 0 {
 						// Incremental read — runner walks the partition
@@ -784,6 +853,7 @@ func (s *Service) buildInputs(ctx context.Context, g *graph.PipelineGraph, nodeI
 							"path":       "s3://" + spec.Bucket + "/" + spec.Prefix,
 							"partitions": parts,
 							"start_from": startFrom,
+							"format":     spec.Format,
 						}
 						break
 					}
@@ -1361,7 +1431,7 @@ type bundleTransformConfig struct {
 // bundle itself failed (docker exit non-zero, unparseable response,
 // transform failure). On a transform failure the runner stops; statuses for
 // downstream transforms are absent (they never ran).
-func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, catalog, schema, systemCatalog string, force bool, forceNodes []string, metastoreNetwork, metastoreAddr string) ([]NodeRunStatus, error) {
+func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, workdir string, bundle []bundleTransformConfig, runID, trigger, catalog, schema, systemCatalog string, force bool, forceNodes []string, metastoreNetwork, metastoreAddr string) (*bundleRun, error) {
 	pipelineName := filepath.Base(pipelineDir)
 	warehouse := workspace.LocalWarehouseDir(s.workspace)
 	if err := os.MkdirAll(warehouse, 0o755); err != nil {
@@ -1392,7 +1462,7 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		"run_id":            runID,
 		"transforms":        transforms,
 		"_sf_execution_arn": runID,
-		"_trigger":          "manual",
+		"_trigger":          trigger,
 	}
 	if force {
 		// pipeline_handler unpacks these into each per-transform sub_event;
@@ -1514,20 +1584,25 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	// cloud's CloudWatch payload).
 	var stderrBuf bytes.Buffer
 	var bundleTS io.WriteCloser
+	// firstOut stamps the first byte the container writes on either stream:
+	// cmd.Start to that byte is the `container` phase (docker create + start
+	// + JVM exec, before the runner says anything).
+	firstOut := &firstByte{}
 	if bundleLog != nil {
 		defer bundleLog.Close()
 		bundleTS = observability.NewTimestampedLogWriter(bundleLog)
-		cmd.Stderr = io.MultiWriter(&stderrBuf, bundleTS)
+		cmd.Stderr = firstOut.writer(io.MultiWriter(&stderrBuf, bundleTS))
 	} else {
-		cmd.Stderr = &stderrBuf
+		cmd.Stderr = firstOut.writer(&stderrBuf)
 	}
 
+	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("docker start: %w", err)
 	}
 
 	var finalResp map[string]any
-	scanner := bufio.NewScanner(stdoutPipe)
+	scanner := bufio.NewScanner(firstOut.reader(stdoutPipe))
 	scanner.Buffer(make([]byte, 1024*1024), 64*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -1546,6 +1621,11 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		finalResp = msg
 	}
 	waitErr := cmd.Wait()
+	run := &bundleRun{
+		Response:    finalResp,
+		ContainerMs: firstOut.msSince(startedAt),
+		BundleMs:    msSince(startedAt),
+	}
 	if bundleTS != nil {
 		// Flush any partial trailing line so the log is complete before the
 		// failure returns below point a reader at it.
@@ -1565,6 +1645,7 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 			statuses = append(statuses, st)
 		}
 	}
+	run.Statuses = statuses
 
 	// Every failure return carries the inline bounded stderr tail plus a
 	// pointer at the durable full log — the tail alone truncates the real
@@ -1572,10 +1653,10 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	// the full log exists.
 	logRef := runnerLogRef(bundleLogPath, bundleLogErr)
 	if waitErr != nil {
-		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner: %w\nstderr: %s\n%s", waitErr, boundedStderrTail(stderrBuf.String()), logRef), stderrBuf.String())
+		return run, s.withDerbyHint(fmt.Errorf("pipeline runner: %w\nstderr: %s\n%s", waitErr, boundedStderrTail(stderrBuf.String()), logRef), stderrBuf.String())
 	}
 	if finalResp == nil {
-		return statuses, s.withDerbyHint(fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s\n%s", boundedStderrTail(stderrBuf.String()), logRef), stderrBuf.String())
+		return run, s.withDerbyHint(fmt.Errorf("pipeline runner produced no result JSON\nstderr: %s\n%s", boundedStderrTail(stderrBuf.String()), logRef), stderrBuf.String())
 	}
 	if status, _ := finalResp["status"].(string); status == "failed" {
 		failed, _ := finalResp["failed_node"].(string)
@@ -1583,9 +1664,9 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		// failed. Append the stderr tail so the real Spark stack trace
 		// reaches the caller/dashboard rather than blaming a node by name
 		// alone.
-		return statuses, fmt.Errorf("pipeline failed at node %q\nstderr: %s\n%s", failed, boundedStderrTail(stderrBuf.String()), logRef)
+		return run, fmt.Errorf("pipeline failed at node %q\nstderr: %s\n%s", failed, boundedStderrTail(stderrBuf.String()), logRef)
 	}
-	return statuses, nil
+	return run, nil
 }
 
 // derbyLockHint detects the embedded-Derby "already booted" failure in
@@ -2156,7 +2237,12 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 				}
 			}
 		}
-		if mode == "" && len(mergeKeys) == 0 && len(clusterKeys) == 0 && len(boundKeys) == 0 && len(mergeUpdate) == 0 && !stats {
+		partitionKeys := stringListValue(def["partition_by"])
+		ucTable, _ := def["unity_catalog_table"].(string)
+		ucLocation, _ := def["unity_catalog_location"].(string)
+		replacesJob := jobIDValue(def["replaces_databricks_job"])
+		if mode == "" && len(mergeKeys) == 0 && len(clusterKeys) == 0 && len(boundKeys) == 0 && len(mergeUpdate) == 0 && !stats &&
+			len(partitionKeys) == 0 && ucTable == "" && ucLocation == "" && replacesJob == 0 {
 			// Replace + no merge keys + stats off: leave bare string.
 			// "default" carries the caller's explicit target;
 			// everything else gets "" → runner auto-table.
@@ -2203,6 +2289,18 @@ func buildLocalOutputs(node *graph.Node, defaultTarget string) map[string]any {
 		}
 		if len(mergeUpdate) > 0 {
 			desc["merge_update"] = mergeUpdate
+		}
+		if len(partitionKeys) > 0 {
+			desc["partition_by"] = partitionKeys
+		}
+		if ucTable != "" {
+			desc["uc_table"] = ucTable
+		}
+		if ucLocation != "" {
+			desc["uc_location"] = ucLocation
+		}
+		if replacesJob != 0 {
+			desc["replaces_job"] = replacesJob
 		}
 		out[key] = desc
 	}

@@ -778,6 +778,22 @@ recipe_debugging_runs() {
   banner "recipe debugging-runs: restore the SQL, final run succeeds"
   clv node edit nightly trips --set "sql=$GOOD_SQL" || die "node edit trips (restore) failed"
   run_pipeline nightly
+
+  banner "recipe debugging-runs: pipeline timings --json — every run listed, newest with per-phase timing"
+  local timings
+  timings="$(clv pipeline timings nightly --json)" || die "pipeline timings failed"
+  local nruns
+  nruns="$(jq -r '.runs | length' <<<"$timings")"
+  if [[ "${nruns:-0}" -ge 3 ]]; then
+    pass "pipeline timings lists $nruns runs (≥ 3)"
+  else
+    fail "pipeline timings: expected ≥ 3 runs, got ${nruns:-0}"
+  fi
+  if jq -e '.runs[-1].nodes[0].timing.phases | has("write") and has("inputs") and has("spark_session")' <<<"$timings" >/dev/null; then
+    pass "newest run carries per-phase timing for trips"
+  else
+    fail "pipeline timings: newest run has no per-phase timing: $(jq -c '.runs[-1].nodes' <<<"$timings" | head -c 300)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1649,6 +1665,9 @@ recipe_backfill() {
 # ---------------------------------------------------------------------------
 require_tools
 WORK="$(mktemp -d /tmp/clavesa-verify-cookbook.XXXX)"
+# Timing records of the walkthrough runs stay with the tempdir, out of the
+# developer's real run history (~/.local/state/clavesa/runs).
+export CLAVESA_RUN_HISTORY_DIR="$WORK/run-history"
 # Snapshot the binary into the workdir (a parallel build must not yank it
 # out mid-run) and run THAT copy.
 cp "$BIN" "$WORK/clavesa"

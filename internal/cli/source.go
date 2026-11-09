@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/service"
+	"github.com/vesahyp/clavesa/internal/sources"
 )
 
 // newSourceCmd implements ADR-017's `clavesa source` noun: workspace-
@@ -50,11 +51,12 @@ Examples:
 }
 
 func newSourceRegisterCmd() *cobra.Command {
-	var from, kind, bucket, prefix, format string
+	var from, kind, bucket, prefix, format, table string
 	var attach, attachTo, attachAs, creds string
 	var partitions []string
 	var startFrom string
 	var manageNotifications bool
+	var noTrigger bool
 	var readOptions map[string]string
 
 	cmd := &cobra.Command{
@@ -70,6 +72,12 @@ Two shorthands cover the common cases — pass --from with the URL form:
 For s3, you can also pass kind/bucket/prefix explicitly:
 
   clavesa source register logs --kind s3 --bucket my-bucket --prefix events/ --format json
+
+A table a Databricks step wrote (Unity Catalog) takes a uc:// URL, or
+--table. It needs a Databricks connection (clavesa workspace connect
+databricks) and reads in the cloud only:
+
+  clavesa source register orders --from uc://main.sales.orders
 
 --format is inferred from the trailing filename when omitted. Pass
 --attach <pipeline-dir> --to <transform> [--as <alias>] to attach the
@@ -99,10 +107,15 @@ Local runs fall back to listing (no queue), with identical results.`,
 				Partitions:                partitions,
 				StartFrom:                 startFrom,
 				ManageBucketNotifications: manageNotifications,
+				NoTrigger:                 noTrigger,
 				ReadOptions:               readOptions,
 			}
 			if from != "" {
-				if strings.HasPrefix(from, "s3://") {
+				if strings.HasPrefix(from, sources.UCScheme) {
+					// AddSource derives the table from the URL.
+					spec.Kind = sources.KindUnityCatalog
+					spec.URL = from
+				} else if strings.HasPrefix(from, "s3://") {
 					if spec.Kind == "" {
 						spec.Kind = "s3"
 					}
@@ -116,6 +129,12 @@ Local runs fall back to listing (no queue), with identical results.`,
 					}
 					spec.URL = from
 				}
+			}
+			if table != "" {
+				if spec.Kind == "" {
+					spec.Kind = sources.KindUnityCatalog
+				}
+				spec.Table = table
 			}
 			if spec.Kind == "" {
 				return fmt.Errorf("specify --from <url> or --kind explicitly")
@@ -135,6 +154,8 @@ Local runs fall back to listing (no queue), with identical results.`,
 			case "s3":
 				fmt.Printf("  bucket: %s\n", stored.Bucket)
 				fmt.Printf("  prefix: %s\n", stored.Prefix)
+			case sources.KindUnityCatalog:
+				fmt.Printf("  table:  %s\n", stored.Table)
 			}
 
 			if attach != "" {
@@ -153,8 +174,9 @@ Local runs fall back to listing (no queue), with identical results.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3")
-	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3); inferred from --from when omitted")
+	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog")
+	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3, unity-catalog); inferred from --from when omitted")
+	cmd.Flags().StringVar(&table, "table", "", "Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog; needs clavesa workspace connect databricks)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (kind=s3)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix (kind=s3); auto-suffixed with /")
 	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json, tsv); inferred from filename if omitted")
@@ -165,6 +187,7 @@ Local runs fall back to listing (no queue), with identical results.`,
 	cmd.Flags().StringSliceVar(&partitions, "partitions", nil, "kind=s3: comma-separated Hive partition keys (e.g. year,month,day) for partition-column recovery")
 	cmd.Flags().StringVar(&startFrom, "start-from", "", `kind=s3 with --partitions: first-run seed before queue-drain takes over ("all" | "now" | "<cursor>")`)
 	cmd.Flags().BoolVar(&manageNotifications, "manage-notifications", false, "kind=s3: have terraform manage the bucket's EventBridge notification config (authoritative — replaces existing notification config). Default off; only enable when clavesa owns the source bucket")
+	cmd.Flags().BoolVar(&noTrigger, "no-trigger", false, "kind=s3: new files do not start runs; the pipeline runs on its schedule and drains the queue then")
 	cmd.Flags().StringToStringVar(&readOptions, "read-option", nil, "repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns (e.g. --read-option delimiter=$'\\t' --read-option header=false)")
 	return cmd
 }
@@ -183,10 +206,11 @@ func nonEmptyStrings(in []string) []string {
 }
 
 func newSourceEditCmd() *cobra.Command {
-	var from, kind, bucket, prefix, format, creds string
+	var from, kind, bucket, prefix, format, creds, table string
 	var partitions []string
 	var startFrom string
 	var manageNotifications bool
+	var noTrigger bool
 	var readOptions map[string]string
 
 	cmd := &cobra.Command{
@@ -224,8 +248,14 @@ the next run automatically.`,
 			if changed("from") {
 				// Re-derive the location from scratch; an explicit
 				// --kind/--bucket/--prefix/--format below still wins.
-				spec.URL, spec.Bucket, spec.Prefix, spec.Format = "", "", "", ""
-				if strings.HasPrefix(from, "s3://") {
+				spec.URL, spec.Bucket, spec.Prefix, spec.Format, spec.Table = "", "", "", "", ""
+				if strings.HasPrefix(from, sources.UCScheme) {
+					spec.Kind, spec.URL = sources.KindUnityCatalog, from
+					spec.Partitions = nil
+					spec.StartFrom = ""
+					spec.ManageBucketNotifications = false
+					spec.NoTrigger = false
+				} else if strings.HasPrefix(from, "s3://") {
 					spec.Kind, spec.URL = "s3", from
 				} else {
 					spec.Kind, spec.URL = "http", from
@@ -235,11 +265,16 @@ the next run automatically.`,
 					spec.Partitions = nil
 					spec.StartFrom = ""
 					spec.ManageBucketNotifications = false
+					spec.NoTrigger = false
 				}
 				touched = true
 			}
 			if changed("kind") {
 				spec.Kind = kind
+				touched = true
+			}
+			if changed("table") {
+				spec.Table = table
 				touched = true
 			}
 			if changed("bucket") {
@@ -270,6 +305,10 @@ the next run automatically.`,
 				spec.ManageBucketNotifications = manageNotifications
 				touched = true
 			}
+			if changed("no-trigger") {
+				spec.NoTrigger = noTrigger
+				touched = true
+			}
 			if changed("read-option") {
 				spec.ReadOptions = readOptions
 				touched = true
@@ -288,12 +327,15 @@ the next run automatically.`,
 			case "s3":
 				fmt.Printf("  bucket: %s\n", stored.Bucket)
 				fmt.Printf("  prefix: %s\n", stored.Prefix)
+			case sources.KindUnityCatalog:
+				fmt.Printf("  table:  %s\n", stored.Table)
 			}
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3")
-	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3)")
+	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog")
+	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3, unity-catalog)")
+	cmd.Flags().StringVar(&table, "table", "", "Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (kind=s3)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix (kind=s3); auto-suffixed with /")
 	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json, tsv)")
@@ -301,6 +343,7 @@ the next run automatically.`,
 	cmd.Flags().StringSliceVar(&partitions, "partitions", nil, `kind=s3: comma-separated Hive partition keys; pass "" to clear`)
 	cmd.Flags().StringVar(&startFrom, "start-from", "", `kind=s3 with --partitions: watermark seed ("all" | "now" | "<cursor>")`)
 	cmd.Flags().BoolVar(&manageNotifications, "manage-notifications", false, "kind=s3: have terraform manage the bucket's EventBridge notification config")
+	cmd.Flags().BoolVar(&noTrigger, "no-trigger", false, "kind=s3: new files do not start runs; the pipeline runs on its schedule and drains the queue then")
 	cmd.Flags().StringToStringVar(&readOptions, "read-option", nil, "repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns")
 	return cmd
 }
@@ -333,6 +376,9 @@ func newSourceListCmd() *cobra.Command {
 				location := s.URL
 				if s.Kind == "s3" {
 					location = "s3://" + s.Bucket + "/" + s.Prefix
+				}
+				if s.Kind == sources.KindUnityCatalog {
+					location = sources.UCScheme + s.Table
 				}
 				rows[i] = []string{s.Name, s.Kind, s.Format, s.Credentials, location}
 			}
@@ -374,6 +420,8 @@ func newSourceShowCmd() *cobra.Command {
 			case "s3":
 				fmt.Printf("Bucket:  %s\n", spec.Bucket)
 				fmt.Printf("Prefix:  %s\n", spec.Prefix)
+			case sources.KindUnityCatalog:
+				fmt.Printf("Table:   %s\n", spec.Table)
 			}
 			if spec.Credentials != "" {
 				fmt.Printf("Cred:    %s\n", spec.Credentials)
@@ -383,6 +431,9 @@ func newSourceShowCmd() *cobra.Command {
 				if spec.StartFrom != "" {
 					fmt.Printf("Start:   %s\n", spec.StartFrom)
 				}
+			}
+			if spec.NoTrigger {
+				fmt.Println("Trigger: off (new files do not start runs; the schedule runs the pipeline)")
 			}
 			if spec.ManageBucketNotifications {
 				fmt.Println("Notif:   managed (terraform owns the bucket's EventBridge notification config)")
@@ -482,6 +533,8 @@ type sourceJSON struct {
 	Partitions                []string `json:"partitions,omitempty"`
 	StartFrom                 string   `json:"start_from,omitempty"`
 	ManageBucketNotifications bool     `json:"manage_bucket_notifications,omitempty"`
+	NoTrigger                 bool     `json:"no_trigger,omitempty"`
+	Table                     string   `json:"table,omitempty"`
 }
 
 func sourceJSONOne(s service.SourceSpec) sourceJSON {
@@ -491,6 +544,8 @@ func sourceJSONOne(s service.SourceSpec) sourceJSON {
 		Format: s.Format, Credentials: s.Credentials,
 		Partitions: s.Partitions, StartFrom: s.StartFrom,
 		ManageBucketNotifications: s.ManageBucketNotifications,
+		NoTrigger:                 s.NoTrigger,
+		Table:                     s.Table,
 	}
 }
 

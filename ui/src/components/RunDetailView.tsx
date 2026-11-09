@@ -26,6 +26,7 @@ import { NodeDetailDrawer, type NodeSpec } from "@/components/NodeDetailDrawer";
 import { SourceInspectorDrawer } from "@/components/SourceInspectorDrawer";
 
 import {
+  useDatabricksRun,
   useExecutionStates,
   useLineage,
   useNodeRuns,
@@ -34,6 +35,7 @@ import {
 } from "@/lib/queries";
 import type { NodeRun, Run } from "@/lib/queries";
 import { formatDuration, formatRelative, formatRowCount } from "@/lib/format";
+import { nodePhaseSegments, parseNodeTiming } from "@/lib/runTiming";
 import {
   liveNodeColor,
   nodeVariant,
@@ -100,9 +102,10 @@ export function RunDetailView({ dir, runId }: RunDetailViewProps) {
     [runs.data, runId],
   );
 
-  // arn ties node_runs to this execution. During a live cloud run runRow
-  // isn't loaded yet (runs is gated to settled), but runId IS the SFN
-  // execution ARN for cloud, so the join key still resolves.
+  // arn ties node_runs to this execution. runId is the runs table's
+  // `run_id`: for a fully-cloud run that is only the last segment of the
+  // SFN execution ARN (the states endpoint maps it to the ARN server side),
+  // so node_runs resolves once runRow has loaded at settle.
   const arn = runRow?.sf_execution_arn || runId;
   const nodeRuns = useNodeRuns(pipelineName, {
     dir,
@@ -300,6 +303,8 @@ export function RunDetailView({ dir, runId }: RunDetailViewProps) {
       />
 
       <TriageStrip rows={Array.from(perNode.values())} />
+
+      <DatabricksRunCard dir={dir} runKey={arn} enabled={!isLocal} />
 
       <Card className="mt-6">
         <CardHeader className="pb-3">
@@ -499,6 +504,49 @@ function RunHeader({
 // Triage strip — image digest + module version, surfaced once at the top.
 // ---------------------------------------------------------------------------
 
+/**
+ * What this run did in Databricks (ADR-027): the Unity Catalog tables it
+ * wrote and the jobs it started, each with a link. Renders nothing when
+ * the run published nothing, so unconnected workspaces see no change.
+ * CLI twin: `clavesa pipeline databricks-run <run>`.
+ */
+function DatabricksRunCard({ dir, runKey, enabled }: { dir: string; runKey: string; enabled: boolean }) {
+  const run = useDatabricksRun(dir, runKey, enabled);
+  const d = run.data;
+  if (!d?.found) return null;
+  return (
+    <Card className="mt-6" data-testid="run-databricks-card">
+      <CardHeader className="pb-3">
+        <CardTitle>Databricks</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-2 text-sm">
+        {d.tables.map((t) => (
+          <div key={t.full_name} className="flex flex-wrap items-center gap-2" data-testid="run-databricks-table">
+            <span className="rounded bg-muted px-1.5 py-0.5 text-xs">Unity Catalog</span>
+            <a className="font-mono text-xs underline" href={t.url} target="_blank" rel="noreferrer">
+              {t.full_name}
+            </a>
+            <span className="text-xs text-muted-foreground">{t.action}</span>
+            {t.lineage && <span className="text-xs text-muted-foreground">lineage {t.lineage}</span>}
+          </div>
+        ))}
+        {d.jobs.map((j) => (
+          <div key={j.job_id} className="flex flex-wrap items-center gap-2" data-testid="run-databricks-job">
+            <span className="rounded bg-muted px-1.5 py-0.5 text-xs">Job {j.job_id}</span>
+            {j.error ? (
+              <span className="text-xs text-status-failed">not started: {j.error}</span>
+            ) : (
+              <a className="font-mono text-xs underline" href={j.run_page_url} target="_blank" rel="noreferrer">
+                run {j.run_id}
+              </a>
+            )}
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
 function TriageStrip({ rows }: { rows: NodeRun[] }) {
   const digest = rows.find((r) => r.runner_image_digest)?.runner_image_digest;
   const version = rows.find((r) => r.module_version)?.module_version;
@@ -566,6 +614,41 @@ function PerNodeRow({ row }: { row: NodeRun }) {
           )}
         </div>
       )}
+      <NodePhaseBar row={row} />
     </li>
+  );
+}
+
+function fmtMb(b: number | undefined): string {
+  return ((b ?? 0) / 1_048_576).toFixed(1);
+}
+
+// Thin stacked bar of a node's own phases. Timing arrives as JSON text on the
+// node_runs row; absent or unparsable timing renders nothing.
+function NodePhaseBar({ row }: { row: NodeRun }) {
+  const t = parseNodeTiming(row.timing);
+  if (!t) return null;
+  const segs = nodePhaseSegments(t, row.duration_ms);
+  const total = segs.reduce((a, s) => a + s.ms, 0);
+  if (total <= 0) return null;
+  const w = t.spark?.write;
+  const lines = segs.map((s) => `${s.key}: ${Math.round(s.ms)} ms`);
+  if (w) {
+    lines.push(
+      `${w.num_stages ?? 0} stages, ${w.num_tasks ?? 0} tasks, ${fmtMb(w.input_bytes)} MB read, ${fmtMb(w.shuffle_write_bytes)} MB shuffle`,
+    );
+  }
+  return (
+    <div
+      className="flex h-1.5 w-full gap-0.5 overflow-hidden rounded-sm"
+      title={lines.join("\n")}
+      data-testid="node-phase-bar"
+    >
+      {segs
+        .filter((s) => s.ms > 0)
+        .map((s) => (
+          <div key={s.key} style={{ width: `${(s.ms / total) * 100}%`, background: s.color }} />
+        ))}
+    </div>
   );
 }

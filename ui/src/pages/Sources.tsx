@@ -43,7 +43,7 @@ export function Sources() {
   const filtered = useMemo(() => {
     if (!q) return allSources;
     return allSources.filter((s) =>
-      [s.name, s.kind, s.format, s.url, s.bucket, s.prefix].some((f) =>
+      [s.name, s.kind, s.format, s.url, s.bucket, s.prefix, s.table].some((f) =>
         f.toLowerCase().includes(q),
       ),
     );
@@ -127,7 +127,7 @@ export function Sources() {
 // drift, the registered spec still reflects the server, not this.
 function inferFromURL(
   url: string,
-): { kind: string; bucket?: string; prefix?: string; format: string } | null {
+): { kind: string; bucket?: string; prefix?: string; table?: string; format: string } | null {
   const u = url.trim();
   if (!u) return null;
   const fmtFromName = (name: string): string => {
@@ -141,6 +141,9 @@ function inferFromURL(
     const i = s.lastIndexOf("/");
     return i < 0 ? s : s.slice(i + 1);
   };
+  if (u.startsWith("uc://")) {
+    return { kind: "unity-catalog", table: u.slice("uc://".length), format: "" };
+  }
   if (u.startsWith("s3://")) {
     const rest = u.slice("s3://".length);
     const slash = rest.indexOf("/");
@@ -170,7 +173,9 @@ function SourceForm({
   const initialUrl = editing
     ? editing.kind === "s3"
       ? `s3://${editing.bucket}/${editing.prefix}`
-      : editing.url
+      : editing.kind === "unity-catalog"
+        ? `uc://${editing.table}`
+        : editing.url
     : "";
   const [name, setName] = useState(editing?.name ?? "");
   const [url, setUrl] = useState(initialUrl);
@@ -181,7 +186,8 @@ function SourceForm({
       (editing.format ||
         (editing.partitions && editing.partitions.length > 0) ||
         editing.start_from ||
-        editing.manage_bucket_notifications)
+        editing.manage_bucket_notifications ||
+        editing.no_trigger)
     ),
   );
   const [format, setFormat] = useState(editing?.format ?? "");
@@ -192,6 +198,7 @@ function SourceForm({
   const [manageNotifications, setManageNotifications] = useState(
     editing?.manage_bucket_notifications ?? false,
   );
+  const [noTrigger, setNoTrigger] = useState(editing?.no_trigger ?? false);
   const [busy, setBusy] = useState(false);
   const credList = useCredentials();
 
@@ -214,21 +221,24 @@ function SourceForm({
       // source from s3 to http doesn't ship leftover s3 fields the
       // server would reject.
       const isS3 = inferFromURL(url)?.kind === "s3";
+      // A uc:// source takes only the table: no format, no credential.
+      const isUC = inferFromURL(url)?.kind === "unity-catalog";
       const payload = {
         name,
         url,
-        credentials: credentials || undefined,
-        format: format || undefined,
+        credentials: isUC ? undefined : credentials || undefined,
+        format: isUC ? undefined : format || undefined,
         partitions: isS3 && parts.length ? parts : undefined,
         start_from: isS3 ? startFrom || undefined : undefined,
         manage_bucket_notifications:
           isS3 ? manageNotifications || undefined : undefined,
+        no_trigger: isS3 ? noTrigger || undefined : undefined,
       };
       const stored = isEdit
         ? await updateSource(name, payload)
         : await registerSource(payload);
       toast.success(
-        `${isEdit ? "Updated" : "Registered"} ${stored.name} (${stored.kind}/${stored.format})`,
+        `${isEdit ? "Updated" : "Registered"} ${stored.name} (${stored.kind}${stored.format ? `/${stored.format}` : ""})`,
       );
       onDone();
     } catch (e) {
@@ -289,14 +299,19 @@ function SourceForm({
             >
               →{" "}
               <span className="text-foreground">kind={inf.kind}</span>
+              {inf.kind === "unity-catalog" && (
+                <>
+                  , table=<span className="text-foreground" data-testid="register-inference-table">{inf.table || "?"}</span>
+                </>
+              )}
               {inf.kind === "s3" && (
                 <>
                   , bucket=<span className="text-foreground">{inf.bucket || "?"}</span>
                   , prefix=<span className="text-foreground">{inf.prefix || "(whole bucket)"}</span>
                 </>
               )}
-              , format=
-              {effectiveFormat ? (
+              {inf.kind !== "unity-catalog" && <>, format=</>}
+              {inf.kind === "unity-catalog" ? null : effectiveFormat ? (
                 <span className="text-foreground">{effectiveFormat}</span>
               ) : (
                 <span className="italic">no extension — set it under Advanced</span>
@@ -405,11 +420,31 @@ function SourceForm({
                 </span>
               </span>
             </label>
+            <label className="flex items-start gap-2 sm:col-span-2">
+              <input
+                type="checkbox"
+                checked={noTrigger}
+                onChange={(e) => setNoTrigger(e.target.checked)}
+                disabled={busy}
+                className="mt-0.5"
+                data-testid="source-no-trigger-input"
+              />
+              <span className="space-y-0.5">
+                <span className="block text-xs text-foreground">
+                  Do not start runs on new files (kind=s3)
+                </span>
+                <span className="block text-[11px] text-muted-foreground">
+                  New files do not start runs. The pipeline runs on its
+                  schedule and drains the queue then.
+                </span>
+              </span>
+            </label>
           </div>
         )}
         <p className="text-xs text-muted-foreground">
-          Paste an https:// URL for kind=http or an s3:// URL for kind=s3
-          (same-account). Format is inferred from the trailing filename;
+          Paste an https:// URL for kind=http, an s3:// URL for kind=s3
+          (same-account), or uc://catalog.schema.table for a Unity Catalog
+          table (needs a Databricks connection). Format is inferred from the trailing filename;
           for directory URLs (no filename), pick the format under Advanced.
         </p>
       </CardContent>
@@ -527,7 +562,9 @@ function SourceRow({
                 text={
                   spec.kind === "s3"
                     ? `s3://${spec.bucket}/${spec.prefix}`
-                    : spec.url
+                    : spec.kind === "unity-catalog"
+                      ? `uc://${spec.table}`
+                      : spec.url
                 }
                 query={query}
               />

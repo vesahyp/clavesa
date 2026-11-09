@@ -172,7 +172,7 @@ func TestRunPipelineBundleFailureNamesFullLog(t *testing.T) {
 	}
 
 	bundle := []bundleTransformConfig{{NodeID: "t1", Language: "sql", LogicPath: filepath.Join(t.TempDir(), "logic.txt")}}
-	_, err := svc.runPipelineBundle(context.Background(), "img:latest", pipelineDir, t.TempDir(), bundle, "run-test", "", "", "", false, nil, "", "")
+	_, err := svc.runPipelineBundle(context.Background(), "img:latest", pipelineDir, t.TempDir(), bundle, "run-test", "manual", "", "", "", false, nil, "", "")
 	if err == nil {
 		t.Fatal("runPipelineBundle should fail against the failing docker stub")
 	}
@@ -215,7 +215,7 @@ func TestRunPipelineBundleFailureLogFallback(t *testing.T) {
 	}
 
 	bundle := []bundleTransformConfig{{NodeID: "t1", Language: "sql", LogicPath: filepath.Join(t.TempDir(), "logic.txt")}}
-	_, err := svc.runPipelineBundle(context.Background(), "img:latest", pipelineDir, t.TempDir(), bundle, "run-test", "", "", "", false, nil, "", "")
+	_, err := svc.runPipelineBundle(context.Background(), "img:latest", pipelineDir, t.TempDir(), bundle, "run-test", "manual", "", "", "", false, nil, "", "")
 	if err == nil {
 		t.Fatal("runPipelineBundle should fail against the failing docker stub")
 	}

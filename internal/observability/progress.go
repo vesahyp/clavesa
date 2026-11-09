@@ -362,8 +362,12 @@ func progressStates(ctx context.Context, store ProgressStore, run string, nowMs 
 			continue
 		}
 		name := strings.TrimSuffix(key[len(prefix):], ".json")
-		if name == "" || name == "_run" {
-			// "_run" is the run-level marker, not a node.
+		if name == "" || name == "_run" || name == "_timing" || name == "_databricks" {
+			// "_run" is the run-level marker, "_timing" the run's timing
+			// record (internal/runtiming) and "_databricks" what the run
+			// did in Unity Catalog (ADR-027); none is a node. Read as a
+			// node, _databricks has no status, so it counted as a node
+			// still running and kept the dashboard's pill on "Running".
 			continue
 		}
 		snap := readProgressSnapshot(ctx, store, key)

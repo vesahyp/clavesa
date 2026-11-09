@@ -118,7 +118,7 @@ func (s *Service) prepareCloudLocalRun(ctx context.Context, dir string, opts Run
 	// Deployed runner Lambda env: the s3:// warehouse, Glue catalog/schema,
 	// and system-catalog the container targets. One round-trip, reused for
 	// both the bundle dispatch and the runs-row write.
-	functionName := pipelineRunnerLambdaName(pipelineName)
+	functionName := pipelineRunnerLambdaName(s.awsName(pipelineName))
 	lc := lambda.NewFromConfig(cfg)
 	lambdaEnv, err := lambdaRunnerEnv(ctx, lc, functionName)
 	if err != nil {
@@ -127,7 +127,7 @@ func (s *Service) prepareCloudLocalRun(ctx context.Context, dir string, opts Run
 
 	// Full ordered transform list (post-apply resolved I/O) from the deployed
 	// SFN definition.
-	transforms, err := loadPipelineTransforms(ctx, sfn.NewFromConfig(cfg), pipelineName)
+	transforms, err := loadPipelineTransforms(ctx, sfn.NewFromConfig(cfg), s.awsName(pipelineName))
 	if err != nil {
 		return nil, fmt.Errorf("resolve pipeline transforms from SFN definition: %w", err)
 	}

@@ -527,15 +527,57 @@ func (h *Handler) resolveExecRef(r *http.Request) (dir, run string, ok bool) {
 		return "", "", false
 	}
 	q := r.URL.Query()
-	if dir := q.Get("dir"); dir != "" {
-		return dir, q.Get("run"), true
+	if dir = q.Get("dir"); dir != "" {
+		run = q.Get("run")
+	} else {
+		arn := q.Get("arn")
+		if arn == "" || observability.StateMachineNameFromExecutionARN(arn) != "" {
+			return "", "", false
+		}
+		dir, run = observability.SplitExecRef(arn)
 	}
-	arn := q.Get("arn")
-	if arn == "" || observability.StateMachineNameFromExecutionARN(arn) != "" {
-		return "", "", false
+	return dir, h.sfnRunRef(r.Context(), dir, run), true
+}
+
+// sfnRunRef turns the short run id of a fully-cloud run into its SFN
+// execution ARN. The runs table and the dashboard address a cloud run by
+// `run_id`, the last segment of the execution ARN, but the runner keys the
+// warehouse `_progress/<run>/` tree by the full ARN and only an ARN reaches
+// DescribeExecution. Without this, a finished cloud run read by its short id
+// finds no markers and no `_run.json`, and ExecutionStates reports it as
+// RUNNING forever.
+//
+// The run is returned unchanged on a local warehouse, for an ARN, for a
+// cloud-local run (its `local-` id is the progress key itself, see
+// service/run_cloud_local.go), and when the pipeline has no deployed state
+// machine.
+func (h *Handler) sfnRunRef(ctx context.Context, dir, run string) string {
+	if dir == "" || run == "" || h.isLocalWarehouse() ||
+		observability.StateMachineNameFromExecutionARN(run) != "" ||
+		strings.HasPrefix(run, "local-") {
+		return run
 	}
-	dir, run = observability.SplitExecRef(arn)
-	return dir, run, true
+	smARN, err := readStateMachineARN(ctx, h.root, pathutil.ResolveDir(h.root, dir))
+	if err != nil || smARN == "" {
+		return run
+	}
+	execARN, ok := executionARNFor(smARN, run)
+	if !ok {
+		return run
+	}
+	return execARN
+}
+
+// executionARNFor builds the execution ARN of execution name under state
+// machine smARN: arn:aws:states:<region>:<acct>:stateMachine:<sm> becomes
+// arn:aws:states:<region>:<acct>:execution:<sm>:<name>.
+func executionARNFor(smARN, name string) (string, bool) {
+	const sm = ":stateMachine:"
+	i := strings.Index(smARN, sm)
+	if i < 0 {
+		return "", false
+	}
+	return smARN[:i] + ":execution:" + smARN[i+len(sm):] + ":" + name, true
 }
 
 // GetExecutionStates returns per-state status for one execution, designed to

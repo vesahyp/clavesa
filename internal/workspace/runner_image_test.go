@@ -3,6 +3,7 @@ package workspace
 import (
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/vesahyp/clavesa/internal/runner"
@@ -21,6 +22,22 @@ func dockerAvailable() bool {
 
 func imageTagExists(ref string) bool {
 	return exec.Command("docker", "image", "inspect", ref).Run() == nil
+}
+
+// TestRunnerBuildArgsNoProvenance guards the Lambda image format: without
+// --provenance=false, BuildKit pushes an OCI index with an attestation
+// manifest and Lambda's CreateFunction rejects it (Docker Desktop 29).
+func TestRunnerBuildArgsNoProvenance(t *testing.T) {
+	got := runnerBuildArgs("v1.2.3", "/ws/runner", "img:v1.2.3", "img:latest")
+	want := []string{
+		"build", "--provenance=false", "--sbom=false",
+		"--build-arg", "CLAVESA_MODULE_VERSION=v1.2.3",
+		"-t", "img:v1.2.3", "-t", "img:latest",
+		"/ws/runner",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("runnerBuildArgs = %q, want %q", got, want)
+	}
 }
 
 // TestEnsureLocalRunnerImageRestoresVersionTag reproduces the v2.7.4 deploy

@@ -321,6 +321,78 @@ func TestPipelineRunsAndLogs(t *testing.T) {
 	if st.ErrorMsg == "" {
 		t.Errorf("node %q error_msg is empty, want the runner's error text", transformID)
 	}
+
+	// --- Step 10: `pipeline timings` over the same three runs. ---
+
+	type timingNode struct {
+		Node   string                     `json:"node"`
+		Timing map[string]json.RawMessage `json:"timing"`
+	}
+	type timingRecord struct {
+		RunID  string           `json:"run_id"`
+		Status string           `json:"status"`
+		Phases map[string]int64 `json:"phases"`
+		Nodes  []timingNode     `json:"nodes"`
+	}
+	type timingHistory struct {
+		GeneratedAt string         `json:"generated_at"`
+		HistoryDir  string         `json:"history_dir"`
+		Runs        []timingRecord `json:"runs"`
+	}
+	timingsJSONOut := run(t, "pipeline", "timings", "orders", "--workspace", ws, "--json")
+	var timings timingHistory
+	if err := json.Unmarshal([]byte(timingsJSONOut), &timings); err != nil {
+		t.Fatalf("parse pipeline timings --json: %v\noutput: %s", err, timingsJSONOut)
+	}
+	if timings.GeneratedAt == "" || timings.HistoryDir != "" {
+		t.Errorf("pipeline timings --json: generated_at %q, history_dir %q (want set, empty)", timings.GeneratedAt, timings.HistoryDir)
+	}
+	if len(timings.Runs) < 3 {
+		t.Fatalf("pipeline timings --json returned %d runs, want >= 3; output: %s", len(timings.Runs), timingsJSONOut)
+	}
+	runPhaseKeys := []string{"startup", "prepare", "lock", "metastore", "image", "inputs", "container", "boot", "bundle", "nodes", "record"}
+	nodePhaseKeys := []string{"spark_session", "catalog", "inputs", "transform", "write", "glue_sync", "stats", "table_state", "system"}
+	withTiming := 0
+	for _, rec := range timings.Runs {
+		for _, k := range runPhaseKeys {
+			if _, ok := rec.Phases[k]; !ok {
+				t.Errorf("run %s phases missing key %q: %v", rec.RunID, k, rec.Phases)
+			}
+		}
+		for _, n := range rec.Nodes {
+			if n.Timing == nil {
+				continue
+			}
+			withTiming++
+			var phases map[string]int64
+			if err := json.Unmarshal(n.Timing["phases"], &phases); err != nil {
+				t.Errorf("run %s node %s timing.phases: %v", rec.RunID, n.Node, err)
+				continue
+			}
+			for _, k := range nodePhaseKeys {
+				if _, ok := phases[k]; !ok {
+					t.Errorf("run %s node %s timing.phases missing key %q: %v", rec.RunID, n.Node, k, phases)
+				}
+			}
+			for _, k := range []string{"inputs", "outputs", "spark"} {
+				if _, ok := n.Timing[k]; !ok {
+					t.Errorf("run %s node %s timing missing %q", rec.RunID, n.Node, k)
+				}
+			}
+		}
+	}
+	if withTiming == 0 {
+		t.Errorf("no node in pipeline timings --json carries a non-null timing; output: %s", timingsJSONOut)
+	}
+
+	timingsTextOut := run(t, "pipeline", "timings", "orders", "--workspace", ws)
+	lines := strings.Split(strings.TrimRight(timingsTextOut, "\n"), "\n")
+	if len(lines) != len(timings.Runs)+1 {
+		t.Errorf("pipeline timings table has %d lines, want a header + %d rows:\n%s", len(lines), len(timings.Runs), timingsTextOut)
+	}
+	if !strings.HasPrefix(lines[0], "STARTED") || !strings.Contains(lines[0], "TRANSFORM") || strings.Contains(lines[0], "WORKSPACE") {
+		t.Errorf("pipeline timings header = %q", lines[0])
+	}
 }
 
 // extractRunID pulls the run id out of a text-mode `pipeline run`'s

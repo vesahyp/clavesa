@@ -147,9 +147,24 @@ bin/clavesa pipeline logs nightly --tail 3 --json --workspace $WS
 {"source":"local","log_group":"/tmp/clavesa-cookbook/nightly/.clavesa/runs/9c1e.../_bundle.log","function_name":"","events":[{"timestamp":"2026-08-05T07:02:14.812Z","message":"pyspark.errors.exceptions.captured.AnalysisException: ..."},{"timestamp":"...","message":"..."},{"timestamp":"...","message":"..."}],"truncated":true}
 ```
 
+## Where the time went: `pipeline timings`
+
+A run that is slow is a different question from a run that failed. Every local run records its time per phase, and `pipeline timings` lists that history, oldest first:
+
+```bash
+bin/clavesa pipeline timings nightly --workspace $WS
+```
+
+```
+STARTED           STATUS     TOTAL  STARTUP  METASTORE  SPARK  READS  TRANSFORM  WRITES  STATS  OTHER
+2026-10-06 10:11  SUCCEEDED  48.2s  4.1s     2.3s       9.8s   3.0s   0.4s       17.5s   -      11.1s
+```
+
+`STARTUP` is the CLI, the run lock, the runner image check and the container start; `SPARK` the session build and the first catalog round trip; `READS`, `TRANSFORM`, `WRITES` and `STATS` the sum over the nodes; `OTHER` the rest (Delta table-state reads, the system-table writes, the `runs`-row container). `--json` prints the full record per run: the run-level phases, and per node the phases, per-input and per-output milliseconds, and a Spark stage summary (stages, tasks, input and shuffle bytes, spill, executor time) for each phase that ran Spark jobs. `--since 7d` and `--runs 5` bound the list; `--all` reads every workspace on the machine from the run history dir (`~/.local/state/clavesa/runs` unless `$CLAVESA_RUN_HISTORY_DIR` or `$XDG_STATE_HOME` says otherwise), which is what a cross-project chart reads.
+
 ## Where the artifacts live on disk
 
-Nothing above is a black box. Every local run writes a durable trail under the pipeline and the workspace: the full captured log sits at `<pipeline>/.clavesa/runs/<runID>/_bundle.log` (what `pipeline logs` reads), and the run/node status markers `pipeline runs` and `pipeline status` read live in the workspace-shared `<workspace>/.clavesa/warehouse/_progress/<runID>/` tree (`_run.json` for the run, one `<node>.json` per node). Both survive the run that wrote them — `grep` them directly if you'd rather not go through the CLI, or point a log shipper at the `_bundle.log` files.
+Nothing above is a black box. Every local run writes a durable trail under the pipeline and the workspace: the full captured log sits at `<pipeline>/.clavesa/runs/<runID>/_bundle.log` (what `pipeline logs` reads), and the run/node status markers `pipeline runs` and `pipeline status` read live in the workspace-shared `<workspace>/.clavesa/warehouse/_progress/<runID>/` tree (`_run.json` for the run, one `<node>.json` per node, `_timing.json` for the per-phase record `pipeline timings` reads). Both survive the run that wrote them — `grep` them directly if you'd rather not go through the CLI, or point a log shipper at the `_bundle.log` files.
 
 ## Fix it and confirm
 
@@ -201,6 +216,10 @@ bin/clavesa pipeline logs nightly --tail 3 --json --workspace $WS | jq '{n: (.ev
 # Restore the SQL; the pipeline runs clean again.
 bin/clavesa node edit nightly trips --set "sql=SELECT VendorID, tpep_pickup_datetime, payment_type, total_amount FROM src_trips" --workspace $WS
 bin/clavesa pipeline run nightly --workspace $WS ; echo "exit=$?"    # exit=0
+
+# pipeline timings lists every run; the newest carries per-phase timing for trips.
+bin/clavesa pipeline timings nightly --json --workspace $WS | jq '{runs: (.runs | length), trips_phases: (.runs[-1].nodes[0].timing.phases | keys | length)}'
+# → {"runs":3,"trips_phases":9}   (runs ≥ 3; the failed run is in the list too)
 ```
 
 ## What to expect — and the limits

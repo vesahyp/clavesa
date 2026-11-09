@@ -153,9 +153,9 @@ func TestS3ValidationRejectsBadInputs(t *testing.T) {
 			"start_from set without partitions",
 		},
 		{
-			"partitions with csv rejected",
-			Spec{Name: "x", Kind: "s3", Bucket: "b", Format: "csv", Partitions: []string{"year"}},
-			"format=parquet",
+			"no_trigger on http rejected",
+			Spec{Name: "x", Kind: "http", URL: "https://example.com/data.parquet", Format: "parquet", NoTrigger: true},
+			"no_trigger is only valid for kind=s3",
 		},
 		{
 			"empty partition name rejected",
@@ -170,6 +170,18 @@ func TestS3ValidationRejectsBadInputs(t *testing.T) {
 				t.Errorf("Add(%#v) err = %v, want substring %q", c.spec, err, c.want)
 			}
 		})
+	}
+}
+
+// A raw landing zone is often JSON lines partitioned by day: partitioned
+// sources take every format the runner reads.
+func TestPartitionedSourceTakesJSONAndCSV(t *testing.T) {
+	t.Parallel()
+	st := New(t.TempDir())
+	for _, f := range []string{"json", "csv"} {
+		if err := st.Add(Spec{Name: "events_" + f, Kind: "s3", Bucket: "b", Prefix: "raw/", Format: f, Partitions: []string{"event_date"}}); err != nil {
+			t.Errorf("format %s: %v", f, err)
+		}
 	}
 }
 

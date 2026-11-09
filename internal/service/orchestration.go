@@ -109,6 +109,10 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	// Trigger queue ARN expressions from source modules (legacy inline +
 	// registered s3 sources materialised below).
 	queueExprs := make([]string, 0)
+	// pollerQueues is queueExprs minus the registered s3 sources marked
+	// no_trigger: the runner still drains those queues, the poller does
+	// not watch them.
+	pollerQueues := make([]string, 0)
 	sourceIDs := make([]string, 0)
 	for _, n := range g.Nodes {
 		if n.Type == "source" {
@@ -117,14 +121,20 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	}
 	sort.Strings(sourceIDs)
 	for _, id := range sourceIDs {
-		queueExprs = append(queueExprs, fmt.Sprintf("module.%s.trigger_queue_arn", id))
+		expr := fmt.Sprintf("module.%s.trigger_queue_arn", id)
+		queueExprs = append(queueExprs, expr)
+		pollerQueues = append(pollerQueues, expr)
 	}
 	registeredS3, err := s.collectRegisteredS3Sources(g, nodeByID)
 	if err != nil {
 		return err
 	}
 	for _, src := range registeredS3 {
-		queueExprs = append(queueExprs, fmt.Sprintf("module.%s.trigger_queue_arn", srcModuleName(src.Name)))
+		expr := fmt.Sprintf("module.%s.trigger_queue_arn", srcModuleName(src.Name))
+		queueExprs = append(queueExprs, expr)
+		if !src.NoTrigger {
+			pollerQueues = append(pollerQueues, expr)
+		}
 	}
 
 	// External S3 buckets — union of inline source-module buckets and
@@ -164,6 +174,11 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	// machine to listen to.
 	upstreamProducers := s.upstreamProducerPipelines(g, pipelineName, resolvePipelineSchema(abs, pipelineName))
 
+	upstreamAWSNames := make(map[string]string, len(upstreamProducers))
+	for _, producer := range upstreamProducers {
+		upstreamAWSNames[producer] = workspace.PipelineAWSName(ws, producer)
+	}
+
 	// Producer-grain lookup for cross-pipeline CDF reads (GH: dim CDF
 	// crash). Keyed schema → table → the producing node's output
 	// merge_keys, so buildNodeInputsExpr stamps the upstream's grain on
@@ -191,11 +206,19 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	// transform node uses for `runner_image`.
 	runnerImageExpr := "data.terraform_remote_state.workspace.outputs.runner_image"
 
+	// Workspace-scoped AWS names (manifest aws_names = "workspace"). Empty
+	// for a legacy workspace: tfgen and the source module then keep
+	// clavesa-${var.pipeline_name}, so the emitted .tf does not change.
+	awsNameForSources := ""
+	if ws != nil && ws.AWSNames == workspace.AWSNamesWorkspace {
+		awsNameForSources = workspace.PipelineAWSName(ws, pipelineName)
+	}
+
 	// Materialise registered s3 source modules at the top of the file.
 	sourceModuleSrc := s.ModuleSource(abs, SourceModuleRel)
 	var sourceBlocks strings.Builder
 	for _, src := range registeredS3 {
-		emitS3SourceModule(&sourceBlocks, sourceModuleSrc, src)
+		emitS3SourceModule(&sourceBlocks, sourceModuleSrc, src, awsNameForSources)
 	}
 
 	// Per-transform invocation payloads — tfgen renders one entry per
@@ -254,20 +277,34 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		})
 	}
 
+	ucConfig, err := s.unityCatalogConfig(ws, abs)
+	if err != nil {
+		return fmt.Errorf("orchestration: %w", err)
+	}
+	compute, err := pipelineCompute(g.Nodes)
+	if err != nil {
+		return err
+	}
 	tfBody, err := tfgen.Emit(tfgen.Pipeline{
+		Compute:           compute,
 		PipelineNameExpr:  "var.pipeline_name",
+		AWSName:           awsNameForSources,
+		UpstreamAWSNames:  upstreamAWSNames,
 		Catalog:           catalog,
 		SchemaExpr:        "var.schema",
 		SystemCatalog:     systemCatalog,
 		BucketExpr:        bucketExpr,
 		RunnerImageExpr:   runnerImageExpr,
+		RunnerArchExpr:    "data.terraform_remote_state.workspace.outputs.runner_architecture",
 		ScheduleExpr:      "var.trigger_schedule",
 		BatchWindowExpr:   "var.trigger_batch_window",
 		TriggerQueueExprs: queueExprs,
+		PollerQueueExprs:  pollerQueues,
 		UpstreamPipelines: upstreamProducers,
 		Transforms:        transforms,
 		ExternalBuckets:   externalBuckets,
 		UpstreamSchemas:   upstreamSchemas,
+		UnityCatalog:      ucConfig,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestration: emit tf: %w", err)
@@ -401,6 +438,8 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 			case "http":
 				entries = append(entries, fmt.Sprintf(`%s = { kind = "http", url = %q, format = %q%s }`,
 					alias, spec.URL, spec.Format, credBlock))
+			case sources.KindUnityCatalog:
+				entries = append(entries, fmt.Sprintf(`%s = { kind = "uc_table", table = %q }`, alias, spec.Table))
 			case "s3":
 				// Notification-drain ingest: the runner drains this source's
 				// SQS queue (S3 ObjectCreated events) for new keys when the
@@ -414,8 +453,8 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 						startFrom = "all"
 					}
 					quoted := quoteList(spec.Partitions)
-					entries = append(entries, fmt.Sprintf(`%s = { kind = "partitioned_path", path = "s3://%s/%s", partitions = [%s], start_from = %q, queue_url = %s }`,
-						alias, spec.Bucket, spec.Prefix, quoted, startFrom, queueURLRef))
+					entries = append(entries, fmt.Sprintf(`%s = { kind = "partitioned_path", path = "s3://%s/%s", partitions = [%s], start_from = %q, format = %q, queue_url = %s }`,
+						alias, spec.Bucket, spec.Prefix, quoted, startFrom, spec.Format, queueURLRef))
 					break
 				}
 				readOptsAttr := ""
@@ -507,6 +546,10 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		len(outputMergeKeys(nodeByID[id], "default")) == 0 &&
 		len(outputClusterBy(nodeByID[id], "default")) == 0 &&
 		len(outputBoundBy(nodeByID[id], "default")) == 0 &&
+		len(outputPartitionBy(nodeByID[id], "default")) == 0 &&
+		outputStringField(nodeByID[id], "default", "unity_catalog_table") == "" &&
+		outputStringField(nodeByID[id], "default", "unity_catalog_location") == "" &&
+		outputReplacesJob(nodeByID[id], "default") == 0 &&
 		len(outputMergeUpdate(nodeByID[id], "default")) == 0 &&
 		!outputStats(nodeByID[id], "default") {
 		return fmt.Sprintf(`{ default = %s }`, defaultDest)
@@ -541,7 +584,12 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		boundBy := outputBoundBy(nodeByID[id], key)
 		mergeUpdate := outputMergeUpdate(nodeByID[id], key)
 		stats := outputStats(nodeByID[id], key)
-		if mode == "replace" && len(mergeKeys) == 0 && len(clusterBy) == 0 && len(boundBy) == 0 && len(mergeUpdate) == 0 && !stats {
+		partitionBy := outputPartitionBy(nodeByID[id], key)
+		ucTable := outputStringField(nodeByID[id], key, "unity_catalog_table")
+		ucLocation := outputStringField(nodeByID[id], key, "unity_catalog_location")
+		replacesJob := outputReplacesJob(nodeByID[id], key)
+		if mode == "replace" && len(mergeKeys) == 0 && len(clusterBy) == 0 && len(boundBy) == 0 && len(mergeUpdate) == 0 && !stats &&
+			len(partitionBy) == 0 && ucTable == "" && ucLocation == "" && replacesJob == 0 {
 			entries = append(entries, fmt.Sprintf("%s = %s", key, dest))
 			continue
 		}
@@ -561,9 +609,22 @@ func buildNodeOutputsExpr(id string, nodeByID map[string]graph.Node, edgesByFrom
 		if len(mergeUpdate) > 0 {
 			mergeUpdateAttr = fmt.Sprintf(", merge_update = { %s }", joinMergeUpdate(mergeUpdate))
 		}
+		ucAttr := ""
+		if len(partitionBy) > 0 {
+			ucAttr += fmt.Sprintf(", partition_by = [%s]", quoteList(partitionBy))
+		}
+		if ucTable != "" {
+			ucAttr += fmt.Sprintf(", uc_table = %q", ucTable)
+		}
+		if ucLocation != "" {
+			ucAttr += fmt.Sprintf(", uc_location = %q", ucLocation)
+		}
+		if replacesJob != 0 {
+			ucAttr += fmt.Sprintf(", replaces_job = %d", replacesJob)
+		}
 		entries = append(entries, fmt.Sprintf(
-			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s%s%s%s }`,
-			key, dest, mode, quoteList(mergeKeys), clusterAttr, boundAttr, statsAttr, mergeUpdateAttr))
+			`%s = { kind = "delta_table", table_id = %s, mode = %q, merge_keys = [%s]%s%s%s%s%s }`,
+			key, dest, mode, quoteList(mergeKeys), clusterAttr, boundAttr, statsAttr, mergeUpdateAttr, ucAttr))
 	}
 	return "{ " + strings.Join(entries, ", ") + " }"
 }
@@ -657,10 +718,15 @@ func srcModuleName(specName string) string { return "src_" + specName }
 // declares, including the v0.23.0 `manage_bucket_notifications` flag.
 // sourceModuleSrc is the pre-computed source = "..." string (depth-aware
 // relative to the pipeline directory).
-func emitS3SourceModule(b *strings.Builder, sourceModuleSrc string, spec sources.Spec) {
+func emitS3SourceModule(b *strings.Builder, sourceModuleSrc string, spec sources.Spec, awsName string) {
 	fmt.Fprintf(b, "module %q {\n", srcModuleName(spec.Name))
 	fmt.Fprintf(b, "  source = %q\n\n", sourceModuleSrc)
 	fmt.Fprintf(b, "  pipeline_name = var.pipeline_name\n")
+	if awsName != "" {
+		// Workspace-scoped AWS names: the module names its queue and rule
+		// from this instead of clavesa-<pipeline_name>.
+		fmt.Fprintf(b, "  aws_name      = %q\n", awsName)
+	}
 	fmt.Fprintf(b, "  name          = %q\n", spec.Name)
 	fmt.Fprintf(b, "  bucket        = %q\n", spec.Bucket)
 	fmt.Fprintf(b, "  prefix        = %q\n", spec.Prefix)
@@ -704,6 +770,27 @@ func sourceHasPartitions(n graph.Node) bool {
 func formatCredentialHCL(c credentials.Spec) string {
 	return fmt.Sprintf(`, credentials = { kind = %q, header_name = %q, value_prefix = %q, secret = %q }`,
 		c.Kind, c.HeaderName, c.ValuePrefix, c.Secret)
+}
+
+// pipelineCompute picks where a deployed pipeline's runs execute. Since
+// v2.2.0 one run is one bundle (every transform in one Spark session), so
+// compute is per pipeline: "fargate" when any enabled transform asks for
+// it (the whole bundle then runs in one ECS Fargate task), else "lambda".
+// "emr-serverless" is refused until it is built.
+func pipelineCompute(nodes []graph.Node) (string, error) {
+	compute := "lambda"
+	for _, n := range nodes {
+		if n.Type != "transform" || !nodeEnabled(n) {
+			continue
+		}
+		switch v, _ := n.Config["compute"].(string); v {
+		case "fargate":
+			compute = tfgen.ComputeFargate
+		case "emr-serverless":
+			return "", fmt.Errorf(`transform %q: compute = "emr-serverless" is not built yet; use "lambda" (default) or "fargate"`, n.ID)
+		}
+	}
+	return compute, nil
 }
 
 // isCloudCompute reports whether a transform's `compute` config selects
@@ -904,6 +991,69 @@ func outputClusterBy(n graph.Node, key string) []string {
 		}
 	}
 	return keys
+}
+
+// outputPartitionBy returns the partition_by list configured for an output,
+// in declared order. Empty when unset.
+func outputPartitionBy(n graph.Node, key string) []string {
+	defs, ok := n.Config["output_definitions"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	def, ok := defs[key].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return stringListValue(def["partition_by"])
+}
+
+// outputReplacesJob returns the replaces_databricks_job ID configured for an
+// output, or 0 when unset. HCL numbers parse to int64 or float64 (JSON from
+// the UI is float64).
+func outputReplacesJob(n graph.Node, key string) int64 {
+	defs, ok := n.Config["output_definitions"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	def, ok := defs[key].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	return jobIDValue(def["replaces_databricks_job"])
+}
+
+// stringListValue converts a decoded list value to []string, skipping
+// non-string items.
+func stringListValue(v interface{}) []string {
+	raw, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, x := range raw {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// jobIDValue converts a decoded number (int, int64 or float64) to int64.
+// Anything else, or a non-positive number, gives 0.
+func jobIDValue(v interface{}) int64 {
+	var n int64
+	switch x := v.(type) {
+	case int64:
+		n = x
+	case int:
+		n = int64(x)
+	case float64:
+		n = int64(x)
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // outputBoundBy returns the bound_by list configured for an output, in

@@ -20,6 +20,16 @@ to clear. --output-merge-update sets per-column merge expressions (col=spec
 pairs) so CDF-incremental aggregates accumulate on a mode=merge output
 instead of being overwritten; does not change mode. Pass with no value to
 clear.
+--output-partition-by Hive-partitions the output on the given columns and is
+required for --output-mode replace_partitions (dynamic partition overwrite:
+each run replaces only the partitions in the batch); it cannot be combined
+with --output-cluster-by. --output-unity-catalog-table names the Unity
+Catalog table the output writes, --output-unity-catalog-location is the
+s3:// path where a new Unity Catalog table is created, and
+--output-replaces-databricks-job gives the ID of the Databricks job whose
+step this output replaces (the runner refuses to write while that job is
+unpaused). Pass partition-by, the table or the location with no value, or the
+job with 0, to clear.
 
 Examples:
   clavesa node edit my-pipeline source1 --set bucket=my-data
@@ -29,6 +39,8 @@ Examples:
   clavesa node edit my-pipeline daily_revenue --output-cluster-by region,day
   clavesa node edit my-pipeline daily_counts --output-merge-update event_count=additive,last_seen=max
   clavesa node edit my-pipeline orders --output-mode append
+  clavesa node edit my-pipeline events --output-mode replace_partitions --output-partition-by event_date
+  clavesa node edit my-pipeline events --output-unity-catalog-table main.analytics.events --output-replaces-databricks-job 123456789
   clavesa node edit my-pipeline enrich --add-output outliers
   clavesa node edit my-pipeline source1    # show settable keys
 
@@ -48,17 +60,21 @@ clavesa node edit <pipeline-dir> <node-id> [flags]
 ## Flags
 
 ```
-      --add-output strings                   declare an additional output key on a multi-output transform (repeatable). Seeded with mode=replace; tune via direct .tf edit
-      --incremental-input strings            read this input alias incrementally (Delta CDF version range, watermark-tracked). Repeatable. Per-input opt-in; transforms full-read by default
-      --non-incremental-input strings        drop an alias from incremental_inputs so it reverts to full-read on every run (repeatable)
-      --output-bound-by strings              comma-separated columns to statically bound a merge output's target scan on (must be functionally determined by merge_keys); pass with no value to clear
-      --output-cluster-by strings            comma-separated columns to liquid-cluster the output Delta table on (replace/append outputs); does not change mode. Pass with no value to clear
-      --output-merge-keys strings            comma-separated columns forming the natural key; sets mode=merge implicitly
-      --output-merge-update stringToString   col=spec pairs giving per-column merge expressions for mode=merge outputs (e.g. event_count=additive,last_seen=max). Spec is a keyword (additive, min, max, sketch) or a raw SparkSQL expression. Does not change mode. Pass with no value to clear (default [])
-      --output-mode string                   default-output mode: "replace" (default; full overwrite), "append", or "merge"
-      --output-stats                         opt this transform's outputs into per-column stats (null %, distinct, top-K, percentiles); pass --output-stats=false to turn off
-      --remove-output strings                remove a non-default output key from output_definitions (repeatable)
-      --set key=value                        set key=value (repeatable) (default map[])
+      --add-output strings                     declare an additional output key on a multi-output transform (repeatable). Seeded with mode=replace; tune via direct .tf edit
+      --incremental-input strings              read this input alias incrementally (Delta CDF version range, watermark-tracked). Repeatable. Per-input opt-in; transforms full-read by default
+      --non-incremental-input strings          drop an alias from incremental_inputs so it reverts to full-read on every run (repeatable)
+      --output-bound-by strings                comma-separated columns to statically bound a merge output's target scan on (must be functionally determined by merge_keys); pass with no value to clear
+      --output-cluster-by strings              comma-separated columns to liquid-cluster the output Delta table on (replace/append outputs); does not change mode. Pass with no value to clear
+      --output-merge-keys strings              comma-separated columns forming the natural key; sets mode=merge implicitly
+      --output-merge-update stringToString     col=spec pairs giving per-column merge expressions for mode=merge outputs (e.g. event_count=additive,last_seen=max). Spec is a keyword (additive, min, max, sketch) or a raw SparkSQL expression. Does not change mode. Pass with no value to clear (default [])
+      --output-mode string                     default-output mode: "replace" (default; full overwrite), "append", "merge", or "replace_partitions" (dynamic partition overwrite; needs --output-partition-by)
+      --output-partition-by strings            comma-separated columns to Hive-partition the output Delta table on; required for --output-mode replace_partitions, cannot be combined with --output-cluster-by. Pass with no value to clear
+      --output-replaces-databricks-job int     ID of the Databricks job whose step this output replaces; the runner refuses to write while that job is unpaused. Pass 0 to clear
+      --output-stats                           opt this transform's outputs into per-column stats (null %, distinct, top-K, percentiles); pass --output-stats=false to turn off
+      --output-unity-catalog-location string   s3:// path where a new Unity Catalog table is created. Pass "" to clear
+      --output-unity-catalog-table string      Unity Catalog table the output writes (catalog.schema.table, schema.table or table). Pass "" to clear
+      --remove-output strings                  remove a non-default output key from output_definitions (repeatable)
+      --set key=value                          set key=value (repeatable) (default map[])
 ```
 
 ## Global flags

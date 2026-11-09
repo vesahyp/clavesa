@@ -399,7 +399,36 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 			MaxTaskDurationMs:     int64Pointer(rowAt(r, idx, "max_task_duration_ms")),
 		})
 	}
+	p.fillTimingFromProgress(ctx, out)
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
+}
+
+// fillTimingFromProgress sets each row's Timing from the `metrics` object
+// on its terminal `_progress/<run>/<node>.json` marker, which carries the
+// same timing object the runner writes to the node_runs `timing` column.
+// A file read per row; no Spark. Rows whose marker is gone or carries no
+// timing (older runner, `{}` on a skipped node) keep Timing empty.
+func (p *LocalProvider) fillTimingFromProgress(ctx context.Context, rows []NodeRun) {
+	store := p.progressStore()
+	for i := range rows {
+		// The marker tree is keyed by the pipeline run (sf_execution_arn on
+		// a node_runs row); run_id on the row is the node invocation's own.
+		runID := rows[i].SfExecutionARN
+		if runID == "" {
+			runID = rows[i].RunID
+		}
+		if runID == "" || rows[i].Node == "" {
+			continue
+		}
+		snap := readProgressSnapshot(ctx, store, progressPrefix(runID)+rows[i].Node+".json")
+		if snap == nil {
+			continue
+		}
+		raw := strings.TrimSpace(string(snap.Metrics))
+		if strings.HasPrefix(raw, "{") && raw != "{}" {
+			rows[i].Timing = raw
+		}
+	}
 }
 
 // Runs reads the per-pipeline-execution rollup directly from the warehouse
@@ -805,7 +834,7 @@ func (p *LocalProvider) nodeRunsFromProgress(ctx context.Context, q NodeRunsQuer
 				continue
 			}
 			nodeID := strings.TrimSuffix(key[len(prefix):], ".json")
-			if nodeID == "" || nodeID == "_run" {
+			if nodeID == "" || nodeID == "_run" || nodeID == "_timing" || nodeID == "_databricks" {
 				continue
 			}
 			if q.Node != "" && nodeID != q.Node {

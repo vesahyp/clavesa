@@ -107,6 +107,11 @@ type NodeRun struct {
 	ExecutorCPUTimeMs    *int64 `json:"executor_cpu_time_ms,omitempty"`
 	ExecutorRunTimeMs    *int64 `json:"executor_run_time_ms,omitempty"`
 	MaxTaskDurationMs    *int64 `json:"max_task_duration_ms,omitempty"`
+	// Timing is the runner's per-node timing object (per-phase ms,
+	// per-input / per-output ms, Spark summary per phase) as the raw JSON
+	// string the `timing` column holds. Empty for older runners and on the
+	// dashboard's progress-marker fast path; internal/runtiming decodes it.
+	Timing string `json:"timing,omitempty"`
 }
 
 // NodeRunsResult is the body of GET /data/node-runs.

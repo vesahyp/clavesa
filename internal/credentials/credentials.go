@@ -31,6 +31,16 @@ const RelDir = ".clavesa/credentials"
 // can ship .gitignore'd plaintext secrets without leaking them.
 const SecretFileGlob = ".clavesa/credentials/*.secret"
 
+// Credential kinds.
+const (
+	// KindHeader injects one HTTP header into a source fetch (ADR-017).
+	KindHeader = "header"
+	// KindDatabricksOAuth is a Databricks service principal: client ID +
+	// OAuth secret, used for the Unity Catalog publish (ADR-027). Sources
+	// cannot reference it; only the workspace's Databricks connection can.
+	KindDatabricksOAuth = "databricks-oauth"
+)
+
 // Spec is the on-disk shape of one credential. The Secret field is a
 // URL-style reference (`arn:aws:secretsmanager:...`, `env:VAR`,
 // `file:<rel>`); secret material is fetched at runtime by the backend
@@ -39,10 +49,17 @@ type Spec struct {
 	// Name is set on Load from the filename so callers don't double-source.
 	Name string `json:"-"`
 
-	// Kind is the credential discriminator. Slice 2: only "header".
-	// Future kinds (`assume-role`, multi-header / OAuth / signed-request
-	// flows) extend the discriminator without breaking the registry.
+	// Kind is the credential discriminator: "header" (ADR-017 slice 2)
+	// or "databricks-oauth" (ADR-027: a Databricks service principal's
+	// OAuth machine-to-machine login). Future kinds extend the
+	// discriminator without breaking the registry.
 	Kind string `json:"kind"`
+
+	// ClientID is the Databricks service principal's application ID
+	// (kind="databricks-oauth"). Not a secret: it is the principal's name
+	// in Unity Catalog grants. Secret holds the reference to its OAuth
+	// secret.
+	ClientID string `json:"client_id,omitempty"`
 
 	// HeaderName is the HTTP header to inject (kind="header"). Typically
 	// "Authorization".
@@ -119,12 +136,22 @@ func (s Spec) validate() error {
 		return err
 	}
 	switch s.Kind {
-	case "header":
+	case KindHeader:
 		if s.HeaderName == "" {
 			return fmt.Errorf("header_name is required for kind=header")
 		}
+		if s.ClientID != "" {
+			return fmt.Errorf("client_id is only valid for kind=%s", KindDatabricksOAuth)
+		}
+	case KindDatabricksOAuth:
+		if s.ClientID == "" {
+			return fmt.Errorf("client_id is required for kind=%s (the service principal's application ID)", KindDatabricksOAuth)
+		}
+		if s.HeaderName != "" || s.ValuePrefix != "" {
+			return fmt.Errorf("header_name and value_prefix are only valid for kind=%s", KindHeader)
+		}
 	default:
-		return fmt.Errorf("unsupported credential kind %q (slice 2: only header)", s.Kind)
+		return fmt.Errorf("unsupported credential kind %q (supported: %s, %s)", s.Kind, KindHeader, KindDatabricksOAuth)
 	}
 	if s.Secret == "" {
 		return fmt.Errorf("secret reference is required (arn:aws:secretsmanager:..., env:VAR, or file:<path>)")

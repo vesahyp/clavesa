@@ -745,14 +745,26 @@ func isNotFoundS3(err error) bool {
 	return strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "NoSuchKey")
 }
 
-// runTerraformExec is the production terraform runner: a plain
-// `terraform <args...>` in dir, inheriting the parent process's
-// environment (AWS_PROFILE / AWS_REGION / ~/.aws), same as deployFlow.tf
-// in internal/cli/deploy.go. exitCode is terraform's own exit status;
-// err is non-nil only when the binary itself couldn't be started.
-func runTerraformExec(ctx context.Context, dir string, stdout, stderr io.Writer, args ...string) (int, error) {
+// runTerraformWithEnv is the production terraform runner: runTerraformExec
+// with the workspace's Terraform environment (TerraformEnv: the process
+// environment plus DATABRICKS_CLIENT_SECRET for a workspace connected to
+// Databricks, ADR-027), same as deployFlow.tf in internal/cli/deploy.go.
+func (s *Service) runTerraformWithEnv(ctx context.Context, dir string, stdout, stderr io.Writer, args ...string) (int, error) {
+	env, err := s.TerraformEnv(ctx)
+	if err != nil {
+		return -1, err
+	}
+	return runTerraformExec(ctx, dir, env, stdout, stderr, args...)
+}
+
+// runTerraformExec runs a plain `terraform <args...>` in dir with env
+// (nil inherits the process environment). exitCode is terraform's own
+// exit status; err is non-nil only when the binary itself couldn't be
+// started.
+func runTerraformExec(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, args ...string) (int, error) {
 	c := exec.CommandContext(ctx, "terraform", args...)
 	c.Dir = dir
+	c.Env = env
 	c.Stdout = stdout
 	c.Stderr = stderr
 	err := c.Run()

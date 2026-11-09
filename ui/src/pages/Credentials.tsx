@@ -15,6 +15,7 @@ import { useChrome } from "@/components/PageChrome";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { NativeSelect } from "@/components/ui/native-select";
 import { RegistryList } from "@/pages/RegistryList";
 import {
   deleteCredential,
@@ -119,24 +120,35 @@ export function Credentials() {
   );
 }
 
+type CredentialKind = "header" | "databricks-oauth";
+
 function RegisterForm({ onDone }: { onDone: () => void }) {
+  const [kind, setKind] = useState<CredentialKind>("header");
   const [name, setName] = useState("");
   const [headerName, setHeaderName] = useState("Authorization");
   const [valuePrefix, setValuePrefix] = useState("Bearer ");
+  const [clientId, setClientId] = useState("");
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const isDatabricks = kind === "databricks-oauth";
+  const ready = !!name && !!secret && (isDatabricks ? !!clientId : !!headerName);
+
   async function submit() {
-    if (!name || !headerName || !secret) return;
+    if (!ready) return;
     setBusy(true);
     try {
-      const stored = await registerCredential({
-        name,
-        kind: "header",
-        header_name: headerName,
-        value_prefix: valuePrefix,
-        secret,
-      });
+      const stored = await registerCredential(
+        isDatabricks
+          ? { name, kind, client_id: clientId, secret }
+          : {
+              name,
+              kind,
+              header_name: headerName,
+              value_prefix: valuePrefix,
+              secret,
+            },
+      );
       toast.success(`Registered ${stored.name} (${stored.backend})`);
       onDone();
     } catch (e) {
@@ -150,33 +162,68 @@ function RegisterForm({ onDone }: { onDone: () => void }) {
     <Card className="mb-6">
       <CardContent className="space-y-3 p-6">
         <div className="grid gap-3 sm:grid-cols-2">
+          <NativeSelect
+            aria-label="kind"
+            data-testid="credential-kind-select"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as CredentialKind)}
+            disabled={busy}
+          >
+            <option value="header">header (source fetch)</option>
+            <option value="databricks-oauth">
+              databricks-oauth (Unity Catalog publish)
+            </option>
+          </NativeSelect>
           <Input
-            placeholder="name (e.g. stripe)"
+            placeholder={isDatabricks ? "name (e.g. dbx-sp)" : "name (e.g. stripe)"}
+            data-testid="credential-name-input"
             value={name}
             onChange={(e) => setName(e.target.value)}
             disabled={busy}
           />
-          <Input
-            placeholder="header (e.g. Authorization)"
-            value={headerName}
-            onChange={(e) => setHeaderName(e.target.value)}
-            disabled={busy}
-          />
         </div>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Input
-            placeholder='value prefix (e.g. "Bearer ")'
-            value={valuePrefix}
-            onChange={(e) => setValuePrefix(e.target.value)}
-            disabled={busy}
-          />
-          <Input
-            placeholder="secret reference (env:STRIPE_KEY)"
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-            disabled={busy}
-          />
-        </div>
+        {isDatabricks ? (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Input
+              placeholder="client ID (service principal application ID)"
+              data-testid="credential-client-id-input"
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+              disabled={busy}
+            />
+            <Input
+              placeholder="secret reference (env:DATABRICKS_CLIENT_SECRET)"
+              data-testid="credential-secret-input"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              disabled={busy}
+            />
+          </div>
+        ) : (
+          <>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Input
+                placeholder="header (e.g. Authorization)"
+                value={headerName}
+                onChange={(e) => setHeaderName(e.target.value)}
+                disabled={busy}
+              />
+              <Input
+                placeholder='value prefix (e.g. "Bearer ")'
+                value={valuePrefix}
+                onChange={(e) => setValuePrefix(e.target.value)}
+                disabled={busy}
+              />
+            </div>
+            <Input
+              placeholder="secret reference (env:STRIPE_KEY)"
+              data-testid="credential-secret-input"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              disabled={busy}
+            />
+          </>
+        )}
         <div className="flex items-center justify-between">
           <p className="text-xs text-muted-foreground">
             Backends: <code className="font-mono">env:VAR</code>,{" "}
@@ -186,8 +233,9 @@ function RegisterForm({ onDone }: { onDone: () => void }) {
             deploys.
           </p>
           <Button
+            data-testid="credential-register-button"
             onClick={submit}
-            disabled={busy || !name || !headerName || !secret}
+            disabled={busy || !ready}
           >
             Register
           </Button>
@@ -246,8 +294,10 @@ function CredentialRow({
               )}
             </div>
             <code className="break-all font-mono text-xs text-muted-foreground">
-              {spec.header_name}
-              {spec.value_prefix ? `: ${spec.value_prefix}…` : ""} → {spec.secret}
+              {spec.kind === "databricks-oauth"
+                ? `client ${spec.client_id}`
+                : `${spec.header_name}${spec.value_prefix ? `: ${spec.value_prefix}…` : ""}`}{" "}
+              → {spec.secret}
             </code>
           </div>
           <Button

@@ -77,6 +77,7 @@ Set `window.TRACKER_CONFIG` before the script loads:
     sanitize: null,                  // function(value) -> value, see below
     clicks: "tagged",                // or "all", see Click maps below
     clickData: null,                 // function(element) -> object, see below
+    spa: false,                      // true: pushState/Back path changes send a pageview
     debug: false                     // console.log every event
   };
 </script>
@@ -136,6 +137,14 @@ Tagged elements read the same in both modes, so click-through rate still joins
 to their impressions. An untagged click gets no `view` or `displayed`, because
 nothing measured it entering the viewport, and inventing one would put
 elements in the CTR denominator that were never counted.
+
+`spa: true` is for a single-page app. A load sends one `pageview`; with this
+on, every later path change made with `history.pushState`, or by Back and
+Forward, sends another, so pages reached inside the app are counted.
+`replaceState` and query-only or hash-only changes do not, because apps use
+them to mirror their own state into the URL. Impressions (`view`,
+`displayed`) need no flag: elements added after load are observed as they
+appear.
 
 `clickData` adds fields of your own to a click. It receives the clicked
 element, so your markup stays your business:

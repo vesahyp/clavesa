@@ -8,7 +8,8 @@ A credential is a named entry recording how to authenticate an outbound
 request — never the secret material itself. Sources reference credentials
 by name via --credentials.
 
-Slice 2: kind=header only. Three secret backends:
+Kinds: header (source fetches) and databricks-oauth (the Unity Catalog
+publish, see clavesa workspace connect databricks). Three secret backends:
   arn:aws:secretsmanager:...   cloud-native, runtime fetch via Secrets Manager
   env:VAR_NAME                 local-only (rejected for cloud deploys)
   file:<workspace-rel>         local-only, gitignored under .clavesa/credentials/*.secret

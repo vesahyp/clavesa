@@ -258,6 +258,10 @@ interface OutputDefault {
   mode?: string;
   merge_keys?: string[];
   cluster_by?: string[];
+  partition_by?: string[];
+  unity_catalog_table?: string;
+  unity_catalog_location?: string;
+  replaces_databricks_job?: number;
   merge_update?: Record<string, string>;
 }
 
@@ -272,6 +276,21 @@ function readDefaultOutput(config: Record<string, unknown>): OutputDefault {
   const cb = Array.isArray(def.cluster_by)
     ? (def.cluster_by.filter((k) => typeof k === "string") as string[])
     : undefined;
+  const pb = Array.isArray(def.partition_by)
+    ? (def.partition_by.filter((k) => typeof k === "string") as string[])
+    : undefined;
+  const ucTable =
+    typeof def.unity_catalog_table === "string"
+      ? def.unity_catalog_table
+      : undefined;
+  const ucLocation =
+    typeof def.unity_catalog_location === "string"
+      ? def.unity_catalog_location
+      : undefined;
+  const job =
+    typeof def.replaces_databricks_job === "number"
+      ? def.replaces_databricks_job
+      : undefined;
   let mu: Record<string, string> | undefined;
   if (
     def.merge_update &&
@@ -286,7 +305,16 @@ function readDefaultOutput(config: Record<string, unknown>): OutputDefault {
     }
     if (Object.keys(out).length > 0) mu = out;
   }
-  return { mode, merge_keys: mk, cluster_by: cb, merge_update: mu };
+  return {
+    mode,
+    merge_keys: mk,
+    cluster_by: cb,
+    partition_by: pb,
+    unity_catalog_table: ucTable,
+    unity_catalog_location: ucLocation,
+    replaces_databricks_job: job,
+    merge_update: mu,
+  };
 }
 
 // readTransformStats reports whether every declared output key has
@@ -325,6 +353,20 @@ function TransformOutputSection({
   const [clusterByText, setClusterByText] = useState<string>(
     (parsed.cluster_by ?? []).join(", ")
   );
+  const [partitionByText, setPartitionByText] = useState<string>(
+    (parsed.partition_by ?? []).join(", ")
+  );
+  const [ucTable, setUcTable] = useState<string>(
+    parsed.unity_catalog_table ?? ""
+  );
+  const [ucLocation, setUcLocation] = useState<string>(
+    parsed.unity_catalog_location ?? ""
+  );
+  const [replacesJob, setReplacesJob] = useState<string>(
+    parsed.replaces_databricks_job !== undefined
+      ? String(parsed.replaces_databricks_job)
+      : ""
+  );
   const [mergeUpdateText, setMergeUpdateText] = useState<string>(
     Object.entries(parsed.merge_update ?? {})
       .map(([col, spec]) => `${col} = ${spec}`)
@@ -343,6 +385,14 @@ function TransformOutputSection({
     setMode(parsed.mode ?? "");
     setKeysText((parsed.merge_keys ?? []).join(", "));
     setClusterByText((parsed.cluster_by ?? []).join(", "));
+    setPartitionByText((parsed.partition_by ?? []).join(", "));
+    setUcTable(parsed.unity_catalog_table ?? "");
+    setUcLocation(parsed.unity_catalog_location ?? "");
+    setReplacesJob(
+      parsed.replaces_databricks_job !== undefined
+        ? String(parsed.replaces_databricks_job)
+        : ""
+    );
     setMergeUpdateText(
       Object.entries(parsed.merge_update ?? {})
         .map(([col, spec]) => `${col} = ${spec}`)
@@ -389,6 +439,43 @@ function TransformOutputSection({
         delete nextDefault.cluster_by;
       } else {
         nextDefault.cluster_by = clusterBy;
+      }
+      const partitionBy = partitionByText
+        .split(/[\s,]+/)
+        .map((k) => k.trim())
+        .filter((k) => k.length > 0);
+      if (partitionBy.length > 0 && clusterBy.length > 0) {
+        throw new Error(
+          "An output cannot set both Partition by and Cluster by; clear one."
+        );
+      }
+      if (mode === "replace_partitions" && partitionBy.length === 0) {
+        throw new Error("Mode replace_partitions needs Partition by columns.");
+      }
+      if (partitionBy.length === 0) {
+        delete nextDefault.partition_by;
+      } else {
+        nextDefault.partition_by = partitionBy;
+      }
+      if (ucTable.trim() === "") {
+        delete nextDefault.unity_catalog_table;
+      } else {
+        nextDefault.unity_catalog_table = ucTable.trim();
+      }
+      if (ucLocation.trim() === "") {
+        delete nextDefault.unity_catalog_location;
+      } else {
+        nextDefault.unity_catalog_location = ucLocation.trim();
+      }
+      const jobText = replacesJob.trim();
+      if (jobText === "") {
+        delete nextDefault.replaces_databricks_job;
+      } else {
+        const jobId = Number(jobText);
+        if (!Number.isInteger(jobId) || jobId <= 0) {
+          throw new Error("Replaced Databricks job ID must be a positive integer.");
+        }
+        nextDefault.replaces_databricks_job = jobId;
       }
       const mergeUpdate: Record<string, string> = {};
       for (const line of mergeUpdateText.split("\n")) {
@@ -454,6 +541,7 @@ function TransformOutputSection({
           <option value="replace">replace</option>
           <option value="append">append</option>
           <option value="merge">merge</option>
+          <option value="replace_partitions">replace_partitions</option>
         </NativeSelect>
       </Field>
       <Field label="Merge Keys" htmlFor="cfg-output-merge-keys">
@@ -481,6 +569,60 @@ function TransformOutputSection({
       <p className="mb-2 text-[11px] text-muted-foreground">
         Columns to liquid-cluster the output table on (prune-friendly reads).
         Optional; merge outputs already cluster by their merge keys.
+      </p>
+      <Field label="Partition by" htmlFor="cfg-output-partition-by">
+        <Input
+          id="cfg-output-partition-by"
+          data-testid="output-partition-by-input"
+          value={partitionByText}
+          placeholder="event_date"
+          onChange={(e) => setPartitionByText(e.target.value)}
+          className="font-mono text-xs"
+        />
+      </Field>
+      <p className="mb-2 text-[11px] text-muted-foreground">
+        Columns to Hive-partition the output table on. Required for mode
+        replace_partitions (each run replaces only the partitions in the
+        batch). Cannot be combined with Cluster by.
+      </p>
+      <Field label="Unity Catalog table" htmlFor="cfg-output-uc-table">
+        <Input
+          id="cfg-output-uc-table"
+          data-testid="output-unity-catalog-table-input"
+          value={ucTable}
+          placeholder="catalog.schema.table"
+          onChange={(e) => setUcTable(e.target.value)}
+          className="font-mono text-xs"
+        />
+      </Field>
+      <Field label="Unity Catalog location" htmlFor="cfg-output-uc-location">
+        <Input
+          id="cfg-output-uc-location"
+          data-testid="output-unity-catalog-location-input"
+          value={ucLocation}
+          placeholder="s3://bucket/path"
+          onChange={(e) => setUcLocation(e.target.value)}
+          className="font-mono text-xs"
+        />
+      </Field>
+      <p className="mb-2 text-[11px] text-muted-foreground">
+        The table is the Unity Catalog table this output writes. The location
+        is the s3:// path where a new table is created.
+      </p>
+      <Field label="Replaced Databricks job ID" htmlFor="cfg-output-replaces-job">
+        <Input
+          id="cfg-output-replaces-job"
+          data-testid="output-replaces-databricks-job-input"
+          value={replacesJob}
+          inputMode="numeric"
+          placeholder="123456789"
+          onChange={(e) => setReplacesJob(e.target.value)}
+          className="font-mono text-xs"
+        />
+      </Field>
+      <p className="mb-2 text-[11px] text-muted-foreground">
+        The Databricks job whose step this output replaces. The runner
+        refuses to write while that job is unpaused.
       </p>
       <Field label="Merge update (aggregate-aware)" htmlFor="cfg-output-merge-update">
         <Textarea
@@ -612,13 +754,17 @@ function ComputeSection({
         >
           <option value="lambda">lambda</option>
           <option value="fargate">fargate</option>
-          <option value="emr-serverless">emr-serverless</option>
+          <option value="emr-serverless" disabled>
+            emr-serverless (not built)
+          </option>
         </NativeSelect>
       </Field>
       <p className="mb-1 text-[11px] text-muted-foreground">
-        AWS target for a deployed pipeline. Local runs ignore it — pick
-        <code> fargate</code> or <code>emr-serverless</code> only when the
-        cloud workload outgrows Lambda.
+        AWS target for a deployed pipeline. Local runs ignore it. Pick
+        <code> fargate</code> when a run outgrows Lambda (15 min, 10 GB): the
+        whole pipeline run then goes to one Fargate task, sized by the
+        pipeline variables <code>fargate_cpu</code> and{" "}
+        <code>fargate_memory_gb</code>.
       </p>
       {savedAt && !error && (
         <span className="text-[11px] text-muted-foreground">Saved</span>

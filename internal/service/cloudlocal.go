@@ -84,6 +84,20 @@ func cloudLocalDockerArgs(image string, env, perNodeEnv map[string]string, heapA
 		"CLAVESA_SYSTEM_CATALOG",
 		"CLAVESA_PIPELINE",
 		"CLAVESA_WATERMARKS",
+		// ADR-027: the Unity Catalog publish, so a laptop run against the
+		// cloud warehouse registers tables, pushes lineage and starts jobs
+		// like the Lambda (ADR-014, ADR-024). The secret is only its
+		// Secrets Manager ARN; the container reads it with the forwarded
+		// host AWS credentials.
+		"CLAVESA_DATABRICKS_HOST",
+		"CLAVESA_DATABRICKS_CLIENT_ID",
+		"CLAVESA_DATABRICKS_SECRET",
+		"CLAVESA_DATABRICKS_JOBS",
+		"CLAVESA_UC_CATALOG",
+		"CLAVESA_UC_SCHEMA",
+		"CLAVESA_UC_PUBLISH",
+		"CLAVESA_UC_LINEAGE",
+		"CLAVESA_UC_READERS",
 	} {
 		if v, ok := env[key]; ok {
 			args = append(args, "-e", key+"="+v)

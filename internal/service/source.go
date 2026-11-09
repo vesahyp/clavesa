@@ -8,11 +8,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/vesahyp/clavesa/internal/credentials"
 	"github.com/vesahyp/clavesa/internal/fileops"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/hclutil"
 	"github.com/vesahyp/clavesa/internal/sources"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // SourceSpec mirrors sources.Spec at the service boundary so callers (CLI,
@@ -140,6 +142,22 @@ func (s *Service) normalizeSourceSpec(spec SourceSpec) (SourceSpec, error) {
 	// references (e.g. s3://bucket/path/file.parquet) become a prefix
 	// of `path/file.parquet/` after normalization, which Spark reads
 	// as a single-file dataset just fine.
+	// uc://catalog.schema.table promotes to kind=unity-catalog (ADR-027).
+	// Needs a Databricks connection on the workspace: the table is read
+	// with credentials Unity Catalog vends to that connection.
+	if strings.HasPrefix(spec.URL, sources.UCScheme) || spec.Kind == sources.KindUnityCatalog {
+		if strings.HasPrefix(spec.URL, sources.UCScheme) {
+			spec.Kind = sources.KindUnityCatalog
+			if spec.Table == "" {
+				spec.Table = strings.TrimPrefix(spec.URL, sources.UCScheme)
+			}
+			spec.URL = ""
+		}
+		if err := s.requireDatabricksForSource(); err != nil {
+			return SourceSpec{}, err
+		}
+		return spec, nil
+	}
 	if strings.HasPrefix(spec.URL, "s3://") {
 		bucket, key, _ := strings.Cut(spec.URL[len("s3://"):], "/")
 		// An s3:// URL always means kind=s3 — overwrite any
@@ -177,14 +195,28 @@ func (s *Service) normalizeSourceSpec(spec SourceSpec) (SourceSpec, error) {
 	// registry at register time. Without this the user discovers their
 	// typo at `pipeline run` instead of at `source register`.
 	if spec.Credentials != "" {
-		if _, err := s.GetCredential(spec.Credentials); err != nil {
+		cred, err := s.GetCredential(spec.Credentials)
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return SourceSpec{}, fmt.Errorf("%w: %q (try `clavesa credential register`)", ErrCredentialNotFound, spec.Credentials)
 			}
 			return SourceSpec{}, fmt.Errorf("validate credential reference: %w", err)
 		}
+		if cred.Kind == credentials.KindDatabricksOAuth {
+			return SourceSpec{}, fmt.Errorf("credential %q is kind %s; a source needs a header credential (databricks-oauth is only for `clavesa workspace connect databricks`)", spec.Credentials, cred.Kind)
+		}
 	}
 	return spec, nil
+}
+
+// requireDatabricksForSource refuses a unity-catalog source when the
+// workspace has no Databricks connection.
+func (s *Service) requireDatabricksForSource() error {
+	m, err := workspace.Load(s.workspace)
+	if err != nil || m == nil || m.Databricks == nil {
+		return fmt.Errorf("a unity-catalog source needs a Databricks connection; run `clavesa workspace connect databricks` first")
+	}
+	return nil
 }
 
 // ListSources returns every registered source, sorted by name.
@@ -405,6 +437,9 @@ func (s *Service) resolveSourceForAttach(name string) (kind string, resolved map
 		return "s3", desc, "", nil
 	case "http":
 		return "http", nil, "sources." + spec.Name, nil
+	case sources.KindUnityCatalog:
+		// Like http: the legacy sentinel, resolved at orchestration time.
+		return sources.KindUnityCatalog, nil, "sources." + spec.Name, nil
 	default:
 		return "", nil, "", fmt.Errorf("source %q kind %q not supported", name, spec.Kind)
 	}

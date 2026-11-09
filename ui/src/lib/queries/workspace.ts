@@ -276,6 +276,307 @@ export async function migrateBackend(): Promise<MigrateResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Databricks connection (ADR-027) — the Unity Catalog publish target
+// ---------------------------------------------------------------------------
+
+const DatabricksCheck = z.object({
+  id: z.string(),
+  title: z.string(),
+  status: z.enum(["pass", "fail", "unknown", "skipped"]),
+  detail: z.string().optional().default(""),
+  fix: z.string().optional().default(""),
+});
+export type DatabricksCheck = z.infer<typeof DatabricksCheck>;
+
+const DatabricksStatus = z.object({
+  connected: z.boolean(),
+  saved: z.boolean().optional().default(false),
+  /** Terraform addresses a disconnect released: objects that stay, unmanaged. */
+  released: z.array(z.string()).optional().default([]),
+  client_id: z.string().optional().default(""),
+  connection: z
+    .object({
+      host: z.string(),
+      catalog: z.string(),
+      credential: z.string(),
+      external_location: z.string().optional().default(""),
+      create_catalog: z.boolean().optional().default(false),
+      publish_tables: z.boolean(),
+      push_lineage: z.boolean(),
+      readers: z.array(z.string()).nullish().transform((v) => v ?? []),
+    })
+    .nullish(),
+  checks: z.array(DatabricksCheck).nullish().transform((v) => v ?? []),
+});
+export type DatabricksStatus = z.infer<typeof DatabricksStatus>;
+
+export interface DatabricksConnectInput {
+  host: string;
+  catalog: string;
+  credential: string;
+  external_location?: string;
+  create_catalog: boolean;
+  publish_tables: boolean;
+  push_lineage: boolean;
+  /** CLI twin: --reader. Principals that get SELECT on every table clavesa registers. */
+  readers?: string[];
+}
+
+/** GET /api/workspace/databricks — the recorded connection; no Databricks call. */
+export function useDatabricks() {
+  return useQuery({
+    queryKey: ["workspace", "databricks"],
+    queryFn: async () =>
+      DatabricksStatus.parse(await request("/workspace/databricks")),
+  });
+}
+
+/**
+ * Runs `fetch` and parses a DatabricksStatus. A failed check is still a
+ * 200 (with `saved: false`); any other status throws with the server's
+ * error message.
+ */
+async function databricksCall(
+  path: string,
+  init: RequestInit,
+): Promise<DatabricksStatus> {
+  const res = await fetch(`${BASE_URL}${path}`, init);
+  const body: unknown = await res.json().catch(() => ({}));
+  if (res.ok) return DatabricksStatus.parse(body);
+  const msg =
+    body && typeof body === "object" && "error" in body
+      ? String((body as { error: unknown }).error)
+      : `${init.method} ${path}: HTTP ${res.status}`;
+  throw new Error(msg);
+}
+
+/**
+ * PUT /api/workspace/databricks — run the admin checks and record the
+ * connection when none fails. CLI twin: `clavesa workspace connect
+ * databricks`. `saved` in the answer says whether it was recorded.
+ */
+export function connectDatabricks(
+  input: DatabricksConnectInput,
+): Promise<DatabricksStatus> {
+  return databricksCall("/workspace/databricks", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+/** POST /api/workspace/databricks/check — CLI twin: `workspace databricks --check`. */
+export function checkDatabricks(): Promise<DatabricksStatus> {
+  return databricksCall("/workspace/databricks/check", { method: "POST" });
+}
+
+const DatabricksTable = z.object({
+  full_name: z.string(),
+  type: z.string(),
+  location: z.string().optional().default(""),
+  owner: z.string().optional().default(""),
+  by_clavesa: z.boolean(),
+  url: z.string(),
+});
+export type DatabricksTable = z.infer<typeof DatabricksTable>;
+
+const DatabricksPipelineTables = z.object({
+  pipeline: z.string(),
+  dir: z.string(),
+  schema: z.string(),
+  schema_url: z.string(),
+  schema_error: z.string().optional().default(""),
+  tables: z.array(DatabricksTable).nullish().transform((v) => v ?? []),
+  jobs: z.array(z.number()).nullish().transform((v) => v ?? []),
+});
+export type DatabricksPipelineTables = z.infer<typeof DatabricksPipelineTables>;
+
+/**
+ * GET /api/workspace/databricks/tables — each pipeline's tables in Unity
+ * Catalog, read from Databricks. CLI twin: `workspace databricks tables`.
+ */
+export function useDatabricksTables(enabled: boolean) {
+  return useQuery({
+    queryKey: ["workspace", "databricks", "tables"],
+    enabled,
+    queryFn: async () =>
+      z
+        .object({ pipelines: z.array(DatabricksPipelineTables) })
+        .parse(await request("/workspace/databricks/tables")),
+  });
+}
+
+/**
+ * PUT /api/pipeline/databricks-jobs — the jobs a pipeline starts after a
+ * successful run. CLI twin: `pipeline databricks-jobs <p> --set …`.
+ */
+export async function setDatabricksJobs(
+  pipeline: string,
+  jobs: number[],
+): Promise<{ pipeline: string; jobs: number[] }> {
+  const res = await fetch(`${BASE_URL}/pipeline/databricks-jobs`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pipeline, jobs }),
+  });
+  const body: unknown = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `PUT /pipeline/databricks-jobs: HTTP ${res.status}`,
+    );
+  }
+  return z
+    .object({ pipeline: z.string(), jobs: z.array(z.number()).nullish().transform((v) => v ?? []) })
+    .parse(body);
+}
+
+const DatabricksCompareResult = z.object({
+  pass: z.boolean(),
+  existing: z.string(),
+  shadow: z.string(),
+  partition: z.string(),
+  where: z.string().optional().default(""),
+  partitions: z
+    .array(
+      z.object({
+        partition: z.string(),
+        status: z.string(),
+        rows: z.tuple([z.number().nullable(), z.number().nullable()]),
+        sums: z.record(z.string(), z.tuple([z.unknown(), z.unknown()])).nullish().transform((v) => v ?? {}),
+      }),
+    )
+    .nullish()
+    .transform((v) => v ?? []),
+  schema_diff: z.array(z.string()).nullish().transform((v) => v ?? []),
+});
+export type DatabricksCompareResult = z.infer<typeof DatabricksCompareResult>;
+
+export interface DatabricksCompareInput {
+  pipeline: string;
+  existing: string;
+  shadow: string;
+  partition: string;
+  sums: string[];
+  where?: string;
+}
+
+/**
+ * POST /api/pipeline/databricks-compare — the shadow-mode check. CLI twin:
+ * `pipeline databricks-compare <p> --existing … --shadow … --partition …`.
+ */
+export async function compareDatabricksTables(input: DatabricksCompareInput): Promise<DatabricksCompareResult> {
+  const res = await fetch(`${BASE_URL}/pipeline/databricks-compare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body: unknown = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `POST /pipeline/databricks-compare: HTTP ${res.status}`,
+    );
+  }
+  return DatabricksCompareResult.parse(body);
+}
+
+const PreflightResult = z.object({
+  ready: z.boolean(),
+  checks: z.array(DatabricksCheck).nullish().transform((v) => v ?? []),
+});
+export type PreflightResult = z.infer<typeof PreflightResult>;
+
+/**
+ * POST /api/databricks/preflight — read-only checks for a step to replace.
+ * CLI twin: `clavesa workspace databricks preflight`.
+ */
+export async function runPreflight(input: {
+  host: string;
+  profile: string;
+  principal?: string;
+  table?: string;
+  shadow_location?: string;
+  job?: number;
+  inputs?: string[];
+  readers?: string[];
+  /** CLI twin: --compute (default fargate). */
+  compute?: string;
+  subnets?: string[];
+}): Promise<PreflightResult> {
+  const res = await fetch(`${BASE_URL}/databricks/preflight`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body: unknown = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      body && typeof body === "object" && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `POST /databricks/preflight: HTTP ${res.status}`,
+    );
+  }
+  return PreflightResult.parse(body);
+}
+
+const DatabricksRun = z.object({
+  found: z.boolean(),
+  status: z.string().optional().default(""),
+  tables: z
+    .array(
+      z.object({
+        full_name: z.string().optional().default(""),
+        action: z.string().optional().default(""),
+        url: z.string().optional().default(""),
+        lineage: z.string().optional().default(""),
+      }),
+    )
+    .nullish()
+    .transform((v) => v ?? []),
+  jobs: z
+    .array(
+      z.object({
+        job_id: z.number(),
+        run_id: z.number().optional(),
+        run_page_url: z.string().optional().default(""),
+        error: z.string().optional().default(""),
+      }),
+    )
+    .nullish()
+    .transform((v) => v ?? []),
+});
+export type DatabricksRun = z.infer<typeof DatabricksRun>;
+
+/**
+ * GET /api/pipeline/databricks-run — the Unity Catalog tables a run wrote
+ * and the Databricks jobs it started. CLI twin: `pipeline databricks-run`.
+ */
+export function useDatabricksRun(
+  dir: string,
+  runId: string | undefined,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["pipeline", "databricks-run", dir, runId],
+    enabled: enabled && !!runId,
+    queryFn: async () =>
+      DatabricksRun.parse(
+        await request(
+          `/pipeline/databricks-run?dir=${encodeURIComponent(dir)}&run=${encodeURIComponent(runId ?? "")}`,
+        ),
+      ),
+  });
+}
+
+/** DELETE /api/workspace/databricks — CLI twin: `workspace disconnect databricks`. */
+export function disconnectDatabricks(): Promise<DatabricksStatus> {
+  return databricksCall("/workspace/databricks", { method: "DELETE" });
+}
+
+// ---------------------------------------------------------------------------
 // Runner requirements — extra Python pip deps baked into the runner image
 // ---------------------------------------------------------------------------
 

@@ -29,7 +29,16 @@ func TestMain(m *testing.M) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Fatalf("build failed: %v\n%s", err, out)
 	}
+	// Every local run mirrors its timing record into the run history dir
+	// (internal/runtiming). Point it at a temp dir so the suite never writes
+	// into the developer's ~/.local/state.
+	historyDir, err := os.MkdirTemp("", "clavesa-test-history-")
+	if err != nil {
+		log.Fatalf("history dir: %v", err)
+	}
+	os.Setenv("CLAVESA_RUN_HISTORY_DIR", historyDir)
 	code := m.Run()
+	os.RemoveAll(historyDir)
 	reapTestWorkspaceContainers()
 	os.Exit(code)
 }

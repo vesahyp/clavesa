@@ -6,10 +6,13 @@ package workspace
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,7 +71,126 @@ type Manifest struct {
 	// nil for manifests without a `backend` key; no migration runs and
 	// nothing is rewritten to disk because of it.
 	Backend *Backend `json:"backend,omitempty"`
+	// Databricks is the workspace's Unity Catalog publish target
+	// (ADR-027). Nil means no publish: the workspace registers its tables
+	// in Glue only, exactly as before. Written by `clavesa workspace
+	// connect databricks` and its UI twin; absent from older manifests.
+	Databricks *Databricks `json:"databricks,omitempty"`
+	// AWSNames selects how pipeline-level AWS resources are named.
+	// "workspace" scopes them to the workspace (clavesa-<workspace>-<pipeline>)
+	// so two workspaces in one account can each have a pipeline called
+	// `orders`. Empty keeps the legacy clavesa-<pipeline> names, so a
+	// workspace deployed before this field existed sees no diff.
+	// `workspace init` writes "workspace" for every new workspace.
+	AWSNames string `json:"aws_names,omitempty"`
 }
+
+// AWSNamesWorkspace is the Manifest.AWSNames value for workspace-scoped names.
+const AWSNamesWorkspace = "workspace"
+
+// maxAWSNameBase is the longest base name used as is. IAM roles and Lambda
+// functions allow 64 characters; the longest suffix clavesa adds is
+// "-runs-writer" (12), and source modules add "-<node>-trigger-dlq".
+const maxAWSNameBase = 40
+
+// PipelineAWSName returns the base name of a pipeline's AWS resources
+// (IAM roles, Lambdas, log groups, state machine, rules, queues). Legacy
+// manifests (and a nil manifest) get clavesa-<pipeline>. Workspace mode gets
+// clavesa-<workspace>-<pipeline>; a base longer than 40 characters is cut to
+// 31 characters, "-" and the first 8 hex characters of the SHA-256 of the
+// full base, so it stays unique and inside the AWS limits.
+func PipelineAWSName(m *Manifest, pipeline string) string {
+	if m == nil || m.AWSNames != AWSNamesWorkspace {
+		return "clavesa-" + pipeline
+	}
+	base := "clavesa-" + m.Name + "-" + pipeline
+	if len(base) <= maxAWSNameBase {
+		return base
+	}
+	sum := sha256.Sum256([]byte(base))
+	return strings.TrimRight(base[:31], "-") + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+// Databricks is the manifest's Unity Catalog connection (ADR-027). It
+// names the credential; the secret itself stays behind the credential's
+// reference.
+type Databricks struct {
+	// Host is the workspace URL, https and no path:
+	// https://dbc-1234abcd-5678.cloud.databricks.com
+	Host string `json:"host"`
+	// Catalog is the Unity Catalog catalog clavesa publishes into. Each
+	// pipeline's schema is created under it (ADR-016's one-pipeline,
+	// one-schema rule holds there too).
+	Catalog string `json:"catalog"`
+	// Credential names a kind=databricks-oauth entry in the credentials
+	// registry.
+	Credential string `json:"credential"`
+	// ExternalLocation names an admin-created external location over the
+	// workspace bucket, which new tables need in the default mode. With
+	// CreateCatalog and no ExternalLocation the generated Terraform
+	// creates the storage credential and the location itself.
+	ExternalLocation string `json:"external_location,omitempty"`
+	// CreateCatalog is the explicit opt-in for a workspace with no real
+	// catalog (ADR-027 section 1, decided by Vesa): the workspace stack
+	// creates Catalog, its managed storage on the workspace bucket, and the
+	// schemas the pipelines name. False (default): Catalog is the team's
+	// existing catalog and clavesa creates neither catalog nor schemas.
+	CreateCatalog bool `json:"create_catalog,omitempty"`
+	// PublishTables and PushLineage switch the two Public Preview APIs
+	// independently, so either can be turned off if Databricks changes it.
+	PublishTables bool `json:"publish_tables"`
+	PushLineage   bool `json:"push_lineage"`
+	// Readers are Databricks principals (users, groups, service
+	// principals) that read the published tables, typically from a SQL
+	// warehouse. Each table clavesa registers gets SELECT for them; with
+	// CreateCatalog they also get USE CATALOG, USE SCHEMA and SELECT on
+	// the catalog. Without it, USE CATALOG and USE SCHEMA on the team's
+	// catalog are the team's grants.
+	Readers []string `json:"readers,omitempty"`
+}
+
+// NormalizeDatabricksHost trims a trailing slash and checks the host is an
+// https URL with no path, query or fragment.
+func NormalizeDatabricksHost(host string) (string, error) {
+	h := strings.TrimRight(strings.TrimSpace(host), "/")
+	if h == "" {
+		return "", fmt.Errorf("databricks.host is required")
+	}
+	u, err := url.Parse(h)
+	if err != nil {
+		return "", fmt.Errorf("databricks.host: %w", err)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return "", fmt.Errorf("databricks.host must be an https URL such as https://dbc-1234abcd-5678.cloud.databricks.com, got %q", host)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("databricks.host must have no path or query, got %q", host)
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
+
+// Validate checks the connection is well-formed. It does not reach
+// Databricks; that is the service layer's checks.
+func (d *Databricks) Validate() error {
+	if _, err := NormalizeDatabricksHost(d.Host); err != nil {
+		return err
+	}
+	if d.Catalog == "" {
+		return fmt.Errorf("databricks.catalog is required")
+	}
+	if !ucIdentRE.MatchString(d.Catalog) {
+		return fmt.Errorf("databricks.catalog %q: use letters, digits and underscores, starting with a letter or underscore", d.Catalog)
+	}
+	if d.Credential == "" {
+		return fmt.Errorf("databricks.credential is required (a kind=databricks-oauth credential)")
+	}
+	return nil
+}
+
+// ucIdentRE is the identifier shape clavesa writes into Unity Catalog
+// without backtick quoting. Unity Catalog allows more; clavesa keeps to
+// the shape its Glue seam already enforces (ADR-016).
+var ucIdentRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Backend is the manifest's remote Terraform backend configuration
 // (ADR-025, "Manifest field"). The only supported Type is "s3".
@@ -250,7 +372,7 @@ func Init(root, name, cloud, catalog, moduleVersion string, backend *Backend) er
 	}
 
 	// Write clavesa.json
-	m := Manifest{Name: name, Cloud: cloud, Version: manifestVersion, Catalog: catalog, SystemCatalog: systemCatalog, Backend: backend}
+	m := Manifest{Name: name, Cloud: cloud, Version: manifestVersion, Catalog: catalog, SystemCatalog: systemCatalog, Backend: backend, AWSNames: AWSNamesWorkspace}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
@@ -544,15 +666,30 @@ func ensureLocalRunnerImageAt(root, moduleVersion string) (string, error) {
 	if err := os.WriteFile(filepath.Join(runnerDir, "extra-requirements.txt"), []byte(extraReqs), 0o644); err != nil {
 		return "", fmt.Errorf("stage runner requirements: %w", err)
 	}
-	cmd := exec.Command("docker", "build",
-		"--build-arg", "CLAVESA_MODULE_VERSION="+moduleVersion,
-		"-t", versioned, "-t", latest, runnerDir)
+	cmd := exec.Command("docker", runnerBuildArgs(moduleVersion, runnerDir, versioned, latest)...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("build runner image: %w", err)
 	}
 	return latest, nil
+}
+
+// runnerBuildArgs is the `docker` argv for the runner image build.
+//
+// --provenance=false: BuildKit (the default builder since Docker 23) attaches
+// a provenance attestation by default, which turns the pushed image into an
+// OCI image index with an attestation manifest. Lambda accepts only a plain
+// single-platform image manifest, so `pipeline deploy` then fails at
+// CreateFunction with "The image manifest, config or layer media type ... is
+// not supported" (seen on Docker Desktop 29).
+func runnerBuildArgs(moduleVersion, contextDir string, tags ...string) []string {
+	args := []string{"build", "--provenance=false", "--sbom=false",
+		"--build-arg", "CLAVESA_MODULE_VERSION=" + moduleVersion}
+	for _, t := range tags {
+		args = append(args, "-t", t)
+	}
+	return append(args, contextDir)
 }
 
 // extractRunnerFiles copies the embedded runner source to dest.
@@ -626,6 +763,11 @@ func Load(root string) (*Manifest, error) {
 	}
 	if m.Backend != nil {
 		if err := m.Backend.Validate(); err != nil {
+			return nil, fmt.Errorf("clavesa.json: %w", err)
+		}
+	}
+	if m.Databricks != nil {
+		if err := m.Databricks.Validate(); err != nil {
 			return nil, fmt.Errorf("clavesa.json: %w", err)
 		}
 	}

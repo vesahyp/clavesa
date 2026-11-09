@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,8 +18,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/spf13/cobra"
 
 	"github.com/vesahyp/clavesa/internal/runner"
+	tuiservice "github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/version"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -62,6 +65,49 @@ type deployFlow struct {
 	// inject a stub so the guard is exercised without a terraform
 	// binary on PATH.
 	CheckTerraformVersion func(ctx context.Context) error
+
+	// Env is the environment terraform runs with (Service.TerraformEnv:
+	// the process environment plus DATABRICKS_CLIENT_SECRET for a
+	// workspace connected to Databricks, ADR-027). Nil inherits the
+	// process environment, as before.
+	Env []string
+	// AfterApply runs after a successful apply, before the runner image
+	// push. Workspace deploy uses it to copy the Databricks OAuth secret
+	// into the runner's Secrets Manager secret (ADR-027).
+	AfterApply func() error
+}
+
+// newDeployFlow builds the deploy flow for a workspace or pipeline stack
+// with the workspace's Terraform environment (ADR-027).
+func newDeployFlow(cmd *cobra.Command, root, tfDir string) (deployFlow, error) {
+	svc := tuiservice.New(root)
+	env, err := svc.TerraformEnv(cmd.Context())
+	if err != nil {
+		return deployFlow{}, err
+	}
+	return deployFlow{WorkspaceRoot: root, TfDir: tfDir, Env: env}, nil
+}
+
+// terraformOutput reads one string output of the stack in dir. A null
+// output is "" (`-raw` exits non-zero on null, which is the normal value
+// of databricks_runner_secret_arn for an arn: credential, so this reads
+// the JSON form).
+func terraformOutput(dir string, env []string, name string) (string, error) {
+	c := exec.Command("terraform", "output", "-json", name)
+	c.Dir = dir
+	c.Env = env
+	out, err := c.Output()
+	if err != nil {
+		return "", fmt.Errorf("terraform output %s: %w", name, err)
+	}
+	var v *string
+	if err := json.Unmarshal(out, &v); err != nil {
+		return "", fmt.Errorf("terraform output %s: %w", name, err)
+	}
+	if v == nil {
+		return "", nil
+	}
+	return *v, nil
 }
 
 // planFilename is the saved-plan file written by `plan` and consumed by
@@ -131,6 +177,12 @@ func (d deployFlow) Run() error {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 
+	if d.AfterApply != nil {
+		if err := d.AfterApply(); err != nil {
+			return err
+		}
+	}
+
 	// Workspace deploy owns the runner-image lifecycle. The image was rebuilt
 	// in preflight; now (with the ECR repository created by the apply above)
 	// push it. The push is unconditional — no staleness gate — so a rebuild
@@ -175,8 +227,20 @@ func (d deployFlow) preflight() error {
 	// Build the local runner image (docker's layer cache decides what work is
 	// needed) so a current `:<version>` tag exists for the post-apply push.
 	// Cheap when nothing changed.
-	if _, err := workspace.EnsureLocalRunnerImage(d.WorkspaceRoot); err != nil {
+	tag, err := workspace.EnsureLocalRunnerImage(d.WorkspaceRoot)
+	if err != nil {
 		return fmt.Errorf("build runner image before deploy: %w", err)
+	}
+	// The Lambdas must run on the architecture the image was built for:
+	// an arm64 image (any Apple Silicon Mac) on an x86_64 Lambda fails
+	// every invocation with Runtime.InvalidEntrypoint / ProcessSpawnFailed.
+	// Recorded as a workspace output the pipeline stacks read.
+	arch, err := workspace.LocalImageArchitecture(tag)
+	if err != nil {
+		return err
+	}
+	if err := workspace.WriteRunnerArchitectureTF(d.WorkspaceRoot, arch); err != nil {
+		return fmt.Errorf("write runner_architecture.tf: %w", err)
 	}
 	return nil
 }
@@ -338,6 +402,7 @@ func dockerLoginECR(ctx context.Context, cfg aws.Config, registry string, errOut
 func (d deployFlow) tf(args ...string) error {
 	c := exec.Command("terraform", args...)
 	c.Dir = d.TfDir
+	c.Env = d.Env
 	c.Stdout = d.stdout()
 	c.Stderr = d.stderr()
 	c.Stdin = d.stdin()

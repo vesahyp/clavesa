@@ -365,6 +365,96 @@ def test_topo_sort_cycle_falls_back_to_input_order():
     assert ordered == transforms, ordered
 
 
+def test_bundle_json_carries_timing_and_runner_block():
+    """Each transform entry carries the timing object handler() left in
+    _LAST_NODE_TIMING (failed nodes too); cascade-skips carry null; the top
+    level carries runner.boot_ms / total_ms."""
+    mod = _load_runner()
+    transforms = [
+        {"node": "a", "language": "sql", "logic_path": "/tmp/a.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+        {"node": "b", "language": "sql", "logic_path": "/tmp/b.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+        {"node": "c", "language": "sql", "logic_path": "/tmp/c.txt", "inputs": {"b": "..."}, "outputs": {"default": ""}, "parents": ["b"]},
+        {"node": "d", "language": "sql", "logic_path": "/tmp/d.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+    ]
+    responses = {
+        "a": {"status": "ok", "output_rows": 1},
+        "b": {"status": "skipped", "reason": "no new partitions"},
+        "d": RuntimeError("boom"),
+    }
+
+    def timing_for(node):
+        return mod._timing_object(
+            {"write": 100 + ord(node), "system": 7}, outputs={"default": 100 + ord(node)}
+        )
+
+    def fake_handler(event, context):
+        import os as _os
+        node = _os.environ.get("CLAVESA_NODE", "")
+        mod._LAST_NODE_TIMING = timing_for(node)
+        resp = responses.get(node, {"status": "ok"})
+        if isinstance(resp, BaseException):
+            raise resp
+        return resp
+
+    # Pretend this is the first bundle of the process, booted 1.5s ago.
+    mod._BUNDLE_BOOTED = False
+    mod._RUNNER_T0 = mod.time.time() - 1.5
+    orig = mod.handler
+    mod.handler = fake_handler  # type: ignore[assignment]
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = mod.pipeline_handler({
+                "_pipeline_run": True,
+                "run_id": "test-run",
+                "transforms": transforms,
+                "_sf_execution_arn": "test-run",
+                "_trigger": "manual",
+            }, None)
+    finally:
+        mod.handler = orig  # type: ignore[assignment]
+
+    by_node = {t["node"]: t for t in result["transforms"]}
+    assert by_node["a"]["timing"] == timing_for("a"), by_node["a"]
+    assert by_node["a"]["timing"]["phases"]["system"] == 7
+    assert by_node["b"]["timing"] == timing_for("b"), by_node["b"]
+    assert by_node["c"]["status"] == "skipped" and by_node["c"]["timing"] is None, by_node["c"]
+    assert by_node["d"]["status"] == "failed" and by_node["d"]["timing"] == timing_for("d"), by_node["d"]
+    json.dumps(result)  # the whole payload stays JSON-serialisable
+
+    runner_block = result["runner"]
+    assert set(runner_block) == {"boot_ms", "total_ms"}, runner_block
+    assert 1400 <= runner_block["boot_ms"] <= 5000, runner_block
+    assert runner_block["total_ms"] >= runner_block["boot_ms"], runner_block
+
+    # A second bundle in the same (warm) process reports boot_ms = 0.
+    mod.handler = fake_handler  # type: ignore[assignment]
+    try:
+        with redirect_stdout(io.StringIO()):
+            again = mod.pipeline_handler({
+                "_pipeline_run": True,
+                "run_id": "test-run-2",
+                "transforms": transforms[:1],
+                "_sf_execution_arn": "test-run-2",
+            }, None)
+    finally:
+        mod.handler = orig  # type: ignore[assignment]
+    assert again["runner"]["boot_ms"] == 0, again["runner"]
+    assert again["runner"]["total_ms"] < 1400, again["runner"]
+
+
+def test_handler_not_setting_timing_yields_null():
+    """A handler that leaves no timing (stale value from a prior node must
+    not leak) reports timing: null."""
+    mod = _load_runner()
+    mod._LAST_NODE_TIMING = {"stale": True}
+    transforms = [
+        {"node": "a", "language": "sql", "logic_path": "/tmp/a.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+    ]
+    result, _events, _calls = _drive(mod, transforms, {"a": {"status": "ok"}})
+    assert result["transforms"][0]["timing"] is None, result["transforms"][0]
+
+
 if __name__ == "__main__":
     test_force_and_trigger_from_nested_execution_input()
     test_force_nodes_from_nested_execution_input()
@@ -377,4 +467,6 @@ if __name__ == "__main__":
     test_reorders_misordered_payload()
     test_topo_sort_ignores_unknown_parents()
     test_topo_sort_cycle_falls_back_to_input_order()
+    test_bundle_json_carries_timing_and_runner_block()
+    test_handler_not_setting_timing_yields_null()
     print("PASS")

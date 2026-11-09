@@ -9,6 +9,12 @@ variable "pipeline_name" {
   description = "Pipeline-level namespace. Used in S3 paths, Glue catalog naming, resource tagging, and Step Functions state machine naming. Must be unique within an AWS account and region."
 }
 
+variable "aws_name" {
+  type        = string
+  default     = null
+  description = "Base name of the AWS resources (queue, DLQ, EventBridge rule). Null keeps clavesa-<pipeline_name>. Workspaces created with aws_names = \"workspace\" pass clavesa-<workspace>-<pipeline> so two workspaces in one account can share a pipeline name."
+}
+
 variable "name" {
   type        = string
   description = "Unique node identifier within the pipeline. Used in S3 paths, Glue catalog entries, and resource naming."

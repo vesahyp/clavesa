@@ -228,8 +228,12 @@ cmd_run() {
   "$BIN" deploy --yes --workspace "$SMOKE_WS" \
     || die "clavesa deploy failed"
   pass "workspace + pipelines deployed"
+  # Only the stacks `clavesa deploy` deploys: the workspace and the
+  # pipelines. An opt-in `_` stack (_maintenance) has a backend.tf from
+  # init but no state until its own `pipeline deploy` (the old smoke
+  # workspace had deployed it; a fresh one has not).
   local key
-  for key in $(echo "$migrate_json" | jq -r '.stacks[].key'); do
+  for key in $(echo "$migrate_json" | jq -r '.stacks[] | select((.dir | startswith("_")) | not) | .key'); do
     aws s3api head-object --bucket "$state_bucket" --key "$key" >/dev/null 2>&1 \
       || die "state object s3://$state_bucket/$key missing after deploy"
   done

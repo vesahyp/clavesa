@@ -90,6 +90,46 @@ type Spec struct {
 	// the bucket. Opt-in because the resource replaces any other
 	// notification config on the bucket.
 	ManageBucketNotifications bool `json:"manage_bucket_notifications,omitempty"`
+
+	// NoTrigger, when true on a kind=s3 source, keeps new files from
+	// starting pipeline runs: the generated poller Lambda leaves this
+	// source's queue alone. The runner still drains the queue on the
+	// runs that do happen (the schedule), so the queue and its IAM stay.
+	NoTrigger bool `json:"no_trigger,omitempty"`
+
+	// Table is the full three-part Unity Catalog name
+	// (`<catalog>.<schema>.<table>`) for kind="unity-catalog": a table a
+	// Databricks step wrote, read by a clavesa transform (ADR-027). Empty
+	// for other kinds.
+	Table string `json:"table,omitempty"`
+}
+
+// KindUnityCatalog is the source kind for a Unity Catalog table.
+const KindUnityCatalog = "unity-catalog"
+
+// UCScheme is the URL shorthand prefix that auto-promotes to
+// kind=unity-catalog (`uc://catalog.schema.table`).
+const UCScheme = "uc://"
+
+// ValidUCTable reports whether name is exactly three dot-separated
+// identifiers (letters, digits, underscore; not starting with a digit).
+func ValidUCTable(name string) error {
+	parts := strings.Split(name, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("table %q must be a three-part Unity Catalog name <catalog>.<schema>.<table>", name)
+	}
+	for _, p := range parts {
+		if p == "" {
+			return fmt.Errorf("table %q has an empty part (want <catalog>.<schema>.<table>)", name)
+		}
+		for i, c := range p {
+			ok := c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || (i > 0 && c >= '0' && c <= '9')
+			if !ok {
+				return fmt.Errorf("table %q part %q contains invalid char %q (allowed: letters, digits, _; no leading digit)", name, p, c)
+			}
+		}
+	}
+	return nil
 }
 
 // Store is the file-backed source registry rooted at a workspace directory.
@@ -141,10 +181,10 @@ func (s *Store) Path(name string) string {
 // runner having a matching read path.
 func validKind(kind string) error {
 	switch kind {
-	case "http", "s3":
+	case "http", "s3", KindUnityCatalog:
 		return nil
 	default:
-		return fmt.Errorf("unsupported source kind %q (supported: http, s3)", kind)
+		return fmt.Errorf("unsupported source kind %q (supported: http, s3, unity-catalog)", kind)
 	}
 }
 
@@ -166,11 +206,27 @@ func (s Spec) validate() error {
 	if err := validKind(s.Kind); err != nil {
 		return err
 	}
+	if s.Kind == KindUnityCatalog {
+		if err := ValidUCTable(s.Table); err != nil {
+			return err
+		}
+		if s.URL != "" || s.Bucket != "" || s.Prefix != "" || s.Format != "" || len(s.ReadOptions) > 0 ||
+			len(s.Partitions) > 0 || s.StartFrom != "" || s.ManageBucketNotifications || s.NoTrigger || s.Credentials != "" {
+			return fmt.Errorf("kind=unity-catalog takes only a table (url, bucket, prefix, format, read options, credentials, partitions, start_from, manage_bucket_notifications and no_trigger are not valid)")
+		}
+		return nil
+	}
+	if s.Table != "" {
+		return fmt.Errorf("table is only valid for kind=unity-catalog (got kind=%q)", s.Kind)
+	}
 	if s.Kind != "s3" && (len(s.Partitions) > 0 || s.StartFrom != "") {
 		return fmt.Errorf("partitions / start_from are only valid for kind=s3 (got kind=%q)", s.Kind)
 	}
 	if s.Kind != "s3" && s.ManageBucketNotifications {
 		return fmt.Errorf("manage_bucket_notifications is only valid for kind=s3 (got kind=%q)", s.Kind)
+	}
+	if s.Kind != "s3" && s.NoTrigger {
+		return fmt.Errorf("no_trigger is only valid for kind=s3 (got kind=%q)", s.Kind)
 	}
 	switch s.Kind {
 	case "http":
@@ -204,12 +260,6 @@ func (s Spec) validate() error {
 	}
 	if s.StartFrom != "" && len(s.Partitions) == 0 {
 		return fmt.Errorf("start_from set without partitions — start_from is a watermark seed and requires Hive-style partition keys")
-	}
-	if len(s.Partitions) > 0 && s.Format != "parquet" {
-		// Runner's partitioned_path read hardcodes spark.read.parquet — CSV
-		// and JSON partitioned reads aren't wired yet. Reject here so the
-		// failure surfaces at register time, not deep in a runner log line.
-		return fmt.Errorf("partitioned reads require format=parquet (got %q)", s.Format)
 	}
 	if s.Format == "" {
 		return fmt.Errorf("format is required (parquet, csv, json, or tsv)")

@@ -53,6 +53,11 @@ type Pipeline struct {
 	// the same tag is picked up on the next apply.
 	RunnerImageExpr string
 
+	// RunnerArchExpr is the HCL expression for the runner image's Lambda
+	// architecture (`data.terraform_remote_state.workspace.outputs.runner_architecture`).
+	// Empty: no architectures argument (Lambda's x86_64 default).
+	RunnerArchExpr string
+
 	// ScheduleExpr is the HCL expression for an EventBridge schedule
 	// (e.g. "var.trigger_schedule"). The emitter wraps in a conditional
 	// at plan time — Terraform's count = X != null ? 1 : 0 pattern.
@@ -66,6 +71,12 @@ type Pipeline struct {
 	// queue ARNs (one per source). Empty disables the poller.
 	TriggerQueueExprs []string
 
+	// PollerQueueExprs is the subset of TriggerQueueExprs the poller
+	// watches. nil means all of TriggerQueueExprs; non-nil and empty
+	// means no poller. The runner's SQS drain IAM always uses
+	// TriggerQueueExprs.
+	PollerQueueExprs []string
+
 	// UpstreamPipelines is the list of sibling pipeline names whose
 	// state-machine SUCCEEDED events should auto-start this pipeline
 	// (ADR-016 §6 cross-pipeline trigger). Each name becomes one
@@ -75,12 +86,27 @@ type Pipeline struct {
 	// pipeline's `inputs` is the opt-in (no separate knob).
 	UpstreamPipelines []string
 
+	// AWSName is the literal base name of this pipeline's AWS resources
+	// (workspace.PipelineAWSName). Empty keeps the legacy
+	// clavesa-${PipelineNameExpr}.
+	AWSName string
+
+	// UpstreamAWSNames maps a producer pipeline name to its AWS base name
+	// (workspace.PipelineAWSName). A producer missing from the map uses the
+	// legacy clavesa-<producer>.
+	UpstreamAWSNames map[string]string
+
 	// Transforms is the ordered list of transform invocations the per-
 	// pipeline Lambda will iterate through inside one Spark session.
 	// Order matters: pipeline_handler executes them sequentially, with
 	// downstream skips driven by `Parents`. Replaces the v2.1.x
 	// StateMachine + NodeMeta pair.
 	Transforms []TransformConfig
+
+	// Compute is where a pipeline run executes: "" or "lambda" (the
+	// runner Lambda) or ComputeFargate (one ECS Fargate task per run,
+	// see fargate.go). "emr-serverless" is refused: not built.
+	Compute string
 
 	// ExternalBuckets is the list of S3 buckets the pipeline's transforms
 	// read from that live OUTSIDE the workspace bucket (kind=s3 sources,
@@ -104,6 +130,66 @@ type Pipeline struct {
 	// so the upstream DB lives under the SAME catalog as this pipeline;
 	// p.Catalog is used for the DB-name encoding. Empty list emits nothing.
 	UpstreamSchemas []string
+
+	// UnityCatalog, when set, emits the Databricks provider and this
+	// pipeline's Unity Catalog schema (ADR-027). Nil for a workspace
+	// without a Databricks connection: the output is then byte-identical
+	// to before.
+	UnityCatalog *UnityCatalogConfig
+}
+
+// awsBase returns the HCL template fragment (no quotes) that starts every
+// AWS resource name of this pipeline.
+func (p Pipeline) awsBase() string {
+	if p.AWSName != "" {
+		return p.AWSName
+	}
+	return "clavesa-${" + p.PipelineNameExpr + "}"
+}
+
+// sfnLogGroupName is the state machine's log group. Legacy workspaces keep
+// /clavesa/<pipeline>/sfn; workspace-scoped names use /clavesa/<aws base>/sfn.
+func (p Pipeline) sfnLogGroupName() string {
+	if p.AWSName != "" {
+		return "/clavesa/" + p.AWSName + "/sfn"
+	}
+	return "/clavesa/${" + p.PipelineNameExpr + "}/sfn"
+}
+
+// upstreamAWSName is the AWS base name of a producer pipeline.
+func (p Pipeline) upstreamAWSName(producer string) string {
+	if n, ok := p.UpstreamAWSNames[producer]; ok && n != "" {
+		return n
+	}
+	return "clavesa-" + producer
+}
+
+// UnityCatalogConfig is the workspace's Databricks connection as the
+// pipeline stack needs it. Literal values, quoted by the emitter.
+type UnityCatalogConfig struct {
+	Host     string // https://dbc-....cloud.databricks.com
+	ClientID string // service principal application ID
+	Catalog  string // Unity Catalog catalog; the schema goes under it
+	// ModuleSource is the `source` of the embedded
+	// unity-catalog/aws/schema module, relative to the pipeline dir.
+	ModuleSource string
+	// CreateSchema is true for a --create-catalog workspace: the catalog
+	// is new and has no schemas, so the pipeline stack creates its own.
+	// False: the schema is the team's and must exist (ADR-027 section 1).
+	CreateSchema bool
+	// SecretARNExpr is the HCL expression for the Secrets Manager ARN the
+	// runner reads the OAuth secret from: a quoted literal for an arn:
+	// credential, the workspace stack's databricks_runner_secret_arn
+	// output otherwise.
+	SecretARNExpr string
+	// PublishTables and PushLineage are the connection's two switches.
+	PublishTables bool
+	PushLineage   bool
+	// Readers get SELECT on every table the runner registers.
+	Readers []string
+	// JobsExpr is the HCL expression for the Databricks job IDs the runner
+	// starts after a successful run (ADR-027 section 6, option A).
+	JobsExpr string
 }
 
 // TransformConfig describes one transform invocation rendered into the
@@ -153,13 +239,132 @@ func Emit(p Pipeline) (string, error) {
 	emitLogGroup(&b, p)
 	emitIAMRole(&b, p)
 	emitPipelineLambda(&b, p)
-	emitStateMachine(&b, p)
+	emitFargate(&b, p)
+	if p.fargate() {
+		emitFargateStateMachine(&b, p)
+	} else {
+		emitStateMachine(&b, p)
+	}
 	emitSchedule(&b, p)
 	emitPoller(&b, p)
 	emitUpstreamTriggers(&b, p)
 	emitRunsWriter(&b, p)
+	emitDatabricksJobsVar(&b, p)
+	emitTeamS3Locals(&b, p)
+	emitUnityCatalogSchema(&b, p)
 
 	return b.String(), nil
+}
+
+// emitArchitectures sets an image Lambda's architecture to the one the
+// pushed runner image was built for (the workspace's runner_architecture
+// output, written by `workspace deploy`). try() keeps workspaces deployed
+// before the output existed on x86_64, Lambda's default.
+func emitArchitectures(b *strings.Builder, p Pipeline) {
+	if p.RunnerArchExpr == "" {
+		return
+	}
+	fmt.Fprintf(b, "  architectures = [try(%s, \"x86_64\")]\n", p.RunnerArchExpr)
+}
+
+// emitDatabricksJobsVar declares the pipeline's list of downstream
+// Databricks jobs (ADR-027 section 6, option A). Declared here, in the
+// clavesa-owned orchestration.tf, so pipelines created before the
+// connection need no edit; the value lives in terraform.tfvars, which
+// `clavesa pipeline databricks-jobs` and the pipeline vars UI write.
+func emitDatabricksJobsVar(b *strings.Builder, p Pipeline) {
+	uc := p.UnityCatalog
+	if uc == nil || uc.JobsExpr != "var.databricks_jobs" {
+		return
+	}
+	fmt.Fprintf(b, "variable \"databricks_jobs\" {\n")
+	fmt.Fprintf(b, "  description = \"Databricks job IDs clavesa starts after every successful run (ADR-027).\"\n")
+	fmt.Fprintf(b, "  type        = list(number)\n")
+	fmt.Fprintf(b, "  default     = []\n")
+	fmt.Fprintf(b, "}\n\n")
+}
+
+// emitTeamS3Locals declares the team-storage grants of the runner role
+// (ADR-027 provisional decision 3: a taken-over table's data stays in the
+// team's bucket). `clavesa pipeline deploy` fills the three variables in
+// databricks_access.auto.tfvars from Unity Catalog: write on each output
+// table's folder (an existing external table's location, or the output's
+// unity_catalog_location), read on each external input table's folder,
+// and the KMS keys those buckets encrypt with.
+func emitTeamS3Locals(b *strings.Builder, p Pipeline) {
+	if p.UnityCatalog == nil {
+		return
+	}
+	b.WriteString(`variable "databricks_s3_write" {
+  description = "clavesa-managed (ADR-027): s3:// folders of Unity Catalog tables this pipeline writes in the team's storage. Set by clavesa pipeline deploy."
+  type        = list(string)
+  default     = []
+}
+
+variable "databricks_s3_read" {
+  description = "clavesa-managed (ADR-027): s3:// folders of external Unity Catalog tables this pipeline reads. Set by clavesa pipeline deploy."
+  type        = list(string)
+  default     = []
+}
+
+variable "databricks_kms_keys" {
+  description = "clavesa-managed (ADR-027): KMS key ARNs of the team buckets above (SSE-KMS). Set by clavesa pipeline deploy."
+  type        = list(string)
+  default     = []
+}
+
+locals {
+  _clavesa_team_write   = [for u in var.databricks_s3_write : trimsuffix(replace(replace(u, "s3a://", ""), "s3://", ""), "/")]
+  _clavesa_team_read    = [for u in var.databricks_s3_read : trimsuffix(replace(replace(u, "s3a://", ""), "s3://", ""), "/")]
+  _clavesa_team_all     = concat(local._clavesa_team_write, local._clavesa_team_read)
+  _clavesa_team_buckets = distinct([for x in local._clavesa_team_all : split("/", x)[0]])
+  _clavesa_team_s3_statements = concat(
+    length(local._clavesa_team_all) == 0 ? [] : [
+      { Sid = "TeamTablesList", Effect = "Allow", Action = ["s3:ListBucket", "s3:GetBucketLocation"], Resource = [for bk in local._clavesa_team_buckets : "arn:aws:s3:::${bk}"] },
+      { Sid = "TeamTablesRead", Effect = "Allow", Action = ["s3:GetObject"], Resource = [for x in local._clavesa_team_all : "arn:aws:s3:::${x}/*"] },
+    ],
+    length(local._clavesa_team_write) == 0 ? [] : [
+      { Sid = "TeamTablesWrite", Effect = "Allow", Action = ["s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"], Resource = [for x in local._clavesa_team_write : "arn:aws:s3:::${x}/*"] },
+    ],
+    length(var.databricks_kms_keys) == 0 ? [] : [
+      { Sid = "TeamTablesKMS", Effect = "Allow", Action = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource = var.databricks_kms_keys },
+    ],
+  )
+}
+
+`)
+}
+
+// emitUnityCatalogSchema calls the embedded unity-catalog schema module
+// for this pipeline (ADR-027). The module configures the Databricks
+// provider itself, so this root file adds no required_providers block
+// (the pipeline's main.tf already holds the one a module may have). The
+// schema name is the same sanitized identifier as the Glue side's schema
+// half: a table is `<uc catalog>.<schema>.<table>` in Databricks and
+// `<catalog>__<schema>.<table>` in Glue.
+func emitUnityCatalogSchema(b *strings.Builder, p Pipeline) {
+	uc := p.UnityCatalog
+	if uc == nil || !uc.CreateSchema {
+		// Default mode: the schema is the team's and already exists.
+		return
+	}
+	fmt.Fprintf(b, "# Unity Catalog publish (ADR-027): this pipeline's schema in the catalog\n")
+	fmt.Fprintf(b, "# clavesa created (--create-catalog). Without that flag the schema is\n")
+	fmt.Fprintf(b, "# the team's and is not managed here.\n")
+	fmt.Fprintf(b, "# The runner registers the tables; this owns only the schema. The client\n")
+	fmt.Fprintf(b, "# secret comes from DATABRICKS_CLIENT_SECRET, set by clavesa deploy.\n")
+	fmt.Fprintf(b, "module \"unity_catalog_schema\" {\n")
+	fmt.Fprintf(b, "  source               = %q\n", uc.ModuleSource)
+	fmt.Fprintf(b, "  databricks_host      = %q\n", uc.Host)
+	fmt.Fprintf(b, "  databricks_client_id = %q\n", uc.ClientID)
+	fmt.Fprintf(b, "  catalog              = %q\n", uc.Catalog)
+	fmt.Fprintf(b, "  schema               = %s\n", p.SchemaExpr)
+	fmt.Fprintf(b, "  pipeline_name        = %s\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "}\n\n")
+	fmt.Fprintf(b, "output \"unity_catalog_schema\" {\n")
+	fmt.Fprintf(b, "  description = \"This pipeline's Unity Catalog schema, <catalog>.<schema> (ADR-027).\"\n")
+	fmt.Fprintf(b, "  value       = module.unity_catalog_schema.full_name\n")
+	fmt.Fprintf(b, "}\n\n")
 }
 
 // emitTagsLocal writes the shared `local.clavesa_tags` block referenced by
@@ -192,6 +397,13 @@ func (p Pipeline) validate() error {
 	}
 	if len(p.Transforms) == 0 {
 		return fmt.Errorf("tfgen: at least one transform is required")
+	}
+	switch p.Compute {
+	case "", "lambda", ComputeFargate:
+	case "emr-serverless":
+		return fmt.Errorf(`compute = "emr-serverless" is not built yet; use "lambda" or "fargate"`)
+	default:
+		return fmt.Errorf("tfgen: unknown compute %q", p.Compute)
 	}
 	for i, t := range p.Transforms {
 		if t.NodeID == "" {
@@ -342,7 +554,7 @@ func safeCatalogLiteral(catalog string) string {
 func emitLogGroup(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "# CloudWatch log group — Step Functions execution logging (90-day retention).\n")
 	fmt.Fprintf(b, "resource \"aws_cloudwatch_log_group\" \"sfn_logs\" {\n")
-	fmt.Fprintf(b, "  name              = \"/clavesa/${%s}/sfn\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name              = \"%s\"\n", p.sfnLogGroupName())
 	fmt.Fprintf(b, "  retention_in_days = 90\n")
 	fmt.Fprintf(b, "  tags              = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -370,19 +582,20 @@ func emitIAMRole(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_iam_role\" \"sfn_exec\" {\n")
-	fmt.Fprintf(b, "  name               = \"clavesa-${%s}-orchestration\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name               = \"%s-orchestration\"\n", p.awsBase())
 	fmt.Fprintf(b, "  assume_role_policy = data.aws_iam_policy_document.sfn_assume.json\n")
 	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"sfn_exec_policy\" {\n")
-	fmt.Fprintf(b, "  name = \"clavesa-${%s}-orchestration\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name = \"%s-orchestration\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role = aws_iam_role.sfn_exec.id\n\n")
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
 	fmt.Fprintf(b, "    Statement = [\n")
 	// v2.2.0: only the per-pipeline runner Lambda is invoked from this SFN.
 	fmt.Fprintf(b, "      { Sid = \"LambdaInvoke\", Effect = \"Allow\", Action = [\"lambda:InvokeFunction\"], Resource = [aws_lambda_function.pipeline_runner.arn] },\n")
+	b.WriteString(fargateSFNStatements(p))
 	fmt.Fprintf(b, "      { Sid = \"CloudWatchLogsDelivery\", Effect = \"Allow\", Action = [\n")
 	fmt.Fprintf(b, "          \"logs:CreateLogDelivery\", \"logs:GetLogDelivery\", \"logs:UpdateLogDelivery\",\n")
 	fmt.Fprintf(b, "          \"logs:DeleteLogDelivery\", \"logs:ListLogDeliveries\", \"logs:PutResourcePolicy\",\n")
@@ -417,6 +630,43 @@ func emitIAMRole(b *strings.Builder, p Pipeline) {
 // version.go moved to v2.5.0). Single source of truth now.
 var moduleVersionLiteral = version.Module
 
+// writeRunnerEnv writes the runner's environment as HCL `KEY = value`
+// lines at indent: the Lambda's variables and, for compute = "fargate",
+// local.pipeline_runner_env, which the task definition's environment is
+// built from. pipeline_handler sets per-transform CLAVESA_NODE /
+// CLAVESA_LANGUAGE / CLAVESA_LOGIC_S3_PATH from the event payload before
+// each iteration; only workspace-level invariants live here.
+func writeRunnerEnv(b *strings.Builder, p Pipeline, in string) {
+	safeCatalog := safeCatalogLiteral(p.Catalog)
+	sysCatalogSafe := safeCatalogLiteral(p.SystemCatalog)
+	fmt.Fprintf(b, "%sCLAVESA_PIPELINE            = %s\n", in, p.PipelineNameExpr)
+	fmt.Fprintf(b, "%sCLAVESA_CATALOG             = \"%s\"\n", in, safeCatalog)
+	fmt.Fprintf(b, "%sCLAVESA_SCHEMA              = %s\n", in, p.SchemaExpr)
+	fmt.Fprintf(b, "%sCLAVESA_SYSTEM_CATALOG      = \"%s\"\n", in, sysCatalogSafe)
+	fmt.Fprintf(b, "%sCLAVESA_WAREHOUSE           = \"s3://${%s}/${%s}/_warehouse/\"\n", in, p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "%sCLAVESA_SYSTEM_WAREHOUSE    = \"s3://${%s}/_system/pipelines/\"\n", in, p.BucketExpr)
+	fmt.Fprintf(b, "%sCLAVESA_WATERMARKS          = \"s3://${%s}/${%s}/_watermarks/\"\n", in, p.BucketExpr, p.PipelineNameExpr)
+	fmt.Fprintf(b, "%sCLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest\n", in)
+	fmt.Fprintf(b, "%sCLAVESA_MODULE_VERSION      = \"%s\"\n", in, moduleVersionLiteral)
+	if uc := p.UnityCatalog; uc != nil {
+		// ADR-027: the Unity Catalog publish. The secret is an ARN, read
+		// by the runner at run time; never the secret itself.
+		fmt.Fprintf(b, "%sCLAVESA_DATABRICKS_HOST      = %q\n", in, uc.Host)
+		fmt.Fprintf(b, "%sCLAVESA_DATABRICKS_CLIENT_ID = %q\n", in, uc.ClientID)
+		fmt.Fprintf(b, "%sCLAVESA_DATABRICKS_SECRET    = %s\n", in, uc.SecretARNExpr)
+		fmt.Fprintf(b, "%sCLAVESA_UC_CATALOG           = %q\n", in, uc.Catalog)
+		fmt.Fprintf(b, "%sCLAVESA_UC_SCHEMA            = replace(%s, \"-\", \"_\")\n", in, p.SchemaExpr)
+		fmt.Fprintf(b, "%sCLAVESA_UC_PUBLISH           = \"%t\"\n", in, uc.PublishTables)
+		fmt.Fprintf(b, "%sCLAVESA_UC_LINEAGE           = \"%t\"\n", in, uc.PushLineage)
+		if len(uc.Readers) > 0 {
+			fmt.Fprintf(b, "%sCLAVESA_UC_READERS           = jsonencode([%s])\n", in, quotedList(uc.Readers))
+		}
+		if uc.JobsExpr != "" {
+			fmt.Fprintf(b, "%sCLAVESA_DATABRICKS_JOBS      = jsonencode(%s)\n", in, uc.JobsExpr)
+		}
+	}
+}
+
 func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	safeCatalog := safeCatalogLiteral(p.Catalog)
 	sysCatalogSafe := safeCatalogLiteral(p.SystemCatalog)
@@ -445,13 +695,18 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "    actions = [\"sts:AssumeRole\"]\n")
 	fmt.Fprintf(b, "    principals {\n")
 	fmt.Fprintf(b, "      type        = \"Service\"\n")
-	fmt.Fprintf(b, "      identifiers = [\"lambda.amazonaws.com\"]\n")
+	if p.fargate() {
+		// The Fargate task runs as this same role (task_role_arn).
+		fmt.Fprintf(b, "      identifiers = [\"lambda.amazonaws.com\", \"ecs-tasks.amazonaws.com\"]\n")
+	} else {
+		fmt.Fprintf(b, "      identifiers = [\"lambda.amazonaws.com\"]\n")
+	}
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  }\n")
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_iam_role\" \"pipeline_runner\" {\n")
-	fmt.Fprintf(b, "  name               = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name               = \"%s-runner\"\n", p.awsBase())
 	fmt.Fprintf(b, "  assume_role_policy = data.aws_iam_policy_document.pipeline_runner_assume.json\n")
 	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -462,11 +717,18 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	// transform's input bucket); writes stay scoped to this pipeline's
 	// own warehouse / watermarks / system pipelines DB.
 	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"pipeline_runner\" {\n")
-	fmt.Fprintf(b, "  name = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name = \"%s-runner\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role = aws_iam_role.pipeline_runner.id\n\n")
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
-	fmt.Fprintf(b, "    Statement = [\n")
+	if p.UnityCatalog != nil {
+		// ADR-027: the team-storage statements (emitTeamS3Locals) are
+		// appended; each is present only when its list is non-empty, as
+		// IAM refuses a statement with no resources.
+		fmt.Fprintf(b, "    Statement = concat([\n")
+	} else {
+		fmt.Fprintf(b, "    Statement = [\n")
+	}
 
 	// S3 read — workspace bucket + everything inside. Logic uploads,
 	// every transform's inputs (including same-account s3 sources), and
@@ -554,7 +816,14 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 		fmt.Fprintf(b, "      { Sid = \"SQSDrain\", Effect = \"Allow\", Action = [\"sqs:ReceiveMessage\", \"sqs:DeleteMessage\", \"sqs:GetQueueAttributes\"], Resource = %s },\n", queueListExpr)
 	}
 
-	fmt.Fprintf(b, "    ]\n")
+	// ADR-027: the runner reads the Databricks service principal's OAuth
+	// secret to register tables, push lineage and start jobs.
+	if uc := p.UnityCatalog; uc != nil {
+		fmt.Fprintf(b, "      { Sid = \"DatabricksSecret\", Effect = \"Allow\", Action = [\"secretsmanager:GetSecretValue\"], Resource = [%s] },\n", uc.SecretARNExpr)
+		fmt.Fprintf(b, "    ], local._clavesa_team_s3_statements)\n")
+	} else {
+		fmt.Fprintf(b, "    ]\n")
+	}
 	fmt.Fprintf(b, "  })\n")
 	fmt.Fprintf(b, "}\n\n")
 
@@ -564,9 +833,10 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	// memory at 3008MB; users with a raised quota can bump this in the
 	// generated .tf), and env (per-pipeline knobs).
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"pipeline_runner\" {\n")
-	fmt.Fprintf(b, "  function_name = \"clavesa-${%s}-runner\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  function_name = \"%s-runner\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role          = aws_iam_role.pipeline_runner.arn\n")
 	fmt.Fprintf(b, "  package_type  = \"Image\"\n")
+	emitArchitectures(b, p)
 	fmt.Fprintf(b, "  image_uri     = \"${local.pipeline_runner_repo_uri}@${data.aws_ecr_image.pipeline_runner.image_digest}\"\n")
 	fmt.Fprintf(b, "  timeout       = 900   # 15min — the Lambda max; one container handles every transform\n")
 	fmt.Fprintf(b, "  memory_size   = 3008  # New AWS accounts default to a 3008MB per-function quota; bump via Service Quotas + raise this if you need more headroom for Spark broadcast tables\n\n")
@@ -578,18 +848,7 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  environment {\n")
 	fmt.Fprintf(b, "    variables = {\n")
-	// pipeline_handler sets per-transform CLAVESA_NODE / CLAVESA_LANGUAGE
-	// / CLAVESA_LOGIC_S3_PATH from the event payload before each iteration;
-	// only workspace-level invariants live here.
-	fmt.Fprintf(b, "      CLAVESA_PIPELINE            = %s\n", p.PipelineNameExpr)
-	fmt.Fprintf(b, "      CLAVESA_CATALOG             = \"%s\"\n", safeCatalog)
-	fmt.Fprintf(b, "      CLAVESA_SCHEMA              = %s\n", p.SchemaExpr)
-	fmt.Fprintf(b, "      CLAVESA_SYSTEM_CATALOG      = \"%s\"\n", sysCatalogSafe)
-	fmt.Fprintf(b, "      CLAVESA_WAREHOUSE           = \"s3://${%s}/${%s}/_warehouse/\"\n", p.BucketExpr, p.PipelineNameExpr)
-	fmt.Fprintf(b, "      CLAVESA_SYSTEM_WAREHOUSE    = \"s3://${%s}/_system/pipelines/\"\n", p.BucketExpr)
-	fmt.Fprintf(b, "      CLAVESA_WATERMARKS          = \"s3://${%s}/${%s}/_watermarks/\"\n", p.BucketExpr, p.PipelineNameExpr)
-	fmt.Fprintf(b, "      CLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest\n")
-	fmt.Fprintf(b, "      CLAVESA_MODULE_VERSION      = \"%s\"\n", moduleVersionLiteral)
+	writeRunnerEnv(b, p, "      ")
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  tags = local.clavesa_tags\n")
@@ -613,7 +872,7 @@ func emitStateMachine(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "# v2.2.0: was multi-state (one Task per transform); collapsed because\n")
 	fmt.Fprintf(b, "# pipeline_handler now loops transforms inside one Spark session.\n")
 	fmt.Fprintf(b, "resource \"aws_sfn_state_machine\" \"pipeline\" {\n")
-	fmt.Fprintf(b, "  name     = \"clavesa-${%s}\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name     = \"%s\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role_arn = aws_iam_role.sfn_exec.arn\n")
 	fmt.Fprintf(b, "  type     = \"STANDARD\"\n\n")
 	fmt.Fprintf(b, "  definition = jsonencode({\n")
@@ -690,7 +949,7 @@ func emitSchedule(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "# is non-null (count pattern).\n")
 	fmt.Fprintf(b, "resource \"aws_cloudwatch_event_rule\" \"schedule\" {\n")
 	fmt.Fprintf(b, "  count = %s != null ? 1 : 0\n\n", p.ScheduleExpr)
-	fmt.Fprintf(b, "  name                = \"clavesa-${%s}-schedule\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name                = \"%s-schedule\"\n", p.awsBase())
 	fmt.Fprintf(b, "  description         = \"Scheduled trigger for Clavesa pipeline: ${%s}\"\n", p.PipelineNameExpr)
 	fmt.Fprintf(b, "  schedule_expression = %s\n", p.ScheduleExpr)
 	fmt.Fprintf(b, "  tags                = local.clavesa_tags\n")
@@ -710,14 +969,14 @@ func emitSchedule(b *strings.Builder, p Pipeline) {
 
 	fmt.Fprintf(b, "resource \"aws_iam_role\" \"events_trigger\" {\n")
 	fmt.Fprintf(b, "  count = %s != null ? 1 : 0\n\n", p.ScheduleExpr)
-	fmt.Fprintf(b, "  name               = \"clavesa-${%s}-trigger\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name               = \"%s-trigger\"\n", p.awsBase())
 	fmt.Fprintf(b, "  assume_role_policy = data.aws_iam_policy_document.events_assume[0].json\n")
 	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"events_trigger_policy\" {\n")
 	fmt.Fprintf(b, "  count = %s != null ? 1 : 0\n\n", p.ScheduleExpr)
-	fmt.Fprintf(b, "  name = \"clavesa-${%s}-trigger\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name = \"%s-trigger\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role = aws_iam_role.events_trigger[0].id\n\n")
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version   = \"2012-10-17\"\n")
@@ -744,10 +1003,14 @@ func emitSchedule(b *strings.Builder, p Pipeline) {
 // ---------------------------------------------------------------------------
 
 func emitPoller(b *strings.Builder, p Pipeline) {
-	if len(p.TriggerQueueExprs) == 0 || p.BatchWindowExpr == "" {
+	pollerQueues := p.TriggerQueueExprs
+	if p.PollerQueueExprs != nil {
+		pollerQueues = p.PollerQueueExprs
+	}
+	if len(pollerQueues) == 0 || p.BatchWindowExpr == "" {
 		return
 	}
-	queueListExpr := "[" + strings.Join(p.TriggerQueueExprs, ", ") + "]"
+	queueListExpr := "[" + strings.Join(pollerQueues, ", ") + "]"
 
 	fmt.Fprintf(b, "# SQS poller — Lambda that checks source queues on a schedule and starts\n")
 	fmt.Fprintf(b, "# the state machine when any queue has messages.\n")
@@ -776,14 +1039,14 @@ func emitPoller(b *strings.Builder, p Pipeline) {
 
 	fmt.Fprintf(b, "resource \"aws_iam_role\" \"poller\" {\n")
 	fmt.Fprintf(b, "  count              = local._poller_enabled ? 1 : 0\n")
-	fmt.Fprintf(b, "  name               = \"clavesa-${%s}-poller\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name               = \"%s-poller\"\n", p.awsBase())
 	fmt.Fprintf(b, "  assume_role_policy = data.aws_iam_policy_document.poller_assume[0].json\n")
 	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"poller\" {\n")
 	fmt.Fprintf(b, "  count = local._poller_enabled ? 1 : 0\n")
-	fmt.Fprintf(b, "  name  = \"clavesa-${%s}-poller\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name  = \"%s-poller\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role  = aws_iam_role.poller[0].id\n\n")
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
@@ -797,7 +1060,7 @@ func emitPoller(b *strings.Builder, p Pipeline) {
 
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"poller\" {\n")
 	fmt.Fprintf(b, "  count            = local._poller_enabled ? 1 : 0\n")
-	fmt.Fprintf(b, "  function_name    = \"clavesa-${%s}-poller\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  function_name    = \"%s-poller\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role             = aws_iam_role.poller[0].arn\n")
 	fmt.Fprintf(b, "  runtime          = \"python3.12\"\n")
 	fmt.Fprintf(b, "  handler          = \"poller.handler\"\n")
@@ -815,7 +1078,7 @@ func emitPoller(b *strings.Builder, p Pipeline) {
 
 	fmt.Fprintf(b, "resource \"aws_cloudwatch_event_rule\" \"poller\" {\n")
 	fmt.Fprintf(b, "  count               = local._poller_enabled ? 1 : 0\n")
-	fmt.Fprintf(b, "  name                = \"clavesa-${%s}-poller\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name                = \"%s-poller\"\n", p.awsBase())
 	fmt.Fprintf(b, "  description         = \"Polls source queues for ${%s} at ${%s}\"\n", p.PipelineNameExpr, p.BatchWindowExpr)
 	fmt.Fprintf(b, "  schedule_expression = %s\n", p.BatchWindowExpr)
 	fmt.Fprintf(b, "  tags                = local.clavesa_tags\n")
@@ -872,13 +1135,13 @@ func emitUpstreamTriggers(b *strings.Builder, p Pipeline) {
 		// hyphens). Mirrors safeCatalogLiteral's hyphen→underscore fold.
 		safe := strings.ReplaceAll(producer, "-", "_")
 		arnExpr := fmt.Sprintf(
-			"arn:aws:states:${data.aws_region.clavesa_upstream.region}:${data.aws_caller_identity.clavesa_upstream.account_id}:stateMachine:clavesa-%s",
-			producer,
+			"arn:aws:states:${data.aws_region.clavesa_upstream.region}:${data.aws_caller_identity.clavesa_upstream.account_id}:stateMachine:%s",
+			p.upstreamAWSName(producer),
 		)
 
 		// EventBridge rule on the producer's state machine.
 		fmt.Fprintf(b, "resource \"aws_cloudwatch_event_rule\" \"upstream_%s\" {\n", safe)
-		fmt.Fprintf(b, "  name        = \"clavesa-${%s}-from-%s\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  name        = \"%s-from-%s\"\n", p.awsBase(), producer)
 		fmt.Fprintf(b, "  description = \"Auto-start ${%s} when upstream pipeline %s succeeds\"\n", p.PipelineNameExpr, producer)
 		fmt.Fprintf(b, "  event_pattern = jsonencode({\n")
 		fmt.Fprintf(b, "    source        = [\"aws.states\"]\n")
@@ -895,7 +1158,7 @@ func emitUpstreamTriggers(b *strings.Builder, p Pipeline) {
 		// producer keeps the resource set self-contained and avoids
 		// permission drift across multiple targets sharing one role.
 		fmt.Fprintf(b, "resource \"aws_iam_role\" \"upstream_trigger_%s\" {\n", safe)
-		fmt.Fprintf(b, "  name = \"clavesa-${%s}-from-%s\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  name = \"%s-from-%s\"\n", p.awsBase(), producer)
 		fmt.Fprintf(b, "  assume_role_policy = jsonencode({\n")
 		fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
 		fmt.Fprintf(b, "    Statement = [{ Effect = \"Allow\", Action = \"sts:AssumeRole\", Principal = { Service = \"events.amazonaws.com\" } }]\n")
@@ -904,7 +1167,7 @@ func emitUpstreamTriggers(b *strings.Builder, p Pipeline) {
 		fmt.Fprintf(b, "}\n\n")
 
 		fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"upstream_trigger_%s\" {\n", safe)
-		fmt.Fprintf(b, "  name = \"clavesa-${%s}-from-%s\"\n", p.PipelineNameExpr, producer)
+		fmt.Fprintf(b, "  name = \"%s-from-%s\"\n", p.awsBase(), producer)
 		fmt.Fprintf(b, "  role = aws_iam_role.upstream_trigger_%s.id\n", safe)
 		fmt.Fprintf(b, "  policy = jsonencode({\n")
 		fmt.Fprintf(b, "    Version   = \"2012-10-17\"\n")
@@ -982,7 +1245,7 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_iam_role\" \"runs_writer\" {\n")
-	fmt.Fprintf(b, "  name               = \"clavesa-${%s}-runs-writer\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name               = \"%s-runs-writer\"\n", p.awsBase())
 	fmt.Fprintf(b, "  assume_role_policy = data.aws_iam_policy_document.runs_writer_assume.json\n")
 	fmt.Fprintf(b, "  tags               = local.clavesa_tags\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -994,7 +1257,7 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	// files directly).
 	sysCatalogSafe := safeCatalogLiteral(p.SystemCatalog)
 	fmt.Fprintf(b, "resource \"aws_iam_role_policy\" \"runs_writer\" {\n")
-	fmt.Fprintf(b, "  name = \"clavesa-${%s}-runs-writer\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name = \"%s-runs-writer\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role = aws_iam_role.runs_writer.id\n\n")
 	fmt.Fprintf(b, "  policy = jsonencode({\n")
 	fmt.Fprintf(b, "    Version = \"2012-10-17\"\n")
@@ -1084,9 +1347,10 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"runs_writer\" {\n")
-	fmt.Fprintf(b, "  function_name = \"clavesa-${%s}-runs-writer\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  function_name = \"%s-runs-writer\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role          = aws_iam_role.runs_writer.arn\n")
 	fmt.Fprintf(b, "  package_type  = \"Image\"\n")
+	emitArchitectures(b, p)
 	fmt.Fprintf(b, "  image_uri     = \"${local.runs_writer_repo_uri}@${data.aws_ecr_image.runs_writer.image_digest}\"\n")
 	fmt.Fprintf(b, "  timeout       = 120  # cold start ~5s + first Delta write ~30s on a fresh DB\n")
 	fmt.Fprintf(b, "  memory_size   = 1536 # PySpark needs the headroom even for one-row writes\n\n")
@@ -1108,7 +1372,7 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "}\n\n")
 
 	fmt.Fprintf(b, "resource \"aws_cloudwatch_event_rule\" \"runs\" {\n")
-	fmt.Fprintf(b, "  name        = \"clavesa-${%s}-runs\"\n", p.PipelineNameExpr)
+	fmt.Fprintf(b, "  name        = \"%s-runs\"\n", p.awsBase())
 	fmt.Fprintf(b, "  description = \"Captures terminal Step Functions execution events for ${%s} into the runs Delta table\"\n", p.PipelineNameExpr)
 	fmt.Fprintf(b, "  event_pattern = jsonencode({\n")
 	fmt.Fprintf(b, "    source        = [\"aws.states\"]\n")
@@ -1145,3 +1409,12 @@ const sidecarDirName = "_clavesa_sidecar"
 // SidecarDirName exposes the constant for the service layer that has to
 // materialise the directory contents.
 func SidecarDirName() string { return sidecarDirName }
+
+// quotedList renders strings as a comma-separated list of HCL string literals.
+func quotedList(items []string) string {
+	q := make([]string, len(items))
+	for i, s := range items {
+		q[i] = fmt.Sprintf("%q", s)
+	}
+	return strings.Join(q, ", ")
+}

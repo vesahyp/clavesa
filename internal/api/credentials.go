@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/vesahyp/clavesa/internal/httputil"
 )
@@ -26,7 +27,10 @@ type CredentialSpec struct {
 	Kind        string `json:"kind"`
 	HeaderName  string `json:"header_name,omitempty"`
 	ValuePrefix string `json:"value_prefix,omitempty"`
-	Secret      string `json:"secret"`
+	// ClientID is the Databricks service principal application ID
+	// (kind=databricks-oauth).
+	ClientID string `json:"client_id,omitempty"`
+	Secret   string `json:"secret"`
 	// Backend is a derived discriminator (arn|env|file) the UI uses to
 	// label the backend without re-parsing the prefix.
 	Backend string `json:"backend,omitempty"`
@@ -124,6 +128,10 @@ func (h *CredentialsHandler) delete(w http.ResponseWriter, r *http.Request) {
 	}
 	if c, ok := err.(credentialInUseConflicter); ok {
 		httputil.WriteJSON(w, http.StatusConflict, deleteCredentialResponse{Usages: c.InUseUsages()})
+		return
+	}
+	if strings.Contains(err.Error(), "Databricks connection") {
+		httputil.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
 	httputil.WriteError(w, http.StatusInternalServerError, err.Error())

@@ -255,6 +255,12 @@ type Service struct {
 	// rollup runs — without touching Docker.
 	recordRun func(ctx context.Context, image, pipelineDir string, outcome *runOutcome, cascadeSkipped []string, ensureMetastore func(ctx context.Context, workspaceRoot, workspaceName string) (network, addr string))
 
+	// runBundle runs the local pipeline bundle container. Defaults to
+	// runPrepBundle (the real docker run) in New; tests stub it with a fake
+	// runner response so the run-timing assembly and the trigger plumbing
+	// can be exercised without Docker.
+	runBundle func(ctx context.Context, prep *runPrep, bundle []bundleTransformConfig) (*bundleRun, error)
+
 	// cloudLocalDispatch is the "cloud warehouse, local compute" docker
 	// dispatcher (ADR-024) — defaults to the real runCloudLocalEvent in
 	// New, stubbed by tests so the backfill-stage --compute local routing
@@ -312,9 +318,10 @@ func New(workspace string) *Service {
 		checkTerraformVersion: wspkg.TerraformVersionOK,
 		checkStateBucket:      checkStateBucketS3,
 		stateObjectStatus:     stateObjectStatusS3,
-		runTerraform:          runTerraformExec,
 	}
+	s.runTerraform = s.runTerraformWithEnv
 	s.cloudLocalDispatch = s.runCloudLocalEvent
+	s.runBundle = s.runPrepBundle
 	return s
 }
 
@@ -419,4 +426,12 @@ func (s *Service) ensureS3Client() error {
 		s.s3Client = s3.NewFromConfig(cfg)
 	})
 	return s.s3Err
+}
+
+// awsName is the base name of a pipeline's AWS resources in this
+// workspace (clavesa-<pipeline>, or clavesa-<workspace>-<pipeline> for a
+// workspace with aws_names = "workspace"). See workspace.PipelineAWSName.
+func (s *Service) awsName(pipeline string) string {
+	m, _ := wspkg.Load(s.workspace)
+	return wspkg.PipelineAWSName(m, pipeline)
 }

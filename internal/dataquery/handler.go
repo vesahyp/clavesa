@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/httputil"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/pricing"
+	"github.com/vesahyp/clavesa/internal/runtiming"
 )
 
 const (
@@ -34,6 +36,7 @@ type Handler struct {
 	cloud    observability.Provider
 	resolver *observability.Resolver
 	queryFn  QueryFunc
+	timingFn RunTimingsFunc
 }
 
 // QueryFunc runs one workspace-level ad-hoc SQL statement through the
@@ -46,6 +49,14 @@ type Handler struct {
 // (ADR-015).
 type QueryFunc func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error)
 
+// RunTimingsFunc reads the run-timing history of the pipeline at dir
+// through the shared service seam (service.Service.RunTimings), oldest
+// first. limit 0 = all runs; since 0 = no time bound. A func for the same
+// import-cycle reason as QueryFunc. Wired via WithRunTimingsService from
+// cli/ui.go; `clavesa pipeline timings` calls the same service method
+// (ADR-015).
+type RunTimingsFunc func(ctx context.Context, dir string, limit int, since time.Duration) ([]runtiming.Record, error)
+
 // NewHandler returns a Handler that serves:
 //
 //	GET /data/source                                — read sample rows from an S3 object
@@ -53,6 +64,7 @@ type QueryFunc func(ctx context.Context, sql, dir string, maxRows int) (*observa
 //	GET /data/tables/{database}/{table}/snapshots   — Iceberg snapshot history (freshness/rowcount)
 //	GET /data/node-runs                             — typed query of <pipeline>.node_runs
 //	GET /data/runs                                  — typed query of <pipeline>.runs (per-execution rollup)
+//	GET /data/run-timings                           — run-timing history of one pipeline (service seam)
 //
 // The observability endpoints (snapshots, node-runs, runs) delegate to a
 // CloudProvider so the local provider can implement the same shapes; ADR-014.
@@ -122,6 +134,9 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 		}
 		handlePipelineCost(w, r, p, h.systemGlueDBFor(r), h.pipelineNameFor(r))
 	})
+	mux.HandleFunc("GET /data/run-timings", func(w http.ResponseWriter, r *http.Request) {
+		handleRunTimings(w, r, h.timingFn, h.pipelineNameFor(r))
+	})
 	mux.HandleFunc("GET /data/tables-state", func(w http.ResponseWriter, r *http.Request) {
 		p, ok := h.providerFor(w, r)
 		if !ok {
@@ -181,6 +196,14 @@ func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 // (and, on cloud, its dialect) is decided by the seam.
 func (h *Handler) WithQueryService(fn QueryFunc) *Handler {
 	h.queryFn = fn
+	return h
+}
+
+// WithRunTimingsService wires GET /data/run-timings to the shared
+// service read (service.Service.RunTimings), the same one
+// `clavesa pipeline timings` uses (ADR-015).
+func (h *Handler) WithRunTimingsService(fn RunTimingsFunc) *Handler {
+	h.timingFn = fn
 	return h
 }
 
@@ -765,6 +788,58 @@ func handlePipelineCost(w http.ResponseWriter, r *http.Request, p observability.
 		return
 	}
 	httputil.WriteJSON(w, http.StatusOK, pricing.AggregateCost(pipeline, res.Rows))
+}
+
+// runTimingsDefaultLimit matches `clavesa pipeline timings --runs`.
+const runTimingsDefaultLimit = 20
+
+// handleRunTimings serves GET /data/run-timings?dir=<pipelineDir>[&limit=N][&since=<dur>].
+//
+// Returns runtiming.History for the pipeline at `dir`: its run-timing
+// records, oldest first, with history_dir "" (the records come from the
+// workspace, not the cross-workspace history dir). The same JSON as
+// `clavesa pipeline timings --json`. limit defaults to 20; 0 = all.
+// since is a Go duration or a day count ("7d"); empty = no bound.
+func handleRunTimings(w http.ResponseWriter, r *http.Request, fn RunTimingsFunc, pipeline string) {
+	dir := strings.TrimSpace(r.URL.Query().Get("dir"))
+	if dir == "" {
+		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
+		return
+	}
+	if pipeline == "" || !observability.IsValidPipelineName(pipeline) {
+		httputil.WriteError(w, http.StatusBadRequest, "could not resolve a valid pipeline name from dir")
+		return
+	}
+	limit := runTimingsDefaultLimit
+	if s := r.URL.Query().Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			httputil.WriteError(w, http.StatusBadRequest, "limit must be a non-negative integer (0 = all)")
+			return
+		}
+		limit = n
+	}
+	since, err := runtiming.ParseSince(r.URL.Query().Get("since"))
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if fn == nil {
+		httputil.WriteError(w, http.StatusNotImplemented, "run timings are not wired on this server")
+		return
+	}
+	recs, err := fn(r.Context(), dir, limit, since)
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if recs == nil {
+		recs = []runtiming.Record{}
+	}
+	httputil.WriteJSON(w, http.StatusOK, runtiming.History{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Runs:        recs,
+	})
 }
 
 // handleTables serves GET /data/tables-state?pipeline=<name>[&dir=<dir>][&limit=N].

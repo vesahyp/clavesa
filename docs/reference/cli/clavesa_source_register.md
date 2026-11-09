@@ -13,6 +13,12 @@ For s3, you can also pass kind/bucket/prefix explicitly:
 
   clavesa source register logs --kind s3 --bucket my-bucket --prefix events/ --format json
 
+A table a Databricks step wrote (Unity Catalog) takes a uc:// URL, or
+--table. It needs a Databricks connection (clavesa workspace connect
+databricks) and reads in the cloud only:
+
+  clavesa source register orders --from uc://main.sales.orders
+
 --format is inferred from the trailing filename when omitted. Pass
 --attach <pipeline-dir> --to <transform> [--as <alias>] to attach the
 new source to a pipeline in one step.
@@ -40,13 +46,15 @@ clavesa source register <name> [flags]
       --bucket string                S3 bucket name (kind=s3)
       --credentials string           name of a registered credential (slice 2: header auth)
       --format string                data format (parquet, csv, json, tsv); inferred from filename if omitted
-      --from string                  URL shorthand: https://… for kind=http, s3://… for kind=s3
-      --kind string                  source kind (http, s3); inferred from --from when omitted
+      --from string                  URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog
+      --kind string                  source kind (http, s3, unity-catalog); inferred from --from when omitted
       --manage-notifications         kind=s3: have terraform manage the bucket's EventBridge notification config (authoritative — replaces existing notification config). Default off; only enable when clavesa owns the source bucket
+      --no-trigger                   kind=s3: new files do not start runs; the pipeline runs on its schedule and drains the queue then
       --partitions strings           kind=s3: comma-separated Hive partition keys (e.g. year,month,day) for partition-column recovery
       --prefix string                S3 key prefix (kind=s3); auto-suffixed with /
       --read-option stringToString   repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns (e.g. --read-option delimiter=$'\t' --read-option header=false) (default [])
       --start-from string            kind=s3 with --partitions: first-run seed before queue-drain takes over ("all" | "now" | "<cursor>")
+      --table string                 Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog; needs clavesa workspace connect databricks)
       --to string                    transform node id (when --attach is set)
 ```
 

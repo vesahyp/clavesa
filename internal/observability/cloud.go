@@ -126,6 +126,17 @@ func (c *CloudProvider) undeployed() bool { return c.athenaOutputBucket == "" }
 // whose system-catalog Glue DB was rebuilt: the system Delta tables
 // (runs / node_runs / tables / column_stats / dashboard datasets)
 // haven't been created yet, and Athena 500s the SELECT.
+// isAthenaMissingColumnErr reports an Athena/Trino "Column 'x' cannot be
+// resolved" (COLUMN_NOT_FOUND) failure for the named column.
+func isAthenaMissingColumnErr(err error, column string) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "column '"+strings.ToLower(column)+"'") &&
+		(strings.Contains(msg, "cannot be resolved") || strings.Contains(msg, "column_not_found"))
+}
+
 func isAthenaMissingTableErr(err error) bool {
 	if err == nil {
 		return false
@@ -259,13 +270,21 @@ func (c *CloudProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
   jvm_gc_time_ms,
   executor_cpu_time_ms,
   executor_run_time_ms,
-  max_task_duration_ms
+  max_task_duration_ms,
+  %s
 FROM "%s"."node_runs"
 %s
 ORDER BY started_at DESC
-LIMIT %d`, dbName, whereClause, q.Limit+1)
+LIMIT %d`, "timing", dbName, whereClause, q.Limit+1)
 
 	rows, truncated, _, err := c.runAthenaSelect(ctx, sql, q.Limit)
+	if err != nil && isAthenaMissingColumnErr(err, "timing") {
+		// A deployed workspace whose node_runs table predates v2.22.0 has
+		// no `timing` column until its next run appends one (mergeSchema).
+		// Read the table without it rather than blank the run history.
+		sql = strings.Replace(sql, "\n  timing\nFROM", "\n  CAST(NULL AS varchar) AS timing\nFROM", 1)
+		rows, truncated, _, err = c.runAthenaSelect(ctx, sql, q.Limit)
+	}
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			return &NodeRunsResult{Rows: []NodeRun{}}, nil
@@ -275,7 +294,7 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 
 	out := make([]NodeRun, 0, len(rows))
 	for _, row := range rows {
-		if len(row.Data) < 32 {
+		if len(row.Data) < 33 {
 			continue
 		}
 		out = append(out, NodeRun{
@@ -312,6 +331,8 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 			ExecutorCPUTimeMs:     intDatum(row.Data[29]),
 			ExecutorRunTimeMs:     intDatum(row.Data[30]),
 			MaxTaskDurationMs:     intDatum(row.Data[31]),
+
+			Timing: stringDatum(row.Data[32]),
 		})
 	}
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
@@ -1051,8 +1072,10 @@ func (c *CloudProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 		// dir-mode ref) — no logs to fetch. Empty, not a 500.
 		return &ExecutionLogsResult{Source: LogSourceCloudWatch, Events: []LogEvent{}}, nil
 	}
-	pipelineName := PipelineNameFromStateMachineName(smName)
-	functionName := pipelineName + "-" + q.Step
+	// The state machine and the Lambdas share one AWS base name
+	// (clavesa-<pipeline> or clavesa-<workspace>-<pipeline>), so the
+	// state machine name is the function-name prefix in either mode.
+	functionName := smName + "-" + q.Step
 	logGroup := "/aws/lambda/" + functionName
 
 	hist, err := c.sfn.GetExecutionHistory(ctx, &sfn.GetExecutionHistoryInput{

@@ -318,6 +318,8 @@ func fetchRegistrySourceRows(ctx context.Context, s3c dataquery.S3Client, spec s
 			return nil, err
 		}
 		return Convert(qr).Items, nil
+	case "unity-catalog":
+		return nil, fmt.Errorf("source %q is a Unity Catalog table (%s): previewing it needs a deployed pipeline and the Databricks connection, so run the pipeline in the cloud instead", spec.Name, spec.Table)
 	default:
 		return nil, fmt.Errorf("source kind %q not supported in preview", spec.Kind)
 	}

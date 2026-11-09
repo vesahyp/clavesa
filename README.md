@@ -132,6 +132,14 @@ Now drive the rest from the browser:
 
    ![Per-execution run detail with DAG, triage strip, and per-node breakdown](docs/images/run-detail.png)
 
+   Every run also records where its time went. `pipeline run` from the terminal ends with a `Time` line (startup, metastore, Spark session, nodes) and a per-node table (reads, transform, write, stats, Spark stages and tasks), and the history is one command away:
+
+   ```bash
+   clavesa pipeline timings demo --workspace $WS
+   ```
+
+   One row per run: startup, metastore, Spark, reads, transform, writes, stats, other. `--json` prints the full records, `--all` covers every workspace on the machine. The pipeline dashboard shows the same history as a stacked bar per run in the **Where the time goes** card, and the run detail shows each node's phases as a bar.
+
    Run it twice more (back to the dashboard, **Run pipeline**) so the seeded `/dashboards/pipeline-runs-demo` duration chart has more than one point:
 
    ![Pipeline runs dashboard for the demo pipeline, five widgets driven by the seeded JSON and populated by three local runs](docs/images/dashboard.png)
@@ -189,6 +197,7 @@ AWS_PROFILE=my-account clavesa deploy --workspace $WS
 
 - **[docs/reference/](docs/reference/)** is the look-up material: the full **[CLI reference](docs/reference/cli/README.md)** (every command and flag, generated from the binary), plus per-module input/output docs.
 - **[docs/cookbook/](docs/cookbook/README.md)** holds task-oriented recipes — how to solve a specific problem end to end.
+- **[docs/databricks/getting-started.md](docs/databricks/getting-started.md)** is for a team on Databricks with Unity Catalog: run one step of a Databricks pipeline on clavesa, with its table and lineage still in Unity Catalog, a shadow run, a daily comparison, the switch and the roll-back ([ADR-027](docs/decisions/027-unity-catalog-publish.md)).
 - **[docs/remote-state.md](docs/remote-state.md)** covers moving a workspace's Terraform state to a shared S3 backend so more than one developer can deploy against it ([ADR-025](docs/decisions/025-remote-terraform-backend.md)).
 - **[CHANGELOG.md](CHANGELOG.md)** lists what shipped in each release, in user-facing terms.
 - **[docs/architecture.md](docs/architecture.md)** covers system layers and the data model.

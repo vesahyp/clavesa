@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -22,7 +22,7 @@ dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
 
 sync-runner: ## Copy runner/ → internal/runner/files/ so the embedded copy used by `clavesa workspace init` stays in sync
-	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/spark_conf.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/spark_conf.py runner/unity_catalog.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
 
 sync-modules: ## Copy modules/ → internal/modules/files/ (tracked .tf/.py/.md/.hcl files only) so `terraform init` resolves embedded modules locally
 	@rm -rf internal/modules/files
@@ -169,6 +169,29 @@ sync-public: ## Publish docs/source updates to the public repo on main, NO versi
 
 smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
 	@./scripts/cloud-smoke.sh run
+
+smoke-databricks: $(if $(SKIP_BUILD),,build) ## Unity Catalog gate (ADR-027): run a published pipeline on a connected, deployed workspace and assert the table, lineage and downstream Databricks run in Databricks (UC_SMOKE_WS / UC_SMOKE_PIPELINE)
+	bash scripts/uc-smoke.sh
+
+smoke-databricks-shadow: $(if $(SKIP_BUILD),,build) ## Shadow-mode gate: preflight, a shadow run and a passing comparison on the test workspace (UC_SHADOW_* env, see the script); no DBUs
+	bash scripts/uc-shadow-smoke.sh
+
+# Shadow mode's daily check (docs/cookbook/replace-a-databricks-step.md).
+# Runs against a deployed, connected workspace; exit status 1 on FAIL, so
+# cron (or jeeves' cronrun) can alert on it. DAYS=n limits both tables to
+# the last n days of PARTITION; WHERE=<predicate> instead for any filter.
+SHADOW_CLAVESA ?= $(CURDIR)/bin/clavesa
+shadow-compare: ## Shadow mode: compare the Databricks step's table with clavesa's per partition (WS= PIPELINE= EXISTING= SHADOW= PARTITION= SUMS=a,b [DAYS=7 | WHERE=...] [JSON=1]); exit 1 on fail
+	@test -n "$(WS)" -a -n "$(PIPELINE)" -a -n "$(EXISTING)" -a -n "$(SHADOW)" -a -n "$(PARTITION)" || \
+	  { echo "usage: make shadow-compare WS=<workspace dir> PIPELINE=<pipeline> EXISTING=<c.s.t> SHADOW=<c.s.t> PARTITION=<column> SUMS=<a,b> [DAYS=7 | WHERE=<predicate>] [JSON=1]"; exit 2; }
+	cd "$(WS)" && "$(SHADOW_CLAVESA)" pipeline databricks-compare "$(PIPELINE)" \
+	  --existing "$(EXISTING)" --shadow "$(SHADOW)" --partition "$(PARTITION)" \
+	  $(if $(SUMS),--sum "$(SUMS)") \
+	  $(if $(WHERE),--where "$(WHERE)",$(if $(DAYS),--where "$(PARTITION) >= date_sub(current_date(), $(DAYS))")) \
+	  $(if $(JSON),--json)
+
+screenshots-unity-catalog: ## Screenshot + assert the Unity Catalog page and a run's Databricks card (needs a running `clavesa ui` on a connected workspace; UC_RUN=<run id>, see the script)
+	bash scripts/uc-screenshots.sh
 
 verify-readme: $(if $(SKIP_BUILD),,build) ## Walk the README quick-start literally (UI via playwright-cli) and assert the mandatory pages (CLAVESA_VERIFY_ADDR to override the :8080 UI port)
 	@./scripts/verify-readme.sh

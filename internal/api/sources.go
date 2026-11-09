@@ -38,6 +38,8 @@ type SourceSpec struct {
 	Partitions                []string `json:"partitions,omitempty"`
 	StartFrom                 string   `json:"start_from,omitempty"`
 	ManageBucketNotifications bool     `json:"manage_bucket_notifications,omitempty"`
+	NoTrigger                 bool     `json:"no_trigger,omitempty"`
+	Table                     string   `json:"table,omitempty"`
 }
 
 // SourceUsage names a pipeline that references the source. Returned in

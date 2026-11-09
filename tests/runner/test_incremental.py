@@ -586,7 +586,7 @@ def test_resolve_output_dict_append():
     os.environ["CLAVESA_SCHEMA"] = "p"
 
     s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "", "mode": "append"})
-    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False, "merge_update": {}, "cluster_by": [], "bound_by": []}
+    assert s == {"kind": "delta_table", "target": "clavesa_demo_ws__p.n__default", "mode": "append", "merge_keys": [], "stats": False, "merge_update": {}, "cluster_by": [], "bound_by": [], "partition_by": []}
 
     # stats opt-in flows through to the resolved spec — the call site
     # only reads spec["stats"], so propagation is the whole test.
@@ -616,6 +616,75 @@ def test_resolve_output_cluster_by_and_merge_update():
     s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "db.t"})
     assert s["merge_update"] == {}
     assert s["cluster_by"] == []
+
+
+def test_partition_dirs_for_whole_partition_reads():
+    """replace_partitions + notification drain: the drained files map to
+    their day folders, so the run re-reads each touched day whole."""
+    runner = _load_runner()
+    base = "s3://b/raw/events/"
+    keys = [
+        "s3://b/raw/events/event_date=2026-11-10/part-0001.json",
+        "s3://b/raw/events/event_date=2026-11-10/part-0002.json",
+        "s3://b/raw/events/event_date=2026-11-11/part-0000.json",
+        "s3://b/elsewhere/x.json",
+    ]
+    assert runner._partition_dirs(keys, base, 1) == [
+        "s3://b/raw/events/event_date=2026-11-10/",
+        "s3://b/raw/events/event_date=2026-11-11/",
+        "s3://b/elsewhere/x.json",
+    ]
+
+
+def test_fargate_event_adds_the_execution_identity():
+    """compute = "fargate": the S3 bundle plus the env Step Functions sets
+    is exactly the event the Lambda state machine would have sent."""
+    runner = _load_runner()
+    bundle = {"pipeline": "p", "transforms": [{"node": "n"}]}
+    ev = runner.fargate_event(bundle, {
+        "CLAVESA_SF_EXECUTION_ARN": "arn:aws:states:r:1:execution:sm:id",
+        "CLAVESA_SF_STARTED_AT": "2026-11-08T20:00:00Z",
+        "CLAVESA_EXECUTION_INPUT": '{"_trigger": "scheduled"}',
+    })
+    assert ev["_pipeline_run"] is True
+    assert ev["transforms"] == [{"node": "n"}]
+    assert ev["_sf_execution_arn"] == "arn:aws:states:r:1:execution:sm:id"
+    assert ev["_execution_input"] == {"_trigger": "scheduled"}
+    assert "_pipeline_run" not in bundle  # the bundle is not mutated
+    assert runner.fargate_event(bundle, {"CLAVESA_EXECUTION_INPUT": "not json"})["_execution_input"] == {}
+
+
+def test_read_keys_format_passes_paths_as_one_list():
+    """json() and csv() take (path, schema, ...): several paths must go in
+    one list, or the second path is parsed as a schema (the bug a
+    two-day partitioned JSON read hit on Lambda: PARSE_SYNTAX_ERROR at
+    's3://...')."""
+    runner = _load_runner()
+    calls = []
+
+    class _Reader:
+        def option(self, *_a, **_k):
+            return self
+
+        def schema(self, *_a):
+            return self
+
+        def json(self, *args):
+            calls.append(("json", args))
+            return "df"
+
+        def parquet(self, *args):
+            calls.append(("parquet", args))
+            return "df"
+
+    class _Spark:
+        read = _Reader()
+
+    keys = ["s3://b/raw/d=1/", "s3://b/raw/d=2/"]
+    runner._read_keys_format(_Spark(), keys, "json", "s3://b/raw/")
+    runner._read_keys_format(_Spark(), keys, "parquet", "s3://b/raw/")
+    assert calls[0] == ("json", (keys,)), calls[0]
+    assert calls[1] == ("parquet", tuple(keys)), calls[1]
 
 
 def test_merge_set_clause_primitives_and_raw():
@@ -1019,3 +1088,19 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_resolve_output_unity_catalog_fields():
+    runner = _load_runner()
+    s = runner._resolve_output("default", {"kind": "delta_table", "table_id": "db.t", "mode": "replace_partitions",
+                                           "partition_by": ["event_date"], "uc_table": "a.b.c",
+                                           "uc_location": "s3://team/t", "replaces_job": "42"})
+    assert s["mode"] == "replace_partitions"
+    assert s["partition_by"] == ["event_date"]
+    assert s["uc_table"] == "a.b.c" and s["uc_location"] == "s3://team/t" and s["replaces_job"] == 42
+    try:
+        runner._resolve_output("default", {"kind": "delta_table", "table_id": "db.t", "partition_by": ["d"], "cluster_by": ["d"]})
+    except RuntimeError as exc:
+        assert "cannot both be set" in str(exc)
+    else:
+        raise AssertionError("partition_by + cluster_by must be refused")

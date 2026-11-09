@@ -25,6 +25,8 @@ const SourceSpec = z.object({
   partitions: z.array(z.string()).optional().default([]),
   start_from: z.string().optional().default(""),
   manage_bucket_notifications: z.boolean().optional().default(false),
+  no_trigger: z.boolean().optional().default(false),
+  table: z.string().optional().default(""),
 });
 export type SourceSpec = z.infer<typeof SourceSpec>;
 
@@ -37,6 +39,7 @@ const CredentialSpec = z.object({
   kind: z.string(),
   header_name: z.string().optional().default(""),
   value_prefix: z.string().optional().default(""),
+  client_id: z.string().optional().default(""),
   secret: z.string(),
   backend: z.string().optional().default(""),
 });
@@ -63,6 +66,7 @@ export async function registerCredential(spec: {
   kind?: string;
   header_name?: string;
   value_prefix?: string;
+  client_id?: string;
   secret: string;
 }): Promise<CredentialSpec> {
   return requestParsed("/credentials", CredentialSpec, {
@@ -111,6 +115,8 @@ export async function registerSource(spec: {
   partitions?: string[];
   start_from?: string;
   manage_bucket_notifications?: boolean;
+  no_trigger?: boolean;
+  table?: string;
 }): Promise<SourceSpec> {
   // kind omitted on purpose — the server sniffs `s3://` vs `https://`
   // out of the URL field. Caller can still pass kind explicitly when
@@ -139,6 +145,8 @@ export async function updateSource(
     partitions?: string[];
     start_from?: string;
     manage_bucket_notifications?: boolean;
+    no_trigger?: boolean;
+    table?: string;
   },
 ): Promise<SourceSpec> {
   return requestParsed(`/sources/${encodeURIComponent(name)}`, SourceSpec, {

@@ -107,6 +107,8 @@ func TestProgressStatesSkipsRunMarkerAndStale(t *testing.T) {
 	}
 	// Run-level marker — must be skipped, not treated as a node.
 	write("_run", `{"status":"RUNNING"}`)
+	// The run's Unity Catalog record (ADR-027) — not a node either.
+	write("_databricks", `{"status":"running","tables":[],"updated_ms":`+itoa(now)+`}`)
 	// Fresh running node.
 	write("fresh", `{"status":"running","tasks_total":10,"updated_ms":`+itoa(now)+`}`)
 	// Stale running node — older than the freshness window → dropped.
@@ -118,6 +120,9 @@ func TestProgressStatesSkipsRunMarkerAndStale(t *testing.T) {
 
 	if _, ok := states["_run"]; ok {
 		t.Error("_run marker must not appear as a node")
+	}
+	if _, ok := states["_databricks"]; ok {
+		t.Error("_databricks record must not appear as a node")
 	}
 	if got := states["fresh"].Status; got != "RUNNING" {
 		t.Errorf("fresh status = %q, want RUNNING", got)

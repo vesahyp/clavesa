@@ -30,6 +30,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/pipelinestatus"
 	"github.com/vesahyp/clavesa/internal/preview"
+	"github.com/vesahyp/clavesa/internal/runtiming"
 	tuiservice "github.com/vesahyp/clavesa/internal/service"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 )
@@ -135,6 +136,8 @@ func toAPISpec(s tuiservice.SourceSpec) api.SourceSpec {
 		Format: s.Format, Credentials: s.Credentials,
 		Partitions: s.Partitions, StartFrom: s.StartFrom,
 		ManageBucketNotifications: s.ManageBucketNotifications,
+		NoTrigger:                 s.NoTrigger,
+		Table:                     s.Table,
 	}
 }
 
@@ -145,6 +148,8 @@ func toServiceSpec(s api.SourceSpec) tuiservice.SourceSpec {
 		Format: s.Format, Credentials: s.Credentials,
 		Partitions: s.Partitions, StartFrom: s.StartFrom,
 		ManageBucketNotifications: s.ManageBucketNotifications,
+		NoTrigger:                 s.NoTrigger,
+		Table:                     s.Table,
 	}
 }
 
@@ -320,6 +325,7 @@ func toAPICred(c tuiservice.CredentialSpec) api.CredentialSpec {
 		Kind:        c.Kind,
 		HeaderName:  c.HeaderName,
 		ValuePrefix: c.ValuePrefix,
+		ClientID:    c.ClientID,
 		Secret:      c.Secret,
 		Backend:     c.SecretBackend(),
 	}
@@ -331,6 +337,7 @@ func toServiceCred(c api.CredentialSpec) tuiservice.CredentialSpec {
 		Kind:        c.Kind,
 		HeaderName:  c.HeaderName,
 		ValuePrefix: c.ValuePrefix,
+		ClientID:    c.ClientID,
 		Secret:      c.Secret,
 	}
 }
@@ -764,6 +771,11 @@ Examples:
 				WithResolver(resolver).
 				WithQueryService(func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error) {
 					return svc.Query(ctx, sql, tuiservice.QueryOptions{Dir: dir, MaxRows: maxRows})
+				}).
+				// GET /data/run-timings reads through Service.RunTimings,
+				// the same read as `clavesa pipeline timings` (ADR-015).
+				WithRunTimingsService(func(ctx context.Context, dir string, limit int, since time.Duration) ([]runtiming.Record, error) {
+					return svc.RunTimings(ctx, dir, tuiservice.RunTimingsQuery{Limit: limit, Since: since})
 				})
 			// nil-safe: catalog handler renders an empty list in local-only mode.
 			var catalogClient api.GlueClient

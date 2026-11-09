@@ -40,7 +40,7 @@ import (
 func (s *Service) RunPipelineCloud(ctx context.Context, dir string, opts RunOpts) (string, error) {
 	abs := s.resolveDir(dir)
 	pipelineName := filepath.Base(abs)
-	stateMachineName := "clavesa-" + pipelineName
+	stateMachineName := s.awsName(pipelineName)
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {

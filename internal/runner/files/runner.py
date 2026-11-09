@@ -31,6 +31,13 @@ both Lambda invocations and local `clavesa pipeline run` commands.
 
 from __future__ import annotations
 
+# Process boot stamp for the bundle's stdout `runner.boot_ms` / `total_ms`.
+# Captured before any other import so it includes interpreter + module load.
+import time as _boot_time
+
+_RUNNER_T0 = _boot_time.time()
+
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -50,6 +57,16 @@ _s3_endpoint = os.environ.get("CLAVESA_S3_ENDPOINT")
 if _s3_endpoint and not os.environ.get("AWS_ENDPOINT_URL_S3"):
     os.environ["AWS_ENDPOINT_URL_S3"] = _s3_endpoint
 from typing import Any, Iterable
+
+# ADR-027 Unity Catalog publish; a sibling module like spark_conf and
+# run_lock. Stdlib-only at import time. The fallback covers runner.py
+# loaded by file path (the tests under tests/runner/), where the runner
+# folder is not on sys.path.
+try:
+    import unity_catalog as _uc
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import unity_catalog as _uc
 
 # Directory Spark writes its event log into (see spark_conf.py:
 # spark.eventLog.dir). The runner tails the single log file in here after
@@ -535,6 +552,197 @@ def _read_spark_metrics(offset: int) -> dict[str, int | None]:
 
 
 # ---------------------------------------------------------------------------
+# Per-phase node timing (the "timing" object on the terminal progress marker,
+# the bundle stdout JSON, and the node_runs.timing column). Wall clock per
+# phase from time.monotonic(), plus a Spark stage summary per Spark-capable
+# phase read from the event log slice the phase wrote. Independent of the
+# whole-node _SPARK_METRIC_KEYS read in handler(), which keeps its own
+# node-start offset.
+# ---------------------------------------------------------------------------
+
+_TIMING_PHASES = (
+    "spark_session",
+    "catalog",
+    "inputs",
+    "transform",
+    "write",
+    "glue_sync",
+    "stats",
+    "table_state",
+    "system",
+)
+
+# Phases that can run Spark jobs, so they get an event-log slice.
+_TIMING_SPARK_PHASES = ("inputs", "transform", "write", "stats", "table_state")
+
+_TIMING_SPARK_KEYS = (
+    "num_stages",
+    "num_tasks",
+    "input_bytes",
+    "input_records",
+    "shuffle_read_bytes",
+    "shuffle_write_bytes",
+    "memory_spilled_bytes",
+    "disk_spilled_bytes",
+    "executor_run_time_ms",
+)
+
+
+def _timing_object(phases, inputs=None, outputs=None, spark=None, system_ms=None) -> dict:
+    """Pure helper: build the timing object from raw phase-timer data.
+
+    Every phase in ``_TIMING_PHASES`` is present (0 when it did not run).
+    ``spark`` maps phase -> metric dict; a phase is kept only when it is a
+    Spark-capable phase and its slice saw at least one stage, and only the
+    ``_TIMING_SPARK_KEYS`` survive (None -> 0). ``system_ms`` overrides
+    ``phases["system"]`` when given.
+    """
+    phases = phases or {}
+    out_phases = {p: int(phases.get(p) or 0) for p in _TIMING_PHASES}
+    if system_ms is not None:
+        out_phases["system"] = int(system_ms)
+    spark_out: dict[str, dict[str, int]] = {}
+    for p in _TIMING_SPARK_PHASES:
+        s = (spark or {}).get(p)
+        if not isinstance(s, dict):
+            continue
+        summary = {k: int(s.get(k) or 0) for k in _TIMING_SPARK_KEYS}
+        if summary["num_stages"] <= 0:
+            continue
+        spark_out[p] = summary
+    return {
+        "phases": out_phases,
+        "inputs": {str(k): int(v or 0) for k, v in (inputs or {}).items()},
+        "outputs": {str(k): int(v or 0) for k, v in (outputs or {}).items()},
+        "spark": spark_out,
+    }
+
+
+def _timing_log_line(node: str, timing: dict) -> str:
+    """One stderr line per node summarising the timing object."""
+    ph = (timing or {}).get("phases") or {}
+
+    def s(p):
+        ms = int(ph.get(p) or 0)
+        return f"{ms / 1000:.1f}s" if ms else "0s"
+
+    return (
+        f"[clavesa] timing {node}: inputs={s('inputs')} transform={s('transform')} "
+        f"write={s('write')} stats={s('stats')} table_state={s('table_state')} "
+        f"(spark_session={s('spark_session')} catalog={s('catalog')})"
+    )
+
+
+def _drain_listener_bus() -> None:
+    """Best-effort wait until Spark's listener bus is empty, so the event log
+    carries the stage/task events of the jobs that just finished before a
+    phase slice is read. One py4j call; returns at once when idle. No-op
+    without a live session or when the JVM method is unavailable."""
+    if _SPARK is None:
+        return
+    try:
+        _SPARK.sparkContext._jsc.sc().listenerBus().waitUntilEmpty(2000)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+class _PhaseTimer:
+    """Accumulates per-phase wall-clock time for one node run.
+
+    ``start``/``stop`` (or the ``measure`` context manager) time a phase with
+    time.monotonic(). Measurements nest: a phase started inside another one
+    (``catalog`` inside a ``write``) is subtracted from the enclosing phase,
+    so each millisecond is counted once. ``detail`` names the per-alias
+    ``inputs`` or per-output ``outputs`` sub-map the time also goes to.
+    Spark-capable phases read their event-log slice at stop when
+    ``spark_slices`` is set. ``close_open`` stops anything a raised exception
+    left running, so a failed phase still reports the time it took.
+    """
+
+    def __init__(self, spark_slices: bool = True):
+        self.phases = dict.fromkeys(_TIMING_PHASES, 0)
+        self.inputs: dict[str, int] = {}
+        self.outputs: dict[str, int] = {}
+        self.spark: dict[str, dict[str, int]] = {}
+        self._spark_slices = spark_slices
+        self._stack: list[dict[str, Any]] = []
+
+    def start(self, phase: str, detail: str | None = None, key: str | None = None):
+        tok = {
+            "phase": phase,
+            "detail": detail,
+            "key": key,
+            "t0": time.monotonic(),
+            "child_ms": 0.0,
+            "offset": None,
+            "done": False,
+        }
+        if self._spark_slices and phase in _TIMING_SPARK_PHASES:
+            tok["offset"] = _event_log_offset()
+        self._stack.append(tok)
+        return tok
+
+    def stop(self, tok) -> None:
+        if tok is None or tok["done"]:
+            return
+        # Stop children first (an exception may have skipped their stop).
+        while self._stack and self._stack[-1] is not tok:
+            self.stop(self._stack[-1])
+        if self._stack and self._stack[-1] is tok:
+            self._stack.pop()
+        tok["done"] = True
+        elapsed = (time.monotonic() - tok["t0"]) * 1000.0
+        own = max(elapsed - tok["child_ms"], 0.0)
+        if self._stack:
+            self._stack[-1]["child_ms"] += elapsed
+        self.add(tok["phase"], own, detail=tok["detail"], key=tok["key"])
+        if tok["offset"] is not None:
+            _drain_listener_bus()
+            self.add_spark(tok["phase"], _read_spark_metrics(tok["offset"]))
+
+    @contextlib.contextmanager
+    def measure(self, phase: str, detail: str | None = None, key: str | None = None):
+        tok = self.start(phase, detail=detail, key=key)
+        try:
+            yield
+        finally:
+            self.stop(tok)
+
+    def close_open(self) -> None:
+        while self._stack:
+            self.stop(self._stack[-1])
+
+    def add(self, phase: str, ms: float, detail: str | None = None, key: str | None = None) -> None:
+        ms_i = int(round(ms))
+        self.phases[phase] = self.phases.get(phase, 0) + ms_i
+        if detail == "inputs" and key is not None:
+            self.inputs[key] = self.inputs.get(key, 0) + ms_i
+        elif detail == "outputs" and key is not None:
+            self.outputs[key] = self.outputs.get(key, 0) + ms_i
+
+    def add_spark(self, phase: str, metrics: dict | None) -> None:
+        if not metrics or not metrics.get("num_stages"):
+            return
+        acc = self.spark.setdefault(phase, dict.fromkeys(_TIMING_SPARK_KEYS, 0))
+        for k in _TIMING_SPARK_KEYS:
+            acc[k] += int(metrics.get(k) or 0)
+
+    def to_dict(self, system_ms: int | None = None) -> dict:
+        return _timing_object(
+            self.phases, self.inputs, self.outputs, self.spark, system_ms=system_ms
+        )
+
+
+# Timing object of the node handler() last ran (with phases.system filled),
+# read by the bundle loop for its stdout JSON. Reset per node by the loop.
+_LAST_NODE_TIMING: dict | None = None
+
+# The bundle's `runner.boot_ms` measures process start to the first bundle
+# loop only; a warm Lambda's later bundles report boot_ms = 0.
+_BUNDLE_BOOTED = False
+
+
+# ---------------------------------------------------------------------------
 # Preview-mode helpers (in-memory rows ↔ DataFrames)
 # ---------------------------------------------------------------------------
 
@@ -1001,15 +1209,39 @@ def _download_http_to_tmp(url: str, headers: dict | None = None) -> str:
     dest = f"/tmp/clavesa-src-{digest}-{base}"
     if not os.path.exists(dest):
         tmp = dest + ".part"
-        req = urllib.request.Request(url, headers=headers or {})  # noqa: S310
-        with urllib.request.urlopen(req) as resp, open(tmp, "wb") as f:  # noqa: S310
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
+        # An explicit User-Agent: some CDNs (the NYC TLC trip-data
+        # CloudFront, 2026-11) answer Python-urllib's default with
+        # 202 and an empty body, which then failed as "not a Parquet file".
+        req_headers = {"User-Agent": _http_user_agent()}
+        req_headers.update(headers or {})
+        req = urllib.request.Request(url, headers=req_headers)  # noqa: S310
+        size = 0
+        try:
+            with urllib.request.urlopen(req) as resp:  # noqa: S310
+                status = getattr(resp, "status", 200)
+                if status != 200:
+                    raise RuntimeError(f"GET {url}: HTTP {status}, expected 200; nothing was read")
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        f.write(chunk)
+            if size == 0:
+                raise RuntimeError(f"GET {url}: the response body was empty")
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
         os.replace(tmp, dest)
     return dest
+
+
+def _http_user_agent() -> str:
+    """User-Agent for http source fetches: clavesa and its version."""
+    version = os.environ.get("CLAVESA_MODULE_VERSION", "") or "dev"
+    return f"clavesa/{version} (+https://clavesa.dev)"
 
 
 def _resolve_http_headers(credential: dict | None) -> dict | None:
@@ -1219,11 +1451,14 @@ def _read_keys_format(spark, keys: list[str], fmt: str, base_path: str, read_opt
             if ro.get("comment"):
                 r = r.option("comment", ro["comment"])
             r = r.option("inferSchema", "true") if schema is None else r.schema(schema)
-            return r.csv(*keys)  # Spark's CSV reader handles TSV via sep
+            # A list, never *keys: csv()'s second positional argument is
+            # the schema, so a second path was parsed as a DDL string.
+            return r.csv(list(keys))  # Spark's CSV reader handles TSV via sep
 
         return _read_delimited_two_pass(_reader, ro)
     if fmt == "json" or fmt == "ndjson":
-        return reader.json(*keys)
+        # A list for the same reason as csv(): json(path, schema, ...).
+        return reader.json(list(keys))
     raise RuntimeError(f"unsupported source format {fmt!r} for drain keys under {base_path!r}")
 
 
@@ -1265,6 +1500,27 @@ def _is_forced(event: Any, node_id: str) -> bool:
     return False
 
 
+def _partition_dirs(keys: list[str], base_path: str, depth: int) -> list[str]:
+    """The partition folders (`<base>/k1=v1/.../kN=vN/`) the given object
+    URIs sit in, de-duplicated, in first-seen order. A key not under
+    base_path or not `depth` partition levels deep is kept as it is."""
+    base = base_path.rstrip("/") + "/"
+    out: list[str] = []
+    for key in keys:
+        norm = "s3://" + key.split("://", 1)[1] if "://" in key else key
+        if not norm.startswith(base):
+            d = key
+        else:
+            parts = norm[len(base):].split("/")
+            if len(parts) > depth and all("=" in p for p in parts[:depth]):
+                d = base + "/".join(parts[:depth]) + "/"
+            else:
+                d = key
+        if d not in out:
+            out.append(d)
+    return out
+
+
 def _drain_if_configured(spark, alias: str, src: dict[str, Any], bucket: str, prefix: str):
     """Notification-drain ingest (Auto-Loader style), shared by the partitioned
     and flat s3 read paths. When the descriptor carries a non-empty `queue_url`,
@@ -1298,6 +1554,11 @@ def _drain_if_configured(spark, alias: str, src: dict[str, Any], bucket: str, pr
     # to a full-prefix read, even when drained keys sit at varying depths.
     fmt = str(src.get("format") or "parquet").lower()
     base_path = f"s3://{bucket}/{prefix}"
+    if src.get("whole_partitions") and src.get("partitions"):
+        dirs = _partition_dirs(keys, base_path, len(src["partitions"]))
+        print(f"[clavesa] input {alias!r}: re-reading {len(dirs)} whole partition(s) the new files belong to "
+              f"(the output replaces partitions)", file=sys.stderr)
+        keys = dirs
     df = _read_keys_format(spark, keys, fmt, base_path, read_options=src.get("read_options") or {})
     return df, {"ack": {"queue_url": queue_url, "handles": handles, "region": region}}
 
@@ -1363,6 +1624,19 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         path = f"s3://{bucket}/{prefix}" if prefix else f"s3://{bucket}/"
         fmt = str(src.get("format") or "parquet").lower()
         return _read_path_format(spark, path, fmt, read_options=src.get("read_options") or {}), None
+
+    if kind == "uc_table":
+        # ADR-027 provisional decision 2: a table a Databricks step wrote,
+        # registered as a workspace source of kind unity-catalog. External:
+        # read from its folder with the runner's IAM role. Managed: read
+        # with credentials Unity Catalog vends for that table; they stay set
+        # for the table's bucket for the rest of this run, so other inputs
+        # and outputs must not be in the same bucket.
+        cfg = _uc.config()
+        if cfg is None:
+            raise RuntimeError(f"input {alias!r}: a Unity Catalog table input needs the workspace's Databricks connection and the cloud warehouse")
+        df, _info = _uc.open_table(spark, _uc.Client(cfg), src["table"])
+        return df, None
 
     if kind == "path":
         # `clavesa pipeline run` emits this when the upstream source
@@ -1534,7 +1808,8 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
                 return None, None
             paths = [f"s3://{bucket}/{leaf}" for _, leaf in new_partitions]
             print(f"[clavesa] input {alias!r}: backfill reading {len(paths)} partitions ({new_partitions[0][0]} → {new_partitions[-1][0]})", file=sys.stderr)
-            df = spark.read.option("basePath", f"s3://{bucket}/{prefix}").parquet(*paths)
+            df = _read_keys_format(spark, paths, str(src.get("format") or "parquet").lower(),
+                                   f"s3://{bucket}/{prefix}", read_options=src.get("read_options") or {})
             return df, None
 
         # The queue takes over only AFTER the first listed run has committed
@@ -1588,7 +1863,10 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
         # columns entirely and the output table schema diverges from a
         # full-prefix read — appending to a table created in full-read
         # mode then fails with INCOMPATIBLE_DATA_FOR_TABLE.
-        df = spark.read.option("basePath", f"s3://{bucket}/{prefix}").parquet(*paths)
+        # The source's format (parquet, json, csv, tsv): a raw landing zone
+        # a Databricks step read is often JSON lines.
+        df = _read_keys_format(spark, paths, str(src.get("format") or "parquet").lower(),
+                               f"s3://{bucket}/{prefix}", read_options=src.get("read_options") or {})
         return df, {"uri": watermark_uri, "new_cursor": new_max}
 
     raise RuntimeError(f"input {alias!r}: unknown kind {kind!r}")
@@ -1806,7 +2084,7 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
     # When merge_keys is declared and mode is unset, default to merge —
     # saves users from picking the right semantics every time.
     mode = dest.get("mode") or ("merge" if merge_keys else "replace")
-    if mode not in ("replace", "append", "merge"):
+    if mode not in ("replace", "append", "merge", "replace_partitions"):
         raise RuntimeError(f"output {key!r}: unsupported mode {mode!r}")
     if mode == "merge" and not merge_keys:
         raise RuntimeError(f"output {key!r}: mode='merge' requires non-empty merge_keys")
@@ -1817,7 +2095,10 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
     cluster_by = list(dest.get("cluster_by") or [])
     bound_by = list(dest.get("bound_by") or [])
     merge_update = dict(dest.get("merge_update") or {})
-    return {
+    partition_by = list(dest.get("partition_by") or [])
+    if partition_by and cluster_by:
+        raise RuntimeError(f"output {key!r}: partition_by and cluster_by cannot both be set (Delta allows one layout)")
+    out = {
         "kind": kind,
         "target": target,
         "mode": mode,
@@ -1826,7 +2107,16 @@ def _resolve_output(key: str, dest: Any, all_outputs: dict | None = None) -> dic
         "stats": stats,
         "cluster_by": cluster_by,
         "bound_by": bound_by,
+        "partition_by": partition_by,
     }
+    # ADR-027: the Unity Catalog table this output writes, where a new one
+    # goes, and the Databricks job whose step it replaces.
+    for opt in ("uc_table", "uc_location"):
+        if dest.get(opt):
+            out[opt] = str(dest[opt])
+    if dest.get("replaces_job"):
+        out["replaces_job"] = int(dest["replaces_job"])
+    return out
 
 
 def _glue_db() -> str:
@@ -1934,14 +2224,27 @@ def _ensure_database(spark, db_part: str) -> None:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_part}")
 
 
-def _create_delta_table(df, table_id: str, cluster_by: list[str]) -> None:
+def _create_delta_table(df, table_id: str, cluster_by: list[str], partition_by: list[str] | None = None,
+                        location: str | None = None) -> None:
     """Create a managed Delta table. When ``cluster_by`` is non-empty the
     table is created with Delta liquid clustering on those columns via
     ``CREATE TABLE ... CLUSTER BY (...) AS SELECT`` (the OSS-Delta path;
     DataFrameWriterV2.clusterBy translates to an unsupported partition
     transform). Clustering is set at creation and preserved by later
     overwrite/append/MERGE writes. Empty ``cluster_by`` falls back to a
-    plain overwrite create."""
+    plain overwrite create.
+
+    ``partition_by`` creates a partitioned table instead (the layout a
+    Databricks step's table usually has); ``location`` makes the table
+    external at that path (ADR-027: a team's own bucket)."""
+    if partition_by or (location and not cluster_by):
+        writer = df.write.format("delta").mode("overwrite")
+        if partition_by:
+            writer = writer.partitionBy(*partition_by)
+        if location:
+            writer = writer.option("path", location)
+        writer.saveAsTable(table_id)
+        return
     keys = cluster_by[:_MAX_CLUSTER_COLS]
     if keys:
         if len(cluster_by) > _MAX_CLUSTER_COLS:
@@ -1956,8 +2259,9 @@ def _create_delta_table(df, table_id: str, cluster_by: list[str]) -> None:
         view = "__create_src_" + table_id.replace(".", "_").replace("-", "_")
         df.createOrReplaceTempView(view)
         cols = ", ".join(f"`{c}`" for c in keys)
+        loc = f" LOCATION '{location}'" if location else ""
         spark.sql(
-            f"CREATE TABLE {table_id} USING delta CLUSTER BY ({cols}) "
+            f"CREATE TABLE {table_id} USING delta CLUSTER BY ({cols}){loc} "
             f"AS SELECT * FROM {view}"
         )
     else:
@@ -2340,6 +2644,15 @@ def _run_operation(event: dict[str, Any]) -> dict[str, Any]:
         _refresh_table_snapshot(event.get("record"), table)
         return {"status": "ok", "operation": op, "table": table, "retain_hours": retain}
 
+    if op == "uc_compare":
+        # docs/cookbook/replace-a-databricks-step.md: the daily shadow check.
+        cfg = _uc.config()
+        if cfg is None:
+            raise RuntimeError("uc_compare needs the Databricks connection (CLAVESA_DATABRICKS_HOST) and the cloud warehouse")
+        result = _uc.compare(spark, _uc.Client(cfg), event["existing"], event["shadow"], event["partition"],
+                             list(event.get("sums") or []), str(event.get("where") or ""))
+        return {"status": "ok", "operation": op, **result}
+
     raise RuntimeError(f"unknown _operation: {op!r}")
 
 
@@ -2399,7 +2712,7 @@ def _apply_snapshot_props(props):
     )
 
 
-def _run_transform(event, context, run_id=""):  # noqa: ARG001
+def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
     """Inner body of handler() — runs one transform invocation. Extracted so
     handler() can wrap it in timing + node_runs telemetry without nesting
     the transform logic in a try/finally that obscures the data path.
@@ -2429,7 +2742,12 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
     Skip semantics: when every partitioned input has zero new partitions, the
     handler returns {"status": "skipped"} without invoking the user transform
     or touching outputs. Watermarks unchanged.
+
+    ``timer`` (a _PhaseTimer, from handler()) receives per-phase wall-clock
+    time; None uses a throwaway timer without event-log slices.
     """
+    if timer is None:
+        timer = _PhaseTimer(spark_slices=False)
     inputs = event.get("inputs", {}) or {}
     outputs = event.get("outputs", {}) or {}
     language = os.environ.get("CLAVESA_LANGUAGE", "sql")
@@ -2470,21 +2788,36 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             or ""
         )
     snapshot_props = {"clavesa.trigger": trigger, "clavesa.run-id": run_id}
+    # Build (or reuse) the session first so its cost lands in spark_session;
+    # _apply_snapshot_props would otherwise build it implicitly.
+    with timer.measure("spark_session"):
+        spark = _spark()
     _apply_snapshot_props(snapshot_props)
 
     logic = _read_text(logic_path)
-    spark = _spark()
 
     # Resolve inputs. Track watermark advances to commit after outputs succeed.
     input_dfs: dict[str, Any] = {}
     pending_watermarks: list[dict[str, Any]] = []
     saw_partitioned = False
     forced = _is_forced(event, my_node)
+    # A replace_partitions output replaces every partition in the run's
+    # output with the run's rows, so the run must read each touched
+    # partition whole. A notification drain hands over only the files that
+    # arrived since the last run: a day landing in several batches would
+    # otherwise be replaced by its latest batch alone (found with a 1 GB
+    # day landing while the event trigger started runs).
+    whole_partitions = any(isinstance(d, dict) and d.get("mode") == "replace_partitions"
+                           for d in outputs.values())
     for alias, src in inputs.items():
         if isinstance(src, dict) and src.get("kind") == "partitioned_path":
             saw_partitioned = True
+            if whole_partitions:
+                src = {**src, "whole_partitions": True}
+        in_tok = timer.start("inputs", detail="inputs", key=alias)
         df, advance = _resolve_input(spark, alias, src, backfill=backfill, forced=forced)
         if df is None:
+            timer.stop(in_tok)
             # Empty partitioned input — skip the entire run.
             return {"status": "skipped", "reason": f"input {alias!r} has no new partitions"}
         # Bundle-level input cache: a plain table/path input that ≥2 nodes of
@@ -2501,11 +2834,13 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                 df = df.cache()
                 _BUNDLE_INPUT_CACHE[src] = df
         df.createOrReplaceTempView(alias)
+        timer.stop(in_tok)
         input_dfs[alias] = df
         if advance is not None:
             pending_watermarks.append(advance)
 
     # Run the transform.
+    tr_tok = timer.start("transform")
     if language == "sql":
         result = {"default": spark.sql(logic)}
     elif language == "python":
@@ -2520,11 +2855,20 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
         result = raw
     else:
         raise RuntimeError(f"unsupported CLAVESA_LANGUAGE: {language!r}")
+    timer.stop(tr_tok)
 
     # Write outputs.
     written: dict[str, str] = {}
     backfill_targets = (backfill or {}).get("target_outputs", {}) if backfill else {}
+    # ADR-027: Unity Catalog publish. None when the pipeline is not
+    # connected (or the warehouse is local, which config() reports).
+    uc_cfg = _uc.config()
+    uc_client = _uc.Client(uc_cfg) if uc_cfg and (uc_cfg["publish"] or uc_cfg["lineage"]) else None
+    uc_published: list[dict[str, Any]] = []
     for key, df in result.items():
+        # Write time per output; _ensure_database nests as `catalog` and is
+        # subtracted. Stopped before the Glue sync / stats that follow.
+        w_tok = timer.start("write", detail="outputs", key=key)
         spec = _resolve_output(key, outputs.get(key, ""), all_outputs=result)
         if backfill and key in backfill_targets:
             # Redirect this output to its staging table; always replace so
@@ -2565,21 +2909,39 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                 flush=True,
             )
             written[key] = spec["target"]
+            timer.stop(w_tok)
             continue
         if spec["kind"] == "path":
             df.write.mode("overwrite").parquet(spec["target"])
+            timer.stop(w_tok)
         else:
             table_id = spec["target"]
             db_part = table_id.rsplit(".", 1)[0]
-            _ensure_database(spark, db_part)
+            with timer.measure("catalog"):
+                _ensure_database(spark, db_part)
+            # ADR-027: look the output up in Unity Catalog before writing. An
+            # existing external table is taken over in place (the Glue table
+            # is pointed at its location); a managed one fails the node with
+            # the fix. Backfill staging tables are never published.
+            uc_ctx = None
+            if uc_client is not None and uc_cfg["publish"] and not (backfill and key in backfill_targets):
+                with timer.measure("unity_catalog"):
+                    uc_ctx = _uc.prepare(uc_client, uc_cfg, spark, table_id, spec)
             # Liquid-clustering columns: an explicit cluster_by wins; else a
             # merge output clusters by its merge_keys (set at create, see #18).
-            cluster_cols = spec["cluster_by"] or (spec["merge_keys"] if spec["mode"] == "merge" else [])
+            # partition_by is the other layout (a table a Databricks step
+            # wrote is usually partitioned by day); Delta allows one of them.
+            partition_cols = spec.get("partition_by") or []
+            cluster_cols = [] if partition_cols else (
+                spec["cluster_by"] or (spec["merge_keys"] if spec["mode"] == "merge" else []))
+            # A new table goes to the output's uc_location when one is set
+            # (ADR-027: a team's own bucket), else the warehouse.
+            create_path = (uc_ctx or {}).get("create_location") or None
             if spec["mode"] == "merge":
                 # First run: no target yet, MERGE has nothing to match
                 # against. Create the table and skip MERGE for this run.
                 if not spark.catalog.tableExists(table_id):
-                    _create_delta_table(df, table_id, cluster_cols)
+                    _create_delta_table(df, table_id, cluster_cols, partition_cols, create_path)
                 else:
                     # Additive schema evolution (GH #61). Delta 4.0's `MERGE
                     # WITH SCHEMA EVOLUTION` does NOT evolve this runner's SQL
@@ -2717,11 +3079,36 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                     finally:
                         if persisted:
                             df.unpersist()
+            elif spec["mode"] == "replace_partitions":
+                # ADR-027: the write a daily Databricks step does. Only the
+                # partitions present in this run's output are replaced (Delta
+                # dynamic partition overwrite), so a re-run of one day is
+                # idempotent and the other days stay. Additive columns merge.
+                if not partition_cols and not spark.catalog.tableExists(table_id):
+                    raise RuntimeError(
+                        f"output {key!r}: mode 'replace_partitions' needs partition_by on a new table")
+                if not spark.catalog.tableExists(table_id):
+                    _create_delta_table(df, table_id, [], partition_cols, create_path)
+                else:
+                    have = spark.sql(f"DESCRIBE DETAIL {table_id}").collect()[0]["partitionColumns"] or []
+                    if not have:
+                        raise RuntimeError(
+                            f"output {key!r}: {table_id} is not partitioned; 'replace_partitions' would replace "
+                            f"the whole table. Use mode 'replace' or 'merge'.")
+                    if partition_cols and [c.lower() for c in have] != [c.lower() for c in partition_cols]:
+                        raise RuntimeError(
+                            f"output {key!r}: {table_id} is partitioned by {have}, the output declares "
+                            f"partition_by {partition_cols}")
+                    (df.write.format("delta").mode("overwrite")
+                       .option("partitionOverwriteMode", "dynamic")
+                       .option("mergeSchema", "true")
+                       .saveAsTable(table_id))
+                    print(f"[clavesa] output {key!r}: replaced partitions by {have}", file=sys.stderr, flush=True)
             elif spec["mode"] == "append":
-                if cluster_cols and not spark.catalog.tableExists(table_id):
-                    # First write of a clustered append table: create it with
-                    # CLUSTER BY so the layout is set; later appends preserve it.
-                    _create_delta_table(df, table_id, cluster_cols)
+                if (cluster_cols or partition_cols or create_path) and not spark.catalog.tableExists(table_id):
+                    # First write of a clustered/partitioned/located append table:
+                    # create it with its layout; later appends preserve it.
+                    _create_delta_table(df, table_id, cluster_cols, partition_cols, create_path)
                 else:
                     # Delta's mode("append").saveAsTable auto-creates if the
                     # table doesn't exist yet; no need to branch on tableExists.
@@ -2734,10 +3121,10 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
                         pass
                     df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
             else:
-                if cluster_cols and not spark.catalog.tableExists(table_id):
-                    # First create of a clustered replace table: CTAS with
-                    # CLUSTER BY. Later overwrites preserve the clustering.
-                    _create_delta_table(df, table_id, cluster_cols)
+                if (cluster_cols or partition_cols or create_path) and not spark.catalog.tableExists(table_id):
+                    # First create of a clustered/partitioned/located replace
+                    # table. Later overwrites preserve the layout.
+                    _create_delta_table(df, table_id, cluster_cols, partition_cols, create_path)
                 else:
                     # Replace semantics: the transform's current output IS the
                     # table, schema included. When the frame's (name, type)
@@ -2770,7 +3157,23 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             # stub. Use the committed table schema (post schema-evolution on
             # the merge path). No-op outside cloud / Glue mode; re-runs are
             # idempotent and re-sync after Spark overwrite resets Glue.
-            _sync_glue_table_schema(table_id, spark.table(table_id).schema)
+            timer.stop(w_tok)
+            with timer.measure("glue_sync"):
+                _sync_glue_table_schema(table_id, spark.table(table_id).schema)
+            if uc_ctx is not None:
+                # Registration failures fail the node: a replaced step that
+                # did not reach its Unity Catalog table did not do its job.
+                with timer.measure("unity_catalog"):
+                    rec = _uc.publish(uc_client, uc_cfg, spark, table_id, uc_ctx)
+                    if uc_cfg["lineage"]:
+                        # Lineage is Public Preview: a failure is logged, not fatal.
+                        try:
+                            _uc.push_lineage(uc_client, uc_cfg, inputs, rec["full_name"], spark.table(table_id).schema.fieldNames())
+                            rec["lineage"] = "pushed"
+                        except Exception as lin_exc:  # noqa: BLE001
+                            rec["lineage"] = f"failed: {lin_exc}"
+                            print(f"[clavesa] unity catalog: lineage push failed: {lin_exc}", file=sys.stderr, flush=True)
+                uc_published.append({"output": key, **rec})
         written[key] = spec["target"]
 
         # Per-output opt-in column statistics (v0.24+). Computed off the
@@ -2780,13 +3183,14 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
         # not mask the transform outcome.
         if spec.get("stats") and spec["kind"] == "delta_table" and not (backfill and key in backfill_targets):
             try:
-                _emit_column_stats(
-                    spark=spark,
-                    df=df,
-                    run_id=run_id,
-                    output_key=key,
-                    table_identifier=spec["target"],
-                )
+                with timer.measure("stats"):
+                    _emit_column_stats(
+                        spark=spark,
+                        df=df,
+                        run_id=run_id,
+                        output_key=key,
+                        table_identifier=spec["target"],
+                    )
             except Exception as stats_exc:  # noqa: BLE001
                 print(
                     f"[clavesa] column_stats write failed for {spec['target']!r}: {stats_exc!r}",
@@ -2812,6 +3216,8 @@ def _run_transform(event, context, run_id=""):  # noqa: ARG001
             _delete_sqs_messages(ack["queue_url"], ack.get("handles") or [], region=ack.get("region"))
 
     response: dict[str, Any] = {"status": "ok", "outputs": written}
+    if uc_published:
+        response["unity_catalog"] = uc_published
     if saw_partitioned:
         response["watermarks_advanced"] = [
             {"uri": adv["uri"], "cursor": list(adv["new_cursor"])}
@@ -2843,6 +3249,7 @@ def _build_node_run_row(
     output_rows: int | None = None,
     peak_rss_mb: int | None = None,
     spark_metrics: dict | None = None,
+    timing: dict | None = None,
 ) -> dict[str, Any]:
     """Pure helper: construct one node_runs row from invocation telemetry.
 
@@ -2859,12 +3266,19 @@ def _build_node_run_row(
 
     pipeline = env_map.get("CLAVESA_PIPELINE", "default")
     node = env_map.get("CLAVESA_NODE", "node")
-    compute_target = (
+    # CLAVESA_COMPUTE is set by the Fargate task definition (fargate_main.py
+    # has no Lambda context); Lambda is recognised by its own env.
+    compute_target = env_map.get("CLAVESA_COMPUTE") or (
         "lambda" if env_map.get("AWS_LAMBDA_FUNCTION_NAME") else "local"
     )
 
     memory_mb: int | None = None
     request_id: str | None = None
+    if env_map.get("CLAVESA_COMPUTE_MEMORY_MB"):
+        try:
+            memory_mb = int(env_map["CLAVESA_COMPUTE_MEMORY_MB"])
+        except ValueError:
+            memory_mb = None
     if context is not None:
         raw = getattr(context, "memory_limit_in_mb", None)
         if raw is not None:
@@ -2930,6 +3344,15 @@ def _build_node_run_row(
     sm = spark_metrics or {}
     for k in _SPARK_METRIC_KEYS:
         row[k] = sm.get(k)
+    # Per-phase timing object as compact JSON text. phases.system is 0 here:
+    # the node_runs write IS the system phase and has not finished yet.
+    # None (SQL NULL) when no timing was captured.
+    if isinstance(timing, dict):
+        t = dict(timing)
+        t["phases"] = {**(timing.get("phases") or {}), "system": 0}
+        row["timing"] = json.dumps(t, separators=(",", ":"))
+    else:
+        row["timing"] = None
     return row
 
 
@@ -3021,6 +3444,10 @@ def _node_runs_schema():
         StructField("executor_cpu_time_ms", LongType(), True),
         StructField("executor_run_time_ms", LongType(), True),
         StructField("max_task_duration_ms", LongType(), True),
+        # Per-phase timing object (JSON text): phases (ms), per-input and
+        # per-output ms, Spark stage summary per phase. Nullable: rows from
+        # older runners read as null; mergeSchema evolves the column in.
+        StructField("timing", StringType(), True),
     ])
 
 
@@ -3851,7 +4278,10 @@ def handler(event, context):
     if isinstance(event, dict) and event.get("_operation"):
         return _run_operation(event)
 
+    global _LAST_NODE_TIMING
+    _LAST_NODE_TIMING = None
     started_ms = int(time.time() * 1000)
+    timer = _PhaseTimer()
     is_cold_start = _SPARK is None
     # Byte offset into the Spark event log at handler entry. The post-run
     # metric read seeks past this so a warm-worker reuse aggregates only
@@ -3904,7 +4334,7 @@ def handler(event, context):
         progress_poller.start()
 
     try:
-        response = _run_transform(event, context, run_id=run_id)
+        response = _run_transform(event, context, run_id=run_id, timer=timer)
         if isinstance(response, dict) and response.get("status") == "skipped":
             status = "skipped"
         # Record one row per Iceberg-mode output into <pipeline>.tables so
@@ -3925,7 +4355,8 @@ def handler(event, context):
                 if target.count(".") < 1:
                     continue
                 try:
-                    added = _record_table_state(run_id, output_key, target)
+                    with timer.measure("table_state"):
+                        added = _record_table_state(run_id, output_key, target)
                     if added is not None:
                         output_rows_total = (output_rows_total or 0) + added
                 except Exception as table_exc:  # noqa: BLE001
@@ -3954,7 +4385,17 @@ def handler(event, context):
     finally:
         if progress_poller is not None:
             progress_poller.stop()
+        # Close any phase an exception left open so the failing phase still
+        # reports its time; later phases stay 0.
+        try:
+            timer.close_open()
+        except Exception:  # noqa: BLE001
+            pass
         ended_ms = int(time.time() * 1000)
+        try:
+            timing = timer.to_dict()
+        except Exception:  # noqa: BLE001
+            timing = None
         # Terminal marker: overwrite the last running tick with a final
         # snapshot so the progress file is AUTHORITATIVE for completed nodes.
         # The backend no longer has to infer "done" from a stale-but-running
@@ -3963,9 +4404,11 @@ def handler(event, context):
         # same value stamped on the response) so the Go node-runs fast path
         # can read it without re-querying. No stage/task counters here on
         # purpose; the progress bar only shows for in-flight nodes. "metrics"
-        # is reserved for future executor/shuffle telemetry and ships empty
-        # for now. Best-effort: a write failure must never affect or mask the
+        # carries the per-phase timing object; it is rewritten once more
+        # below with phases.system filled after the node_runs write.
+        # Best-effort: a write failure must never affect or mask the
         # transform outcome.
+        terminal_payload = None
         if progress_target is not None:
             terminal = (
                 "failed"
@@ -3974,20 +4417,19 @@ def handler(event, context):
                 if status == "skipped"
                 else "succeeded"
             )
-            _write_progress(
-                progress_target,
-                {
-                    "status": terminal,
-                    "started_ms": started_ms,
-                    "ended_ms": ended_ms,
-                    "output_rows": output_rows_total,
-                    "error": (error_msg or "")[:500]
-                    if status == "failed"
-                    else "",
-                    "updated_ms": ended_ms,
-                    "metrics": {},
-                },
-            )
+            terminal_payload = {
+                "status": terminal,
+                "started_ms": started_ms,
+                "ended_ms": ended_ms,
+                "output_rows": output_rows_total,
+                "error": (error_msg or "")[:500]
+                if status == "failed"
+                else "",
+                "updated_ms": ended_ms,
+                "metrics": timing if timing is not None else {},
+            }
+            _write_progress(progress_target, terminal_payload)
+        system_t0 = time.monotonic()
         try:
             # Resource + Spark task-metric capture. Both are best-effort and
             # already inside this try, so a failure here logs and is
@@ -4007,6 +4449,7 @@ def handler(event, context):
                 output_rows=output_rows_total,
                 peak_rss_mb=peak_rss,
                 spark_metrics=spark_metrics,
+                timing=timing,
             )
             _record_node_run(row)
         except Exception as record_exc:  # noqa: BLE001
@@ -4014,6 +4457,17 @@ def handler(event, context):
                 f"[clavesa] node_runs write failed: {record_exc!r}",
                 file=sys.stderr,
             )
+        try:
+            system_ms = int(round((time.monotonic() - system_t0) * 1000))
+            timing = timer.to_dict(system_ms=system_ms)
+            _LAST_NODE_TIMING = timing
+            if terminal_payload is not None:
+                _write_progress(
+                    progress_target, {**terminal_payload, "metrics": timing}
+                )
+            print(_timing_log_line(node, timing), file=sys.stderr, flush=True)
+        except Exception as timing_exc:  # noqa: BLE001
+            print(f"[clavesa] timing capture failed: {timing_exc!r}", file=sys.stderr)
 
 
 def _topo_sort_transforms(transforms):
@@ -4214,7 +4668,7 @@ def _run_lock_holder(event):
     # Same keying as _record_node_run's compute_target: a local docker
     # container driving an s3 warehouse (ADR-024 cloud-local compute) is
     # compute=local even though it takes the same S3 lock.
-    compute = "lambda" if fn else "local"
+    compute = os.environ.get("CLAVESA_COMPUTE") or ("lambda" if fn else "local")
     return {"run_id": run_id, "compute": compute, "host": host, "pid": os.getpid()}
 
 
@@ -4267,6 +4721,14 @@ def _run_pipeline_bundle(event, context):
     """The bundle loop body of ``pipeline_handler`` — runs every transform
     sequentially in one Spark session. Split out of pipeline_handler so the
     run-lock wrapper there can release the lease in a finally."""
+    global _BUNDLE_BOOTED, _LAST_NODE_TIMING
+    # runner.boot_ms: process start (_RUNNER_T0) to this loop, first bundle
+    # of the process only. A warm container's later bundles start the clock
+    # here and report boot_ms = 0.
+    loop_t0 = time.time()
+    run_t0 = loop_t0 if _BUNDLE_BOOTED else _RUNNER_T0
+    _BUNDLE_BOOTED = True
+    boot_ms = max(int(round((loop_t0 - run_t0) * 1000)), 0)
     transforms = event.get("transforms", []) or []
     # Defensive: the emitter SHOULD already topo-order this list, but a
     # mis-ordered payload (GH #6) would otherwise run a consumer before its
@@ -4334,7 +4796,7 @@ def _run_pipeline_bundle(event, context):
                 },
             )
             skipped_set.add(node)
-            results.append({"node": node, "status": "skipped", "note": note})
+            results.append({"node": node, "status": "skipped", "note": note, "timing": None})
             continue
 
         # Per-transform env: handler() reads CLAVESA_NODE / CLAVESA_LANGUAGE
@@ -4379,6 +4841,9 @@ def _run_pipeline_bundle(event, context):
         # — those were the old stdout progress channel, replaced by the
         # progress-file tree the Go reader watches for both cloud and
         # cloud-local runs.
+        # handler() leaves this node's timing object (phases.system filled)
+        # in _LAST_NODE_TIMING, on success and on failure alike.
+        _LAST_NODE_TIMING = None
         try:
             resp = handler(sub_event, context)
         except Exception as exc:  # noqa: BLE001
@@ -4392,6 +4857,7 @@ def _run_pipeline_bundle(event, context):
                 "status": "failed",
                 "error_class": err_class,
                 "error_msg": err_msg,
+                "timing": _LAST_NODE_TIMING,
             })
             overall_status = "failed"
             failed_node = node
@@ -4409,13 +4875,22 @@ def _run_pipeline_bundle(event, context):
         if node_status == "skipped":
             note = resp.get("reason", "") if isinstance(resp, dict) else ""
             skipped_set.add(node)
-            results.append({"node": node, "status": "skipped", "note": note})
-        else:
             results.append({
+                "node": node,
+                "status": "skipped",
+                "note": note,
+                "timing": _LAST_NODE_TIMING,
+            })
+        else:
+            ok_rec = {
                 "node": node,
                 "status": "ok",
                 "output_rows": output_rows,
-            })
+                "timing": _LAST_NODE_TIMING,
+            }
+            if isinstance(resp, dict) and resp.get("unity_catalog"):
+                ok_rec["unity_catalog"] = resp["unity_catalog"]
+            results.append(ok_rec)
 
         # Test-only hook (#23): when CLAVESA_TEST_KILL_SESSION_AFTER_NODE names
         # the node just finished, deterministically kill the cached py4j session
@@ -4442,7 +4917,32 @@ def _run_pipeline_bundle(event, context):
         "status": overall_status,
         "transforms": results,
         "failed_node": failed_node,
+        "runner": {
+            "boot_ms": boot_ms,
+            "total_ms": max(int(round((time.time() - run_t0) * 1000)), 0),
+        },
     }
+
+    # ADR-027 section 6, option A: after the whole run succeeded, start the
+    # declared Databricks jobs once each. The record goes to the progress
+    # sink as `_databricks.json` beside the node files, where the run page
+    # reads it (local and cloud alike, ADR-014). A job that fails to start
+    # is recorded, not raised: the clavesa run itself succeeded.
+    uc_published = [p for r in results for p in (r.get("unity_catalog") or [])]
+    try:
+        uc_cfg = _uc.config()
+    except _uc.UCError as cfg_exc:
+        uc_cfg = None
+        print(f"[clavesa] unity catalog: {cfg_exc}", file=sys.stderr, flush=True)
+    if uc_cfg is not None and (uc_published or uc_cfg["jobs"]):
+        started = []
+        if overall_status == "ok" and uc_cfg["jobs"]:
+            started = _uc.start_jobs(_uc.Client(uc_cfg), uc_cfg)
+            result["databricks_runs"] = started
+        _write_progress(
+            _progress_target(os.environ, sf_execution_arn, "_databricks"),
+            {"tables": uc_published, "jobs": started, "status": overall_status},
+        )
 
     # GH #2: returning a clean dict makes the Lambda invocation "succeed"
     # at the AWS API layer, so Step Functions marks the execution
@@ -4462,6 +4962,78 @@ def _run_pipeline_bundle(event, context):
             )
         )
     return result
+
+
+def fargate_event(bundle: dict, env: dict) -> dict:
+    """The pipeline_handler event of a Fargate run: the bundle Terraform
+    wrote to S3 (the same payload the Lambda state machine carries) plus
+    the execution identity Step Functions passes as container env.
+    Pure, so it is unit-tested without AWS."""
+    event = dict(bundle)
+    event["_pipeline_run"] = True
+    event["_sf_execution_arn"] = env.get("CLAVESA_SF_EXECUTION_ARN", "")
+    event["_sf_execution_started_at"] = env.get("CLAVESA_SF_STARTED_AT", "")
+    raw_input = env.get("CLAVESA_EXECUTION_INPUT") or "{}"
+    try:
+        event["_execution_input"] = json.loads(raw_input)
+    except ValueError:
+        event["_execution_input"] = {}
+    return event
+
+
+def _container_peak_memory_mb() -> int | None:
+    """Peak memory of this container in MB, best-effort: the ECS task
+    metadata endpoint's stats (Fargate), else cgroup v2 / v1 counters."""
+    uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
+    if uri:
+        try:
+            import urllib.request  # noqa: PLC0415
+
+            with urllib.request.urlopen(uri + "/stats", timeout=3) as resp:
+                stats = json.loads(resp.read())
+            peak = (stats.get("memory_stats") or {}).get("max_usage")
+            if peak:
+                return int(peak) // (1024 * 1024)
+        except Exception:  # noqa: BLE001
+            pass
+    for path in ("/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"):
+        try:
+            with open(path) as f:
+                return int(f.read().strip()) // (1024 * 1024)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def run_fargate() -> int:
+    """CLAVESA_FARGATE=1 mode: one ECS Fargate task runs one pipeline run
+    (compute = "fargate"). The bundle is too big for ECS container
+    overrides (8 KB), so Terraform writes it to S3 and the state machine
+    passes its URI plus the execution identity as env. Returns the exit
+    status: 0 when the run did not fail, so ecs:runTask.sync marks the
+    Step Functions execution FAILED otherwise."""
+    import boto3  # noqa: PLC0415
+
+    uri = os.environ["CLAVESA_BUNDLE_URI"]
+    bucket, key = _split_s3(uri)
+    body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+    event = fargate_event(json.loads(body), dict(os.environ))
+    print(f"[clavesa] fargate: {len(event.get('transforms') or [])} transform(s), run {event['_sf_execution_arn']}",
+          file=sys.stderr, flush=True)
+    started = time.time()
+    result = pipeline_handler(event, None)
+    peak = _container_peak_memory_mb()
+    limit = os.environ.get("CLAVESA_COMPUTE_MEMORY_MB", "?")
+    print(f"[clavesa] fargate: run took {time.time() - started:.1f}s, peak memory "
+          f"{peak if peak is not None else '?'} MB of {limit} MB", file=sys.stderr, flush=True)
+    print(json.dumps(result, default=str), flush=True)
+    if isinstance(result, dict) and result.get("status") == "failed":
+        last = (result.get("transforms") or [{}])[-1] if result.get("transforms") else {}
+        print(f"[clavesa] fargate: run failed at {result.get('failed_node')}: "
+              f"{last.get('error_class', result.get('error_class', 'Error'))}: "
+              f"{last.get('error_msg', result.get('error_msg', ''))}", file=sys.stderr, flush=True)
+        return 1
+    return 0
 
 
 def run_local() -> None:
@@ -5105,6 +5677,12 @@ elif os.environ.get("CLAVESA_RECORD_RUN") == "1":
 elif os.environ.get("CLAVESA_TRANSPILE_SERVER") == "1":
     try:
         run_transpile_server()
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+        sys.exit(1)
+elif os.environ.get("CLAVESA_FARGATE") == "1":
+    try:
+        sys.exit(run_fargate())
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
         sys.exit(1)

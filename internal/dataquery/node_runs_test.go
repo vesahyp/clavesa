@@ -42,6 +42,8 @@ func nodeRunsHeader() athenatypes.Row {
 		"input_bytes", "input_records", "num_stages", "num_tasks",
 		"num_failed_tasks", "jvm_gc_time_ms", "executor_cpu_time_ms",
 		"executor_run_time_ms", "max_task_duration_ms",
+		// Per-node timing object (JSON string), appended last.
+		"timing",
 	)
 }
 
@@ -81,6 +83,7 @@ func TestNodeRunsBasic(t *testing.T) {
 						"512", "2", "0", "0", "12577", "12577",
 						"6133", "14", "9", "124", "0", "1083", "11605",
 						"43346", "2462",
+						`{"phases":{"write":1200}}`,
 					),
 					nodeRunsRow(
 						"run-def", "my_pipeline", "filter_complete",
@@ -91,6 +94,7 @@ func TestNodeRunsBasic(t *testing.T) {
 						"exec-0",
 						// Older row without Spark metrics — all null.
 						"", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+						"",
 					),
 				},
 			},
@@ -128,6 +132,12 @@ func TestNodeRunsBasic(t *testing.T) {
 	}
 	if r.Rows[0].NumTasks == nil || *r.Rows[0].NumTasks != 124 {
 		t.Errorf("rows[0].NumTasks = %v, want 124", r.Rows[0].NumTasks)
+	}
+	if r.Rows[0].Timing != `{"phases":{"write":1200}}` {
+		t.Errorf("rows[0].Timing = %q, want the timing column verbatim", r.Rows[0].Timing)
+	}
+	if r.Rows[1].Timing != "" {
+		t.Errorf("rows[1].Timing = %q, want empty", r.Rows[1].Timing)
 	}
 	// Null Spark columns on the older row stay nil.
 	if r.Rows[1].PeakRSSMB != nil {
@@ -201,6 +211,7 @@ func TestNodeRunsTruncated(t *testing.T) {
 			"100", "ok", "lambda", "1024", "false", "", "", "",
 			"sha256:abc123", "v0.13.0", "", "exec-trunc",
 			"", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+			"", // timing
 		))
 	}
 	athc := &mockAthenaClient{

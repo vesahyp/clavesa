@@ -26,6 +26,15 @@ cloud against a local warehouse is rejected.
 Local filesystem sources only on the local path — S3 sources need cloud
 dispatch.
 
+On a local warehouse, CLAVESA_TRIGGER labels the run (default "manual"; any
+non-empty string, e.g. "cron") in the run marker, the runs table and the
+timing record. Every local run writes a timing record (per-phase wall-clock
+time plus the runner's per-node timing) to
+<workspace>/.clavesa/warehouse/_progress/<run>/_timing.json and a copy to the
+run history dir: $CLAVESA_RUN_HISTORY_DIR, else $XDG_STATE_HOME/clavesa/runs,
+else ~/.local/state/clavesa/runs. The run ends with a short phase table;
+--json carries the record under "timing".
+
 Pipeline directory:
   Pass the pipeline directory as the first argument, relative to the
   workspace root (e.g. "my-pipeline") or as an absolute path. Omit it to

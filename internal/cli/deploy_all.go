@@ -142,6 +142,11 @@ func deployAll(cmd *cobra.Command, autoApprove, planOnly bool) error {
 			failures = append(failures, fmt.Sprintf("%s: orchestration sync: %v", info.Name, err))
 			continue
 		}
+		if err := syncDatabricksAccess(cmd, svc, absDir, cmd.OutOrStdout()); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Pipeline %s failed: %v\n", info.Name, err)
+			failures = append(failures, fmt.Sprintf("%s: %v", info.Name, err))
+			continue
+		}
 		if err := (deployFlow{
 			WorkspaceRoot:    root,
 			TfDir:            absDir,

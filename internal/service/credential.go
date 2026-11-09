@@ -79,6 +79,9 @@ func (s *Service) DeleteCredential(name string, force bool) error {
 		return err
 	}
 	if !force {
+		if m, err := s.loadManifest(); err == nil && m.Databricks != nil && m.Databricks.Credential == name {
+			return &ErrCredentialUsedByConnection{Name: name}
+		}
 		usages, err := s.findCredentialUsages(name)
 		if err != nil {
 			return fmt.Errorf("scan sources for credential usage: %w", err)

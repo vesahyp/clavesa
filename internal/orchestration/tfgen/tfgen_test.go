@@ -259,6 +259,38 @@ func TestEmit_PollerStillWorks(t *testing.T) {
 	}
 }
 
+// TestEmit_PollerQueueExprs asserts the poller watches PollerQueueExprs
+// when set, the SQS drain IAM keeps all TriggerQueueExprs, and an empty
+// non-nil PollerQueueExprs emits no poller.
+func TestEmit_PollerQueueExprs(t *testing.T) {
+	t.Parallel()
+	p := twoTransforms()
+	p.BatchWindowExpr = "var.trigger_batch_window"
+	p.TriggerQueueExprs = []string{"module.src_x.trigger_queue_arn", "module.src_y.trigger_queue_arn"}
+	p.PollerQueueExprs = []string{"module.src_x.trigger_queue_arn"}
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if !strings.Contains(out, "_poller_queue_arns = [module.src_x.trigger_queue_arn]\n") {
+		t.Error("poller should watch only PollerQueueExprs")
+	}
+	if !strings.Contains(out, "module.src_y.trigger_queue_arn") {
+		t.Error("SQS drain IAM lost the no-trigger queue")
+	}
+	p.PollerQueueExprs = []string{}
+	out, err = Emit(p)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if strings.Contains(out, `resource "aws_lambda_function" "poller"`) {
+		t.Error("poller emitted although PollerQueueExprs is empty")
+	}
+	if !strings.Contains(out, `Sid = "SQSDrain"`) {
+		t.Error("SQSDrain IAM missing")
+	}
+}
+
 // TestEmit_UpstreamTriggers asserts that when UpstreamPipelines is
 // populated, the emitter produces one EventBridge rule + role + role
 // policy + target per producer, all with consistent naming and the
@@ -371,6 +403,106 @@ func TestEmit_NoExternalBuckets(t *testing.T) {
 	}
 }
 
+// TestEmit_UnityCatalog: a connected workspace gets one module call for the
+// pipeline's Unity Catalog schema (ADR-027); an unconnected one gets
+// nothing, so its orchestration.tf is unchanged.
+func TestEmit_UnityCatalog(t *testing.T) {
+	t.Parallel()
+	off, err := Emit(twoTransforms())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(off, "unity_catalog") || strings.Contains(off, "databricks") {
+		t.Errorf("unconnected pipeline mentions Unity Catalog:\n%s", off)
+	}
+
+	cfg := UnityCatalogConfig{
+		Host: "https://dbc-1.cloud.databricks.com", ClientID: "app-id", Catalog: "analytics",
+		ModuleSource:  "../.clavesa/modules/v9.9.9/unity-catalog/aws/schema",
+		SecretARNExpr: `"arn:aws:secretsmanager:us-east-2:1:secret:x"`,
+		PublishTables: true, JobsExpr: "var.databricks_jobs",
+	}
+
+	// Default mode: the team's schema; only the runner env, IAM and the
+	// jobs variable change.
+	p := twoTransforms()
+	existing := cfg
+	p.UnityCatalog = &existing
+	on, err := Emit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`CLAVESA_DATABRICKS_HOST      = "https://dbc-1.cloud.databricks.com"`,
+		`CLAVESA_DATABRICKS_CLIENT_ID = "app-id"`,
+		`CLAVESA_DATABRICKS_SECRET    = "arn:aws:secretsmanager:us-east-2:1:secret:x"`,
+		`CLAVESA_UC_CATALOG           = "analytics"`,
+		`CLAVESA_UC_SCHEMA            = replace(var.schema, "-", "_")`,
+		`CLAVESA_UC_PUBLISH           = "true"`,
+		`CLAVESA_UC_LINEAGE           = "false"`,
+		`CLAVESA_DATABRICKS_JOBS      = jsonencode(var.databricks_jobs)`,
+		`Sid = "DatabricksSecret"`,
+		`variable "databricks_jobs" {`,
+	} {
+		if !strings.Contains(on, want) {
+			t.Errorf("default mode: missing %q", want)
+		}
+	}
+	if strings.Contains(on, "CLAVESA_UC_READERS") {
+		t.Error("no readers: CLAVESA_UC_READERS must not be emitted")
+	}
+	withReaders := existing
+	withReaders.Readers = []string{"analysts", "vesa@example.com"}
+	p.UnityCatalog = &withReaders
+	if out, err := Emit(p); err != nil || !strings.Contains(out, `CLAVESA_UC_READERS           = jsonencode(["analysts", "vesa@example.com"])`) {
+		t.Errorf("readers env missing (err %v)", err)
+	}
+	p.UnityCatalog = &existing
+	if strings.Contains(on, "unity_catalog_schema") {
+		t.Error("default mode must not manage the team's schema")
+	}
+
+	// --create-catalog: the pipeline stack also creates its schema.
+	created := cfg
+	created.CreateSchema = true
+	p.UnityCatalog = &created
+	on, err = Emit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`module "unity_catalog_schema" {`,
+		`source               = "../.clavesa/modules/v9.9.9/unity-catalog/aws/schema"`,
+		`databricks_client_id = "app-id"`,
+		`catalog              = "analytics"`,
+		`schema               = var.schema`,
+		`value       = module.unity_catalog_schema.full_name`,
+	} {
+		if !strings.Contains(on, want) {
+			t.Errorf("create-catalog mode: missing %q", want)
+		}
+	}
+	if strings.Contains(on, "required_providers") && !strings.Contains(off, "required_providers") {
+		t.Error("orchestration.tf must not add a required_providers block (main.tf holds the one a module may have)")
+	}
+}
+
+// TestEmit_Architectures: both image Lambdas follow the pushed image's
+// architecture; an arm64 image on an x86_64 Lambda cannot start.
+func TestEmit_Architectures(t *testing.T) {
+	t.Parallel()
+	p := twoTransforms()
+	p.RunnerArchExpr = "data.terraform_remote_state.workspace.outputs.runner_architecture"
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := `architectures = [try(data.terraform_remote_state.workspace.outputs.runner_architecture, "x86_64")]`
+	if n := strings.Count(out, line); n != 2 {
+		t.Errorf("architectures line appears %d times, want 2 (pipeline runner + runs_writer)", n)
+	}
+}
+
 // TestEmit_Validate asserts the new validation rules around Transforms.
 func TestEmit_Validate(t *testing.T) {
 	t.Parallel()
@@ -401,5 +533,69 @@ func TestEmit_Validate(t *testing.T) {
 	p.Transforms[0].LogicS3URI = ""
 	if _, err := Emit(p); err == nil {
 		t.Error("expected error for empty LogicS3URI; got nil")
+	}
+}
+
+// TestEmit_WorkspaceScopedNames asserts that with AWSName set every AWS
+// resource name uses the literal workspace-scoped base and the upstream
+// trigger names the producer's own base. Tags and S3 prefixes keep the
+// plain pipeline name.
+func TestEmit_WorkspaceScopedNames(t *testing.T) {
+	t.Parallel()
+	p := twoTransforms()
+	p.AWSName = "clavesa-ws-orders"
+	p.UpstreamPipelines = []string{"bronze"}
+	p.UpstreamAWSNames = map[string]string{"bronze": "clavesa-ws-bronze"}
+	p.ScheduleExpr = "var.trigger_schedule"
+	p.TriggerQueueExprs = []string{"module.src_a.queue_arn"}
+	p.BatchWindowExpr = "var.trigger_batch_window"
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	for _, w := range []string{
+		`name               = "clavesa-ws-orders-orchestration"`,
+		`function_name = "clavesa-ws-orders-runner"`,
+		`name     = "clavesa-ws-orders"`,
+		`name                = "clavesa-ws-orders-schedule"`,
+		`function_name    = "clavesa-ws-orders-poller"`,
+		`function_name = "clavesa-ws-orders-runs-writer"`,
+		`name        = "clavesa-ws-orders-runs"`,
+		`name              = "/clavesa/clavesa-ws-orders/sfn"`,
+		`stateMachine:clavesa-ws-bronze"`,
+		`name        = "clavesa-ws-orders-from-bronze"`,
+		`"clavesa:pipeline" = var.pipeline_name`,
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("Emit output missing %q", w)
+		}
+	}
+	if strings.Contains(out, "clavesa-${var.pipeline_name}") {
+		t.Errorf("workspace mode still emits clavesa-${var.pipeline_name}")
+	}
+}
+
+// TestEmit_LegacyNamesUnchanged pins the legacy names an already-deployed
+// workspace has, so an upgrade shows no Terraform diff.
+func TestEmit_LegacyNamesUnchanged(t *testing.T) {
+	t.Parallel()
+	p := twoTransforms()
+	p.UpstreamPipelines = []string{"bronze"}
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	for _, w := range []string{
+		`"clavesa-${var.pipeline_name}-orchestration"`,
+		`"clavesa-${var.pipeline_name}-runner"`,
+		`"clavesa-${var.pipeline_name}"`,
+		`"clavesa-${var.pipeline_name}-runs-writer"`,
+		`"/clavesa/${var.pipeline_name}/sfn"`,
+		`stateMachine:clavesa-bronze"`,
+		`"clavesa-${var.pipeline_name}-from-bronze"`,
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("legacy Emit output missing %q", w)
+		}
 	}
 }

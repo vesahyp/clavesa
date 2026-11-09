@@ -50,6 +50,9 @@ Examples:
 		newWorkspaceBackendCmd(),
 		newWorkspaceSetBackendCmd(),
 		newWorkspaceMigrateStateCmd(),
+		newWorkspaceConnectCmd(),
+		newWorkspaceDisconnectCmd(),
+		newWorkspaceDatabricksCmd(),
 	)
 
 	return cmd
@@ -874,11 +877,16 @@ func newWorkspacePlanCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			env, err := tuiservice.New(root).TerraformEnv(cmd.Context())
+			if err != nil {
+				return err
+			}
 			if err := tfInit(root, os.Stdout, os.Stderr); err != nil {
 				return fmt.Errorf("terraform init: %w", err)
 			}
 			c := exec.Command("terraform", "plan")
 			c.Dir = root
+			c.Env = env
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
 			return c.Run()
@@ -909,13 +917,30 @@ Use --plan-only to stop after plan without applying.`,
 				return err
 			}
 			printTargetContext("workspace deploy", root, "")
-			return deployFlow{
-				WorkspaceRoot:    root,
-				TfDir:            root,
-				BuildRunnerImage: true,
-				AutoApprove:      autoApprove,
-				PlanOnly:         planOnly,
-			}.Run()
+			flow, err := newDeployFlow(cmd, root, root)
+			if err != nil {
+				return err
+			}
+			flow.BuildRunnerImage = true
+			flow.AutoApprove = autoApprove
+			flow.PlanOnly = planOnly
+			flow.AfterApply = func() error {
+				// ADR-027: an env:/file: Databricks secret reaches the
+				// runner through the Secrets Manager secret the apply just
+				// created; the value is written here, never by Terraform.
+				svc := tuiservice.New(root)
+				put, err := svc.PutDatabricksRunnerSecret(cmd.Context(), func() (string, error) {
+					return terraformOutput(root, flow.Env, "databricks_runner_secret_arn")
+				})
+				if err != nil {
+					return fmt.Errorf("copy the Databricks secret for the runner: %w", err)
+				}
+				if put {
+					fmt.Fprintln(os.Stdout, "Copied the Databricks OAuth secret into Secrets Manager for the runner.")
+				}
+				return nil
+			}
+			return flow.Run()
 		},
 	}
 	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive 'Apply this plan?' confirmation")
@@ -989,12 +1014,17 @@ echoed to stderr before any AWS calls.`,
 				return err
 			}
 
+			env, err := tuiservice.New(root).TerraformEnv(cmd.Context())
+			if err != nil {
+				return err
+			}
 			args2 := []string{"destroy"}
 			if autoApprove {
 				args2 = append(args2, "-auto-approve")
 			}
 			c := exec.Command("terraform", args2...)
 			c.Dir = root
+			c.Env = env
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
 			c.Stdin = os.Stdin

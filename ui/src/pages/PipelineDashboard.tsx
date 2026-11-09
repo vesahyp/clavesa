@@ -14,7 +14,7 @@
  * this page is data the user already has — no new backend.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { ArrowUp, ChevronRight, FileWarning, History, Laptop, Loader2, Play, Settings, Zap } from "lucide-react";
 import { ReactFlowProvider } from "@xyflow/react";
@@ -42,6 +42,7 @@ import {
   PipelineGraph as PipelineGraphView,
   deriveNodeOutputs,
 } from "@/components/PipelineGraph";
+const RunTimingsCard = lazy(() => import("@/components/RunTimingsCard"));
 import { PipelineHealthHeader } from "@/components/PipelineHealthHeader";
 import { NodesGrid, type NodeInfo } from "@/components/NodesGrid";
 import type { NodeSpec } from "@/components/NodeDetailDrawer";
@@ -800,6 +801,10 @@ export function PipelineDashboard() {
                 )}
               </CardContent>
             </Card>
+
+            <Suspense fallback={<Card data-testid="run-timings-card" className="opacity-50"><CardHeader><CardTitle>Where the time goes</CardTitle></CardHeader></Card>}>
+              <RunTimingsCard dir={queryDir} />
+            </Suspense>
 
             {/* Cost — north-star "cost per billion records processed".
                 Throughput (rec/s) stays useful pre-deploy when compute is

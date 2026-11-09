@@ -27,6 +27,7 @@ func rightsizeRows(node string, n int, allocMB, peak string) []athenatypes.Row {
 			"sha256:abc123", "v2.3.0", "", "exec-0",
 			// peak_rss + 14 aggregates; memory/disk spill (cols 3+4) zero.
 			peak, "", "0", "0", "", "", "", "", "", "", "", "", "", "", "",
+			"", // timing
 		))
 	}
 	return rows

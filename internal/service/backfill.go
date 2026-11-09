@@ -198,7 +198,7 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	// resolve without re-running Terraform's evaluator. Fetch the whole
 	// env map once: it serves both canonical resolution and (when
 	// --compute local) the docker dispatcher's env mirroring.
-	functionName := pipelineRunnerLambdaName(pipelineName)
+	functionName := pipelineRunnerLambdaName(s.awsName(pipelineName))
 	lc := lambda.NewFromConfig(cfg)
 	lambdaEnv, err := lambdaRunnerEnv(ctx, lc, functionName)
 	if err != nil {
@@ -220,7 +220,7 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 	// Lambda Task Parameters, plus our `_backfill` override block. Fetch
 	// the resolved inputs/outputs from the live SFN definition — that's
 	// the only place the post-apply terraform references resolve.
-	inputs, outputs, language, logicPath, err := loadNodeIO(ctx, sfn.NewFromConfig(cfg), pipelineName, req.Node)
+	inputs, outputs, language, logicPath, err := loadNodeIO(ctx, sfn.NewFromConfig(cfg), s.awsName(pipelineName), req.Node)
 	if err != nil {
 		return nil, fmt.Errorf("resolve node I/O from SFN definition: %w", err)
 	}
@@ -596,7 +596,7 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	}
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
-	functionName := pipelineRunnerLambdaName(pipelineName)
+	functionName := pipelineRunnerLambdaName(s.awsName(pipelineName))
 
 	// respPayload is the runner's terminal response envelope, regardless of
 	// which compute produced it — the same runnerResponse* checks run
@@ -779,7 +779,7 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID, compute strin
 	}
 	lc := lambda.NewFromConfig(cfg)
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
-	functionName := pipelineRunnerLambdaName(pipelineName)
+	functionName := pipelineRunnerLambdaName(s.awsName(pipelineName))
 
 	// respPayload is the runner's terminal response envelope, regardless of
 	// which compute produced it — the same runnerResponse* checks run
@@ -836,8 +836,8 @@ func findGraphNode(g *graph.PipelineGraph, nodeID string) *graph.Node {
 // name). v2.2.0+ is single-Lambda-per-pipeline — every transform, plus
 // the backfill_promote / backfill_discard operations, run inside this one
 // function. Earlier (v2.1.x) per-node `<schema>-<node>` Lambdas are gone.
-func pipelineRunnerLambdaName(pipelineName string) string {
-	return "clavesa-" + pipelineName + "-runner"
+func pipelineRunnerLambdaName(awsName string) string {
+	return awsName + "-runner"
 }
 
 func newBackfillRunID() string {
@@ -971,7 +971,7 @@ func (s *Service) firstTransformDB(ctx context.Context, lc *lambda.Client, g *gr
 		if g.Nodes[i].Type != "transform" {
 			continue
 		}
-		fn := pipelineRunnerLambdaName(pipelineName)
+		fn := pipelineRunnerLambdaName(s.awsName(pipelineName))
 		return canonicalFromLambdaEnv(ctx, lc, fn, &g.Nodes[i])
 	}
 	return "", "", "", fmt.Errorf("pipeline has no transforms")
@@ -1013,8 +1013,7 @@ func outputModeAndKeys(g *graph.PipelineGraph, nodeID, key string) (string, []st
 // values (S3 paths, Iceberg table ids) the runner expects — we can't
 // rebuild them from the .tf alone because module-output references resolve
 // at apply time.
-func loadNodeIO(ctx context.Context, client *sfn.Client, pipelineName, nodeID string) (any, any, string, string, error) {
-	smName := "clavesa-" + pipelineName
+func loadNodeIO(ctx context.Context, client *sfn.Client, smName, nodeID string) (any, any, string, string, error) {
 	var nextToken *string
 	var arn string
 	for {
@@ -1160,8 +1159,7 @@ func allTransformsFromDefinition(def string) ([]map[string]any, error) {
 // (S3 paths, table ids) the runner needs, which can't be rebuilt from the .tf
 // alone (module-output references resolve at apply time). Mirrors loadNodeIO's
 // state-machine lookup, returning every transform instead of one.
-func loadPipelineTransforms(ctx context.Context, client *sfn.Client, pipelineName string) ([]map[string]any, error) {
-	smName := "clavesa-" + pipelineName
+func loadPipelineTransforms(ctx context.Context, client *sfn.Client, smName string) ([]map[string]any, error) {
 	var nextToken *string
 	var arn string
 	for {

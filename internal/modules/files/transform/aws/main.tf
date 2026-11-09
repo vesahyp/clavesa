@@ -33,7 +33,8 @@ locals {
 }
 
 resource "aws_s3_object" "logic" {
-  count = var.compute == "lambda" ? 1 : 0
+  # lambda and fargate both run the runner container against S3.
+  count = contains(["lambda", "fargate"], var.compute) ? 1 : 0
 
   bucket  = var.bucket
   key     = local._logic_key

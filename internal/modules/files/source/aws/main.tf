@@ -1,4 +1,5 @@
 locals {
+  aws_base    = coalesce(var.aws_name, "clavesa-${var.pipeline_name}")
   output_name = "default"
   # Pass-through: the source's "output" is just the user-configured S3 location.
   # No staging step, no Glue ETL job — the runner Lambda reads directly from
@@ -30,7 +31,7 @@ locals {
 # ---------------------------------------------------------------------------
 
 resource "aws_sqs_queue" "trigger" {
-  name                      = "clavesa-${var.pipeline_name}-${var.name}-trigger"
+  name                      = "${local.aws_base}-${var.name}-trigger"
   message_retention_seconds = 86400 # 1 day
 
   # The runner Lambda drains this queue with ReceiveMessage and only deletes a
@@ -55,7 +56,7 @@ resource "aws_sqs_queue" "trigger" {
 # trigger queue's redrive policy (not EventBridge), so it needs no queue policy
 # of its own.
 resource "aws_sqs_queue" "trigger_dlq" {
-  name                      = "clavesa-${var.pipeline_name}-${var.name}-trigger-dlq"
+  name                      = "${local.aws_base}-${var.name}-trigger-dlq"
   message_retention_seconds = 1209600 # 14 days
   tags                      = local.tags
 }
@@ -78,7 +79,7 @@ resource "aws_sqs_queue_policy" "trigger" {
 }
 
 resource "aws_cloudwatch_event_rule" "s3_trigger" {
-  name        = "clavesa-${var.pipeline_name}-${var.name}-s3-trigger"
+  name        = "${local.aws_base}-${var.name}-s3-trigger"
   description = "Fires when new objects arrive at s3://${var.bucket}/${var.prefix}"
 
   event_pattern = jsonencode({

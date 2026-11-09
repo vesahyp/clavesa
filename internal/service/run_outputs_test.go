@@ -92,6 +92,39 @@ func TestBuildLocalOutputsBoundBy(t *testing.T) {
 	}
 }
 
+// TestBuildLocalOutputsUnityCatalog covers the partition_by and Unity
+// Catalog passthrough to the runner-event descriptor.
+func TestBuildLocalOutputsUnityCatalog(t *testing.T) {
+	node := &graph.Node{
+		ID:   "events",
+		Type: "transform",
+		Config: map[string]interface{}{
+			"output_definitions": map[string]interface{}{
+				"default": map[string]interface{}{
+					"mode":                    "replace_partitions",
+					"partition_by":            []interface{}{"event_date"},
+					"unity_catalog_table":     "main.analytics.events",
+					"unity_catalog_location":  "s3://b/events",
+					"replaces_databricks_job": int64(123456789),
+				},
+			},
+		},
+	}
+	def := buildLocalOutputs(node, "demo.events")["default"].(map[string]any)
+	if def["mode"] != "replace_partitions" {
+		t.Errorf("mode = %v", def["mode"])
+	}
+	if !reflect.DeepEqual(def["partition_by"], []string{"event_date"}) {
+		t.Errorf("partition_by = %v", def["partition_by"])
+	}
+	if def["uc_table"] != "main.analytics.events" || def["uc_location"] != "s3://b/events" {
+		t.Errorf("uc keys = %v / %v", def["uc_table"], def["uc_location"])
+	}
+	if def["replaces_job"] != int64(123456789) {
+		t.Errorf("replaces_job = %v", def["replaces_job"])
+	}
+}
+
 // TestBuildLocalOutputsBareReplace keeps the legacy fast path: bare
 // "default" entry with no merge_keys + no explicit mode stays as the
 // raw target string the runner reads as auto-Iceberg replace.

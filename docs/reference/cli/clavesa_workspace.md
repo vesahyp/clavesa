@@ -28,8 +28,11 @@ clavesa workspace
 ## Subcommands
 
 - [clavesa workspace backend](clavesa_workspace_backend.md) — Show the workspace's configured Terraform backend
+- [clavesa workspace connect](clavesa_workspace_connect.md) — Connect the workspace to an outside catalog
+- [clavesa workspace databricks](clavesa_workspace_databricks.md) — Show the workspace's Databricks connection
 - [clavesa workspace deploy](clavesa_workspace_deploy.md) — terraform init -upgrade → plan -out=tfplan → apply tfplan, with preflight
 - [clavesa workspace destroy](clavesa_workspace_destroy.md) — terraform destroy on the workspace (sweeping system-catalog Glue tables first)
+- [clavesa workspace disconnect](clavesa_workspace_disconnect.md) — Remove a connection to an outside catalog
 - [clavesa workspace init](clavesa_workspace_init.md) — Initialize a new workspace
 - [clavesa workspace migrate-state](clavesa_workspace_migrate-state.md) — Move the workspace's Terraform state onto the configured remote backend
 - [clavesa workspace plan](clavesa_workspace_plan.md) — Run terraform plan on the workspace

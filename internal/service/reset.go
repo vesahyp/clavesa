@@ -169,7 +169,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 		if first == nil {
 			return nil, fmt.Errorf("reset: pipeline %s has no transform nodes", req.Dir)
 		}
-		_, db, _, err := canonicalFromLambdaEnv(ctx, lc, pipelineRunnerLambdaName(pipelineName), first)
+		_, db, _, err := canonicalFromLambdaEnv(ctx, lc, pipelineRunnerLambdaName(s.awsName(pipelineName)), first)
 		if err != nil {
 			return nil, fmt.Errorf("resolve canonical target: %w", err)
 		}

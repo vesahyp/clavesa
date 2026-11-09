@@ -63,6 +63,29 @@ func TestSecretBackendDispatch(t *testing.T) {
 	}
 }
 
+func TestDatabricksOAuthRoundTrip(t *testing.T) {
+	t.Parallel()
+	st := New(t.TempDir())
+	in := Spec{Name: "dbx-sp", Kind: KindDatabricksOAuth, ClientID: "6f1c-app", Secret: "arn:aws:secretsmanager:us-east-2:1:secret:dbx"}
+	if err := st.Add(in); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	got, err := st.Get("dbx-sp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != in {
+		t.Errorf("Get = %+v, want %+v", got, in)
+	}
+	data, err := os.ReadFile(st.Path("dbx-sp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"client_id": "6f1c-app"`) || strings.Contains(string(data), "header_name") {
+		t.Errorf("on-disk shape:\n%s", data)
+	}
+}
+
 func TestValidationRejectsBadInputs(t *testing.T) {
 	t.Parallel()
 	ws := t.TempDir()
@@ -77,6 +100,9 @@ func TestValidationRejectsBadInputs(t *testing.T) {
 		{"missing header", Spec{Name: "stripe", Kind: "header", Secret: "env:K"}, "header_name is required"},
 		{"missing secret", Spec{Name: "stripe", Kind: "header", HeaderName: "Authorization"}, "secret reference is required"},
 		{"bad backend", Spec{Name: "stripe", Kind: "header", HeaderName: "Authorization", Secret: "weird:thing"}, "known backend prefix"},
+		{"databricks without client id", Spec{Name: "dbx", Kind: KindDatabricksOAuth, Secret: "env:K"}, "client_id is required"},
+		{"databricks with header", Spec{Name: "dbx", Kind: KindDatabricksOAuth, ClientID: "id", HeaderName: "Authorization", Secret: "env:K"}, "only valid for kind=header"},
+		{"header with client id", Spec{Name: "stripe", Kind: "header", HeaderName: "Authorization", ClientID: "id", Secret: "env:K"}, "only valid for kind=databricks-oauth"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

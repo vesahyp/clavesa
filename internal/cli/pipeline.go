@@ -63,9 +63,13 @@ Examples:
 		newPipelineLogsCmd(),
 		newPipelineRightsizeCmd(),
 		newPipelineCostCmd(),
+		newPipelineTimingsCmd(),
 		newPipelineOptimizeCmd(),
 		newOrchestrationCmd(),
 		newPipelineBackfillCmd(),
+		newPipelineDatabricksJobsCmd(),
+		newPipelineDatabricksRunCmd(),
+		newPipelineDatabricksCompareCmd(),
 	)
 
 	return cmd
@@ -381,13 +385,16 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 				return err
 			}
 			fmt.Printf("Synced orchestration.tf (emitter %s).\n", service.ModuleVersion)
-			return deployFlow{
-				WorkspaceRoot:    ws,
-				TfDir:            dir,
-				BuildRunnerImage: false,
-				AutoApprove:      autoApprove,
-				PlanOnly:         planOnly,
-			}.Run()
+			if err := syncDatabricksAccess(cmd, svc, dir, os.Stdout); err != nil {
+				return err
+			}
+			flow, err := newDeployFlow(cmd, ws, dir)
+			if err != nil {
+				return err
+			}
+			flow.AutoApprove = autoApprove
+			flow.PlanOnly = planOnly
+			return flow.Run()
 		},
 	}
 	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive 'Apply this plan?' confirmation")
@@ -442,7 +449,20 @@ still echoed to stderr before any AWS calls.
 					return err
 				}
 			}
+			// ADR-027, --create-catalog: the pipeline's Unity Catalog schema
+			// must be empty before Terraform can drop it.
+			dropped, err := service.New(ws).UnregisterPipelineDatabricksTables(cmd.Context(), dir)
+			if err != nil {
+				return err
+			}
+			for _, t := range dropped {
+				fmt.Printf("Unity Catalog: unregistered %s (the schema is clavesa's and goes with the pipeline)\n", t)
+			}
 
+			env, err := service.New(ws).TerraformEnv(cmd.Context())
+			if err != nil {
+				return err
+			}
 			if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
 				return fmt.Errorf("terraform init: %w", err)
 			}
@@ -452,6 +472,7 @@ still echoed to stderr before any AWS calls.
 			}
 			c := exec.Command("terraform", args2...)
 			c.Dir = dir
+			c.Env = env
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
 			c.Stdin = os.Stdin
@@ -595,7 +616,11 @@ func newPipelineTerraformCmd(tfSubcmd, short string) *cobra.Command {
 		Long:  short + ".\n\n" + pipelineDirHelp,
 		Args:  cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dir, _, _, err := resolvePipelineDir(cmd, args, 0)
+			dir, _, ws, err := resolvePipelineDir(cmd, args, 0)
+			if err != nil {
+				return err
+			}
+			env, err := service.New(ws).TerraformEnv(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -604,6 +629,7 @@ func newPipelineTerraformCmd(tfSubcmd, short string) *cobra.Command {
 			}
 			c := exec.Command("terraform", tfSubcmd)
 			c.Dir = dir
+			c.Env = env
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr
 			return c.Run()
@@ -646,6 +672,15 @@ cloud against a local warehouse is rejected.
 Local filesystem sources only on the local path — S3 sources need cloud
 dispatch.
 
+On a local warehouse, CLAVESA_TRIGGER labels the run (default "manual"; any
+non-empty string, e.g. "cron") in the run marker, the runs table and the
+timing record. Every local run writes a timing record (per-phase wall-clock
+time plus the runner's per-node timing) to
+<workspace>/.clavesa/warehouse/_progress/<run>/_timing.json and a copy to the
+run history dir: $CLAVESA_RUN_HISTORY_DIR, else $XDG_STATE_HOME/clavesa/runs,
+else ~/.local/state/clavesa/runs. The run ends with a short phase table;
+--json carries the record under "timing".
+
 ` + pipelineDirHelp,
 		Args: cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -685,6 +720,11 @@ dispatch.
 			// local warehouse is a harmless no-op.
 			if err := service.ValidateCompute(warehouse, compute); err != nil {
 				return err
+			}
+			// ADR-027: a local warehouse never reaches Unity Catalog; say so
+			// rather than leave a connected user wondering.
+			if m, _ := workspace.Load(ws); m != nil && m.Databricks != nil && warehouse == workspace.WarehouseLocal {
+				fmt.Fprintln(os.Stderr, "Unity Catalog: not published: the warehouse is local. Run against the cloud warehouse (--warehouse cloud, or --compute local with it) to write the Databricks tables.")
 			}
 
 			if !jsonOut {
@@ -773,6 +813,7 @@ func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut, force bool, force
 	result, err := svc.RunPipelineWithOpts(cmd.Context(), dir, service.RunOpts{
 		Force:      force,
 		ForceNodes: forceNodes,
+		Trigger:    service.TriggerFromEnv(),
 	})
 	if err != nil {
 		if result != nil && jsonOut {
@@ -796,6 +837,10 @@ func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut, force bool, force
 		if n.Note != "" {
 			fmt.Printf("  %s: %s\n", n.NodeID, n.Note)
 		}
+	}
+	if result.Timing != nil {
+		fmt.Println()
+		printRunTiming(os.Stdout, result.Timing)
 	}
 	return nil
 }
@@ -823,7 +868,9 @@ func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait, force bool,
 		return err
 	}
 	pipelineName := filepath.Base(abs)
-	stateMachineName := "clavesa-" + pipelineName
+	wsRoot, _ := resolveWorkspaceRoot(cmd)
+	wsManifest, _ := workspace.Load(wsRoot)
+	stateMachineName := workspace.PipelineAWSName(wsManifest, pipelineName)
 
 	if !wait {
 		if jsonOut {
@@ -871,7 +918,22 @@ func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait, force bool,
 		}
 		return fmt.Errorf("execution did not succeed")
 	}
+	printRunDatabricks(cmd, execARN)
 	return nil
+}
+
+// printRunDatabricks prints what a finished run did in Databricks (ADR-027),
+// when the workspace is connected. Best-effort: the run itself is over.
+func printRunDatabricks(cmd *cobra.Command, runID string) {
+	svc, _, err := newService(cmd)
+	if err != nil {
+		return
+	}
+	run, err := svc.GetDatabricksRun(cmd.Context(), "", runID)
+	if err != nil || !run.Found {
+		return
+	}
+	printDatabricksRun(os.Stdout, run)
 }
 
 // runCloudLocalPipeline is the CLI shell for `pipeline run --compute local` on
@@ -910,6 +972,7 @@ func runCloudLocalPipeline(cmd *cobra.Command, abs string, jsonOut, _ bool, forc
 		return runErr
 	}
 	fmt.Printf("Status: SUCCEEDED\n")
+	printRunDatabricks(cmd, runID)
 	return nil
 }
 
