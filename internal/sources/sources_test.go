@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -224,4 +225,43 @@ func stringIndex(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+func TestKinesisSpecValidation(t *testing.T) {
+	t.Parallel()
+	st := New(t.TempDir())
+	good := []Spec{
+		{Name: "a", Kind: KindKinesis, Stream: "my-stream"},
+		{Name: "b", Kind: KindKinesis, Stream: "S_1.x", Region: "eu-west-1", StartingPosition: "LATEST", Endpoint: "http://localhost:4566"},
+		{Name: "c", Kind: KindKinesis, Stream: "s", StartingPosition: "TRIM_HORIZON"},
+	}
+	for _, s := range good {
+		if err := st.Add(s); err != nil {
+			t.Errorf("Add(%q): %v", s.Name, err)
+		}
+	}
+	bad := []Spec{
+		{Name: "d", Kind: KindKinesis},
+		{Name: "e", Kind: KindKinesis, Stream: "bad name"},
+		{Name: "f", Kind: KindKinesis, Stream: strings.Repeat("x", 129)},
+		{Name: "g", Kind: KindKinesis, Stream: "s", StartingPosition: "AT_TIMESTAMP"},
+		{Name: "h", Kind: KindKinesis, Stream: "s", StartingPosition: "NEWEST"},
+		{Name: "i", Kind: KindKinesis, Stream: "s", Format: "json"},
+		{Name: "j", Kind: KindKinesis, Stream: "s", Bucket: "b"},
+		{Name: "k", Kind: KindKinesis, Stream: "s", URL: "https://x"},
+		{Name: "l", Kind: KindKinesis, Stream: "s", Credentials: "c"},
+		{Name: "m", Kind: KindKinesis, Stream: "s", Partitions: []string{"y"}},
+		{Name: "n", Kind: "http", URL: "https://x/y.csv", Format: "csv", Stream: "s"},
+		{Name: "o", Kind: "s3", Bucket: "b", Format: "json", Region: "eu-west-1"},
+		{Name: "p", Kind: KindUnityCatalog, Table: "m.s.o", Endpoint: "http://x"},
+	}
+	for _, s := range bad {
+		if err := st.Add(s); err == nil {
+			t.Errorf("Add(%q) = nil, want error", s.Name)
+		}
+	}
+	err := st.Add(Spec{Name: "q", Kind: KindKinesis, Stream: "s", StartingPosition: "AT_TIMESTAMP"})
+	if err == nil || !strings.Contains(err.Error(), "spark-sql-kinesis-connector#67") {
+		t.Errorf("AT_TIMESTAMP error = %v", err)
+	}
 }

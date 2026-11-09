@@ -1,5 +1,5 @@
 #!/bin/sh
-# Nine modes:
+# Ten modes:
 #   CLAVESA_METASTORE_SERVER=1 — long-lived Derby Network Server. Owns
 #                                 $CLAVESA_WAREHOUSE/_metastore/metastore_db and serves it over JDBC
 #                                 on port 1527 so the warm query worker and on-demand pipeline-run
@@ -24,9 +24,15 @@
 #                                 POST /transpile on CLAVESA_TRANSPILE_SERVER_PORT (default 8770). Wired by
 #                                 `clavesa ui` to transpile authored Spark serving-SQL to Athena/Trino for
 #                                 cloud serving. No Spark/Connect/pyspark — pure-Python, starts in ms.
-#   default                     — Lambda runtime; hand off to the standard bootstrap.
+#   CLAVESA_STREAM=1         — long-lived Spark Structured Streaming query for one stream node
+#                                 (ADR-028): Kinesis or Kafka into one Delta table. Config JSON in
+#                                 CLAVESA_STREAM_CONFIG; with drain=true it stops when caught up.
 #   CLAVESA_FARGATE=1        — one ECS Fargate task runs one pipeline run (compute = "fargate"): reads the
 #                                 bundle from CLAVESA_BUNDLE_URI, runs pipeline_handler, exits non-zero on failure.
+#   default                     — Lambda runtime; hand off to the standard bootstrap.
+if [ "$CLAVESA_STREAM" = "1" ]; then
+    exec python /var/task/stream_query.py
+fi
 if [ "$CLAVESA_FARGATE" = "1" ] || [ "$CLAVESA_METASTORE_SERVER" = "1" ] || [ "$CLAVESA_PREVIEW" = "1" ] || [ "$CLAVESA_RUN" = "1" ] || [ "$CLAVESA_QUERY" = "1" ] || [ "$CLAVESA_QUERY_SERVER" = "1" ] || [ "$CLAVESA_CONNECT_SERVER" = "1" ] || [ "$CLAVESA_RECORD_RUN" = "1" ] || [ "$CLAVESA_TRANSPILE_SERVER" = "1" ]; then
     exec python /var/task/runner.py
 else

@@ -166,7 +166,9 @@ Every check prints `ok`. One line says `skip  Storage for new tables: no --exter
 
 In shadow mode clavesa runs the step every day and writes a **second** table, `$SHADOW`, in the team's bucket. The Databricks step keeps running unchanged and nobody reads the shadow table yet.
 
-**The input.** Raw files in the team's bucket, with the same partition key as the table. (For a Unity Catalog table instead: `clavesa source register raw --from uc://<catalog>.<schema>.<table>`.)
+**The input.** Raw files in the team's bucket, with the same partition key as the table. (For a Unity Catalog table instead: `clavesa source register raw --from uc://<catalog>.<schema>.<table>`. For a step that reads a **Kinesis stream**, see the box below.)
+
+> **A step that reads Kinesis** ([ADR-028](../decisions/028-kinesis-stream-source.md), recipe: [kinesis-to-unity-catalog](../cookbook/kinesis-to-unity-catalog.md)). Register the stream instead of the files: `clavesa source register raw_events --kind kinesis --stream <stream name>`. Each scheduled run reads what arrived since the last run, from a checkpoint in the clavesa bucket, and appends it to the table; a run that stops part-way writes nothing twice. Your SQL runs per micro-batch, so keep it row-level (parse, cast, filter), keep the columns `_source_partition` and `_source_offset`, and use `--output-mode append` with `--output-partition-by` (no `replace_partitions`). Schedule the runs more often than the stream's retention (24 hours by default), for example every 15 minutes. In shadow mode clavesa is a second reader of the stream next to the Databricks job: a shard serves 5 reads a second and 2 MB/s to all its polling readers together, so check that the stream has that headroom (CloudWatch `ReadProvisionedThroughputExceeded` stays at 0). The daily comparison in step 9 works the same, by the day column your SQL derives.
 
 ```bash
 clavesa source register raw_events --kind s3 --bucket $TEAM_BUCKET --prefix $RAW_PREFIX \
@@ -335,6 +337,7 @@ Clavesa pays AWS, in your account; there is no clavesa service to pay.
 
 - **Measured**, on synthetic events at about 1 KB an event, ARM Fargate in us-east-2: a 1 GB day took 34 seconds of task time at 8 vCPU and 16 GB (about 0.003 USD), plus a minute or two of start-up. Time grew linearly with the data in the measured range (up to 1.25 GB a run).
 - **Estimated, not measured:** a step that reads 2 TB a month (67 GB a day) extrapolates to about 11 minutes a day at 8 vCPU, about 2 USD a month of Fargate, about 3 to 4 USD a month with the fixed AWS costs. 67 GB is 54 times the largest measured run, so treat this as an estimate. Check it against the first real runs: each run's log ends with its time and peak memory.
+- **A Kinesis step, estimated, not measured at volume:** 2 billion events and 2 TB a month, read every 15 minutes (about 23,000 events and 23 MB a run) on a 2 vCPU, 8 GB Fargate task. Most of each run is start-up (about a minute) and the drain is seconds, so about 1.5 to 2 minutes of task time per run: about 10 to 15 USD a month of Fargate, plus a few USD of S3 requests and logs. Lambda costs more at this rate (a 10 GB function for about 90 seconds, 2,900 times a month: about 45 USD). The stream itself is the team's and costs the same either way. The proof (`make smoke-kinesis`) ran 4,000 events; it proves correctness, not throughput.
 - **The Databricks side:** the step's DBUs stop after the switch. Look up what the step costs today before you decide (`system.billing.usage`, filtered to the job's ID).
 - The preflight and the comparison cost no DBUs.
 

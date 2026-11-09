@@ -594,6 +594,9 @@ def _input_endpoint(client: Client, cfg: dict[str, Any], alias: str, src: Any) -
             url = src.get("url", "")
         elif kind == "s3":
             url = f"s3://{src.get('bucket', '')}/{src.get('prefix', '')}"
+        elif kind == "kinesis":
+            # ADR-028: the stream itself, by name (Kinesis has no URL form).
+            url = f"kinesis:{src.get('region') or os.environ.get('AWS_REGION', '')}:{src.get('stream_name', '')}"
         else:
             url = str(src.get("path") or src.get("table") or src.get("table_id") or "")
     name = _meta_name("clavesa", pipeline, "in", alias)

@@ -19,6 +19,13 @@ databricks) and reads in the cloud only:
 
   clavesa source register orders --from uc://main.sales.orders
 
+An Amazon Kinesis data stream takes a kinesis:// URL, or --stream. A
+transform that reads it must have it as its only input and append to one
+output:
+
+  clavesa source register events --from kinesis://my-stream
+  clavesa source register events --kind kinesis --stream my-stream --region eu-west-1 --starting-position LATEST
+
 --format is inferred from the trailing filename when omitted. Pass
 --attach <pipeline-dir> --to <transform> [--as <alias>] to attach the
 new source to a pipeline in one step.
@@ -45,15 +52,19 @@ clavesa source register <name> [flags]
       --attach string                also attach to a pipeline in this workspace (pipeline dir)
       --bucket string                S3 bucket name (kind=s3)
       --credentials string           name of a registered credential (slice 2: header auth)
+      --endpoint string              kind=kinesis: endpoint URL override (LocalStack)
       --format string                data format (parquet, csv, json, tsv); inferred from filename if omitted
-      --from string                  URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog
-      --kind string                  source kind (http, s3, unity-catalog); inferred from --from when omitted
+      --from string                  URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog, kinesis://<stream> for kind=kinesis
+      --kind string                  source kind (http, s3, unity-catalog, kinesis); inferred from --from when omitted
       --manage-notifications         kind=s3: have terraform manage the bucket's EventBridge notification config (authoritative — replaces existing notification config). Default off; only enable when clavesa owns the source bucket
       --no-trigger                   kind=s3: new files do not start runs; the pipeline runs on its schedule and drains the queue then
       --partitions strings           kind=s3: comma-separated Hive partition keys (e.g. year,month,day) for partition-column recovery
       --prefix string                S3 key prefix (kind=s3); auto-suffixed with /
       --read-option stringToString   repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns (e.g. --read-option delimiter=$'\t' --read-option header=false) (default [])
+      --region string                Kinesis stream region (kind=kinesis); default is the deploy region
       --start-from string            kind=s3 with --partitions: first-run seed before queue-drain takes over ("all" | "now" | "<cursor>")
+      --starting-position string     kind=kinesis: TRIM_HORIZON (default, oldest record) or LATEST
+      --stream string                Kinesis data stream name (kind=kinesis)
       --table string                 Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog; needs clavesa workspace connect databricks)
       --to string                    transform node id (when --attach is set)
 ```

@@ -122,7 +122,7 @@ function RegistrySourceBody({ name }: { name: string }) {
   const preview = useQuery({
     queryKey: ["source-preview", name],
     queryFn: () => getRegistrySourcePreview(name, 0, 1),
-    enabled: !!name && !!spec && !spec.credentials && spec.kind !== "unity-catalog",
+    enabled: !!name && !!spec && !spec.credentials && spec.kind !== "unity-catalog" && spec.kind !== "kinesis",
     staleTime: 60_000,
     retry: 0,
   });
@@ -152,7 +152,9 @@ function RegistrySourceBody({ name }: { name: string }) {
     ? `s3://${spec.bucket ?? ""}/${spec.prefix ?? ""}`
     : spec.kind === "unity-catalog"
       ? (spec.table ?? "—")
-      : (spec.url ?? "—");
+      : spec.kind === "kinesis"
+        ? `kinesis://${spec.stream}`
+        : (spec.url ?? "—");
 
   return (
     <>
@@ -169,7 +171,15 @@ function RegistrySourceBody({ name }: { name: string }) {
       </Section>
 
       <Section label={`Columns${columns.length > 0 ? ` · ${columns.length}` : ""}`}>
-        {spec.kind === "unity-catalog" ? (
+        {spec.kind === "kinesis" ? (
+          <span
+            className="text-xs text-muted-foreground"
+            data-testid="source-inspector-kinesis-note"
+          >
+            Preview is unavailable for Kinesis streams. Columns resolve when
+            the pipeline runs.
+          </span>
+        ) : spec.kind === "unity-catalog" ? (
           <span
             className="text-xs text-muted-foreground"
             data-testid="source-inspector-uc-note"

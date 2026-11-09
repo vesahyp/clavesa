@@ -158,6 +158,17 @@ func (s *Service) normalizeSourceSpec(spec SourceSpec) (SourceSpec, error) {
 		}
 		return spec, nil
 	}
+	// kinesis://<stream> promotes to kind=kinesis (ADR-028).
+	if strings.HasPrefix(spec.URL, sources.KinesisScheme) {
+		spec.Kind = sources.KindKinesis
+		if spec.Stream == "" {
+			spec.Stream = strings.TrimPrefix(spec.URL, sources.KinesisScheme)
+		}
+		spec.URL = ""
+	}
+	if spec.Kind == sources.KindKinesis {
+		return spec, nil
+	}
 	if strings.HasPrefix(spec.URL, "s3://") {
 		bucket, key, _ := strings.Cut(spec.URL[len("s3://"):], "/")
 		// An s3:// URL always means kind=s3 — overwrite any
@@ -440,6 +451,9 @@ func (s *Service) resolveSourceForAttach(name string) (kind string, resolved map
 	case sources.KindUnityCatalog:
 		// Like http: the legacy sentinel, resolved at orchestration time.
 		return sources.KindUnityCatalog, nil, "sources." + spec.Name, nil
+	case sources.KindKinesis:
+		// Like http: the legacy sentinel, resolved at orchestration time.
+		return sources.KindKinesis, nil, "sources." + spec.Name, nil
 	default:
 		return "", nil, "", fmt.Errorf("source %q kind %q not supported", name, spec.Kind)
 	}

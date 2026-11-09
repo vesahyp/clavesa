@@ -40,6 +40,10 @@ type SourceSpec struct {
 	ManageBucketNotifications bool     `json:"manage_bucket_notifications,omitempty"`
 	NoTrigger                 bool     `json:"no_trigger,omitempty"`
 	Table                     string   `json:"table,omitempty"`
+	Stream                    string   `json:"stream,omitempty"`
+	Region                    string   `json:"region,omitempty"`
+	StartingPosition          string   `json:"starting_position,omitempty"`
+	Endpoint                  string   `json:"endpoint,omitempty"`
 }
 
 // SourceUsage names a pipeline that references the source. Returned in

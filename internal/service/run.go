@@ -306,6 +306,9 @@ func (s *Service) prepareRunWith(dir, trigger string, start, entry time.Time) (*
 	if err != nil {
 		return nil, err
 	}
+	if err := s.validateKinesisNodes(&g); err != nil {
+		return nil, err
+	}
 
 	// Per-pipeline run lock (ADR-024, GH #48). Acquired before any of the
 	// expensive setup below so a second dispatcher — another process, the
@@ -833,6 +836,16 @@ func (s *Service) buildInputs(ctx context.Context, g *graph.PipelineGraph, nodeI
 					inputs[alias] = map[string]any{
 						"kind":  "uc_table",
 						"table": spec.Table,
+					}
+				case sources.KindKinesis:
+					stream, region, pos, endpoint := kinesisDescriptorFields(spec)
+					inputs[alias] = map[string]any{
+						"kind":              "kinesis",
+						"spec_name":         spec.Name,
+						"stream_name":       stream,
+						"region":            region,
+						"starting_position": pos,
+						"endpoint_url":      endpoint,
 					}
 				case "s3":
 					if len(spec.Partitions) > 0 {
@@ -1931,7 +1944,8 @@ func dockerImageDigest(ref string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// hasS3Input reports whether any descriptor in inputs reads from S3 — the
+// hasS3Input reports whether any descriptor in inputs reads from S3 (or from
+// Kinesis, which needs the same host AWS credentials) — the
 // signal for forwarding AWS credentials into the runner container. Covers
 // both `kind=s3` (raw s3 source) and `kind=partitioned_path` whose path is
 // s3:// (the v0.12.0 incremental shape registered s3 sources resolve to).
@@ -1942,7 +1956,7 @@ func hasS3Input(inputs map[string]any) bool {
 			continue
 		}
 		k, _ := m["kind"].(string)
-		if k == "s3" {
+		if k == "s3" || k == "kinesis" {
 			return true
 		}
 		if k == "partitioned_path" {

@@ -97,7 +97,10 @@ wget -q "https://repo1.maven.org/maven2/org/apache/derby/derbyclient/${DERBY_VER
 # how to do --packages resolution. Our stripped replacement (needed for the
 # Lambda runtime) gets layered on top after.
 SPARK_VERSION=4.0.2
-echo "Resolving Spark Connect transitive deps via Ivy..."
+# Spark's built-in Kafka source (ADR-028 stream mode) rides the same Ivy
+# resolution: spark-sql-kafka-0-10 plus kafka-clients, the token provider
+# and commons-pool2, all at the Spark version.
+echo "Resolving Spark Connect + Kafka source transitive deps via Ivy..."
 mkdir -p /tmp/clavesa-ivy
 # Spark-submit with --packages resolves the Ivy dep tree before launching the
 # driver. We pass a no-op script so the driver starts, runs in ~2s, and exits;
@@ -105,7 +108,7 @@ mkdir -p /tmp/clavesa-ivy
 # (--version alone won't work — it short-circuits before --packages is parsed.)
 echo 'print("ivy resolution complete")' > /tmp/clavesa-noop.py
 "${SPARK_HOME}/bin/spark-submit" \
-    --packages "org.apache.spark:spark-connect_2.13:${SPARK_VERSION}" \
+    --packages "org.apache.spark:spark-connect_2.13:${SPARK_VERSION},org.apache.spark:spark-sql-kafka-0-10_2.13:${SPARK_VERSION}" \
     --conf "spark.jars.ivy=/tmp/clavesa-ivy" \
     --master "local[1]" \
     /tmp/clavesa-noop.py
@@ -126,4 +129,4 @@ echo "Added ${copied} Spark Connect JAR(s) from Ivy resolution."
 rm -rf /tmp/clavesa-ivy
 
 echo "Installed JARs:"
-ls -1 "${JARS_DIR}/" | grep -E "delta|hadoop-aws|aws-java-sdk-bundle|connect|grpc|protobuf|glue-datacatalog|hive-common|hive-exec|derby" | sort
+ls -1 "${JARS_DIR}/" | grep -E "delta|hadoop-aws|aws-java-sdk-bundle|connect|grpc|protobuf|glue-datacatalog|hive-common|hive-exec|derby|kafka|kinesis" | sort

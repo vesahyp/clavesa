@@ -102,6 +102,49 @@ type Spec struct {
 	// Databricks step wrote, read by a clavesa transform (ADR-027). Empty
 	// for other kinds.
 	Table string `json:"table,omitempty"`
+
+	// Stream is the Kinesis data stream name for kind="kinesis" (ADR-028).
+	Stream string `json:"stream,omitempty"`
+
+	// Region is the AWS region of a kind="kinesis" stream. Empty means
+	// the deploy region (AWS_REGION in the runner).
+	Region string `json:"region,omitempty"`
+
+	// StartingPosition is where a kind="kinesis" source starts on its
+	// first run: "TRIM_HORIZON" (default, oldest record) or "LATEST".
+	StartingPosition string `json:"starting_position,omitempty"`
+
+	// Endpoint overrides the Kinesis endpoint URL for kind="kinesis"
+	// (LocalStack). Empty means the regional AWS endpoint.
+	Endpoint string `json:"endpoint,omitempty"`
+}
+
+// KindKinesis is the source kind for an Amazon Kinesis data stream.
+const KindKinesis = "kinesis"
+
+// KinesisScheme is the URL shorthand prefix that auto-promotes to
+// kind=kinesis (`kinesis://<stream>`).
+const KinesisScheme = "kinesis://"
+
+// Kinesis starting positions.
+const (
+	KinesisTrimHorizon = "TRIM_HORIZON"
+	KinesisLatest      = "LATEST"
+)
+
+// ValidKinesisStream checks the Kinesis stream name rules: 1 to 128
+// characters from a-z A-Z 0-9 _ . -
+func ValidKinesisStream(name string) error {
+	if name == "" || len(name) > 128 {
+		return fmt.Errorf("stream %q must be 1 to 128 characters", name)
+	}
+	for _, c := range name {
+		ok := c == '_' || c == '.' || c == '-' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		if !ok {
+			return fmt.Errorf("stream %q contains invalid char %q (allowed: letters, digits, _ . -)", name, c)
+		}
+	}
+	return nil
 }
 
 // KindUnityCatalog is the source kind for a Unity Catalog table.
@@ -181,10 +224,10 @@ func (s *Store) Path(name string) string {
 // runner having a matching read path.
 func validKind(kind string) error {
 	switch kind {
-	case "http", "s3", KindUnityCatalog:
+	case "http", "s3", KindUnityCatalog, KindKinesis:
 		return nil
 	default:
-		return fmt.Errorf("unsupported source kind %q (supported: http, s3, unity-catalog)", kind)
+		return fmt.Errorf("unsupported source kind %q (supported: http, s3, unity-catalog, kinesis)", kind)
 	}
 }
 
@@ -205,6 +248,26 @@ func (s Spec) validate() error {
 	}
 	if err := validKind(s.Kind); err != nil {
 		return err
+	}
+	if s.Kind != KindKinesis && (s.Stream != "" || s.Region != "" || s.StartingPosition != "" || s.Endpoint != "") {
+		return fmt.Errorf("stream, region, starting_position and endpoint are only valid for kind=kinesis (got kind=%q)", s.Kind)
+	}
+	if s.Kind == KindKinesis {
+		if err := ValidKinesisStream(s.Stream); err != nil {
+			return err
+		}
+		switch s.StartingPosition {
+		case "", KinesisTrimHorizon, KinesisLatest:
+		case "AT_TIMESTAMP":
+			return fmt.Errorf("starting_position AT_TIMESTAMP is not supported: it is broken upstream (awslabs/spark-sql-kinesis-connector#67); use TRIM_HORIZON or LATEST")
+		default:
+			return fmt.Errorf("unsupported starting_position %q (TRIM_HORIZON or LATEST)", s.StartingPosition)
+		}
+		if s.URL != "" || s.Bucket != "" || s.Prefix != "" || s.Format != "" || len(s.ReadOptions) > 0 ||
+			len(s.Partitions) > 0 || s.StartFrom != "" || s.ManageBucketNotifications || s.NoTrigger || s.Credentials != "" || s.Table != "" {
+			return fmt.Errorf("kind=kinesis takes only a stream, region, starting_position and endpoint (url, bucket, prefix, format, read options, credentials, table, partitions, start_from, manage_bucket_notifications and no_trigger are not valid)")
+		}
+		return nil
 	}
 	if s.Kind == KindUnityCatalog {
 		if err := ValidUCTable(s.Table); err != nil {

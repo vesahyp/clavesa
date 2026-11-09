@@ -52,6 +52,7 @@ Examples:
 
 func newSourceRegisterCmd() *cobra.Command {
 	var from, kind, bucket, prefix, format, table string
+	var stream, region, startingPosition, endpoint string
 	var attach, attachTo, attachAs, creds string
 	var partitions []string
 	var startFrom string
@@ -78,6 +79,13 @@ A table a Databricks step wrote (Unity Catalog) takes a uc:// URL, or
 databricks) and reads in the cloud only:
 
   clavesa source register orders --from uc://main.sales.orders
+
+An Amazon Kinesis data stream takes a kinesis:// URL, or --stream. A
+transform that reads it must have it as its only input and append to one
+output:
+
+  clavesa source register events --from kinesis://my-stream
+  clavesa source register events --kind kinesis --stream my-stream --region eu-west-1 --starting-position LATEST
 
 --format is inferred from the trailing filename when omitted. Pass
 --attach <pipeline-dir> --to <transform> [--as <alias>] to attach the
@@ -109,11 +117,19 @@ Local runs fall back to listing (no queue), with identical results.`,
 				ManageBucketNotifications: manageNotifications,
 				NoTrigger:                 noTrigger,
 				ReadOptions:               readOptions,
+				Stream:                    stream,
+				Region:                    region,
+				StartingPosition:          startingPosition,
+				Endpoint:                  endpoint,
 			}
 			if from != "" {
 				if strings.HasPrefix(from, sources.UCScheme) {
 					// AddSource derives the table from the URL.
 					spec.Kind = sources.KindUnityCatalog
+					spec.URL = from
+				} else if strings.HasPrefix(from, sources.KinesisScheme) {
+					// AddSource derives the stream from the URL.
+					spec.Kind = sources.KindKinesis
 					spec.URL = from
 				} else if strings.HasPrefix(from, "s3://") {
 					if spec.Kind == "" {
@@ -136,6 +152,9 @@ Local runs fall back to listing (no queue), with identical results.`,
 				}
 				spec.Table = table
 			}
+			if stream != "" && spec.Kind == "" {
+				spec.Kind = sources.KindKinesis
+			}
 			if spec.Kind == "" {
 				return fmt.Errorf("specify --from <url> or --kind explicitly")
 			}
@@ -149,6 +168,8 @@ Local runs fall back to listing (no queue), with identical results.`,
 			}
 			fmt.Printf("Registered source %s (%s, %s)\n", stored.Name, stored.Kind, stored.Format)
 			switch stored.Kind {
+			case sources.KindKinesis:
+				fmt.Printf("  stream: %s\n", stored.Stream)
 			case "http":
 				fmt.Printf("  url:    %s\n", stored.URL)
 			case "s3":
@@ -174,8 +195,12 @@ Local runs fall back to listing (no queue), with identical results.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog")
-	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3, unity-catalog); inferred from --from when omitted")
+	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog, kinesis://<stream> for kind=kinesis")
+	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3, unity-catalog, kinesis); inferred from --from when omitted")
+	cmd.Flags().StringVar(&stream, "stream", "", "Kinesis data stream name (kind=kinesis)")
+	cmd.Flags().StringVar(&region, "region", "", "Kinesis stream region (kind=kinesis); default is the deploy region")
+	cmd.Flags().StringVar(&startingPosition, "starting-position", "", "kind=kinesis: TRIM_HORIZON (default, oldest record) or LATEST")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "kind=kinesis: endpoint URL override (LocalStack)")
 	cmd.Flags().StringVar(&table, "table", "", "Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog; needs clavesa workspace connect databricks)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (kind=s3)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix (kind=s3); auto-suffixed with /")
@@ -207,6 +232,7 @@ func nonEmptyStrings(in []string) []string {
 
 func newSourceEditCmd() *cobra.Command {
 	var from, kind, bucket, prefix, format, creds, table string
+	var stream, region, startingPosition, endpoint string
 	var partitions []string
 	var startFrom string
 	var manageNotifications bool
@@ -249,7 +275,14 @@ the next run automatically.`,
 				// Re-derive the location from scratch; an explicit
 				// --kind/--bucket/--prefix/--format below still wins.
 				spec.URL, spec.Bucket, spec.Prefix, spec.Format, spec.Table = "", "", "", "", ""
-				if strings.HasPrefix(from, sources.UCScheme) {
+				spec.Stream, spec.Region, spec.StartingPosition, spec.Endpoint = "", "", "", ""
+				if strings.HasPrefix(from, sources.KinesisScheme) {
+					spec.Kind, spec.URL = sources.KindKinesis, from
+					spec.Partitions = nil
+					spec.StartFrom = ""
+					spec.ManageBucketNotifications = false
+					spec.NoTrigger = false
+				} else if strings.HasPrefix(from, sources.UCScheme) {
 					spec.Kind, spec.URL = sources.KindUnityCatalog, from
 					spec.Partitions = nil
 					spec.StartFrom = ""
@@ -275,6 +308,22 @@ the next run automatically.`,
 			}
 			if changed("table") {
 				spec.Table = table
+				touched = true
+			}
+			if changed("stream") {
+				spec.Stream = stream
+				touched = true
+			}
+			if changed("region") {
+				spec.Region = region
+				touched = true
+			}
+			if changed("starting-position") {
+				spec.StartingPosition = startingPosition
+				touched = true
+			}
+			if changed("endpoint") {
+				spec.Endpoint = endpoint
 				touched = true
 			}
 			if changed("bucket") {
@@ -329,13 +378,19 @@ the next run automatically.`,
 				fmt.Printf("  prefix: %s\n", stored.Prefix)
 			case sources.KindUnityCatalog:
 				fmt.Printf("  table:  %s\n", stored.Table)
+			case sources.KindKinesis:
+				fmt.Printf("  stream: %s\n", stored.Stream)
 			}
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog")
-	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3, unity-catalog)")
+	cmd.Flags().StringVar(&from, "from", "", "URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog, kinesis://<stream> for kind=kinesis")
+	cmd.Flags().StringVar(&kind, "kind", "", "source kind (http, s3, unity-catalog, kinesis)")
 	cmd.Flags().StringVar(&table, "table", "", "Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog)")
+	cmd.Flags().StringVar(&stream, "stream", "", "Kinesis data stream name (kind=kinesis)")
+	cmd.Flags().StringVar(&region, "region", "", `Kinesis stream region (kind=kinesis); pass "" for the deploy region`)
+	cmd.Flags().StringVar(&startingPosition, "starting-position", "", `kind=kinesis: TRIM_HORIZON or LATEST; pass "" for the default`)
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", `kind=kinesis: endpoint URL override (LocalStack); pass "" to clear`)
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (kind=s3)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix (kind=s3); auto-suffixed with /")
 	cmd.Flags().StringVar(&format, "format", "", "data format (parquet, csv, json, tsv)")
@@ -380,6 +435,9 @@ func newSourceListCmd() *cobra.Command {
 				if s.Kind == sources.KindUnityCatalog {
 					location = sources.UCScheme + s.Table
 				}
+				if s.Kind == sources.KindKinesis {
+					location = sources.KinesisScheme + s.Stream
+				}
 				rows[i] = []string{s.Name, s.Kind, s.Format, s.Credentials, location}
 			}
 			printTable(os.Stdout, []string{"NAME", "KIND", "FORMAT", "CREDENTIAL", "LOCATION"}, rows)
@@ -422,6 +480,19 @@ func newSourceShowCmd() *cobra.Command {
 				fmt.Printf("Prefix:  %s\n", spec.Prefix)
 			case sources.KindUnityCatalog:
 				fmt.Printf("Table:   %s\n", spec.Table)
+			case sources.KindKinesis:
+				fmt.Printf("Stream:  %s\n", spec.Stream)
+				if spec.Region != "" {
+					fmt.Printf("Region:  %s\n", spec.Region)
+				}
+				pos := spec.StartingPosition
+				if pos == "" {
+					pos = sources.KinesisTrimHorizon
+				}
+				fmt.Printf("Start:   %s\n", pos)
+				if spec.Endpoint != "" {
+					fmt.Printf("Endpoint: %s\n", spec.Endpoint)
+				}
 			}
 			if spec.Credentials != "" {
 				fmt.Printf("Cred:    %s\n", spec.Credentials)
@@ -535,6 +606,10 @@ type sourceJSON struct {
 	ManageBucketNotifications bool     `json:"manage_bucket_notifications,omitempty"`
 	NoTrigger                 bool     `json:"no_trigger,omitempty"`
 	Table                     string   `json:"table,omitempty"`
+	Stream                    string   `json:"stream,omitempty"`
+	Region                    string   `json:"region,omitempty"`
+	StartingPosition          string   `json:"starting_position,omitempty"`
+	Endpoint                  string   `json:"endpoint,omitempty"`
 }
 
 func sourceJSONOne(s service.SourceSpec) sourceJSON {
@@ -546,6 +621,8 @@ func sourceJSONOne(s service.SourceSpec) sourceJSON {
 		ManageBucketNotifications: s.ManageBucketNotifications,
 		NoTrigger:                 s.NoTrigger,
 		Table:                     s.Table,
+		Stream:                    s.Stream, Region: s.Region,
+		StartingPosition: s.StartingPosition, Endpoint: s.Endpoint,
 	}
 }
 

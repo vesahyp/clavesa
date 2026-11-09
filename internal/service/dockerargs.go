@@ -35,6 +35,12 @@ type dockerRunSpec struct {
 	// RecordRun selects CLAVESA_RECORD_RUN=1 (the runs-row writer) instead
 	// of CLAVESA_RUN=1.
 	RecordRun bool
+	// Stream selects CLAVESA_STREAM=1 (ADR-027 stream mode: a long-lived
+	// Structured Streaming query) instead of CLAVESA_RUN=1.
+	Stream bool
+	// Name, when set, is the container name (--name), so a long-lived
+	// stream container can be found, stopped, or killed by name.
+	Name string
 	// Warehouse is the local Hadoop-catalog warehouse dir; exported as
 	// CLAVESA_WAREHOUSE and mounted read-write at the same path.
 	Warehouse string
@@ -64,7 +70,12 @@ type dockerRunSpec struct {
 // args, triage stamps, heap, warehouse mount, site mounts, image.
 func dockerRunArgs(spec dockerRunSpec) []string {
 	args := []string{"run", "--rm", "-i"}
-	if spec.RecordRun {
+	if spec.Name != "" {
+		args = append(args, "--name", spec.Name)
+	}
+	if spec.Stream {
+		args = append(args, "-e", "CLAVESA_STREAM=1")
+	} else if spec.RecordRun {
 		args = append(args, "-e", "CLAVESA_RECORD_RUN=1")
 	} else {
 		args = append(args, "-e", "CLAVESA_RUN=1")

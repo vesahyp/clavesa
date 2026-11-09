@@ -92,6 +92,8 @@ Visual ETL for Terraform pipelines
 | &nbsp;&nbsp;[`clavesa source show`](clavesa_source_show.md) | Show a source's spec |
 | [`clavesa sql`](clavesa_sql.md) | SparkSQL tooling (parse-check, lint) |
 | &nbsp;&nbsp;[`clavesa sql lint`](clavesa_sql_lint.md) | Parse-check a SparkSQL file; exits non-zero on parse failure |
+| [`clavesa stream`](clavesa_stream.md) | Run stream nodes (Kinesis, Kafka) into Delta tables |
+| &nbsp;&nbsp;[`clavesa stream run`](clavesa_stream_run.md) | Run one stream node against the local warehouse |
 | [`clavesa ui`](clavesa_ui.md) | Start the visual editor in your browser |
 | [`clavesa version`](clavesa_version.md) | Print the clavesa version |
 | [`clavesa workspace`](clavesa_workspace.md) | Manage workspaces |

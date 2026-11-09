@@ -119,6 +119,11 @@ type Pipeline struct {
 	// the emitted .tf).
 	ExternalBuckets []string
 
+	// KinesisStreams are the Kinesis data streams the pipeline's
+	// transforms read (kind=kinesis sources). Each gets read-only access
+	// in the runner role's KinesisRead statement.
+	KinesisStreams []KinesisStream
+
 	// UpstreamSchemas is the list of DISTINCT sanitized schema identifiers
 	// this pipeline reads cross-pipeline via `external_inputs` (GH #4). Each
 	// schema gets one pair of aws_lakeformation_permissions in the consumer's
@@ -162,6 +167,13 @@ func (p Pipeline) upstreamAWSName(producer string) string {
 		return n
 	}
 	return "clavesa-" + producer
+}
+
+// KinesisStream names one stream the runner reads. Region empty means the
+// deploy region.
+type KinesisStream struct {
+	Name   string
+	Region string
 }
 
 // UnityCatalogConfig is the workspace's Databricks connection as the
@@ -437,6 +449,9 @@ func emitGlueCatalogDB(b *strings.Builder, p Pipeline) {
 	// system catalog. This is the "owner" read role; finer roles
 	// (analyst/bi/...) layer on later.
 	fmt.Fprintf(b, "data \"aws_caller_identity\" \"clavesa_owner\" {}\n\n")
+	if len(p.KinesisStreams) > 0 {
+		fmt.Fprintf(b, "data \"aws_region\" \"clavesa_kinesis\" {}\n\n")
+	}
 
 	fmt.Fprintf(b, "# Glue catalog database — per-pipeline output namespace (ADR-016).\n")
 	fmt.Fprintf(b, "# location_uri is required for Spark's Glue Hive Client to resolve\n")
@@ -748,6 +763,22 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 		for _, bucket := range p.ExternalBuckets {
 			fmt.Fprintf(b, "          \"arn:aws:s3:::%s\",\n", bucket)
 			fmt.Fprintf(b, "          \"arn:aws:s3:::%s/*\",\n", bucket)
+		}
+		fmt.Fprintf(b, "      ]},\n")
+	}
+
+	// Kinesis read — the streams of kind=kinesis sources.
+	if len(p.KinesisStreams) > 0 {
+		fmt.Fprintf(b, "      { Sid = \"KinesisRead\", Effect = \"Allow\", Action = [\n")
+		fmt.Fprintf(b, "          \"kinesis:DescribeStream\", \"kinesis:DescribeStreamSummary\", \"kinesis:ListShards\",\n")
+		fmt.Fprintf(b, "          \"kinesis:GetShardIterator\", \"kinesis:GetRecords\",\n")
+		fmt.Fprintf(b, "      ], Resource = [\n")
+		for _, ks := range p.KinesisStreams {
+			region := "${data.aws_region.clavesa_kinesis.region}"
+			if ks.Region != "" {
+				region = ks.Region
+			}
+			fmt.Fprintf(b, "          \"arn:aws:kinesis:%s:${data.aws_caller_identity.clavesa_owner.account_id}:stream/%s\",\n", region, ks.Name)
 		}
 		fmt.Fprintf(b, "      ]},\n")
 	}

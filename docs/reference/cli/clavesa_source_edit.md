@@ -27,15 +27,19 @@ clavesa source edit <name> [flags]
 ```
       --bucket string                S3 bucket name (kind=s3)
       --credentials string           name of a registered credential; pass "" to clear
+      --endpoint string              kind=kinesis: endpoint URL override (LocalStack); pass "" to clear
       --format string                data format (parquet, csv, json, tsv)
-      --from string                  URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog
-      --kind string                  source kind (http, s3, unity-catalog)
+      --from string                  URL shorthand: https://… for kind=http, s3://… for kind=s3, uc://catalog.schema.table for kind=unity-catalog, kinesis://<stream> for kind=kinesis
+      --kind string                  source kind (http, s3, unity-catalog, kinesis)
       --manage-notifications         kind=s3: have terraform manage the bucket's EventBridge notification config
       --no-trigger                   kind=s3: new files do not start runs; the pipeline runs on its schedule and drains the queue then
       --partitions strings           kind=s3: comma-separated Hive partition keys; pass "" to clear
       --prefix string                S3 key prefix (kind=s3); auto-suffixed with /
       --read-option stringToString   repeatable Spark read option for delimited text (format=tsv/csv): delimiter, comment, header, columns (default [])
+      --region string                Kinesis stream region (kind=kinesis); pass "" for the deploy region
       --start-from string            kind=s3 with --partitions: watermark seed ("all" | "now" | "<cursor>")
+      --starting-position string     kind=kinesis: TRIM_HORIZON or LATEST; pass "" for the default
+      --stream string                Kinesis data stream name (kind=kinesis)
       --table string                 Unity Catalog table <catalog>.<schema>.<table> (kind=unity-catalog)
 ```
 

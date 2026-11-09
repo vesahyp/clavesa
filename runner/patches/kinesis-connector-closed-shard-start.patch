@@ -1,0 +1,32 @@
+Read closed shards on a fresh start (no shard state from a checkpoint).
+Upstream v2.0.0 (dd327d1) marks a closed shard it has not seen before as
+ShardEnd, so a query that starts on a stream that already has a closed shard
+skips that shard's retained records: data loss on a first start or a
+recovery run after a reshard. Later batches keep the upstream rule.
+Found by clavesa make test-stream (2026-11-01).
+
+--- a/src/main/scala/org/apache/spark/sql/connector/kinesis/ShardSyncer.scala
++++ b/src/main/scala/org/apache/spark/sql/connector/kinesis/ShardSyncer.scala
+@@ -274,7 +274,21 @@
+       } else {
+         AddShardInfoForAncestors(shardId,
+           latestShards, initialPosition, prevShardsList, newShardsInfoMap, memoizationContext)
+-        newShardsInfoMap.put(shardId, new ShardInfo(shardId, new ShardEnd()))
++        // clavesa patch: on a fresh start (no shard state from a checkpoint)
++        // a closed shard still holds records until the stream retention
++        // expires them, so start it at the initial position. Upstream marks
++        // it ShardEnd, which skips those records when a query starts after a
++        // reshard. Later batches keep the upstream rule: a closed shard that
++        // is missing from the previous offsets was already read to its end
++        // (finished shards drop out of the offsets).
++        if (prevShardsList.isEmpty) {
++          if (!newShardsInfoMap.contains(shardId)) {
++            newShardsInfoMap.put(shardId,
++              new ShardInfo(shardId, initialPosition.shardPosition(shardId)))
++          }
++        } else {
++          newShardsInfoMap.put(shardId, new ShardInfo(shardId, new ShardEnd()))
++        }
+       }
+     }
+   }

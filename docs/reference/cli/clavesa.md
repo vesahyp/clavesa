@@ -36,6 +36,7 @@ Quick start:
 - [clavesa runner](clavesa_runner.md) — Manage the PySpark runner image (Python deps, etc.)
 - [clavesa source](clavesa_source.md) — Manage workspace input sources (registry)
 - [clavesa sql](clavesa_sql.md) — SparkSQL tooling (parse-check, lint)
+- [clavesa stream](clavesa_stream.md) — Run stream nodes (Kinesis, Kafka) into Delta tables
 - [clavesa ui](clavesa_ui.md) — Start the visual editor in your browser
 - [clavesa version](clavesa_version.md) — Print the clavesa version
 - [clavesa workspace](clavesa_workspace.md) — Manage workspaces

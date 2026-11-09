@@ -27,6 +27,7 @@ How data actually gets in — each standalone, swap in your own source.
 Start with the **[getting-started guide](../databricks/getting-started.md)**: install, connect your workspace, run a step in shadow mode on your own bucket, compare daily, switch. The two recipes below go deeper.
 
 - **[feed-a-databricks-job](feed-a-databricks-job.md)** — run a cheap step of a Databricks pipeline on clavesa compute, write its table into Unity Catalog under the same name (or take over the existing external table), push lineage, and start the Databricks job that comes next. Gated by `make smoke-databricks` against a live workspace, not by `verify-cookbook`.
+- **[kinesis-to-unity-catalog](kinesis-to-unity-catalog.md)** — a step that reads an Amazon Kinesis stream: each scheduled run drains what arrived since the last one into a Delta table in Unity Catalog, exactly once, on Fargate or Lambda. Gated by `make smoke-kinesis` against a real one-shard stream, not by `verify-cookbook`.
 - **[replace-a-databricks-step](replace-a-databricks-step.md)**: the rollout recipe for that at work. A read-only preflight that lists every grant an admin must make, shadow mode (clavesa writes a second table next to the step's), the daily per-day comparison (`clavesa pipeline databricks-compare`, pass or fail, no DBUs), the history copy, the switch and the roll-back. Gated by `make smoke-databricks-shadow` against a live workspace.
 
 ## Operations & languages

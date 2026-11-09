@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.24.0] — 2026-11-09
+
+### Added
+- **Kinesis streams as a pipeline input** ([ADR-028](docs/decisions/028-kinesis-stream-source.md)). `clavesa source register <name> --kind kinesis --stream <stream>` (or `--from kinesis://<stream>`, and on `/sources` in the UI) registers an Amazon Kinesis Data Stream. A transform that reads it drains the stream in each pipeline run, on Lambda or Fargate: a Spark Structured Streaming query (the AWS open-source Kinesis connector) reads from a checkpoint in the clavesa bucket to the end of the stream, runs the node's SQL on each micro-batch, and appends to the output Delta table. No staging copy, and exactly once: a run stopped part-way writes nothing twice, and the next run continues. The output is published to Unity Catalog with lineage, and the next Databricks jobs start, like any clavesa step. Recipe: [kinesis-to-unity-catalog](docs/cookbook/kinesis-to-unity-catalog.md). Proven on a real stream by `make smoke-kinesis`: Fargate, then Lambda on the same checkpoint, a run stopped mid-drain while events arrived (2,900 of 3,500 rows committed, the next run brought it to exactly 3,500), counts, sums and sample rows checked in Databricks.
+- **Stream nodes, local** (ADR-028). `clavesa stream run <name>` runs a Spark Structured Streaming query that reads a Kinesis stream (`--kind kinesis`) or a Kafka topic (`--kind kafka`) into the Delta table `<catalog>__<schema>.<name>` in the local warehouse. `--drain` stops once the stream is caught up, `--record-key` drops events the producer sent twice, and `--recover` rebuilds after a lost checkpoint without duplicates. `make test-stream` proves it against LocalStack and Kafka.
+
 ## [v2.23.0] — 2026-11-09
 
 This release also carries v2.22.0 (per-phase run timings), which was not published on its own.

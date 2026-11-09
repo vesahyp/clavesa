@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -22,7 +22,8 @@ dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
 
 sync-runner: ## Copy runner/ → internal/runner/files/ so the embedded copy used by `clavesa workspace init` stays in sync
-	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/spark_conf.py runner/unity_catalog.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/stream_query.py runner/spark_conf.py runner/unity_catalog.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	mkdir -p internal/runner/files/patches && cp runner/patches/*.patch internal/runner/files/patches/
 
 sync-modules: ## Copy modules/ → internal/modules/files/ (tracked .tf/.py/.md/.hcl files only) so `terraform init` resolves embedded modules locally
 	@rm -rf internal/modules/files
@@ -167,11 +168,17 @@ release-public: release-check ## Snapshot the dev tree into the public clavesa r
 sync-public: ## Publish docs/source updates to the public repo on main, NO version bump or tag (cookbook / README / web-tracker). No build, no gates. Version-bearing changes use release-public.
 	@./scripts/sync-public.sh
 
+test-stream: $(if $(SKIP_BUILD),,build) ## Stream mode (ADR-028 slice 1) on this machine: LocalStack Kinesis + Kafka containers, exact row counts after kill -9 cycles, a shard split, producer duplicates and a checkpoint reset. Docker-gated, ~25 min, no AWS
+	@./scripts/test-stream.sh
+
 smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
 	@./scripts/cloud-smoke.sh run
 
 smoke-databricks: $(if $(SKIP_BUILD),,build) ## Unity Catalog gate (ADR-027): run a published pipeline on a connected, deployed workspace and assert the table, lineage and downstream Databricks run in Databricks (UC_SMOKE_WS / UC_SMOKE_PIPELINE)
 	bash scripts/uc-smoke.sh
+
+smoke-kinesis: $(if $(SKIP_BUILD),,build) ## Kinesis gate (ADR-028): a 1-shard stream, a pipeline that reads it on Fargate then Lambda, counts and samples checked in Databricks, a run stopped mid-drain; deletes the stream on exit (KIN_SMOKE_* env, see the script). Under 1 USD
+	bash scripts/kinesis-smoke.sh
 
 smoke-databricks-shadow: $(if $(SKIP_BUILD),,build) ## Shadow-mode gate: preflight, a shadow run and a passing comparison on the test workspace (UC_SHADOW_* env, see the script); no DBUs
 	bash scripts/uc-shadow-smoke.sh

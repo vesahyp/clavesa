@@ -599,3 +599,35 @@ func TestEmit_LegacyNamesUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// TestEmit_KinesisStreams: a kind=kinesis source adds a KinesisRead
+// statement on the stream ARN; no streams, no statement.
+func TestEmit_KinesisStreams(t *testing.T) {
+	t.Parallel()
+	off, err := Emit(twoTransforms())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(off, "KinesisRead") || strings.Contains(off, "clavesa_kinesis") {
+		t.Errorf("pipeline without Kinesis streams mentions Kinesis:\n%s", off)
+	}
+	p := twoTransforms()
+	p.KinesisStreams = []KinesisStream{{Name: "events"}, {Name: "other", Region: "eu-west-1"}}
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wants := []string{
+		`Sid = "KinesisRead"`,
+		`"kinesis:DescribeStream"`, `"kinesis:DescribeStreamSummary"`, `"kinesis:ListShards"`,
+		`"kinesis:GetShardIterator"`, `"kinesis:GetRecords"`,
+		`"arn:aws:kinesis:${data.aws_region.clavesa_kinesis.region}:${data.aws_caller_identity.clavesa_owner.account_id}:stream/events"`,
+		`"arn:aws:kinesis:eu-west-1:${data.aws_caller_identity.clavesa_owner.account_id}:stream/other"`,
+		`data "aws_region" "clavesa_kinesis" {}`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(out, w) {
+			t.Errorf("Emit output missing %q", w)
+		}
+	}
+}

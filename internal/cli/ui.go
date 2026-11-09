@@ -138,6 +138,8 @@ func toAPISpec(s tuiservice.SourceSpec) api.SourceSpec {
 		ManageBucketNotifications: s.ManageBucketNotifications,
 		NoTrigger:                 s.NoTrigger,
 		Table:                     s.Table,
+		Stream:                    s.Stream, Region: s.Region,
+		StartingPosition: s.StartingPosition, Endpoint: s.Endpoint,
 	}
 }
 
@@ -150,6 +152,8 @@ func toServiceSpec(s api.SourceSpec) tuiservice.SourceSpec {
 		ManageBucketNotifications: s.ManageBucketNotifications,
 		NoTrigger:                 s.NoTrigger,
 		Table:                     s.Table,
+		Stream:                    s.Stream, Region: s.Region,
+		StartingPosition: s.StartingPosition, Endpoint: s.Endpoint,
 	}
 }
 

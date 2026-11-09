@@ -127,7 +127,7 @@ export function Sources() {
 // drift, the registered spec still reflects the server, not this.
 function inferFromURL(
   url: string,
-): { kind: string; bucket?: string; prefix?: string; table?: string; format: string } | null {
+): { kind: string; bucket?: string; prefix?: string; table?: string; stream?: string; format: string } | null {
   const u = url.trim();
   if (!u) return null;
   const fmtFromName = (name: string): string => {
@@ -143,6 +143,9 @@ function inferFromURL(
   };
   if (u.startsWith("uc://")) {
     return { kind: "unity-catalog", table: u.slice("uc://".length), format: "" };
+  }
+  if (u.startsWith("kinesis://")) {
+    return { kind: "kinesis", stream: u.slice("kinesis://".length), format: "" };
   }
   if (u.startsWith("s3://")) {
     const rest = u.slice("s3://".length);
@@ -175,7 +178,9 @@ function SourceForm({
       ? `s3://${editing.bucket}/${editing.prefix}`
       : editing.kind === "unity-catalog"
         ? `uc://${editing.table}`
-        : editing.url
+        : editing.kind === "kinesis"
+          ? `kinesis://${editing.stream}`
+          : editing.url
     : "";
   const [name, setName] = useState(editing?.name ?? "");
   const [url, setUrl] = useState(initialUrl);
@@ -199,6 +204,10 @@ function SourceForm({
     editing?.manage_bucket_notifications ?? false,
   );
   const [noTrigger, setNoTrigger] = useState(editing?.no_trigger ?? false);
+  const [region, setRegion] = useState(editing?.region ?? "");
+  const [startingPosition, setStartingPosition] = useState(
+    editing?.starting_position ?? "",
+  );
   const [busy, setBusy] = useState(false);
   const credList = useCredentials();
 
@@ -223,11 +232,16 @@ function SourceForm({
       const isS3 = inferFromURL(url)?.kind === "s3";
       // A uc:// source takes only the table: no format, no credential.
       const isUC = inferFromURL(url)?.kind === "unity-catalog";
+      // A kinesis:// source takes the stream plus region and starting
+      // position: no format, no credential.
+      const isKinesis = inferFromURL(url)?.kind === "kinesis";
       const payload = {
         name,
         url,
-        credentials: isUC ? undefined : credentials || undefined,
-        format: isUC ? undefined : format || undefined,
+        credentials: isUC || isKinesis ? undefined : credentials || undefined,
+        format: isUC || isKinesis ? undefined : format || undefined,
+        region: isKinesis ? region || undefined : undefined,
+        starting_position: isKinesis ? startingPosition || undefined : undefined,
         partitions: isS3 && parts.length ? parts : undefined,
         start_from: isS3 ? startFrom || undefined : undefined,
         manage_bucket_notifications:
@@ -260,7 +274,7 @@ function SourceForm({
             data-testid="source-name-input"
           />
           <Input
-            placeholder="https://example.com/data.parquet  or  s3://bucket/prefix/"
+            placeholder="https://example.com/data.parquet  or  s3://bucket/prefix/  or  kinesis://stream"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             disabled={busy}
@@ -310,8 +324,13 @@ function SourceForm({
                   , prefix=<span className="text-foreground">{inf.prefix || "(whole bucket)"}</span>
                 </>
               )}
-              {inf.kind !== "unity-catalog" && <>, format=</>}
-              {inf.kind === "unity-catalog" ? null : effectiveFormat ? (
+              {inf.kind === "kinesis" && (
+                <>
+                  , stream=<span className="text-foreground">{inf.stream || "?"}</span>
+                </>
+              )}
+              {inf.kind !== "unity-catalog" && inf.kind !== "kinesis" && <>, format=</>}
+              {inf.kind === "unity-catalog" || inf.kind === "kinesis" ? null : effectiveFormat ? (
                 <span className="text-foreground">{effectiveFormat}</span>
               ) : (
                 <span className="italic">no extension — set it under Advanced</span>
@@ -322,6 +341,28 @@ function SourceForm({
             </p>
           );
         })()}
+        {inferFromURL(url)?.kind === "kinesis" && (
+          <div className="grid gap-3 sm:grid-cols-2" data-testid="kinesis-fields">
+            <Input
+              placeholder="region (default: the deploy region)"
+              value={region}
+              onChange={(e) => setRegion(e.target.value)}
+              disabled={busy}
+              data-testid="source-region-input"
+            />
+            <select
+              value={startingPosition}
+              onChange={(e) => setStartingPosition(e.target.value)}
+              disabled={busy}
+              className="h-9 rounded-md border bg-background px-2 text-sm"
+              data-testid="source-starting-position-select"
+            >
+              <option value="">starting position: TRIM_HORIZON (default)</option>
+              <option value="TRIM_HORIZON">TRIM_HORIZON</option>
+              <option value="LATEST">LATEST</option>
+            </select>
+          </div>
+        )}
         <div className="flex items-center gap-3">
           <label className="text-xs text-muted-foreground">
             Credentials (optional):
@@ -564,7 +605,9 @@ function SourceRow({
                     ? `s3://${spec.bucket}/${spec.prefix}`
                     : spec.kind === "unity-catalog"
                       ? `uc://${spec.table}`
-                      : spec.url
+                      : spec.kind === "kinesis"
+                        ? `kinesis://${spec.stream}`
+                        : spec.url
                 }
                 query={query}
               />

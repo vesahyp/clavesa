@@ -27,6 +27,10 @@ const SourceSpec = z.object({
   manage_bucket_notifications: z.boolean().optional().default(false),
   no_trigger: z.boolean().optional().default(false),
   table: z.string().optional().default(""),
+  stream: z.string().optional().default(""),
+  region: z.string().optional().default(""),
+  starting_position: z.string().optional().default(""),
+  endpoint: z.string().optional().default(""),
 });
 export type SourceSpec = z.infer<typeof SourceSpec>;
 
@@ -117,6 +121,10 @@ export async function registerSource(spec: {
   manage_bucket_notifications?: boolean;
   no_trigger?: boolean;
   table?: string;
+  stream?: string;
+  region?: string;
+  starting_position?: string;
+  endpoint?: string;
 }): Promise<SourceSpec> {
   // kind omitted on purpose — the server sniffs `s3://` vs `https://`
   // out of the URL field. Caller can still pass kind explicitly when
@@ -147,6 +155,10 @@ export async function updateSource(
     manage_bucket_notifications?: boolean;
     no_trigger?: boolean;
     table?: string;
+    stream?: string;
+    region?: string;
+    starting_position?: string;
+    endpoint?: string;
   },
 ): Promise<SourceSpec> {
   return requestParsed(`/sources/${encodeURIComponent(name)}`, SourceSpec, {

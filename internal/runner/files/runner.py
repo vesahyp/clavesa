@@ -2712,6 +2712,114 @@ def _apply_snapshot_props(props):
     )
 
 
+# Seconds a stream drain leaves before the Lambda limit: the stop, the Unity
+# Catalog publish and the node_runs row run after it.
+_STREAM_LAMBDA_MARGIN_S = 120
+# The longest a drain runs outside Lambda (Fargate, local). The next run
+# continues from the checkpoint, so a cap only bounds one run's length.
+_STREAM_MAX_SECONDS = int(os.environ.get("CLAVESA_STREAM_MAX_SECONDS", "3000"))
+
+
+def _stream_deadline(context) -> float:
+    """Wall-clock time a drain must stop by, from the Lambda context when
+    there is one."""
+    now = time.time()
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        return now + max(30.0, remaining() / 1000.0 - _STREAM_LAMBDA_MARGIN_S)
+    return now + _STREAM_MAX_SECONDS
+
+
+def _run_stream_transform(spark, context, inputs, outputs, logic, language, timer):
+    """ADR-028: one transform whose only input is a Kinesis stream.
+
+    The run drains the stream from its Spark checkpoint (under the
+    warehouse, ``_streams/<table>``) to the end, applies the node's SQL to
+    each micro-batch (the input alias is the view the SQL reads) and
+    appends to the output Delta table with Delta's idempotent-write options,
+    so a batch Spark replays after a crash is not written twice. Then the
+    output is published to Unity Catalog like any other output.
+    """
+    import stream_query as _sq  # noqa: PLC0415
+
+    if len(inputs) != 1 or len(outputs) > 1:
+        raise RuntimeError("a kinesis input must be the transform's only input, and the transform has one "
+                           "output (ADR-028)")
+    if language != "sql":
+        raise RuntimeError("a transform that reads a kinesis source takes SQL (ADR-028)")
+    alias, src = next(iter(inputs.items()))
+    key, dest = next(iter(outputs.items())) if outputs else ("default", "")
+    if isinstance(dest, dict) and dest.get("mode") not in (None, "", "append"):
+        raise RuntimeError(f"output {key!r}: a kinesis input appends; mode {dest.get('mode')!r} is not "
+                           "supported (ADR-028)")
+    spec = _resolve_output(key, dest, all_outputs={key: None})
+    if spec["kind"] != "delta_table":
+        raise RuntimeError(f"output {key!r}: a kinesis input writes a Delta table, not a path")
+    table_id = spec["target"]
+    with timer.measure("catalog"):
+        _ensure_database(spark, table_id.rsplit(".", 1)[0])
+
+    uc_cfg = _uc.config()
+    uc_client = _uc.Client(uc_cfg) if uc_cfg and (uc_cfg["publish"] or uc_cfg["lineage"]) else None
+    uc_ctx = None
+    if uc_client is not None and uc_cfg["publish"]:
+        with timer.measure("unity_catalog"):
+            uc_ctx = _uc.prepare(uc_client, uc_cfg, spark, table_id, spec)
+
+    warehouse = os.environ.get("CLAVESA_WAREHOUSE", "/tmp/clavesa-warehouse").rstrip("/")
+    region = src.get("region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "")
+    endpoint = src.get("endpoint_url") or (f"https://kinesis.{region}.amazonaws.com" if region else "")
+    if not endpoint:
+        raise RuntimeError(f"input {alias!r}: no region for the kinesis stream (set the source's region or AWS_REGION)")
+    location = (uc_ctx or {}).get("create_location") or ""
+    cfg = _sq.StreamConfig(
+        name=os.environ.get("CLAVESA_NODE", key),
+        kind="kinesis",
+        table=table_id,
+        # The Spark checkpoint uses Hadoop's FileContext API, which has no
+        # s3:// implementation in the runner; S3A has one.
+        checkpoint_root=(("s3a://" + warehouse.split("://", 1)[1]) if warehouse.startswith("s3://") else warehouse)
+        + f"/_streams/{table_id}",
+        kinesis={
+            "stream_name": src["stream_name"],
+            "endpoint_url": endpoint,
+            "region": region,
+            "starting_position": src.get("starting_position") or "TRIM_HORIZON",
+        },
+        sql=logic,
+        view=alias,
+        trigger_seconds=int(src.get("trigger_seconds") or 10),
+        drain=True,
+        partition_by=(spec.get("partition_by") or None),
+        location=location,
+        deadline_epoch=_stream_deadline(context),
+        optimize_every_seconds=0,
+    )
+    w_tok = timer.start("write", detail="outputs", key=key)
+    result = _sq.run(cfg, spark=spark)
+    timer.stop(w_tok)
+    print(f"[clavesa] stream {alias!r} -> {table_id}: {result['rows_written']} rows in {result['batches']} "
+          f"batch(es), generation {result['generation']}, "
+          f"{'caught up' if result['caught_up'] else 'stopped at the time limit; the next run continues'}",
+          file=sys.stderr, flush=True)
+
+    with timer.measure("glue_sync"):
+        _sync_glue_table_schema(table_id, spark.table(table_id).schema)
+    response: dict[str, Any] = {"status": "ok", "outputs": {key: table_id}, "stream": result}
+    if uc_ctx is not None:
+        with timer.measure("unity_catalog"):
+            rec = _uc.publish(uc_client, uc_cfg, spark, table_id, uc_ctx)
+            if uc_cfg["lineage"]:
+                try:
+                    _uc.push_lineage(uc_client, uc_cfg, inputs, rec["full_name"], spark.table(table_id).schema.fieldNames())
+                    rec["lineage"] = "pushed"
+                except Exception as lin_exc:  # noqa: BLE001
+                    rec["lineage"] = f"failed: {lin_exc}"
+                    print(f"[clavesa] unity catalog: lineage push failed: {lin_exc}", file=sys.stderr, flush=True)
+        response["unity_catalog"] = [{"output": key, **rec}]
+    return response
+
+
 def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
     """Inner body of handler() — runs one transform invocation. Extracted so
     handler() can wrap it in timing + node_runs telemetry without nesting
@@ -2795,6 +2903,14 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
     _apply_snapshot_props(snapshot_props)
 
     logic = _read_text(logic_path)
+
+    # ADR-028: a transform that reads a Kinesis stream drains it with Spark
+    # Structured Streaming instead of the batch read below.
+    if any(isinstance(d, dict) and d.get("kind") == "kinesis" for d in inputs.values()):
+        if backfill is not None:
+            raise RuntimeError("a transform that reads a kinesis source cannot be backfilled; "
+                               "the stream keeps only its retention window")
+        return _run_stream_transform(spark, context, inputs, outputs, logic, language, timer)
 
     # Resolve inputs. Track watermark advances to commit after outputs succeed.
     input_dfs: dict[str, Any] = {}

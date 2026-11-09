@@ -92,6 +92,9 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	if err != nil {
 		return fmt.Errorf("orchestration: %w", err)
 	}
+	if err := s.validateKinesisNodes(&g); err != nil {
+		return fmt.Errorf("orchestration: %w", err)
+	}
 	transformIDs := make([]string, 0, len(topoOrder))
 	for _, id := range topoOrder {
 		if nodeByID[id].Type == "transform" && nodeEnabled(nodeByID[id]) {
@@ -303,6 +306,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		UpstreamPipelines: upstreamProducers,
 		Transforms:        transforms,
 		ExternalBuckets:   externalBuckets,
+		KinesisStreams:    s.kinesisStreamsOf(&g),
 		UpstreamSchemas:   upstreamSchemas,
 		UnityCatalog:      ucConfig,
 	})
@@ -440,6 +444,10 @@ func (s *Service) buildNodeInputsExpr(id, catalog string, nodeByID map[string]gr
 					alias, spec.URL, spec.Format, credBlock))
 			case sources.KindUnityCatalog:
 				entries = append(entries, fmt.Sprintf(`%s = { kind = "uc_table", table = %q }`, alias, spec.Table))
+			case sources.KindKinesis:
+				stream, region, pos, endpoint := kinesisDescriptorFields(spec)
+				entries = append(entries, fmt.Sprintf(`%s = { kind = "kinesis", spec_name = %q, stream_name = %q, region = %q, starting_position = %q, endpoint_url = %q }`,
+					alias, spec.Name, stream, region, pos, endpoint))
 			case "s3":
 				// Notification-drain ingest: the runner drains this source's
 				// SQS queue (S3 ObjectCreated events) for new keys when the
