@@ -68,6 +68,9 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import unity_catalog as _uc
 
+# ADR-031 Databricks bundle tasks; stdlib-only at import time.
+import bundle_task as _bundle_task  # noqa: E402
+
 # Directory Spark writes its event log into (see spark_conf.py:
 # spark.eventLog.dir). The runner tails the single log file in here after
 # each transform to aggregate per-invocation task metrics onto node_runs.
@@ -276,6 +279,17 @@ def _is_spark_session_dead(session) -> bool:
         return True
     except Exception:  # noqa: BLE001 — any unexpected failure ⇒ treat as dead
         return True
+
+
+def _reset_spark_session_if_dead():
+    """After a failed bundle task: recycle the Spark session only when it
+    died, so the next task (run_if ALL_DONE, a retry) gets a live one and
+    a healthy session is kept."""
+    try:
+        if _SPARK is not None and _is_spark_session_dead(_SPARK):
+            _reset_spark_session()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _reset_spark_session() -> None:
@@ -2902,6 +2916,12 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
         spark = _spark()
     _apply_snapshot_props(snapshot_props)
 
+    # ADR-031: a Databricks bundle task. Its code writes its own tables, so
+    # there are no inputs to resolve and no output mode to apply.
+    if language == "task":
+        with timer.measure("transform"):
+            return _bundle_task.run_node(spark, event)
+
     logic = _read_text(logic_path)
 
     # ADR-028: a transform that reads a Kinesis stream drains it with Spark
@@ -4391,6 +4411,9 @@ def handler(event, context):
     Lambda or doing the write from Athena (Athena's MERGE syntax
     requires column enumeration and lacks `SET *`; SparkSQL accepts both).
     """
+    if isinstance(event, dict) and str(event.get("_operation") or "").startswith("dbx_"):
+        # ADR-031: a Databricks segment of a mixed bundle job (no Spark).
+        return _bundle_task.dbx_operation(event)
     if isinstance(event, dict) and event.get("_operation"):
         return _run_operation(event)
 
@@ -4880,6 +4903,45 @@ def _run_pipeline_bundle(event, context):
     skipped_set: set[str] = set()
     overall_status = "ok"
     failed_node: str | None = None
+    bundle_states = None
+
+    # ADR-031: a pipeline generated from a Databricks bundle runs its tasks
+    # with the job's semantics (run_if, outcomes, retries, timeouts) in
+    # bundle_task.run_job; each task attempt still goes through handler(),
+    # so node_runs rows and progress markers are written as for any node.
+    event = _bundle_task.prepare_cloud_event(event)
+    if isinstance(event.get("_bundle_job"), dict):
+        def _task_handler(sub, ctx):
+            global _LAST_NODE_TIMING
+            node = sub["_bundle_task"].get("task_key", "")
+            os.environ["CLAVESA_NODE"] = node
+            os.environ["CLAVESA_LANGUAGE"] = "task"
+            os.environ["CLAVESA_LOGIC_S3_PATH"] = os.environ.get("CLAVESA_LOGIC_S3_PATH") or "bundle-job.json"
+            sub.setdefault("inputs", {})
+            sub.setdefault("outputs", {})
+            sub["_sf_execution_arn"] = sf_execution_arn
+            sub["_trigger"] = trigger
+            _LAST_NODE_TIMING = None
+            try:
+                return handler(sub, ctx)
+            except Exception:
+                _reset_spark_session_if_dead()
+                raise
+
+        def _not_run(node, state):
+            _now = int(time.time() * 1000)
+            _write_progress(
+                _progress_target(os.environ, sf_execution_arn, node),
+                {"status": "skipped", "started_ms": _now, "ended_ms": _now, "output_rows": None,
+                 "error": state, "updated_ms": _now, "metrics": {}},
+            )
+
+        bundle_resp = _bundle_task.run_job(event, context, _task_handler, progress=_not_run)
+        results = bundle_resp["transforms"]
+        overall_status = bundle_resp["status"]
+        failed_node = bundle_resp["failed_node"]
+        bundle_states = bundle_resp["states"]
+        transforms = []  # the loop below has nothing left to run
 
     for t in transforms:
         if not isinstance(t, dict):
@@ -4936,6 +4998,10 @@ def _run_pipeline_bundle(event, context):
             sub_event["_force"] = True
             if force_nodes:
                 sub_event["_force_nodes"] = force_nodes
+        # ADR-031: a bundle task node carries its task and the run's job.
+        if isinstance(t.get("task"), dict):
+            sub_event["_bundle_task"] = t["task"]
+            sub_event["_bundle_job"] = event.get("_bundle_job") or {}
 
         # GH #43: if a prior successful run left enough shuffle/spill residue
         # that /tmp is already half-full, recycle the session now so Spark's
@@ -5033,6 +5099,8 @@ def _run_pipeline_bundle(event, context):
         "status": overall_status,
         "transforms": results,
         "failed_node": failed_node,
+        # ADR-031: a mixed bundle job's task states go to the next segment.
+        **({"states": bundle_states, "failed": overall_status == "failed"} if bundle_states is not None else {}),
         "runner": {
             "boot_ms": boot_ms,
             "total_ms": max(int(round((time.time() - run_t0) * 1000)), 0),
@@ -5068,8 +5136,12 @@ def _run_pipeline_bundle(event, context):
     # fire downstream pipelines. Local mode (`clavesa pipeline run`)
     # parses the dict directly via internal/service/run.go — keep
     # returning it there.
-    if overall_status == "failed" and os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
-        last = results[-1] if results else {}
+    # ADR-031: a segment of a mixed bundle job returns its states to the
+    # state machine, which fails the execution at its end.
+    in_segment = "_bundle_states" in event
+    if overall_status == "failed" and os.environ.get("AWS_LAMBDA_FUNCTION_NAME") and not in_segment:
+        failed_recs = [r for r in results if r.get("node") == failed_node and r.get("status") == "failed"]
+        last = failed_recs[0] if failed_recs else (results[-1] if results else {})
         raise RuntimeError(
             "clavesa runner: {node} failed ({cls}: {msg})".format(
                 node=failed_node,

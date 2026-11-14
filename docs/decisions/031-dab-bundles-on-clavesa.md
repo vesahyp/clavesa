@@ -1,16 +1,20 @@
 ---
-adr: 29
+adr: 31
 title: One Databricks bundle, two deploy targets; clavesa deploys DAB jobs as its own infrastructure
 date: 2026-11-14
-status: Proposed
+status: Accepted
 deciders: Vesa
 ---
 
-# ADR 029: A Databricks bundle deploys to Databricks or to clavesa
+# ADR 031: A Databricks bundle deploys to Databricks or to clavesa
 
-**Status**: Proposed (2026-11-14). Plan only; nothing in it is built. The
-three open questions were decided by Head Jeeves on 2026-11-14 (section
-"Decided 2026-11-14").
+**Status**: Accepted (2026-11-14). Vesa gave the go-ahead to build it on
+2026-11-14. The three open questions were decided by Head Jeeves on
+2026-11-14 (section "Decided 2026-11-14").
+
+This ADR was first written as ADR-029 in the public `clavesa` repo. That
+number was already taken here by ADR-029 (cheaper SQL on Unity Catalog
+tables), so it is ADR-031 in this repo.
 
 ## Context
 
@@ -192,8 +196,12 @@ target value, `--var`, `BUNDLE_VAR_*`), target overrides merged by
 ### 3. One job becomes one clavesa pipeline, generated and read-only
 
 `clavesa bundle deploy -t aws` turns each job of the target into one clavesa
-pipeline named `<bundle>_<job>`, generated into the clavesa workspace under
-`bundles/<bundle>/<job>/`. Each task becomes one node; `depends_on` becomes
+pipeline named `<bundle>_<job>`, generated into the clavesa workspace as the
+folder `<bundle>_<job>/`, next to the other pipelines (built that way in
+slice 3: the run path takes a pipeline's parent folder to be the workspace,
+so a deeper `bundles/<bundle>/<job>/` would not run). `bundle-job.json` in
+the folder holds the resolved job and marks it as generated, and `bundle/`
+holds a copy of the bundle's files. Each task becomes one node; `depends_on` becomes
 the node's parents. The generated files are derived, so they are not
 committed; `node edit` and the UI editor refuse a bundle pipeline and name
 the line in `databricks.yml` to change. Run history, logs, lineage, cost,
@@ -383,7 +391,9 @@ it.
   Clavesa never copies secret values out of Databricks: the team puts each
   one into Secrets Manager once, and the plan prints the commands, as
   getting-started step 3 does.
-- **Notifications.** One SNS topic per bundle target. Each address in a
+- **Notifications.** (Built in slice 7 as one SNS topic per job and
+  notification kind, in the job's own pipeline stack: a topic shared by
+  the target would need a stack of its own.) One SNS topic per bundle target. Each address in a
   job's `email_notifications` becomes an email subscription on it.
   `on_start`, `on_success` and `on_failure` become EventBridge rules on the
   state machine's execution status. Task-level notifications,
@@ -413,6 +423,13 @@ job itself:
    `runs/get` states until it ends. Waiting costs nothing, so a long
    Databricks task does not keep a Lambda or Fargate task running.
 3. A local run (`--compute local`) does the same from the CLI.
+
+Built in slice 9 with two limits: the clavesa segments of a mixed job run
+on Lambda (Fargate segments are not built; the plan warns), and the
+deployed job's ID comes from `databricks bundle summary -t <target>` with
+the team's own login at `clavesa bundle deploy`. The run-now and runs/get
+calls are made by the runner Lambda (`_operation: dbx_run_now /
+dbx_run_get`), so the state machine needs no HTTP connection of its own.
 
 Data crosses the boundary as tables only. A `{{tasks.<k>.values...}}`
 reference from one side to the other is refused at plan in v1.
@@ -464,7 +481,7 @@ reports every row below with the task, the file and line, and the fix. A
 | `spark.databricks.*` conf | `warn`, dropped |
 | `resources.pipelines` used by a task | `pipeline_task`, as above |
 | `sql_task` `query` / `dashboard` / `alert` | `refuse`, move the SQL into a file |
-| Databricks-only SQL, found by parsing every SQL file, `%sql` cell and literal `spark.sql` string: `ai_*` and `ai_query`, `read_files`, `vector_search`, `http_request`, `secret()`, `is_account_group_member`, `is_member`, `current_metastore`, `STREAM(...)`, `CREATE STREAMING TABLE`, `CREATE MATERIALIZED VIEW`, `APPLY CHANGES`, `COPY INTO`, `CLUSTER BY AUTO`, `GRANT`/`REVOKE`, `CREATE FUNCTION ... LANGUAGE PYTHON`, `SET TAGS` | `refuse` with the rewrite where there is one |
+| Databricks-only SQL, found by parsing every SQL file, `%sql` cell and literal `spark.sql` string: `ai_*` and `ai_query`, `vector_search`, `http_request`, `secret()`, `is_account_group_member`, `is_member`, `current_metastore`, `STREAM(...)`, `CREATE STREAMING TABLE`, `CREATE MATERIALIZED VIEW`, `APPLY CHANGES`, `COPY INTO`, `CLUSTER BY AUTO`, `GRANT`/`REVOKE`, `CREATE FUNCTION ... LANGUAGE PYTHON`, `SET TAGS` | `refuse` with the rewrite where there is one |
 | Python: `dlt` / `pyspark.pipelines` imports, `cloudFiles`, `dbutils.notebook.run`, `dbutils.library`, `dbfs:` and `/dbfs/` paths, Databricks Connect | `refuse` |
 | Notebook magics `%pip`, `%sh`, `%scala`, `%r` | `refuse` |
 | A written table with Delta features clavesa cannot write (deletion vectors, liquid clustering, row filters, column masks) | `refuse` (ADR-027 decision 6; needs `--check-cloud`) |
@@ -472,6 +489,12 @@ reports every row below with the task, the file and line, and the fix. A
 | `{{...}}` references not listed in section 7 | `refuse` |
 | Table names the plan cannot see and that `clavesa.tables` does not list | `refuse` |
 | An unknown key or task name in the `clavesa` variable | `refuse` |
+
+`read_files(...)` in batch SQL was on this list and is run instead (built
+with the end-to-end test, slice 11): the runner reads the files with
+`spark.read` (the `format` and the other options passed through) into a
+temporary view the statement then reads. Databricks' own default-sql
+example reads its input that way. `STREAM read_files(...)` stays refused.
 
 The list of Databricks-only functions is a file in the repo with a test per
 entry, so a missed function is a one-line fix. Code that builds SQL or
@@ -484,7 +507,9 @@ written.
 All commands take `--bundle <dir>` (default: the current directory) and
 `-t/--target` (default: the bundle's default target), and run the same
 service calls as the UI (ADR-015). The UI gets a read-only bundle page with
-the plan report, in a later slice.
+the plan report, in a later slice (built after slice 9: `/bundles`, with the
+plan report and the list of generated pipelines; `clavesa bundle list` is
+its CLI side).
 
 ```bash
 clavesa bundle plan   -t aws [--json] [--check-aws] [--check-cloud]
@@ -625,6 +650,24 @@ itself as an inventory of a team's jobs.
 - **Spark version skew**: Databricks runtimes ship Spark versions other
   than clavesa's 4.0.2, and code that depends on that difference behaves
   differently. The plan warns and does not prove anything.
+
+## Live proof, 2026-11-14 (slice 11)
+
+`make e2e-bundle` on the test workspace (`ucpub`, us-east-2) with Databricks'
+own default-sql example: the same bundle deployed with `databricks bundle
+deploy -t dbx` and `clavesa bundle deploy -t aws`, both runs green, and
+`clavesa bundle compare` PASS on both tables (107 and 31 partitions, the
+columns equal). The mixed target proved `run-now` with `only`: Databricks ran
+`orders_daily` and marked `orders_raw` DISABLED (the Consequences item
+below). Found and fixed on the way: `{{name}}` in a SQL file is a quoted
+string in Databricks; `read_files` is now run, not refused; a workspace whose
+modules were extracted before slice 3 lacked the task module; `catalog:
+unity` needs the runner's Glue access to the job's databases too; the runner
+image was pushed to the profile's region instead of the workspace's.
+
+Open: two clavesa targets of one bundle in one workspace share the
+pipeline `<bundle>_<job>` (the e2e's `aws` and `aws-mixed` do); a target
+name in the pipeline name would separate them.
 
 ## Decided 2026-11-14
 

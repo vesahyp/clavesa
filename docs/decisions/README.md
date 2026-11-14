@@ -43,4 +43,6 @@ Each ADR follows this structure:
 | [026](026-local-source-mirror.md) | Mirror s3 sources locally for local-warehouse runs | Accepted |
 | [027](027-unity-catalog-publish.md) | Clavesa replaces steps in existing Databricks pipelines, writing their existing Unity Catalog tables | Accepted (decision 6 and the work size open) |
 | [028](028-kinesis-stream-source.md) | A Kinesis stream is a workspace source, drained by Spark Structured Streaming in each scheduled run | Accepted |
-| [029](029-dab-bundles-on-clavesa.md) | One Databricks bundle, two deploy targets: clavesa deploys DAB jobs as its own infrastructure | Proposed |
+| [029](029-cheaper-sql-on-unity-catalog-tables.md) | Scheduled SQL moves into clavesa transforms; ad hoc SQL stays on a right-sized serverless warehouse; Athena through Glue federation later | Proposed |
+| [030](030-question-agent-over-mcp.md) | Ad hoc questions go to an agent whose queries run in DuckDB on Lambda through MCP, as the asking user; the warehouse stays for dashboards and fallback | Proposed |
+| [031](031-dab-bundles-on-clavesa.md) | One Databricks bundle, two deploy targets: a DAB job deploys to Databricks, to clavesa in the team's AWS account, or mixed per task | Accepted |

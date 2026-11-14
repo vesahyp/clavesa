@@ -141,6 +141,11 @@ type Pipeline struct {
 	// without a Databricks connection: the output is then byte-identical
 	// to before.
 	UnityCatalog *UnityCatalogConfig
+
+	// Bundle, when set, is a pipeline generated from a Databricks bundle
+	// job (ADR-031): see BundleConfig. Nil leaves the output unchanged.
+	Bundle *BundleConfig
+
 }
 
 // awsBase returns the HCL template fragment (no quotes) that starts every
@@ -252,12 +257,15 @@ func Emit(p Pipeline) (string, error) {
 	emitIAMRole(&b, p)
 	emitPipelineLambda(&b, p)
 	emitFargate(&b, p)
-	if p.fargate() {
+	if p.Bundle != nil && len(p.Bundle.Segments) > 0 {
+		emitSegmentStateMachine(&b, p)
+	} else if p.fargate() {
 		emitFargateStateMachine(&b, p)
 	} else {
 		emitStateMachine(&b, p)
 	}
 	emitSchedule(&b, p)
+	emitBundle(&b, p)
 	emitPoller(&b, p)
 	emitUpstreamTriggers(&b, p)
 	emitRunsWriter(&b, p)
@@ -409,6 +417,9 @@ func (p Pipeline) validate() error {
 	}
 	if len(p.Transforms) == 0 {
 		return fmt.Errorf("tfgen: at least one transform is required")
+	}
+	if p.Bundle != nil && len(p.Bundle.Segments) > 0 && p.fargate() {
+		return fmt.Errorf("tfgen: a mixed bundle job runs its clavesa segments on Lambda; Fargate segments are not built")
 	}
 	switch p.Compute {
 	case "", "lambda", ComputeFargate:
@@ -663,6 +674,9 @@ func writeRunnerEnv(b *strings.Builder, p Pipeline, in string) {
 	fmt.Fprintf(b, "%sCLAVESA_WATERMARKS          = \"s3://${%s}/${%s}/_watermarks/\"\n", in, p.BucketExpr, p.PipelineNameExpr)
 	fmt.Fprintf(b, "%sCLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest\n", in)
 	fmt.Fprintf(b, "%sCLAVESA_MODULE_VERSION      = \"%s\"\n", in, moduleVersionLiteral)
+	if p.Bundle != nil && p.Bundle.SecretsPrefix != "" {
+		fmt.Fprintf(b, "%sCLAVESA_DBX_SECRET_PREFIX   = %q\n", in, p.Bundle.SecretsPrefix)
+	}
 	if uc := p.UnityCatalog; uc != nil {
 		// ADR-027: the Unity Catalog publish. The secret is an ARN, read
 		// by the runner at run time; never the secret itself.
@@ -870,7 +884,11 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	emitArchitectures(b, p)
 	fmt.Fprintf(b, "  image_uri     = \"${local.pipeline_runner_repo_uri}@${data.aws_ecr_image.pipeline_runner.image_digest}\"\n")
 	fmt.Fprintf(b, "  timeout       = 900   # 15min — the Lambda max; one container handles every transform\n")
-	fmt.Fprintf(b, "  memory_size   = 3008  # New AWS accounts default to a 3008MB per-function quota; bump via Service Quotas + raise this if you need more headroom for Spark broadcast tables\n\n")
+	if p.Bundle != nil && p.Bundle.LambdaMemoryMB > 0 {
+		fmt.Fprintf(b, "  memory_size   = %d  # the bundle job's size (ADR-031)\n\n", p.Bundle.LambdaMemoryMB)
+	} else {
+		fmt.Fprintf(b, "  memory_size   = 3008  # New AWS accounts default to a 3008MB per-function quota; bump via Service Quotas + raise this if you need more headroom for Spark broadcast tables\n\n")
+	}
 	fmt.Fprintf(b, "  ephemeral_storage {\n")
 	fmt.Fprintf(b, "    size = 10240  # 10 GB — Spark shuffle/spill space; marginal cost ~$0.00026/run vs 512 MB default (GH #43)\n")
 	fmt.Fprintf(b, "  }\n\n")

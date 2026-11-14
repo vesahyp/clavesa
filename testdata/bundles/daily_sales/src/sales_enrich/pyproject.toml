@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sales_enrich"
+version = "0.1.0"
+description = "Adds country names to the clean orders"
+dependencies = ["pycountry"]
+
+[project.entry-points.packages]
+main = "sales_enrich.main:main"

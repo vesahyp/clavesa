@@ -1,0 +1,23 @@
+resources:
+  jobs:
+    nb:
+      name: notebooks
+      parameters:
+        - name: min_id
+          default: "3"
+      tasks:
+        - task_key: numbers
+          notebook_task:
+            notebook_path: ../notebooks/numbers.py
+            base_parameters:
+              count: "5"
+        - task_key: big
+          depends_on:
+            - task_key: numbers
+          notebook_task:
+            notebook_path: ../notebooks/big.sql
+        - task_key: summary
+          depends_on:
+            - task_key: big
+          notebook_task:
+            notebook_path: ../notebooks/summary.ipynb

@@ -17,3 +17,4 @@ export * from "./queries/sources";
 export * from "./queries/backfills";
 export * from "./queries/workspace";
 export * from "./queries/notebooks";
+export * from "./queries/bundles";

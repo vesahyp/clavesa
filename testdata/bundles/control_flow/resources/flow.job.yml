@@ -1,0 +1,66 @@
+resources:
+  jobs:
+    flow:
+      name: control_flow
+      parameters:
+        - name: letters
+          default: '["a", "b", "c"]'
+      tasks:
+        - task_key: count
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/count.py
+            parameters: ["{{job.parameters.letters}}"]
+
+        - task_key: check
+          depends_on: [{ task_key: count }]
+          condition_task:
+            op: GREATER_THAN
+            left: "{{tasks.count.values.n}}"
+            right: "2"
+
+        - task_key: each
+          depends_on: [{ task_key: check, outcome: "true" }]
+          for_each_task:
+            inputs: "{{job.parameters.letters}}"
+            task:
+              task_key: each_iteration
+              environment_key: default
+              spark_python_task:
+                python_file: ../src/item.py
+                parameters: ["{{input}}"]
+
+        - task_key: never
+          depends_on: [{ task_key: check, outcome: "false" }]
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/mark.py
+            parameters: ["main.cf.never"]
+
+        - task_key: flaky
+          depends_on: [{ task_key: each }]
+          max_retries: 1
+          min_retry_interval_millis: 100
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/flaky.py
+            parameters: ["{{job.run_id}}"]
+
+        - task_key: slow
+          depends_on: [{ task_key: flaky }]
+          timeout_seconds: 5
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/slow.py
+
+        - task_key: cleanup
+          depends_on: [{ task_key: slow }]
+          run_if: ALL_DONE
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/mark.py
+            parameters: ["main.cf.cleanup"]
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"

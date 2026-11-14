@@ -1,0 +1,27 @@
+# Databricks-only SQL: what `clavesa bundle plan` refuses (ADR-031 section 10).
+# One construct per line, fields split by " | ":
+#   kind | pattern | what to do instead | an example the plan must find
+# kind "function": a function call name, case-insensitive; a trailing * matches
+#   a prefix. kind "syntax": a regular expression over the SQL text, with
+#   comments and string literals blanked out, case-insensitive.
+# TestDatabricksOnlyList checks every example, so a missed construct is a
+# one-line fix here.
+function | ai_* | AI functions run only in Databricks: call the model from Python in the task | SELECT ai_query('endpoint', prompt) FROM t
+function | vector_search | vector search runs only in Databricks | SELECT * FROM vector_search(index => 'i', query => 'q')
+function | http_request | call the HTTP API from Python in the task | SELECT http_request(conn => 'c', method => 'GET', path => '/x')
+function | secret | read the secret in Python with dbutils.secrets.get | SELECT secret('scope', 'key') AS k
+function | try_secret | read the secret in Python with dbutils.secrets.get | SELECT try_secret('scope', 'key') AS k
+function | is_account_group_member | Databricks identity functions have no meaning outside Databricks | SELECT * FROM t WHERE is_account_group_member('admins')
+function | is_member | Databricks identity functions have no meaning outside Databricks | SELECT * FROM t WHERE is_member('admins')
+function | current_metastore | Unity Catalog metastore functions run only in Databricks | SELECT current_metastore()
+function | stream | streaming reads run only in Lakeflow pipelines; read the table as a batch | SELECT * FROM STREAM(main.s.events)
+syntax | \bCREATE\s+(?:OR\s+(?:REPLACE|REFRESH)\s+)?STREAMING\s+TABLE\b | streaming tables run only in Lakeflow pipelines: write the table from a task | CREATE OR REFRESH STREAMING TABLE events AS SELECT 1
+syntax | \bCREATE\s+(?:OR\s+(?:REPLACE|REFRESH)\s+)?MATERIALIZED\s+VIEW\b | materialized views run only in Databricks: write a table from a task | CREATE MATERIALIZED VIEW mv AS SELECT 1
+syntax | \bAPPLY\s+CHANGES\b | APPLY CHANGES runs only in Lakeflow pipelines: use MERGE INTO | APPLY CHANGES INTO target FROM STREAM(src) KEYS (id)
+syntax | \bAUTO\s+CDC\b | AUTO CDC runs only in Lakeflow pipelines: use MERGE INTO | CREATE FLOW f AS AUTO CDC INTO target FROM STREAM(src) KEYS (id)
+syntax | \bCOPY\s+INTO\b | read the files with spark.read and INSERT, or use a clavesa s3 source | COPY INTO main.s.t FROM 's3://b/p' FILEFORMAT = JSON
+syntax | \bCLUSTER\s+BY\s+AUTO\b | automatic liquid clustering is Databricks only: drop CLUSTER BY AUTO | CREATE TABLE t (a INT) CLUSTER BY AUTO
+syntax | \bGRANT\b | grants are set in Unity Catalog, not by the job: run them once in Databricks | GRANT SELECT ON TABLE main.s.t TO `analysts`
+syntax | \bREVOKE\b | grants are set in Unity Catalog, not by the job: run them once in Databricks | REVOKE SELECT ON TABLE main.s.t FROM `analysts`
+syntax | \bCREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?FUNCTION\b[^;]*\bLANGUAGE\s+PYTHON\b | Python UDFs in SQL are Databricks only: register the function with spark.udf in Python | CREATE FUNCTION f(x INT) RETURNS INT LANGUAGE PYTHON AS $$ return x $$
+syntax | \b(?:UN)?SET\s+TAGS\b | Unity Catalog tags are set in Databricks, not by the job | ALTER TABLE main.s.t SET TAGS ('pii' = 'true')

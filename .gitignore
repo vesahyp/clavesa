@@ -32,3 +32,6 @@ __pycache__/
 .verify-cookbook-green.json
 # Per-gate logs from make release-gates
 .gates/
+
+# make .venv-tools: the Python tools of verify-cookbook
+/.venv-tools/

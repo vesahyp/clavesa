@@ -1,0 +1,97 @@
+resources:
+  jobs:
+    daily_sales:
+      name: daily_sales
+      schedule:
+        quartz_cron_expression: "0 30 4 * * ?"
+        timezone_id: Europe/Helsinki
+      parameters:
+        - name: run_date
+          default: "2026-11-13"
+        - name: country
+          default: FI
+      email_notifications:
+        on_failure: [sales-data@example.com]
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 3600
+      job_clusters:
+        - job_cluster_key: small
+          new_cluster:
+            spark_version: 17.3.x-scala2.13
+            node_type_id: m5d.large
+            num_workers: 1
+        - job_cluster_key: photon
+          new_cluster:
+            spark_version: 17.3.x-scala2.13
+            node_type_id: r6id.xlarge
+            runtime_engine: PHOTON
+            autoscale:
+              min_workers: 1
+              max_workers: 2
+
+      tasks:
+        - task_key: ingest
+          job_cluster_key: small
+          notebook_task:
+            notebook_path: ../notebooks/ingest.py
+            base_parameters:
+              source_path: ${var.source_path}
+
+        - task_key: clean
+          depends_on:
+            - task_key: ingest
+          sql_task:
+            file:
+              path: ../sql/clean.sql
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              run_date: "{{job.parameters.run_date}}"
+
+        - task_key: enrich
+          depends_on:
+            - task_key: clean
+          job_cluster_key: photon
+          max_retries: 2
+          min_retry_interval_millis: 1000
+          python_wheel_task:
+            package_name: sales_enrich
+            entry_point: main
+            named_parameters:
+              catalog: ${var.catalog}
+              country: "{{job.parameters.country}}"
+          libraries:
+            - whl: ../src/sales_enrich/dist/*.whl
+            - pypi:
+                package: pycountry==24.6.1
+
+        - task_key: check
+          depends_on:
+            - task_key: ingest
+          condition_task:
+            op: GREATER_THAN
+            left: "{{tasks.ingest.values.row_count}}"
+            right: "0"
+
+        - task_key: publish
+          depends_on:
+            - task_key: enrich
+            - task_key: check
+              outcome: "true"
+          job_cluster_key: small
+          notebook_task:
+            notebook_path: ../notebooks/publish.py
+
+        - task_key: refresh_gold
+          depends_on:
+            - task_key: publish
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.gold.id}
+
+        - task_key: weekly
+          depends_on:
+            - task_key: publish
+          run_job_task:
+            job_id: ${resources.jobs.weekly_report.id}

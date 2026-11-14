@@ -29,6 +29,7 @@ import { Runner } from "@/pages/Runner";
 import { Notebooks } from "@/pages/Notebooks";
 import { Notebook } from "@/pages/Notebook";
 import { Query } from "@/pages/Query";
+import { Bundles } from "@/pages/Bundles";
 
 // Dashboard pages pull recharts (~110 KB gzipped). Lazy so /, /tables/*,
 // and /pipelines/* don't pay for charts they don't render.
@@ -96,6 +97,7 @@ createRoot(root).render(
                   <Route path="/notebooks/:name" element={<Notebook />} />
                   <Route path="/query" element={<Query />} />
                   <Route path="/pipelines" element={<PipelinesList />} />
+                  <Route path="/bundles" element={<Bundles />} />
                   <Route
                     path="/pipelines/dashboard"
                     element={<PipelineDashboard />}

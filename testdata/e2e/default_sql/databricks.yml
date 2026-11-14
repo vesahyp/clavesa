@@ -1,0 +1,125 @@
+# The end-to-end test of ADR-031: one bundle, deployed as a Databricks job
+# (target dbx) and as a clavesa job (target aws), and the tables compared.
+#
+# The job and the SQL are Databricks' own example, default_sql of
+# github.com/databricks/bundle-examples (what `databricks bundle init
+# default-sql` creates), fetched at a pinned commit by prepare.py with the
+# edits listed in README.md. This file is ours: it replaces the example's
+# databricks.yml (whose targets point at company.databricks.com).
+#
+# prepare.py writes the workspace host and the input location in place of
+# the two placeholders below.
+bundle:
+  name: default_sql
+
+include:
+  - resources/*.yml
+
+variables:
+  warehouse_id:
+    description: The SQL warehouse the Databricks job's SQL tasks run on
+  catalog:
+    description: The catalog to use
+    default: team_ucpub
+  schema:
+    description: The schema to use
+    default: sales
+  source:
+    description: The sales orders JSON files, read by both targets
+    default: s3://E2E_SOURCE_BUCKET/e2e-bundle/retail-org/sales_orders/
+  clavesa_principal:
+    description: The application ID of clavesa's service principal (aws-mixed only)
+    default: ""
+  clavesa:
+    description: Settings for clavesa deploys (ignored by Databricks)
+    type: complex
+    default: {}
+
+targets:
+  # Databricks, as the example deploys it (schedule paused: the test runs it).
+  dbx:
+    mode: production
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      trigger_pause_status: PAUSED
+    # The same additions in both targets (the anchor is reused by aws): the
+    # job parameter source, and the SQL tasks' parameters (Databricks fills
+    # {{name}} in a SQL file only from sql_task.parameters).
+    resources: &sql_params
+      jobs:
+        default_sql_sql_job:
+          parameters:
+            - name: source
+              default: ${var.source}
+          tasks:
+            - task_key: orders_raw
+              sql_task:
+                parameters:
+                  catalog: "{{job.parameters.catalog}}"
+                  schema: "{{job.parameters.schema}}"
+                  source: "{{job.parameters.source}}"
+            - task_key: orders_daily
+              sql_task:
+                parameters:
+                  catalog: "{{job.parameters.catalog}}"
+                  schema: "{{job.parameters.schema}}"
+                  bundle_target: "{{job.parameters.bundle_target}}"
+
+  # clavesa in the team's AWS account, next to the Databricks tables:
+  # shadow mode writes <table>_clavesa in the same schema.
+  aws:
+    mode: production
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      trigger_pause_status: PAUSED
+    variables:
+      warehouse_id: "-"
+      clavesa:
+        catalog: unity
+        shadow: true
+        # The SQL picks its catalog and schema at run time (USE ... IDENTIFIER),
+        # so the plan is told the tables.
+        tables:
+          orders_raw:
+            writes: [team_ucpub.sales.orders_raw]
+          orders_daily:
+            reads: [team_ucpub.sales.orders_raw]
+            writes: [team_ucpub.sales.orders_daily]
+        compare:
+          team_ucpub.sales.orders_raw: { partition: order_date, sums: [order_number] }
+          team_ucpub.sales.orders_daily: { partition: order_date, sums: [number_of_orders] }
+        compute:
+          orders_raw: { kind: lambda }
+          orders_daily: { kind: lambda }
+    resources: *sql_params
+
+  # A mixed job (ADR-031 section 8): orders_raw on clavesa (shadow), and
+  # orders_daily on Databricks, started by clavesa with run-now on this
+  # target's Databricks job (deployed paused). clavesa's service principal
+  # may run that job.
+  aws-mixed:
+    mode: production
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      trigger_pause_status: PAUSED
+    permissions:
+      - service_principal_name: ${var.clavesa_principal}
+        level: CAN_RUN
+    variables:
+      clavesa:
+        catalog: unity
+        shadow: true
+        place:
+          orders_daily: databricks
+        tables:
+          orders_raw:
+            writes: [team_ucpub.sales.orders_raw]
+        compute:
+          orders_raw: { kind: lambda }
+    resources: *sql_params

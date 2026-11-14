@@ -1,0 +1,85 @@
+# The example bundle of ADR-031 (section 12): a job written the way a
+# Databricks team writes one. Every slice of ADR-031 tests against it.
+# Targets dev and prod deploy to Databricks unchanged; aws is a mixed
+# clavesa target on Unity Catalog; aws-local is clavesa with no Databricks.
+bundle:
+  name: daily_sales
+
+include:
+  - resources/*.yml
+
+artifacts:
+  sales_enrich:
+    type: whl
+    path: ./src/sales_enrich
+    build: python3 -m pip wheel --no-deps --wheel-dir dist .
+
+variables:
+  catalog:
+    description: Unity Catalog catalog of the sales tables
+    default: main
+  source_path:
+    description: Where the raw order files land
+    default: /Volumes/main/sales/raw/orders
+  warehouse_id:
+    description: SQL warehouse for the sql_task
+    default: 0123456789abcdef
+  clavesa:
+    description: Settings for clavesa deploys (ignored by Databricks)
+    type: complex
+    default: {}
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+
+  aws:
+    mode: production
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      trigger_pause_status: PAUSED
+    variables:
+      clavesa:
+        workspace: ~/clavesa/team-dbx
+        catalog: unity
+        place:
+          refresh_gold: databricks
+        compute:
+          enrich: { kind: fargate, cpu: 4, memory_gb: 16 }
+        compare:
+          main.sales.orders_clean: { partition: order_date, sums: [amount] }
+        shadow: true
+        tables:
+          enrich:
+            reads: [main.sales.orders_clean]
+            writes: [main.sales.orders_enriched]
+
+  aws-local:
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      source_path: ${workspace.file_path}/data/orders
+      clavesa:
+        catalog: glue
+        tables:
+          enrich:
+            reads: [main.sales.orders_clean]
+            writes: [main.sales.orders_enriched]
+    resources:
+      jobs:
+        daily_sales:
+          tasks:
+            # A Lakeflow pipeline cannot run without Databricks.
+            - task_key: refresh_gold
+              disabled: true

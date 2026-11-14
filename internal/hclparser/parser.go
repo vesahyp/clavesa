@@ -303,8 +303,10 @@ func (p *parser) parseModuleBlock() (*graph.Node, []graph.Edge, error) {
 	// Determine node type from source pattern.
 	nodeType := nodeTypeFromSource(source)
 	switch nodeType {
-	case "source", "transform", "destination":
-		// known pipeline node type — continue parsing
+	case "source", "transform", "destination", "task":
+		// known pipeline node type — continue parsing. "task" is a
+		// Databricks bundle task (ADR-031): its code writes its own
+		// tables, and its upstream tasks are listed in `parents`.
 	default:
 		return nil, nil, nil // not a pipeline node (e.g. orchestration module)
 	}
@@ -389,6 +391,17 @@ func (p *parser) parseModuleBlock() (*graph.Node, []graph.Edge, error) {
 			}
 			if len(externalInputs) > 0 {
 				config["external_inputs"] = externalInputs
+			}
+		}
+	}
+
+	// A bundle task's upstream tasks (ADR-031): parents = ["a", "b"].
+	if nodeType == "task" {
+		if ps, ok := attrs["parents"].([]interface{}); ok {
+			for _, p := range ps {
+				if from, ok := p.(string); ok && from != "" {
+					edges = append(edges, graph.Edge{FromNode: from, ToNode: moduleName})
+				}
 			}
 		}
 	}

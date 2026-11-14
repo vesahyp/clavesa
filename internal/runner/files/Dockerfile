@@ -59,6 +59,7 @@ COPY run_lock.py ${LAMBDA_TASK_ROOT}/
 COPY stream_query.py ${LAMBDA_TASK_ROOT}/
 COPY spark_conf.py ${LAMBDA_TASK_ROOT}/
 COPY unity_catalog.py ${LAMBDA_TASK_ROOT}/
+COPY bundle_task.py ${LAMBDA_TASK_ROOT}/
 COPY notebook_supervisor.py ${LAMBDA_TASK_ROOT}/
 COPY notebook_repl.py ${LAMBDA_TASK_ROOT}/
 COPY entrypoint.sh /entrypoint.sh

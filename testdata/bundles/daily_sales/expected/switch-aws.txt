@@ -1,0 +1,77 @@
+Switch of job daily_sales (bundle daily_sales) from Databricks to clavesa. Nothing here runs by itself.
+Do it right after a clavesa run, with `clavesa bundle compare -t aws --job daily_sales` passing every day for 7 days.
+
+1. History. A person who can run SQL in Databricks gets MODIFY and MANAGE on the shadow tables, then copies
+   the days before shadow mode began into them, between two clavesa runs:
+
+   GRANT MODIFY, MANAGE, SELECT ON TABLE main.sales.daily_revenue_clavesa TO `<you>`;
+   INSERT INTO main.sales.daily_revenue_clavesa SELECT * FROM main.sales.daily_revenue WHERE <partition column> < DATE'<first day of shadow mode>';
+
+   GRANT MODIFY, MANAGE, SELECT ON TABLE main.sales.orders_clean_clavesa TO `<you>`;
+   INSERT INTO main.sales.orders_clean_clavesa SELECT * FROM main.sales.orders_clean WHERE order_date < DATE'<first day of shadow mode>';
+
+   GRANT MODIFY, MANAGE, SELECT ON TABLE main.sales.orders_enriched_clavesa TO `<you>`;
+   INSERT INTO main.sales.orders_enriched_clavesa SELECT * FROM main.sales.orders_enriched WHERE <partition column> < DATE'<first day of shadow mode>';
+
+   GRANT MODIFY, MANAGE, SELECT ON TABLE main.sales.orders_raw_clavesa TO `<you>`;
+   INSERT INTO main.sales.orders_raw_clavesa SELECT * FROM main.sales.orders_raw WHERE <partition column> < DATE'<first day of shadow mode>';
+
+   Then compare the whole tables: clavesa bundle compare -t aws --job daily_sales
+
+2. Pause the Databricks job: set pause_status: PAUSED on its schedule or trigger in the prod target
+   (or presets: { trigger_pause_status: PAUSED }), run databricks bundle deploy -t prod, and wait until the
+   job has no active run. Compare once more; it must pass.
+
+3. Names. For each MANAGED table, swap the names (for an EXTERNAL table skip this: clavesa takes it over in place,
+   and the shadow table can be dropped after the switch):
+
+   ALTER TABLE main.sales.daily_revenue RENAME TO main.sales.daily_revenue_before_clavesa;
+   ALTER TABLE main.sales.daily_revenue_clavesa RENAME TO main.sales.daily_revenue;
+
+   ALTER TABLE main.sales.orders_clean RENAME TO main.sales.orders_clean_before_clavesa;
+   ALTER TABLE main.sales.orders_clean_clavesa RENAME TO main.sales.orders_clean;
+
+   ALTER TABLE main.sales.orders_enriched RENAME TO main.sales.orders_enriched_before_clavesa;
+   ALTER TABLE main.sales.orders_enriched_clavesa RENAME TO main.sales.orders_enriched;
+
+   ALTER TABLE main.sales.orders_raw RENAME TO main.sales.orders_raw_before_clavesa;
+   ALTER TABLE main.sales.orders_raw_clavesa RENAME TO main.sales.orders_raw;
+
+4. Grants. Copy each old table's grants to the new one (the owner stays clavesa's service principal):
+
+   databricks grants get table main.sales.daily_revenue_before_clavesa -o json \
+     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"changes": [{"principal": a["principal"], "add": a["privileges"]} for a in d.get("privilege_assignments", [])]}))' \
+     > grants.json
+   databricks grants update table main.sales.daily_revenue --json @grants.json
+
+   databricks grants get table main.sales.orders_clean_before_clavesa -o json \
+     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"changes": [{"principal": a["principal"], "add": a["privileges"]} for a in d.get("privilege_assignments", [])]}))' \
+     > grants.json
+   databricks grants update table main.sales.orders_clean --json @grants.json
+
+   databricks grants get table main.sales.orders_enriched_before_clavesa -o json \
+     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"changes": [{"principal": a["principal"], "add": a["privileges"]} for a in d.get("privilege_assignments", [])]}))' \
+     > grants.json
+   databricks grants update table main.sales.orders_enriched --json @grants.json
+
+   databricks grants get table main.sales.orders_raw_before_clavesa -o json \
+     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"changes": [{"principal": a["principal"], "add": a["privileges"]} for a in d.get("privilege_assignments", [])]}))' \
+     > grants.json
+   databricks grants update table main.sales.orders_raw --json @grants.json
+
+5. Point clavesa at the real names. In databricks.yml, target aws, set in the clavesa variable:
+
+     shadow: false
+     replaces_job: <the Databricks job ID of daily_sales>
+
+   so a run refuses to write while that job is unpaused or running. Then:
+
+   clavesa bundle deploy -t aws --job daily_sales --yes
+   clavesa bundle run -t aws --job daily_sales --wait
+
+6. Check: a SQL warehouse query as one of the readers, each table's Lineage tab (the clavesa task upstream),
+   and the jobs that come next. Keep the <table>_before_clavesa tables about a month, then drop them.
+
+Roll-back: swap the names back (ALTER TABLE ... RENAME in reverse), set shadow: true and remove replaces_job,
+deploy, and unpause the Databricks job. An external table taken over in place goes back with RESTORE TABLE
+(docs/cookbook/replace-a-databricks-step.md, step 5).

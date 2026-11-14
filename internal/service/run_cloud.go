@@ -79,6 +79,11 @@ func (s *Service) RunPipelineCloud(ctx context.Context, dir string, opts RunOpts
 			inputPayload["_force_nodes"] = opts.ForceNodes
 		}
 	}
+	// ADR-031: a bundle job's run parameters; the runner merges them over
+	// the job's defaults (bundle_task.prepare_cloud_event).
+	if len(opts.BundleParams) > 0 {
+		inputPayload["params"] = opts.BundleParams
+	}
 	inputJSON, err := json.Marshal(inputPayload)
 	if err != nil {
 		return "", fmt.Errorf("marshal execution input: %w", err)

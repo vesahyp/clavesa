@@ -812,6 +812,7 @@ Examples:
 			// credentials bridge), so the service satisfies
 			// api.RunnerRequirementsService directly.
 			runnerHandler := api.NewRunnerHandler(svc)
+			bundleHandler := api.NewBundleHandler(bundleBridge{svc: svc, root: workspace})
 			backfillHandler := api.NewBackfillHandler(backfillBridge{svc: svc})
 			// Reset/optimize: the api interfaces take the service types
 			// directly (C2-P2-11 dropped the bridge DTOs), so the service
@@ -847,6 +848,7 @@ Examples:
 			credentialsHandler.RegisterRoutes(apiMux)
 			notebooksHandler.RegisterRoutes(apiMux)
 			runnerHandler.RegisterRoutes(apiMux)
+			bundleHandler.RegisterRoutes(apiMux)
 			backfillHandler.RegisterRoutes(apiMux)
 			resetHandler.RegisterRoutes(apiMux)
 			optimizeHandler.RegisterRoutes(apiMux)

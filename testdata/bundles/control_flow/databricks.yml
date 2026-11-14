@@ -1,0 +1,28 @@
+# Job control flow on clavesa (ADR-031 slice 5): a condition with both
+# outcomes, for_each, a retry, a timeout and run_if ALL_DONE.
+bundle:
+  name: control_flow
+
+include:
+  - resources/*.yml
+
+variables:
+  clavesa:
+    description: Settings for clavesa deploys (ignored by Databricks)
+    type: complex
+    default: {}
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+
+  local:
+    default: true
+    variables:
+      clavesa:
+        catalog: glue
+        tables:
+          never: { writes: [main.cf.never] }
+          cleanup: { writes: [main.cf.cleanup] }

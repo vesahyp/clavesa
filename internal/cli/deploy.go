@@ -339,6 +339,18 @@ func (d deployFlow) pushRunnerImage() error {
 	registry := fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com", aws.ToString(ident.Account), region)
 	// Mirrors aws_ecr_repository.runner.name in the workspace main.tf.
 	repoURL := fmt.Sprintf("%s/clavesa-%s/transform-runner", registry, m.Name)
+	// The repository Terraform made says where it is: a workspace in
+	// another region than the profile's default pushed to a repository
+	// that does not exist (found on a us-east-2 workspace with an
+	// eu-north-1 profile).
+	if img, err := terraformOutput(d.TfDir, d.Env, "runner_image"); err == nil && img != "" {
+		if repo, reg, ok := ecrRepoOf(img); ok {
+			repoURL, registry = repo, strings.SplitN(repo, "/", 2)[0]
+			if reg != region {
+				cfg.Region, region = reg, reg
+			}
+		}
+	}
 	// The build (EnsureLocalRunnerImage) always tags the local image with the
 	// binary's version.Module, so that tag is guaranteed present here.
 	localImage := runner.LocalImageName(m.Name) + ":" + version.Module
@@ -433,4 +445,22 @@ func (d deployFlow) confirm() error {
 		return fmt.Errorf("deploy cancelled")
 	}
 	return nil
+}
+
+// ecrRepoOf splits an ECR image reference
+// <account>.dkr.ecr.<region>.amazonaws.com/<repo>[:tag] into the repository
+// URL (no tag) and the region.
+func ecrRepoOf(image string) (repo, region string, ok bool) {
+	host, path, found := strings.Cut(image, "/")
+	if !found {
+		return "", "", false
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 6 || parts[1] != "dkr" || parts[2] != "ecr" {
+		return "", "", false
+	}
+	if i := strings.LastIndex(path, ":"); i >= 0 {
+		path = path[:i]
+	}
+	return host + "/" + path, parts[3], true
 }

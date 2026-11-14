@@ -12,17 +12,26 @@ setup: ## After a fresh clone: mise tools, Go modules, npm packages, bin/clavesa
 	go mod download
 	@test -d ui/node_modules || $(MAKE) ui/node_modules
 	@test -x bin/clavesa || $(MAKE) build
+	@$(MAKE) -s .venv-tools
 	@# site/ is private: the public clavesa snapshot has no site/.
 	@if [ -d site ]; then \
 	  test -d site/web/node_modules || (cd site/web && npm ci --no-fund --no-audit); \
 	  $(MAKE) -s -C site infra/.terraform; \
 	fi
 
+# The Python tools verify-cookbook needs (moto's local S3, boto3, pyarrow),
+# in a git-ignored venv of this repo rather than the machine's Python: a
+# fresh Mac has none of them, and Homebrew's Python refuses global pip
+# installs.
+.venv-tools:
+	python3 -m venv .venv-tools
+	.venv-tools/bin/pip install --quiet --disable-pip-version-check 'moto[server]' boto3 pyarrow
+
 dev: ## Start backend (:8080) and frontend (:5173)
 	@./scripts/dev.sh
 
 sync-runner: ## Copy runner/ → internal/runner/files/ so the embedded copy used by `clavesa workspace init` stays in sync
-	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/stream_query.py runner/spark_conf.py runner/unity_catalog.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
+	cp runner/Dockerfile runner/runner.py runner/run_lock.py runner/stream_query.py runner/spark_conf.py runner/unity_catalog.py runner/bundle_task.py runner/notebook_supervisor.py runner/notebook_repl.py runner/requirements.txt runner/extra-requirements.txt runner/entrypoint.sh runner/spark-class runner/download_jars.sh internal/runner/files/
 	mkdir -p internal/runner/files/patches && cp runner/patches/*.patch internal/runner/files/patches/
 
 sync-modules: ## Copy modules/ → internal/modules/files/ (tracked .tf/.py/.md/.hcl files only) so `terraform init` resolves embedded modules locally
@@ -177,6 +186,9 @@ smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/cla
 smoke-databricks: $(if $(SKIP_BUILD),,build) ## Unity Catalog gate (ADR-027): run a published pipeline on a connected, deployed workspace and assert the table, lineage and downstream Databricks run in Databricks (UC_SMOKE_WS / UC_SMOKE_PIPELINE)
 	bash scripts/uc-smoke.sh
 
+e2e-bundle: $(if $(SKIP_BUILD),,build) ## ADR-031 end-to-end: Databricks' default-sql example deployed as a Databricks job and as a clavesa job, tables compared, and a mixed run (E2E_WS= E2E_WAREHOUSE= E2E_SOURCE_BUCKET= E2E_PROFILE= [E2E_DEPLOY_WORKSPACE=1] [E2E_TEARDOWN=1]); cents of DBUs and AWS
+	bash scripts/bundle-e2e.sh
+
 smoke-kinesis: $(if $(SKIP_BUILD),,build) ## Kinesis gate (ADR-028): a 1-shard stream, a pipeline that reads it on Fargate then Lambda, counts and samples checked in Databricks, a run stopped mid-drain; deletes the stream on exit (KIN_SMOKE_* env, see the script). Under 1 USD
 	bash scripts/kinesis-smoke.sh
 
@@ -204,8 +216,8 @@ verify-readme: $(if $(SKIP_BUILD),,build) ## Walk the README quick-start literal
 	@./scripts/verify-readme.sh
 	@./scripts/green-stamp.sh write verify-readme
 
-verify-cookbook: $(if $(SKIP_BUILD),,build) ## Walk the cookbook recipes literally against a fresh tempdir workspace (local S3 via moto) and assert outcomes — release-gates / nightly, NOT per-commit (GH #86)
-	@./scripts/verify-cookbook.sh
+verify-cookbook: $(if $(SKIP_BUILD),,build) .venv-tools ## Walk the cookbook recipes literally against a fresh tempdir workspace (local S3 via moto) and assert outcomes — release-gates / nightly, NOT per-commit (GH #86)
+	@PATH="$(CURDIR)/.venv-tools/bin:$$PATH" ./scripts/verify-cookbook.sh
 	@./scripts/green-stamp.sh write verify-cookbook
 
 release-gates: build ## Run the four release gates (memory-gated serial/concurrent) + stamps; logs in .gates/, heartbeat in .gates/progress.log (GH #84)

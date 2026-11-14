@@ -1,0 +1,82 @@
+# Exercises the target merge rules the clavesa resolver copies from the
+# Databricks CLI (ADR-031 section 2). Not a runnable job.
+bundle:
+  name: overrides
+
+variables:
+  suffix:
+    default: base
+  size:
+    default: m5d.large
+  clavesa:
+    type: complex
+    default:
+      catalog: glue
+      tables: { a: { writes: [main.s.t] } }
+
+resources:
+  jobs:
+    j:
+      name: j-${var.suffix}-${bundle.target}
+      tags: { team: sales }
+      parameters:
+        - { name: p1, default: one }
+        - { name: p2, default: 2 }
+      job_clusters:
+        - job_cluster_key: c1
+          new_cluster: { spark_version: 16.4.x-scala2.13, node_type_id: "${var.size}", num_workers: 1 }
+      trigger:
+        periodic: { interval: 4, unit: HOURS }
+      tasks:
+        - task_key: a
+          job_cluster_key: c1
+          spark_python_task:
+            python_file: src/a.py
+            parameters: ["--x", "1"]
+          libraries:
+            - pypi: { package: requests }
+        - task_key: b
+          depends_on: [{ task_key: a }]
+          run_if: ALL_DONE
+          sql_task:
+            file: { path: src/b.sql }
+            warehouse_id: w1
+
+targets:
+  one:
+    default: true
+    mode: production
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    presets:
+      name_prefix: "[x] "
+      tags: { env: one }
+      jobs_max_concurrent_runs: 3
+    variables:
+      suffix: one
+      clavesa:
+        catalog: unity
+    resources:
+      jobs:
+        j:
+          parameters:
+            - { name: p2, default: twenty }
+            - { name: p3, default: three }
+          job_clusters:
+            - job_cluster_key: c1
+              new_cluster: { num_workers: 4 }
+          tasks:
+            - task_key: a
+              spark_python_task:
+                parameters: ["--y"]
+              libraries:
+                - pypi: { package: pandas }
+            - task_key: c
+              depends_on: [{ task_key: b }]
+              condition_task: { op: EQUAL_TO, left: "{{tasks.b.result_state}}", right: success }
+  two:
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+    variables:
+      size: { default: r6id.xlarge }

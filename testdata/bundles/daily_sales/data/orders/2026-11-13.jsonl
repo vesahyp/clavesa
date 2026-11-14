@@ -1,0 +1,5 @@
+{"order_id": 1004, "order_date": "2026-11-13", "country": " fi", "amount": 40.00, "customer": "Aino"}
+{"order_id": 1005, "order_date": "2026-11-13", "country": "EE", "amount": 19.90, "customer": "Kati"}
+{"order_id": 1006, "order_date": "2026-11-13", "country": "SE", "amount": null, "customer": "Lars"}
+{"order_id": 1007, "order_date": "2026-11-13", "country": "FI", "amount": 5.25, "customer": " Liisa"}
+{"order_id": 1008, "order_date": "2026-11-13", "country": "DE", "amount": 99.99, "customer": "Jonas"}

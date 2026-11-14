@@ -1,0 +1,10 @@
+resources:
+  pipelines:
+    gold:
+      name: sales_gold
+      catalog: ${var.catalog}
+      schema: sales
+      serverless: true
+      libraries:
+        - file:
+            path: ../pipelines/gold.sql

@@ -437,46 +437,7 @@ still echoed to stderr before any AWS calls.
 			if err != nil {
 				return err
 			}
-			pipelineName := filepath.Base(dir)
-			printTargetContext("destroy "+pipelineName, ws, "")
-
-			if !skipSweep {
-				var sweepIn io.Reader = os.Stdin
-				if autoApprove {
-					sweepIn = autoYesReader()
-				}
-				if err := sweepPipelineGlueTables(cmd.Context(), ws, pipelineName, glueDB, os.Stdout, sweepIn); err != nil {
-					return err
-				}
-			}
-			// ADR-027, --create-catalog: the pipeline's Unity Catalog schema
-			// must be empty before Terraform can drop it.
-			dropped, err := service.New(ws).UnregisterPipelineDatabricksTables(cmd.Context(), dir)
-			if err != nil {
-				return err
-			}
-			for _, t := range dropped {
-				fmt.Printf("Unity Catalog: unregistered %s (the schema is clavesa's and goes with the pipeline)\n", t)
-			}
-
-			env, err := service.New(ws).TerraformEnv(cmd.Context())
-			if err != nil {
-				return err
-			}
-			if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
-				return fmt.Errorf("terraform init: %w", err)
-			}
-			args2 := []string{"destroy"}
-			if autoApprove {
-				args2 = append(args2, "-auto-approve")
-			}
-			c := exec.Command("terraform", args2...)
-			c.Dir = dir
-			c.Env = env
-			c.Stdout = os.Stdout
-			c.Stderr = os.Stderr
-			c.Stdin = os.Stdin
-			return c.Run()
+			return destroyPipeline(cmd, dir, ws, skipSweep, glueDB, autoApprove)
 		},
 	}
 	cmd.Flags().BoolVar(&skipSweep, "skip-sweep", false, "skip the Glue-table sweep preflight")
@@ -741,7 +702,7 @@ else ~/.local/state/clavesa/runs. The run ends with a short phase table;
 			if compute == "local" {
 				return runCloudLocalPipeline(cmd, dir, jsonOut, wait, effectiveForce, forceNodes)
 			}
-			return runCloudPipeline(cmd, dir, jsonOut, wait, effectiveForce, forceNodes)
+			return runCloudPipeline(cmd, dir, jsonOut, wait, service.RunOpts{Force: effectiveForce, ForceNodes: forceNodes})
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit machine-readable output")
@@ -854,16 +815,13 @@ func runLocalPipeline(cmd *cobra.Command, dir string, jsonOut, force bool, force
 // leaves RUNNING.
 //
 // Polls once every 5s; cap is the cobra context (which honors Ctrl-C).
-func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait, force bool, forceNodes []string) error {
+func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait bool, opts service.RunOpts) error {
 	ctx := cmd.Context()
 	svc, _, err := newService(cmd)
 	if err != nil {
 		return err
 	}
-	execARN, err := svc.RunPipelineCloud(ctx, abs, service.RunOpts{
-		Force:      force,
-		ForceNodes: forceNodes,
-	})
+	execARN, err := svc.RunPipelineCloud(ctx, abs, opts)
 	if err != nil {
 		return err
 	}
@@ -1043,4 +1001,50 @@ func newOrchestrationSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&schedule, "schedule", "", `EventBridge schedule expression, e.g. "rate(1 hour)"`)
 
 	return cmd
+}
+
+// destroyPipeline sweeps the runner-created Glue tables, unregisters the
+// pipeline's own Unity Catalog tables and runs terraform destroy (pipeline
+// destroy and bundle destroy).
+func destroyPipeline(cmd *cobra.Command, dir, ws string, skipSweep bool, glueDB string, autoApprove bool) error {
+	pipelineName := filepath.Base(dir)
+	printTargetContext("destroy "+pipelineName, ws, "")
+
+	if !skipSweep {
+		var sweepIn io.Reader = os.Stdin
+		if autoApprove {
+			sweepIn = autoYesReader()
+		}
+		if err := sweepPipelineGlueTables(cmd.Context(), ws, pipelineName, glueDB, os.Stdout, sweepIn); err != nil {
+			return err
+		}
+	}
+	// ADR-027, --create-catalog: the pipeline's Unity Catalog schema
+	// must be empty before Terraform can drop it.
+	dropped, err := service.New(ws).UnregisterPipelineDatabricksTables(cmd.Context(), dir)
+	if err != nil {
+		return err
+	}
+	for _, t := range dropped {
+		fmt.Printf("Unity Catalog: unregistered %s (the schema is clavesa's and goes with the pipeline)\n", t)
+	}
+
+	env, err := service.New(ws).TerraformEnv(cmd.Context())
+	if err != nil {
+		return err
+	}
+	if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
+		return fmt.Errorf("terraform init: %w", err)
+	}
+	args2 := []string{"destroy"}
+	if autoApprove {
+		args2 = append(args2, "-auto-approve")
+	}
+	c := exec.Command("terraform", args2...)
+	c.Dir = dir
+	c.Env = env
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	c.Stdin = os.Stdin
+	return c.Run()
 }

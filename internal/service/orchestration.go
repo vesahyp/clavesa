@@ -288,6 +288,19 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 	if err != nil {
 		return err
 	}
+	// ADR-031: a pipeline generated from a Databricks bundle job runs its
+	// task nodes from bundle-job.json; its compute, schedule, triggers and
+	// notifications come from the job.
+	scheduleExpr := "var.trigger_schedule"
+	var bundleCfg *tfgen.BundleConfig
+	if IsBundlePipeline(abs) {
+		bt, bc, bcompute, err := s.bundleOrchestration(abs, bucketExpr, ws)
+		if err != nil {
+			return fmt.Errorf("orchestration: %w", err)
+		}
+		transforms = append(transforms, bt...)
+		bundleCfg, compute, scheduleExpr = bc, bcompute, ""
+	}
 	tfBody, err := tfgen.Emit(tfgen.Pipeline{
 		Compute:           compute,
 		PipelineNameExpr:  "var.pipeline_name",
@@ -299,7 +312,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		BucketExpr:        bucketExpr,
 		RunnerImageExpr:   runnerImageExpr,
 		RunnerArchExpr:    "data.terraform_remote_state.workspace.outputs.runner_architecture",
-		ScheduleExpr:      "var.trigger_schedule",
+		ScheduleExpr:      scheduleExpr,
 		BatchWindowExpr:   "var.trigger_batch_window",
 		TriggerQueueExprs: queueExprs,
 		PollerQueueExprs:  pollerQueues,
@@ -309,6 +322,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		KinesisStreams:    s.kinesisStreamsOf(&g),
 		UpstreamSchemas:   upstreamSchemas,
 		UnityCatalog:      ucConfig,
+		Bundle:            bundleCfg,
 	})
 	if err != nil {
 		return fmt.Errorf("orchestration: emit tf: %w", err)

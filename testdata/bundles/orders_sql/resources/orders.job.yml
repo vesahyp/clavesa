@@ -1,0 +1,33 @@
+resources:
+  jobs:
+    orders:
+      name: orders
+      parameters:
+        - name: run_date
+          default: "2026-11-13"
+      tasks:
+        - task_key: load
+          spark_python_task:
+            python_file: ../src/load.py
+            parameters:
+              - --source
+              - ${workspace.file_path}/data/orders
+              - --table
+              - ${var.catalog}.sales.orders_raw
+          environment_key: default
+
+        - task_key: clean
+          depends_on:
+            - task_key: load
+          sql_task:
+            file:
+              path: ../sql/clean.sql
+            warehouse_id: 0123456789abcdef
+            parameters:
+              run_date: "{{job.parameters.run_date}}"
+              catalog: ${var.catalog}
+
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"

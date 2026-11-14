@@ -60,7 +60,8 @@ func Validate(g graph.PipelineGraph) []graph.ValidationMessage {
 		connected[e.ToNode] = true
 	}
 	for _, n := range g.Nodes {
-		if connected[n.ID] || hasExternalInputs(n) {
+		// A bundle task with no dependencies is normal (ADR-031).
+		if connected[n.ID] || hasExternalInputs(n) || n.Type == "task" {
 			continue
 		}
 		msgs = append(msgs, graph.ValidationMessage{

@@ -14,6 +14,7 @@ import {
   FileInput,
   KeyRound,
   LayoutDashboard,
+  Package2,
   PanelLeftClose,
   PanelLeftOpen,
   Share2,
@@ -48,6 +49,7 @@ const NAV: NavItem[] = [
     match: (p) =>
       p.startsWith("/pipelines") || p.startsWith("/backfills"),
   },
+  { to: "/bundles", label: "Bundles", icon: Package2, match: (p) => p.startsWith("/bundles") },
   { to: "/dashboards", label: "Dashboards", icon: LayoutDashboard, match: (p) => p.startsWith("/dashboards") },
   { to: "/notebooks", label: "Notebooks", icon: BookOpen, match: (p) => p.startsWith("/notebooks") },
   { to: "/query", label: "Query", icon: Terminal, match: (p) => p.startsWith("/query") },

@@ -8,6 +8,14 @@ Visual ETL for Terraform pipelines
 
 | Command | Description |
 | --- | --- |
+| [`clavesa bundle`](clavesa_bundle.md) | Deploy Databricks bundle (DAB) jobs to clavesa (ADR-031) |
+| &nbsp;&nbsp;[`clavesa bundle compare`](clavesa_bundle_compare.md) | Compare the tables a job writes on Databricks with clavesa's shadow tables (PASS or FAIL) |
+| &nbsp;&nbsp;[`clavesa bundle deploy`](clavesa_bundle_deploy.md) | Deploy the jobs of a bundle target to AWS as clavesa pipelines |
+| &nbsp;&nbsp;[`clavesa bundle destroy`](clavesa_bundle_destroy.md) | Remove a bundle target's jobs from AWS (terraform destroy of their pipelines) |
+| &nbsp;&nbsp;[`clavesa bundle list`](clavesa_bundle_list.md) | List the workspace's pipelines generated from bundle jobs |
+| &nbsp;&nbsp;[`clavesa bundle plan`](clavesa_bundle_plan.md) | Show, task by task, where each job of a bundle target runs and what has to change |
+| &nbsp;&nbsp;[`clavesa bundle run`](clavesa_bundle_run.md) | Run one job of a bundle target on clavesa |
+| &nbsp;&nbsp;[`clavesa bundle switch`](clavesa_bundle_switch.md) | Print the steps and the exact SQL that switch a job's tables from Databricks to clavesa (runs nothing) |
 | [`clavesa credential`](clavesa_credential.md) | Manage workspace credentials (registry) |
 | &nbsp;&nbsp;[`clavesa credential delete`](clavesa_credential_delete.md) | Delete a registered credential |
 | &nbsp;&nbsp;[`clavesa credential list`](clavesa_credential_list.md) | List registered credentials |

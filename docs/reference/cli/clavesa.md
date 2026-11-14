@@ -25,6 +25,7 @@ Quick start:
 
 ## Subcommands
 
+- [clavesa bundle](clavesa_bundle.md) — Deploy Databricks bundle (DAB) jobs to clavesa (ADR-031)
 - [clavesa credential](clavesa_credential.md) — Manage workspace credentials (registry)
 - [clavesa dashboards](clavesa_dashboards.md) — List, inspect, render, and author workspace dashboards
 - [clavesa deploy](clavesa_deploy.md) — Apply the workspace infra and every pipeline in one pass

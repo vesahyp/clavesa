@@ -27,6 +27,9 @@ var nodeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // blocks in already-authored pipelines continue to parse and run for
 // backward compatibility — only the *creation* path is gone.
 func (s *Service) AddNode(dir, nodeType, name string) (PipelineGraph, error) {
+	if err := s.refuseBundleEdit(dir); err != nil {
+		return PipelineGraph{}, err
+	}
 	if nodeType == "source" {
 		return PipelineGraph{}, fmt.Errorf("inline source nodes have been removed (ADR-017 slice 4); use `clavesa source register --from <url>` and `clavesa source attach <pipeline> <source> --to <transform>` instead")
 	}
@@ -132,6 +135,9 @@ func (s *Service) AddNode(dir, nodeType, name string) (PipelineGraph, error) {
 
 // UpdateNode merges attrs into the given node's module block.
 func (s *Service) UpdateNode(dir, nodeID string, attrs map[string]interface{}) (PipelineGraph, error) {
+	if err := s.refuseBundleEdit(dir); err != nil {
+		return PipelineGraph{}, err
+	}
 	// compute is strictly a cloud deploy target. "local" is no longer a
 	// value — local execution is the workspace warehouse, not a
 	// per-node attribute.
@@ -174,6 +180,9 @@ func (s *Service) UpdateNode(dir, nodeID string, attrs map[string]interface{}) (
 
 // DeleteNode removes the given node and all edges referencing it.
 func (s *Service) DeleteNode(dir, nodeID string) (PipelineGraph, error) {
+	if err := s.refuseBundleEdit(dir); err != nil {
+		return PipelineGraph{}, err
+	}
 	abs := s.resolveDir(dir)
 	file, err := hclutil.FindNodeFile(s.fo, abs, nodeID)
 	if err != nil {
@@ -201,6 +210,9 @@ func (s *Service) DeleteNode(dir, nodeID string) (PipelineGraph, error) {
 // (`<node>__default`), so a rename changes that table's identity — data
 // already materialised under the old name is not moved.
 func (s *Service) RenameNode(dir, oldID, newID string) (PipelineGraph, error) {
+	if err := s.refuseBundleEdit(dir); err != nil {
+		return PipelineGraph{}, err
+	}
 	if newID == oldID {
 		return PipelineGraph{}, fmt.Errorf("new name is the same as the current name")
 	}
@@ -273,6 +285,9 @@ func (s *Service) RenameNode(dir, oldID, newID string) (PipelineGraph, error) {
 
 // AddEdge creates an edge from fromNode.fromOutput to toNode.toInput.
 func (s *Service) AddEdge(dir, fromNode, fromOutput, toNode, toInput string) (PipelineGraph, error) {
+	if err := s.refuseBundleEdit(dir); err != nil {
+		return PipelineGraph{}, err
+	}
 	if fromOutput == "" {
 		fromOutput = "default"
 	}
@@ -346,6 +361,9 @@ func (s *Service) AddEdge(dir, fromNode, fromOutput, toNode, toInput string) (Pi
 
 // DeleteEdge removes the edge identified by edgeID.
 func (s *Service) DeleteEdge(dir, edgeID string) (PipelineGraph, error) {
+	if err := s.refuseBundleEdit(dir); err != nil {
+		return PipelineGraph{}, err
+	}
 	fromNode, toNode, ok := hclutil.ParseEdgeID(edgeID)
 	if !ok {
 		return PipelineGraph{}, fmt.Errorf("invalid edge id: %s", edgeID)

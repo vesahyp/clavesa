@@ -160,3 +160,13 @@ var errGuardTFVersion = errGuard("terraform too old for a remote backend")
 type errGuard string
 
 func (e errGuard) Error() string { return string(e) }
+
+func TestEcrRepoOf(t *testing.T) {
+	repo, reg, ok := ecrRepoOf("699166197771.dkr.ecr.us-east-2.amazonaws.com/clavesa-ucpub/transform-runner:latest")
+	if !ok || repo != "699166197771.dkr.ecr.us-east-2.amazonaws.com/clavesa-ucpub/transform-runner" || reg != "us-east-2" {
+		t.Errorf("%s %s %v", repo, reg, ok)
+	}
+	if _, _, ok := ecrRepoOf("clavesa/x/transform-runner:latest"); ok {
+		t.Error("a local image is not an ECR reference")
+	}
+}

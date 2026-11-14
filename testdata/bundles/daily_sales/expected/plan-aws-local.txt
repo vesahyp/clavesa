@@ -1,0 +1,29 @@
+bundle daily_sales, target aws-local (catalog: glue)
+
+daily_sales  (schedule: 0 30 4 * * ? Europe/Helsinki, 1 segment, Fargate 8 vCPU / 60 GB)
+  ingest        notebook   clavesa     ok
+  clean         sql        clavesa     ok
+  enrich        wheel      clavesa     warn   runtime_engine PHOTON: runs without Photon, with the same results
+  check         condition  clavesa     ok
+  publish       notebook   clavesa     refuse notebooks/publish.py:6  %pip install tabulate==0.9.0: move tabulate==0.9.0 to the task's libraries (pypi)
+  refresh_gold  pipeline   clavesa     ok     disabled: not run
+  weekly        run_job    clavesa     ok     starts pipeline daily_sales_weekly_report and waits
+
+weekly_report  (trigger: file_arrival, 1 segment, Fargate 4 vCPU / 16 GB)
+  report        python     clavesa     ok
+
+Tables of daily_sales:
+  ingest        writes main.sales.orders_raw; reads main.sales.orders_raw
+  clean         writes main.sales.orders_clean; reads main.sales.orders_raw
+  enrich        writes main.sales.orders_enriched; reads main.sales.orders_clean
+  publish       writes main.sales.daily_revenue; reads main.sales.orders_enriched
+
+Tables of weekly_report:
+  report        writes main.sales.weekly_revenue; reads main.sales.daily_revenue
+
+Libraries (runner requirements): pycountry==24.6.1
+
+Secrets (put each in AWS Secrets Manager once; clavesa never copies them):
+  sales/api_key            -> clavesa/<workspace>/dbx/sales/api_key  (daily_sales.ingest)
+
+Ready: no.  1 refuse, 1 warn.

@@ -1,0 +1,150 @@
+resource "aws_sfn_state_machine" "pipeline" {
+  name     = "clavesa-${var.pipeline_name}"
+  role_arn = aws_iam_role.sfn_exec.arn
+  type     = "STANDARD"
+
+  definition = jsonencode({
+    Comment = "Clavesa bundle job: ${var.pipeline_name}"
+    StartAt = "Init"
+    States = {
+      Init = {
+        Type       = "Pass"
+        Parameters = { states = {}, failed = false }
+        Next       = "Seg0"
+      }
+      Seg0 = {
+        Type           = "Task"
+        Resource       = "arn:aws:states:::lambda:invoke"
+        TimeoutSeconds = 900
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_runner.arn
+          Payload = {
+            _pipeline_run     = true
+            pipeline          = var.pipeline_name
+            "_bundle_states.$" = "$.states"
+            transforms = [
+              { node = "bronze", language = "task", logic_path = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/bronze/_runtime/logic.sql", inputs = {}, outputs = { default = "" }, parents = [] },
+            ]
+            "_sf_execution_arn.$"        = "$$.Execution.Id"
+            "_sf_execution_started_at.$" = "$$.Execution.StartTime"
+            "_execution_input.$"         = "$$.Execution.Input"
+          }
+        }
+        ResultSelector = {
+          "states.$" = "$.Payload.states"
+          "failed.$" = "$.Payload.failed"
+        }
+        Next = "Seg1Start"
+      }
+      Seg1Start = {
+        Type           = "Task"
+        Resource       = "arn:aws:states:::lambda:invoke"
+        TimeoutSeconds = 900
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_runner.arn
+          Payload = {
+            _operation = "dbx_run_now"
+            job_id     = 923072819710352
+            only       = ["gold"]
+            "states.$" = "$.states"
+            "failed.$" = "$.failed"
+            logic_path = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_bundle/bundle-job.json"
+            "_sf_execution_arn.$"        = "$$.Execution.Id"
+            "_sf_execution_started_at.$" = "$$.Execution.StartTime"
+            "_execution_input.$"         = "$$.Execution.Input"
+          }
+        }
+        ResultSelector = {
+          "states.$" = "$.Payload.states"
+          "failed.$" = "$.Payload.failed"
+          "run_id.$" = "$.Payload.run_id"
+          "done.$"   = "$.Payload.done"
+        }
+        Next = "Seg1Check"
+      }
+      Seg1Poll = {
+        Type           = "Task"
+        Resource       = "arn:aws:states:::lambda:invoke"
+        TimeoutSeconds = 900
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_runner.arn
+          Payload = {
+            _operation = "dbx_run_get"
+            "run_id.$" = "$.run_id"
+            job_id     = 923072819710352
+            only       = ["gold"]
+            "states.$" = "$.states"
+            "failed.$" = "$.failed"
+            logic_path = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_bundle/bundle-job.json"
+            "_sf_execution_arn.$"        = "$$.Execution.Id"
+            "_sf_execution_started_at.$" = "$$.Execution.StartTime"
+            "_execution_input.$"         = "$$.Execution.Input"
+          }
+        }
+        ResultSelector = {
+          "states.$" = "$.Payload.states"
+          "failed.$" = "$.Payload.failed"
+          "run_id.$" = "$.Payload.run_id"
+          "done.$"   = "$.Payload.done"
+        }
+        Next = "Seg1Check"
+      }
+      Seg1Check = {
+        Type    = "Choice"
+        Choices = [{ Variable = "$.done", BooleanEquals = true, Next = "Seg2" }]
+        Default = "Seg1Wait"
+      }
+      Seg1Wait = {
+        Type    = "Wait"
+        Seconds = 30
+        Next    = "Seg1Poll"
+      }
+      Seg2 = {
+        Type           = "Task"
+        Resource       = "arn:aws:states:::lambda:invoke"
+        TimeoutSeconds = 900
+        Parameters = {
+          FunctionName = aws_lambda_function.pipeline_runner.arn
+          Payload = {
+            _pipeline_run     = true
+            pipeline          = var.pipeline_name
+            "_bundle_states.$" = "$.states"
+            transforms = [
+              { node = "silver", language = "task", logic_path = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/silver/_runtime/logic.py", inputs = { bronze = "clavesa_x__default.bronze__default" }, outputs = { default = "" }, parents = ["bronze"] },
+            ]
+            "_sf_execution_arn.$"        = "$$.Execution.Id"
+            "_sf_execution_started_at.$" = "$$.Execution.StartTime"
+            "_execution_input.$"         = "$$.Execution.Input"
+          }
+        }
+        ResultSelector = {
+          "states.$" = "$.Payload.states"
+          "failed.$" = "$.Payload.failed"
+        }
+        Next = "Done"
+      }
+      Done = {
+        Type    = "Choice"
+        Choices = [{ Variable = "$.failed", BooleanEquals = true, Next = "JobFailed" }]
+        Default = "JobSucceeded"
+      }
+      JobFailed = {
+        Type  = "Fail"
+        Error = "BundleTaskFailed"
+        Cause = "a task of the job failed; see the run page"
+      }
+      JobSucceeded = {
+        Type = "Succeed"
+      }
+    }
+  })
+
+  logging_configuration {
+    log_destination        = "${aws_cloudwatch_log_group.sfn_logs.arn}:*"
+    include_execution_data = true
+    level                  = "ERROR"
+  }
+
+  tags       = local.clavesa_tags
+  depends_on = [aws_iam_role_policy.sfn_exec_policy]
+}

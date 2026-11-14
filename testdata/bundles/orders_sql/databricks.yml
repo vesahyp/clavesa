@@ -1,0 +1,27 @@
+# A small bundle for the runner's script mode (ADR-031 slice 3): a
+# spark_python_task loads raw orders, a sql_task with a file cleans them.
+bundle:
+  name: orders_sql
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    default: main
+  clavesa:
+    description: Settings for clavesa deploys (ignored by Databricks)
+    type: complex
+    default: {}
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+
+  local:
+    default: true
+    variables:
+      clavesa:
+        catalog: glue

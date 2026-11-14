@@ -1,0 +1,18 @@
+## main.sales.orders_clean
+1004	2026-11-13	FI	40.00	Aino
+1005	2026-11-13	EE	19.90	Kati
+1007	2026-11-13	FI	5.25	Liisa
+1008	2026-11-13	DE	99.99	Jonas
+## main.sales.orders_enriched
+1004	FI	Finland	40.00	true
+1005	EE	Estonia	19.90	false
+1007	FI	Finland	5.25	true
+1008	DE	Germany	99.99	false
+## main.sales.daily_revenue
+DE	Germany	1	99.99	2026-11-13
+EE	Estonia	1	19.90	2026-11-13
+FI	Finland	2	45.25	2026-11-13
+## main.sales.weekly_revenue
+DE	99.99	1
+EE	19.90	1
+FI	45.25	2

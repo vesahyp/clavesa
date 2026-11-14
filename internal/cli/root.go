@@ -46,6 +46,7 @@ Quick start:
 		newWorkspaceCmd(),
 		newPipelineCmd(),
 		newDeployCmd(),
+		newBundleCmd(),
 		newPlanCmd(),
 		newNodeCmd(),
 		newSourceCmd(),

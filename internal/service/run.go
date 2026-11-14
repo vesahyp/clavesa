@@ -93,6 +93,8 @@ type runPrep struct {
 	// force=true with forceNodes empty == every node in this dispatch.
 	force      bool
 	forceNodes []string
+	// bundleParams are the job parameter values of a bundle pipeline run.
+	bundleParams map[string]string
 	// lease is the per-pipeline run lock acquired in prepareRun (ADR-024:
 	// runs are serialized by a lease in the warehouse — here the file
 	// backend on the workspace's local warehouse dir). Released by
@@ -159,13 +161,13 @@ func (s *Service) RunPipeline(ctx context.Context, dir string) (*RunResult, erro
 // signature.
 //
 //   - Force      — bypass incremental-skip checks for this run. The runner
-//                  re-reads the full source range on partitioned_path inputs
-//                  and Delta CDF inputs that otherwise would have skipped
-//                  because the cursor didn't advance. Watermarks still
-//                  advance on success — the next unforced run resumes
-//                  normal incremental dispatch.
+//     re-reads the full source range on partitioned_path inputs
+//     and Delta CDF inputs that otherwise would have skipped
+//     because the cursor didn't advance. Watermarks still
+//     advance on success — the next unforced run resumes
+//     normal incremental dispatch.
 //   - ForceNodes — narrows Force to the named node IDs. Empty (with Force
-//                  true) means "every node in this dispatch."
+//     true) means "every node in this dispatch."
 type RunOpts struct {
 	Force      bool
 	ForceNodes []string
@@ -173,6 +175,9 @@ type RunOpts struct {
 	// bundle event and the timing record. Empty means "manual". The CLI
 	// fills it from CLAVESA_TRIGGER (see TriggerFromEnv).
 	Trigger string
+	// BundleParams are job parameter values for a pipeline generated
+	// from a Databricks bundle (ADR-031); the job's defaults fill the rest.
+	BundleParams map[string]string
 }
 
 // TriggerFromEnv returns $CLAVESA_TRIGGER, or "manual" when it is unset or
@@ -206,6 +211,7 @@ func (s *Service) RunPipelineWithOpts(ctx context.Context, dir string, opts RunO
 	// defend in depth.
 	prep.force = opts.Force || len(opts.ForceNodes) > 0
 	prep.forceNodes = append([]string(nil), opts.ForceNodes...)
+	prep.bundleParams = opts.BundleParams
 	// Belt-and-suspenders: executeRun releases the run lock at the terminal
 	// moment on every exit path; this defer only covers the impossible
 	// in-between. Idempotent.
@@ -538,6 +544,31 @@ func (s *Service) executeRun(ctx context.Context, prep *runPrep) (*RunResult, er
 	// pipeline_handler enforces internally).
 	for _, nodeID := range prep.order {
 		node := nodeByID[nodeID]
+		// A Databricks bundle task (ADR-031): the runner reads the task
+		// from bundle-job.json; its code writes its own tables.
+		if node != nil && node.Type == "task" {
+			if !nodeEnabled(*node) {
+				continue
+			}
+			var taskParents []string
+			for _, p := range parents[nodeID] {
+				if up := nodeByID[p]; up != nil && up.Type == "task" && !nodeEnabled(*up) {
+					continue
+				}
+				taskParents = append(taskParents, p)
+			}
+			bundle = append(bundle, bundleTransformConfig{
+				NodeID:       nodeID,
+				Node:         node,
+				Inputs:       map[string]any{},
+				Outputs:      map[string]any{},
+				LogicPath:    bundleJobPath(prep.abs),
+				Language:     "task",
+				Parents:      taskParents,
+				BundleParams: prep.bundleParams,
+			})
+			continue
+		}
 		if node == nil || node.Type != "transform" {
 			continue
 		}
@@ -1109,23 +1140,23 @@ func tfvarsCandidates(dir string) []string {
 }
 
 // autoDeltaTableID mirrors runner.py::_table_id_for so Go can pass an
-// explicit Delta table id into the runner's ``outputs.default`` field
+// explicit Delta table id into the runner's “outputs.default“ field
 // (instead of letting the runner auto-generate, which Go can't observe
 // for downstream-input wiring). Same ADR-016 encoding as the runner's
-// ``_glue_db()`` and ``internal/identutil.EncodeGlueDatabase``. Delta
-// tables live under Spark's default ``spark_catalog``, so the identifier
-// is the bare ``<db>.<table>`` two-segment form.
+// “_glue_db()“ and “internal/identutil.EncodeGlueDatabase“. Delta
+// tables live under Spark's default “spark_catalog“, so the identifier
+// is the bare “<db>.<table>“ two-segment form.
 //
-// ADR-019 Slice 3 drops the ``__default`` suffix from single-output
+// ADR-019 Slice 3 drops the “__default“ suffix from single-output
 // transforms. The Go-side service only ever feeds the runner the
-// ``outputs.default`` slot from this pipeline-run path, so the
+// “outputs.default“ slot from this pipeline-run path, so the
 // bare-node-name table segment is always correct here.
 //
 // Slice 4 leaves this shape unchanged. The architectural goal of native
-// three-level ``<catalog>.<schema>.<table>`` addressing is blocked on
+// three-level “<catalog>.<schema>.<table>“ addressing is blocked on
 // Delta 4.0's session-only DeltaCatalog implementation (see
 // runner/spark_conf.py); the on-disk warehouse layout moves to the V2
-// tree via ``_ensure_database``'s LOCATION clause regardless.
+// tree via “_ensure_database“'s LOCATION clause regardless.
 func autoDeltaTableID(catalog, schema, nodeID string) string {
 	nodeSafe := identutil.Sanitize(nodeID)
 	return fmt.Sprintf("%s.%s",
@@ -1424,6 +1455,10 @@ type bundleTransformConfig struct {
 	Language  string
 	Parents   []string
 	TableID   string
+	// BundleParams carries a bundle pipeline's job parameter values
+	// (ADR-031) on its task entries; runPipelineBundle puts them in the
+	// event once.
+	BundleParams map[string]string
 }
 
 // runPipelineBundle invokes the runner image once with CLAVESA_RUN=1 and
@@ -1477,6 +1512,21 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		"_sf_execution_arn": runID,
 		"_trigger":          trigger,
 	}
+	// A pipeline generated from a Databricks bundle (ADR-031): the job and
+	// its tasks from bundle-job.json, and a copy of the bundle's files in
+	// the (mounted) workdir.
+	var extraMounts []dockerMount
+	if bj, err := bundleRunEvent(pipelineDir, workdir, runID, bundle); err != nil {
+		return nil, err
+	} else if bj != nil {
+		event["_bundle_job"] = bj.job
+		for _, entry := range transforms {
+			if t, ok := bj.tasks[entry["node"].(string)]; ok {
+				entry["task"] = t
+			}
+		}
+		extraMounts = bj.mounts
+	}
 	if force {
 		// pipeline_handler unpacks these into each per-transform sub_event;
 		// the runner's _is_forced() check fires when a node is in the set
@@ -1495,6 +1545,9 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 		"CLAVESA_SCHEMA=" + schema,
 		"CLAVESA_SYSTEM_CATALOG=" + systemCatalog,
 	}
+	// Databricks secrets of a bundle job, set in the shell for a local run
+	// (ADR-031: CLAVESA_DBX_SECRET__<scope>__<key>).
+	env = append(env, bundleSecretEnv()...)
 	// Credential env passthrough — union across every transform's
 	// inputs, since one container reads them all. Mirrors the per-
 	// transform logic in runTransform.
@@ -1529,6 +1582,7 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	// from the shared builder), the credentials dir when present, and the
 	// union of input mount roots across every transform's inputs.
 	mounts := []dockerMount{{Host: workdir}, {Host: watermarks}}
+	mounts = append(mounts, extraMounts...)
 	credsDir := filepath.Join(s.workspace, ".clavesa", "credentials")
 	if st, err := os.Stat(credsDir); err == nil && st.IsDir() {
 		mounts = append(mounts, dockerMount{Host: credsDir, RO: true})

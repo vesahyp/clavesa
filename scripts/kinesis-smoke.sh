@@ -48,6 +48,8 @@ region=${AWS_REGION:-$(aws configure get region || true)}
 [[ -n "$region" ]] || { echo "set AWS_REGION" >&2; exit 1; }
 export AWS_REGION=$region
 cd "$ws"
+ver=$("$clavesa" version 2>&1 | grep -o 'v[0-9.]*' | head -1)
+[[ -d ".clavesa/modules/$ver" ]] || { echo "$ws is not on $ver: run '$clavesa workspace upgrade' and 'workspace deploy' first" >&2; exit 1; }
 
 pass() { echo "✓ $*"; }
 fail() { echo "✗ $*" >&2; exit 1; }

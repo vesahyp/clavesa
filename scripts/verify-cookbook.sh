@@ -77,7 +77,7 @@ BIN="$REPO_ROOT/bin/clavesa"
 # QueryQuery.StrictMissing (set on the interactive ad-hoc seam service.Query
 # and on RenderDashboard's widget queries); both recipes are back in the
 # default and green.
-RECIPES="${CLAVESA_COOKBOOK_RECIPES:-multi-stage merge-cdf query-your-data debugging-runs notebooks python-transform http-changing-source dashboards runner-deps s3-bulk-ingest cloudfront-web-analytics backfill}"
+RECIPES="${CLAVESA_COOKBOOK_RECIPES:-multi-stage merge-cdf query-your-data debugging-runs notebooks python-transform http-changing-source dashboards runner-deps s3-bulk-ingest cloudfront-web-analytics backfill move-a-databricks-job}"
 
 # All recipes share ONE workspace named `cookbook` — this is the cookbook's
 # own design (one workspace, one taxi dataset, recipes building on each
@@ -1682,6 +1682,84 @@ WS="$WORK/$WS_NAME"
 # Per-recipe heartbeat to the release-gates progress log (GH #84 follow-up):
 # `tail -f .gates/progress.log` shows "recipe N/M: <name>" during the long
 # run. No-op when run standalone (CLAVESA_PROGRESS_LOG unset).
+# ---------------------------------------------------------------------------
+# Recipe: move-a-databricks-job.md (ADR-031)
+# ---------------------------------------------------------------------------
+# Walks the recipe literally against the example bundle: plan refuses the
+# %pip cell, the one edit makes it ready, bundle run on aws-local runs the
+# whole job (notebook, SQL, wheel, condition, notebook, run_job), and the
+# tables equal the recipe's Verify block. Then the --param run.
+recipe_move_databricks_job() {
+  CURRENT_RECIPE="move-a-databricks-job"
+  ensure_workspace
+
+  banner "recipe move-a-databricks-job: copy the example bundle"
+  local BUNDLE="$WORK/bundle/daily_sales"
+  rm -rf "$WORK/bundle"
+  mkdir -p "$WORK/bundle"
+  cp -R "$REPO_ROOT/testdata/bundles/daily_sales" "$BUNDLE"
+
+  banner "recipe move-a-databricks-job: plan refuses the %pip cell"
+  local plan rc
+  plan="$("$BIN" bundle plan --bundle "$BUNDLE" -t aws-local 2>&1)" && rc=0 || rc=$?
+  if [[ $rc -ne 0 ]] && grep -q "refuse notebooks/publish.py:6  %pip install tabulate==0.9.0" <<<"$plan" && grep -q "Ready: no.  1 refuse, 1 warn." <<<"$plan"; then
+    pass "plan exits 1 with the %pip refuse"
+  else
+    fail "plan before the fix (exit $rc):"$'\n'"$plan"
+  fi
+
+  banner "recipe move-a-databricks-job: the one edit"
+  python3 - "$BUNDLE" <<'PY'
+import sys
+b = sys.argv[1]
+p = f"{b}/notebooks/publish.py"
+s = open(p).read()
+s = s.replace("# MAGIC %pip install tabulate==0.9.0\n\n# COMMAND ----------\n\n", "", 1)
+open(p, "w").write(s)
+p = f"{b}/resources/daily_sales.job.yml"
+s = open(p).read()
+s = s.replace("            notebook_path: ../notebooks/publish.py\n",
+              "            notebook_path: ../notebooks/publish.py\n          libraries:\n            - pypi:\n                package: tabulate==0.9.0\n", 1)
+open(p, "w").write(s)
+PY
+  plan="$("$BIN" bundle plan --bundle "$BUNDLE" -t aws-local 2>&1)" && rc=0 || rc=$?
+  if [[ $rc -eq 0 ]] && grep -q "Ready: yes.  0 refuse, 1 warn." <<<"$plan"; then
+    pass "plan after the fix: Ready: yes"
+  else
+    fail "plan after the fix (exit $rc):"$'\n'"$plan"
+  fi
+
+  banner "recipe move-a-databricks-job: bundle run on aws-local"
+  local out
+  out="$(CLAVESA_DBX_SECRET__sales__api_key=any-value clv bundle run --bundle "$BUNDLE" -t aws-local --job daily_sales --compute local 2>"$WORK/bundle-run.err")" && rc=0 || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    tail -40 "$WORK/bundle-run.err" >&2 || true
+    die "bundle run failed"
+  fi
+  for task in ingest check clean enrich publish weekly; do
+    if grep -Eq "^$task +[a-z_]+ +ok" <<<"$out"; then
+      pass "task $task ok"
+    else
+      fail "task $task not ok:"$'\n'"$out"
+    fi
+  done
+
+  local rev
+  rev="$(clv query "SELECT concat_ws(';', collect_list(concat_ws(',', country, country_name, CAST(orders AS STRING), CAST(revenue AS STRING)))) FROM (SELECT * FROM main__sales.daily_revenue ORDER BY country)" --json 2>/dev/null | jq -r '.rows[0][0] // empty')"
+  if [[ "$rev" == "DE,Germany,1,99.99;EE,Estonia,1,19.90;FI,Finland,2,45.25" ]]; then
+    pass "daily_revenue = $rev"
+  else
+    fail "daily_revenue: got '$rev'"
+  fi
+  assert_count "SELECT count(*) FROM main__sales.orders_clean" 4 "orders_clean rows"
+  assert_count "SELECT count(*) FROM main__sales.weekly_revenue" 3 "weekly_revenue rows"
+
+  banner "recipe move-a-databricks-job: another day with --param"
+  CLAVESA_DBX_SECRET__sales__api_key=any-value clv bundle run --bundle "$BUNDLE" -t aws-local --job daily_sales \
+    --param run_date=2026-11-12 >"$WORK/bundle-run2.log" 2>&1 || die "bundle run --param failed — see $WORK/bundle-run2.log"
+  assert_count "SELECT count(*) FROM main__sales.orders_clean" 7 "orders_clean rows after 2026-11-12"
+}
+
 _total_recipes=$(wc -w <<<"$RECIPES" | tr -d ' ')
 _recipe_i=0
 for r in $RECIPES; do
@@ -1702,6 +1780,7 @@ for r in $RECIPES; do
     dashboards)         recipe_dashboards ;;
     runner-deps)        recipe_runner_deps ;;
     backfill)           recipe_backfill ;;
+    move-a-databricks-job) recipe_move_databricks_job ;;
     *) die "unknown recipe: $r" ;;
   esac
 done

@@ -1,0 +1,26 @@
+# Notebook tasks in the three formats a bundle holds (ADR-031 slice 4): a
+# .py source notebook with %run, %sql, widgets and notebook.exit; a .sql
+# notebook; and an .ipynb notebook.
+bundle:
+  name: notebooks
+
+include:
+  - resources/*.yml
+
+variables:
+  clavesa:
+    description: Settings for clavesa deploys (ignored by Databricks)
+    type: complex
+    default: {}
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://dbc-00000000-0000.cloud.databricks.com
+
+  local:
+    default: true
+    variables:
+      clavesa:
+        catalog: glue

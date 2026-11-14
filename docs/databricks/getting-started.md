@@ -6,6 +6,8 @@ You follow this guide from top to bottom. Nothing is switched until a daily comp
 
 The design is [ADR-027](../decisions/027-unity-catalog-publish.md). Two recipes go deeper: [replace-a-databricks-step](../cookbook/replace-a-databricks-step.md) (the switch and the roll-back in detail) and [feed-a-databricks-job](../cookbook/feed-a-databricks-job.md) (a new table, not a replaced one).
 
+**A whole job instead of one step?** When the job is defined in a bundle (`databricks.yml`), the same bundle can deploy it to clavesa: [move-a-databricks-job](../cookbook/move-a-databricks-job.md) ([ADR-031](../decisions/031-dab-bundles-on-clavesa.md)). Steps 3 to 11 below still apply: a bundle target with `catalog: unity` uses this connection, shadow mode, the comparison (`clavesa bundle compare`) and the switch (`clavesa bundle switch`).
+
 **Status.** Table registration and lineage use Databricks Public Preview APIs. ADR-027 lists what is proven and what is still open.
 
 ## Contents
