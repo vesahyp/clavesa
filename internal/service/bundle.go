@@ -51,11 +51,12 @@ func PlanBundle(ctx context.Context, o BundleOptions) (*bundle.Report, error) {
 }
 
 // BundlePipelineDir is the workspace-relative folder of the pipeline a
-// bundle job becomes: <bundle>_<job>, at the top of the workspace like
-// every pipeline (the run path takes the workspace root to be the
-// pipeline folder's parent). bundle-job.json in it marks it as generated.
-func BundlePipelineDir(bundleName, job string) string {
-	return bundle.PipelineName(bundleName, job)
+// bundle job becomes in a target: <bundle>_<target>_<job>, at the top of
+// the workspace like every pipeline (the run path takes the workspace root
+// to be the pipeline folder's parent). bundle-job.json in it marks it as
+// generated.
+func BundlePipelineDir(bundleName, target, job string) string {
+	return bundle.PipelineName(bundleName, target, job)
 }
 
 // IsBundlePipeline reports whether a pipeline folder was generated from a
@@ -108,7 +109,7 @@ func (s *Service) GenerateBundleJob(ctx context.Context, o BundleOptions, job st
 		}
 		jf.DatabricksJobID = id
 	}
-	rel := BundlePipelineDir(b.Name, job)
+	rel := BundlePipelineDir(b.Name, b.Target, job)
 	abs := filepath.Join(s.workspace, rel)
 	out.Dir, out.Name = abs, filepath.Base(rel)
 	// The task module (modules/task/aws) came with ADR-031: a workspace

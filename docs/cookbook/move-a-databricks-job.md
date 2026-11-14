@@ -66,7 +66,7 @@ daily_sales  (schedule: 0 30 4 * * ? Europe/Helsinki, 1 segment, Fargate 8 vCPU 
   check         condition  clavesa     ok
   publish       notebook   clavesa     refuse notebooks/publish.py:6  %pip install tabulate==0.9.0: move tabulate==0.9.0 to the task's libraries (pypi)
   refresh_gold  pipeline   clavesa     ok     disabled: not run
-  weekly        run_job    clavesa     ok     starts pipeline daily_sales_weekly_report and waits
+  weekly        run_job    clavesa     ok     starts pipeline daily_sales_aws_local_weekly_report and waits
 ...
 Ready: no.  1 refuse, 1 warn.
 ```
@@ -114,7 +114,7 @@ bin/clavesa bundle run --bundle $BUNDLE -t aws-local --job daily_sales --compute
 ```
 
 ```
-Pipeline: daily_sales_daily_sales (.../daily_sales_daily_sales)
+Pipeline: daily_sales_aws_local_daily_sales (.../daily_sales_aws_local_daily_sales)
 Run: ...
 TASK     TYPE       STATUS
 ingest   notebook   ok
@@ -125,7 +125,7 @@ publish  notebook   ok
 weekly   run_job    ok
 ```
 
-What happened: the job became the clavesa pipeline `daily_sales_daily_sales` (read-only: `node edit` names the bundle file to change). The wheel was built from `src/sales_enrich`, `pycountry` and `tabulate` went into the workspace's runner requirements, the notebooks were translated into scripts, and the runner ran the tasks in order in one Spark session: the condition read the task value `row_count` that `ingest` set, and `weekly` ran job `weekly_report` in the same runner.
+What happened: the job became the clavesa pipeline `daily_sales_aws_local_daily_sales` (`<bundle>_<target>_<job>`) (read-only: `node edit` names the bundle file to change). The wheel was built from `src/sales_enrich`, `pycountry` and `tabulate` went into the workspace's runner requirements, the notebooks were translated into scripts, and the runner ran the tasks in order in one Spark session: the condition read the task value `row_count` that `ingest` set, and `weekly` ran job `weekly_report` in the same runner.
 
 ## Verify
 

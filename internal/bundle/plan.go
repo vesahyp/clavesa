@@ -186,7 +186,7 @@ func Plan(b *Bundle) (*Report, error) {
 	}
 
 	for _, j := range jobs {
-		jp := JobPlan{Key: j.Key, Pipeline: PipelineName(b.Name, j.Key)}
+		jp := JobPlan{Key: j.Key, Pipeline: PipelineName(b.Name, b.Target, j.Key)}
 		planJobLevel(b, j, &jp)
 		for i := range j.Tasks {
 			t := &j.Tasks[i]
@@ -201,8 +201,17 @@ func Plan(b *Bundle) (*Report, error) {
 	return r, nil
 }
 
-// PipelineName is the clavesa pipeline a bundle job becomes.
-func PipelineName(bundle, job string) string { return bundle + "_" + job }
+// PipelineName is the clavesa pipeline a bundle job becomes in a target:
+// <bundle>_<target>_<job>. The target is in the name so two clavesa targets
+// of one bundle (shadow and mixed, say) are two pipelines in one workspace.
+func PipelineName(bundle, target, job string) string {
+	return bundle + "_" + nameSafe(target) + "_" + job
+}
+
+var nameUnsafeRe = regexp.MustCompile(`[^A-Za-z0-9_]+`)
+
+// nameSafe makes a target name fit a pipeline name: aws-local -> aws_local.
+func nameSafe(s string) string { return strings.ToLower(nameUnsafeRe.ReplaceAllString(s, "_")) }
 
 func (r *Report) tally() {
 	r.Refuse, r.Warn = 0, 0
@@ -389,7 +398,7 @@ func checkMappedTask(b *Bundle, jobs []*Job, j *Job, t *Task, add func(Severity,
 			if !found {
 				add(Refuse, fmt.Sprintf("run_job_task names job %s, which is not in the bundle", m[1]))
 			} else {
-				add(Note, fmt.Sprintf("starts pipeline %s and waits", PipelineName(b.Name, m[1])))
+				add(Note, fmt.Sprintf("starts pipeline %s and waits", PipelineName(b.Name, b.Target, m[1])))
 			}
 		} else if b.Host != "" {
 			add(Note, fmt.Sprintf("runs Databricks job %s (run-now) and waits", ref))

@@ -196,8 +196,10 @@ target value, `--var`, `BUNDLE_VAR_*`), target overrides merged by
 ### 3. One job becomes one clavesa pipeline, generated and read-only
 
 `clavesa bundle deploy -t aws` turns each job of the target into one clavesa
-pipeline named `<bundle>_<job>`, generated into the clavesa workspace as the
-folder `<bundle>_<job>/`, next to the other pipelines (built that way in
+pipeline named `<bundle>_<target>_<job>` (the target in the name since
+v2.25.1, so two clavesa targets of one bundle are two pipelines in one
+workspace; v2.25.0 named it `<bundle>_<job>`), generated into the clavesa
+workspace as the folder of that name, next to the other pipelines (built that way in
 slice 3: the run path takes a pipeline's parent folder to be the workspace,
 so a deeper `bundles/<bundle>/<job>/` would not run). `bundle-job.json` in
 the folder holds the resolved job and marks it as generated, and `bundle/`
@@ -543,7 +545,7 @@ daily_sales  (schedule: 04:30 Europe/Helsinki, 3 segments, Fargate 8 vCPU / 32 G
   check         condition   clavesa     ok
   refresh_gold  pipeline    databricks  ok     Lakeflow pipeline: stays on Databricks
   publish       notebook    clavesa     refuse notebooks/publish.py:3  %pip install tabulate: move to libraries
-  weekly        run_job     clavesa     ok     starts pipeline daily_sales_weekly_report and waits
+  weekly        run_job     clavesa     ok     starts pipeline daily_sales_aws_weekly_report and waits
 Ready: no.  1 refuse, 1 warn.
 ```
 
@@ -665,9 +667,10 @@ modules were extracted before slice 3 lacked the task module; `catalog:
 unity` needs the runner's Glue access to the job's databases too; the runner
 image was pushed to the profile's region instead of the workspace's.
 
-Open: two clavesa targets of one bundle in one workspace share the
-pipeline `<bundle>_<job>` (the e2e's `aws` and `aws-mixed` do); a target
-name in the pipeline name would separate them.
+Two clavesa targets of one bundle in one workspace shared the pipeline
+`<bundle>_<job>` (the e2e's `aws` and `aws-mixed` did). Since v2.25.1 the
+target is in the pipeline name. Fargate segments for mixed jobs are in
+TODO.md.
 
 ## Decided 2026-11-14
 

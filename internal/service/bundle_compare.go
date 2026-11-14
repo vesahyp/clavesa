@@ -54,7 +54,7 @@ func (s *Service) CompareBundleJob(ctx context.Context, o BundleOptions, job str
 	if err != nil {
 		return nil, err
 	}
-	out := &BundleCompareResult{Job: job, Pipeline: bundle.PipelineName(b.Name, job), Pass: true}
+	out := &BundleCompareResult{Job: job, Pipeline: bundle.PipelineName(b.Name, b.Target, job), Pass: true}
 	tables := append([]string{}, jf.Writes...)
 	sort.Strings(tables)
 	if len(tables) == 0 {

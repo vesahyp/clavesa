@@ -258,3 +258,13 @@ targets:
 		t.Errorf("a -> p (databricks) -> c: want 3 segments, got %d", n)
 	}
 }
+
+func TestPipelineNameHasTheTarget(t *testing.T) {
+	if got := PipelineName("daily_sales", "aws-local", "weekly_report"); got != "daily_sales_aws_local_weekly_report" {
+		t.Errorf("got %s", got)
+	}
+	a, b := planOf(t, dailySales, "aws"), planOf(t, dailySales, "aws-local")
+	if a.Jobs[0].Pipeline == b.Jobs[0].Pipeline {
+		t.Errorf("two targets share pipeline %s", a.Jobs[0].Pipeline)
+	}
+}

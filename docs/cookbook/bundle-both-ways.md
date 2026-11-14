@@ -40,6 +40,8 @@ PASS  team_ucpub.sales.orders_raw vs team_ucpub.sales.orders_raw_clavesa (107 pa
 Job default_sql_sql_job (pipeline default_sql_default_sql_sql_job): PASS
 ```
 
+(Since v2.25.1 the pipeline is `default_sql_aws_default_sql_sql_job`: the target is in the name, so `aws` and `aws-mixed` are two pipelines.)
+
 and for the mixed run, the Databricks run of the `aws-mixed` job shows `orders_raw` DISABLED (not in `only`) and `orders_daily` SUCCESS, started by clavesa's state machine (segments `Seg0`, `Seg1Start`, `Seg1Wait`, `Seg1Poll`).
 
 In Catalog Explorer, `team_ucpub.sales` has the four tables; the Lineage tab of `orders_daily_clavesa` shows `orders_raw_clavesa`, then the clavesa task `orders_daily`.

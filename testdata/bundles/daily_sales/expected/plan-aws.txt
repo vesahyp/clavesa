@@ -8,7 +8,7 @@ daily_sales  (schedule: 0 30 4 * * ? Europe/Helsinki (paused), 2 segments, Lambd
   check         condition  clavesa     ok
   publish       notebook   clavesa     refuse notebooks/publish.py:6  %pip install tabulate==0.9.0: move tabulate==0.9.0 to the task's libraries (pypi)
   refresh_gold  pipeline   databricks  ok     Lakeflow pipeline: its engine exists only in Databricks: stays on Databricks
-  weekly        run_job    clavesa     ok     starts pipeline daily_sales_weekly_report and waits
+  weekly        run_job    clavesa     ok     starts pipeline daily_sales_aws_weekly_report and waits
 
 weekly_report  (trigger: file_arrival (paused), 1 segment, Fargate 4 vCPU / 16 GB)
   report        python     clavesa     ok

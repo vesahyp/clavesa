@@ -45,7 +45,7 @@ func TestBundleRunScriptMode(t *testing.T) {
 	bundleDir := filepath.Join(repoRoot(), "testdata", "bundles", "orders_sql")
 
 	out := run(t, "bundle", "run", "--bundle", bundleDir, "--workspace", ws, "--compute", "local")
-	for _, want := range []string{"Pipeline: orders_sql_orders", "load", "clean"} {
+	for _, want := range []string{"Pipeline: orders_sql_local_orders", "load", "clean"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("bundle run output lacks %q:\n%s", want, out)
 		}
@@ -71,7 +71,7 @@ func TestBundleRunScriptMode(t *testing.T) {
 	}
 
 	// The generated pipeline is read-only.
-	msg := runFails(t, "node", "edit", filepath.Join(ws, "orders_sql_orders"), "clean", "--set", "enabled=false", "--workspace", ws)
+	msg := runFails(t, "node", "edit", filepath.Join(ws, "orders_sql_local_orders"), "clean", "--set", "enabled=false", "--workspace", ws)
 	if !strings.Contains(msg, "generated from job orders of the Databricks bundle orders_sql") {
 		t.Fatalf("node edit on a bundle pipeline: %s", msg)
 	}
@@ -318,11 +318,11 @@ func TestBundleDeployTerraform(t *testing.T) {
 	run(t, "workspace", "init", "test-ws", "--workspace", ws)
 	ds := fixedExample(t)
 	out := run(t, "bundle", "deploy", "--bundle", ds, "-t", "aws-local", "--workspace", ws, "--emit-only")
-	if !strings.Contains(out, "Job daily_sales -> pipeline daily_sales_daily_sales") || !strings.Contains(out, "Job weekly_report -> pipeline daily_sales_weekly_report") {
+	if !strings.Contains(out, "Job daily_sales -> pipeline daily_sales_aws_local_daily_sales") || !strings.Contains(out, "Job weekly_report -> pipeline daily_sales_aws_local_weekly_report") {
 		t.Fatalf("deploy --emit-only:\n%s", out)
 	}
 	checks := map[string][]string{
-		"daily_sales_daily_sales": {
+		"daily_sales_aws_local_daily_sales": {
 			`schedule_expression = "cron(30 4 * * ? *)"`,
 			`schedule_expression_timezone = "Europe/Helsinki"`,
 			`state               = "ENABLED"`,
@@ -332,7 +332,7 @@ func TestBundleDeployTerraform(t *testing.T) {
 			`language   = "task"`,
 			`resource "aws_ecs_task_definition"`,
 		},
-		"daily_sales_weekly_report": {
+		"daily_sales_aws_local_weekly_report": {
 			`bucket = { name = ["example-sales-landing"] }, object = { key = [{ prefix = "weekly/" }] }`,
 		},
 	}
@@ -355,7 +355,7 @@ func TestBundleDeployTerraform(t *testing.T) {
 			}
 		}
 	}
-	vars, _ := os.ReadFile(filepath.Join(ws, "daily_sales_daily_sales", "bundle.auto.tfvars"))
+	vars, _ := os.ReadFile(filepath.Join(ws, "daily_sales_aws_local_daily_sales", "bundle.auto.tfvars"))
 	if !strings.Contains(string(vars), "fargate_cpu       = 8") || !strings.Contains(string(vars), "fargate_memory_gb = 60") {
 		t.Errorf("Fargate size from the clusters (photon: 1 driver + 2 workers r6id.xlarge = 12 vCPU / 96 GB, rounded down to 8 / 60):\n%s", vars)
 	}
@@ -384,7 +384,7 @@ func TestBundleDeployMixed(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bundle deploy --emit-only -t aws: %v\n%s", err, out)
 	}
-	dir := filepath.Join(ws, "daily_sales_daily_sales")
+	dir := filepath.Join(ws, "daily_sales_aws_daily_sales")
 	tf, _ := os.ReadFile(filepath.Join(dir, "orchestration.tf"))
 	for _, want := range []string{`_operation = "dbx_run_now"`, `_operation = "dbx_run_get"`, `job_id     = 923072819710352`,
 		`only       = ["refresh_gold"]`, `Next = "Seg1Start"`, `Type    = "Wait"`, `"_bundle_states.$" = "$.states"`} {
@@ -399,6 +399,22 @@ func TestBundleDeployMixed(t *testing.T) {
 			t.Fatalf("terraform %s: %v\n%s", args[0], err, out)
 		}
 	}
+	// Two clavesa targets of one bundle in one workspace are two pipelines
+	// (v2.25.1: the target is in the pipeline name).
+	run(t, "bundle", "deploy", "--bundle", ds, "-t", "aws-local", "--job", "daily_sales", "--workspace", ws, "--emit-only")
+	for _, p := range []string{"daily_sales_aws_daily_sales", "daily_sales_aws_local_daily_sales"} {
+		jf, err := os.ReadFile(filepath.Join(ws, p, "bundle-job.json"))
+		if err != nil {
+			t.Fatalf("pipeline %s: %v", p, err)
+		}
+		if want := strings.TrimPrefix(strings.TrimSuffix(p, "_daily_sales"), "daily_sales_"); !strings.Contains(string(jf), `"target": "`+strings.ReplaceAll(want, "_", "-")+`"`) {
+			t.Errorf("%s/bundle-job.json is not target %s", p, want)
+		}
+	}
+	if list := run(t, "bundle", "list", "--workspace", ws); !strings.Contains(list, "daily_sales_aws_daily_sales") || !strings.Contains(list, "daily_sales_aws_local_daily_sales") {
+		t.Errorf("bundle list:\n%s", list)
+	}
+
 	// Without the deployed Databricks job, deploy stops and says what to do.
 	bad := "#!/bin/sh\necho 'Error: not deployed' >&2\nexit 1\n"
 	_ = os.WriteFile(filepath.Join(bin, "databricks"), []byte(bad), 0o755)

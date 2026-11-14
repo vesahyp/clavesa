@@ -172,7 +172,7 @@ export CLAVESA_DBX_SECRET__<scope>__<key>.
 				}
 				// The deployed job (clavesa bundle deploy): start its state
 				// machine with the run parameters.
-				dir := filepath.Join(ws, service.BundlePipelineDir(r.Bundle, job))
+				dir := filepath.Join(ws, service.BundlePipelineDir(r.Bundle, r.Target, job))
 				if !service.IsBundlePipeline(dir) {
 					return fmt.Errorf("job %s is not deployed in this workspace: run clavesa bundle deploy -t %s first", job, r.Target)
 				}
@@ -528,7 +528,7 @@ touched (databricks bundle destroy -t <target> does that).
 				}
 			}
 			for _, job := range jobs {
-				dir := filepath.Join(ws, service.BundlePipelineDir(r.Bundle, job))
+				dir := filepath.Join(ws, service.BundlePipelineDir(r.Bundle, r.Target, job))
 				if !service.IsBundlePipeline(dir) {
 					fmt.Printf("Job %s: no pipeline %s in this workspace, nothing to destroy.\n", job, filepath.Base(dir))
 					continue

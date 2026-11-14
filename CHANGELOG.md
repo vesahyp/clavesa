@@ -12,6 +12,11 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.25.1] — 2026-11-14
+
+### Fixed
+- **Two clavesa targets of one Databricks bundle in one workspace are two pipelines** (ADR-031). A bundle job's pipeline is now `<bundle>_<target>_<job>` (the target with anything but letters, digits and `_` as `_`), so a shadow target and a mixed target of the same job no longer deploy over each other. A pipeline deployed by v2.25.0 (`<bundle>_<job>`) is left as it is; remove it with `clavesa pipeline destroy` when it is no longer wanted.
+
 ## [v2.25.0] — 2026-11-14
 
 Databricks bundles on clavesa ([ADR-031](docs/decisions/031-dab-bundles-on-clavesa.md)): a job defined in a Databricks bundle deploys to Databricks or to clavesa, or both, from the same `databricks.yml`.

@@ -16,7 +16,7 @@ func TestCompareBundleJob(t *testing.T) {
 		compareTables = f
 	}(compareTables)
 	compareTables = func(_ *Service, _ context.Context, pipeline string, in DatabricksCompareInput) (DatabricksCompareResult, error) {
-		if pipeline != "daily_sales_daily_sales" {
+		if pipeline != "daily_sales_aws_daily_sales" {
 			t.Errorf("pipeline %s", pipeline)
 		}
 		asked = append(asked, in)
