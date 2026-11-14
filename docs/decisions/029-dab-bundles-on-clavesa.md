@@ -8,7 +8,9 @@ deciders: Vesa
 
 # ADR 029: A Databricks bundle deploys to Databricks or to clavesa
 
-**Status**: Proposed (2026-11-14). Plan only; nothing in it is built.
+**Status**: Proposed (2026-11-14). Plan only; nothing in it is built. The
+three open questions were decided by Head Jeeves on 2026-11-14 (section
+"Decided 2026-11-14").
 
 ## Context
 
@@ -221,7 +223,8 @@ the v2.2.0 single-Task design.
 | job `max_concurrent_runs` | runs are serialized by the existing lease lock (ADR-024); a value above 1 gets a plan warning |
 | `queue` | ignored with a plan note: a run that finds the lock taken waits for it |
 | `disabled: true` | the node is generated disabled |
-| `health`, notifications | not carried in v1; a plan note says so |
+| job `email_notifications` | one SNS topic per bundle target, email subscriptions from the bundle (section 7) |
+| job `health` rules | CloudWatch alarms that publish to that topic (section 7) |
 
 The state machine stays one Task when every task runs on clavesa. It gets
 more states only for a mixed job (section 8).
@@ -318,7 +321,8 @@ runner image) and the Python table calls (`spark.table`,
   map catalog names (`catalogs: { main: prod }`). A bundle pipeline owns
   **single tables**, as in ADR-027: two bundle jobs may write
   different tables of one schema. That relaxes ADR-016 section 5 for bundle
-  pipelines only; a hand-made pipeline still owns its whole schema, and a
+  pipelines in `catalog: glue` only (decided 2026-11-14; ADR-016 has the
+  matching update); a hand-made pipeline still owns its whole schema, and a
   table written by two pipelines is refused at plan.
 
 **Plan knows the tables.** The plan finds each task's reads and writes from
@@ -379,6 +383,15 @@ it.
   Clavesa never copies secret values out of Databricks: the team puts each
   one into Secrets Manager once, and the plan prints the commands, as
   getting-started step 3 does.
+- **Notifications.** One SNS topic per bundle target. Each address in a
+  job's `email_notifications` becomes an email subscription on it.
+  `on_start`, `on_success` and `on_failure` become EventBridge rules on the
+  state machine's execution status. Task-level notifications,
+  `webhook_notifications` and `notification_settings` are not carried; the
+  plan warns.
+- **`health`.** A `RUN_DURATION_SECONDS` rule becomes a CloudWatch alarm on
+  the state machine's `ExecutionTime` metric that publishes to the same
+  topic. Other health metrics are not carried; the plan warns.
 - **`run_as`, `permissions`**: Databricks-only. On clavesa the task runs as
   the pipeline's runner role. A plan note says so.
 
@@ -562,13 +575,13 @@ Each one ends with a commit. The estimates are agent time.
 | 4 | Notebook translation: `.py` source, `.ipynb`, `.sql`; `%run` inlining | `ingest` and `publish` run locally | 3 h |
 | 5 | Handler semantics: `run_if`, `outcome`, retries, timeouts, `condition_task`, `for_each_task`, parameters and `{{...}}` values | unit tests per rule; the whole example runs locally | 4 h |
 | 6 | Wheels and libraries: build `artifacts`, stage and install a wheel, `pypi` into runner requirements | `enrich` runs locally | 3 h |
-| 7 | `bundle deploy` for AWS: generated pipelines, EventBridge Scheduler with time zone, `periodic`, `file_arrival`, `table_update`, compute from clusters | `terraform validate` and `plan` on the generated files in tests; no apply | 5 h |
+| 7 | `bundle deploy` for AWS: generated pipelines, EventBridge Scheduler with time zone, `periodic`, `file_arrival`, `table_update`, compute from clusters, the SNS topic with email subscriptions and the `health` alarms | `terraform validate` and `plan` on the generated files in tests; no apply | 6 h |
 | 8 | `catalog: unity`: ADR-027 publish and lineage per task, shadow names, `bundle compare`, `bundle switch` | unit tests with the fake Databricks client | 4 h |
 | 9 | Mixed jobs: segments, `run-now` with `only`, the poll loop, `run_job_task` both ways | the fake Databricks client; generated ASL golden files | 5 h |
 | 10 | Docs: "Move a whole Databricks job" guide, CLI reference, a cookbook recipe in the verify-cookbook run | `make verify-cookbook` | 2 h |
 | 11 | **Live proof** on the test workspace (`ucpub`, us-east-2, Vesa's own account 699166197771): the example bundle deployed both ways, shadow, compare, a mixed run | `make smoke-bundle` | 3 h, **cloud spend: needs Vesa's go-ahead** |
 
-About 42 hours of agent time in all. Slices 1 to 6 give a team a working
+About 43 hours of agent time in all. Slices 1 to 6 give a team a working
 local answer to "can this job run outside Databricks?" before any AWS
 work. Slices 1 and 2 alone already give the plan report, which is useful by
 itself as an inventory of a team's jobs.
@@ -593,8 +606,11 @@ itself as an inventory of a team's jobs.
   test covers the resolver only; the rest are as good as their tests.
 - **Code that builds names at run time escapes the plan.** It fails at run
   time, before writing, but it fails late.
-- **Table ownership relaxes for bundle pipelines** (section 6): ADR-016's
-  one-pipeline-per-schema rule no longer holds for them.
+- **Table ownership relaxes for bundle pipelines in `catalog: glue`**
+  (section 6): ADR-016's one-pipeline-per-schema rule no longer holds for
+  them.
+- **Email subscriptions need each recipient to confirm** the SNS email
+  once; until then that address gets nothing.
 - **One runner per job** means the job's compute is sized for its largest
   task, and Lambda's 15 minutes cover the whole job.
 - **Managed tables still need the per-table switch** of ADR-027. A job that
@@ -610,16 +626,26 @@ itself as an inventory of a team's jobs.
   than clavesa's 4.0.2, and code that depends on that difference behaves
   differently. The plan warns and does not prove anything.
 
+## Decided 2026-11-14
+
+Head Jeeves answered the three open questions of the first draft:
+
+1. **EMR Serverless is not next.** It comes after slices 1 to 6, and only
+   when a real job needs more than 16 vCPU or a JAR task. Until then the
+   plan refuses those tasks and says why.
+2. **ADR-016 section 5 is relaxed for bundle pipelines in `catalog: glue`
+   only** (section 6). A hand-made pipeline, and the Glue side of a
+   `catalog: unity` bundle pipeline, keep the one-pipeline-per-schema rule.
+   ADR-016 has a dated update that says the same.
+3. **Notifications go to SNS, `health` rules become CloudWatch alarms**,
+   kept minimal (section 7): one topic per bundle target, email
+   subscriptions from the bundle, alarms on that topic. Built in slice 7.
+
 ## Open questions
 
-1. **EMR Serverless.** Clusters above 16 vCPU and JAR tasks need it. Is it
-   the next slice after this plan, or does a team put up with Fargate's
-   maximum first?
-2. **Concurrency in `for_each_task`**: v1 runs the items one after the
+1. **Concurrency in `for_each_task`**: v1 runs the items one after the
    other. Threads in one Spark session are possible but change failure
    isolation; decide after a real job asks.
-3. **Notifications and `health`**: carry them to SNS, or leave them to the
-   clavesa run alarms?
 
 ## Relationships
 
@@ -630,7 +656,7 @@ itself as an inventory of a team's jobs.
   a cloud run are the same; `--compute local` works for bundles.
 - **ADR-015**: CLI and UI share the bundle service calls.
 - **ADR-016**: the `<catalog>__<schema>` encoding for `catalog: glue`; its
-  section 5 is relaxed for bundle pipelines (section 6).
+  section 5 is relaxed for bundle pipelines in `catalog: glue` (section 6).
 - **ADR-023**: SQL is parsed with `sqlglot`, already in the runner image.
 - **ADR-027**: the Unity Catalog write, lineage, shadow mode, comparison,
   switch and roll-back; this ADR widens its scope from one step to a job.

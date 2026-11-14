@@ -146,3 +146,12 @@ This resolves three concerns at once:
 - ADR 013 — Iceberg as the table format. Iceberg's hierarchical namespace is what makes this ADR cheap.
 - ADR 014 — Local–cloud parity. The provider seam handles the catalog/schema translation between Glue (flat) and Hadoop (hierarchical).
 - ADR 015 — CLI / UI parity. Both surfaces expose `catalog` and `schema` as authoring fields.
+
+## Update 2026-11-14: bundle pipelines in `catalog: glue` (ADR-029)
+
+Section 5 (full schema ownership) does not hold for pipelines generated from
+a Databricks bundle with `catalog: glue` (ADR-029, section 6). Those
+pipelines own single tables, as in ADR-027: two bundle jobs may write
+different tables of one schema, and a table written by two pipelines is
+refused at plan. Every other pipeline keeps section 5 unchanged. Decided by
+Head Jeeves on 2026-11-14.
