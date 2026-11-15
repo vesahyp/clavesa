@@ -25,6 +25,9 @@
 //   RUN         the run for page 4 (default: the pipeline's last run, from
 //               the workspace summary)
 //   CLAVESA_BIN the binary (default bin/clavesa in the repo)
+//   BASE_URL    a server that is already running (make hosted-local, for
+//               a local-warehouse workspace served from its published
+//               summary); no clavesa ui is started
 //   AWS_PROFILE passed through to clavesa, as for any command
 //
 // Exit status 1 when a page fails a check or its charts never appear.
@@ -86,12 +89,18 @@ async function startUI(port) {
 
 // The browser first: a missing Chromium fails before a server is running.
 const browser = await chromium.launch();
-const port = await freePort();
-const BASE = `http://127.0.0.1:${port}`;
 rmSync(OUT, { recursive: true, force: true });
 mkdirSync(OUT, { recursive: true });
-console.log(`clavesa ui --workspaces ${WS_DIR} --read-only on ${BASE}`);
-const ui = await startUI(port);
+let BASE = process.env.BASE_URL?.replace(/\/$/, "");
+let ui = { kill() {} };
+if (BASE) {
+  console.log(`using the server at ${BASE}`);
+} else {
+  const port = await freePort();
+  BASE = `http://127.0.0.1:${port}`;
+  console.log(`clavesa ui --workspaces ${WS_DIR} --read-only on ${BASE}`);
+  ui = await startUI(port);
+}
 process.on("exit", () => ui.kill());
 
 let runId = process.env.RUN;

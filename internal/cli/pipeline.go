@@ -617,6 +617,7 @@ func newPipelineRunCmd() *cobra.Command {
 	var compute string
 	var force bool
 	var forceNodes []string
+	var noPublish bool
 	cmd := &cobra.Command{
 		Use:   "run <pipeline-dir>",
 		Short: "Execute the pipeline (local: runner container; cloud: SFN StartExecution)",
@@ -652,6 +653,13 @@ time plus the runner's per-node timing) to
 run history dir: $CLAVESA_RUN_HISTORY_DIR, else $XDG_STATE_HOME/clavesa/runs,
 else ~/.local/state/clavesa/runs. The run ends with a short phase table;
 --json carries the record under "timing".
+
+A local-warehouse workspace that has joined a hosted UI (clavesa workspace
+hosted enable) ends every local run, failed or not, by publishing its
+summary to the hosted UI (as clavesa workspace summary --publish does).
+This is best effort: a failed publish prints one line on stderr and never
+changes the run's exit code or output. --no-publish or CLAVESA_NO_PUBLISH=1
+turns it off.
 
 ` + pipelineDirHelp,
 		Args: cobra.RangeArgs(0, 1),
@@ -705,7 +713,12 @@ else ~/.local/state/clavesa/runs. The run ends with a short phase table;
 			if warehouse == workspace.WarehouseLocal {
 				// compute local == no-op (already local); compute cloud was
 				// rejected above. Either way the local DAG walk runs.
-				return runLocalPipeline(cmd, dir, jsonOut, effectiveForce, forceNodes)
+				runErr := runLocalPipeline(cmd, dir, jsonOut, effectiveForce, forceNodes)
+				// ADR-032: a hosted local-warehouse workspace ends every
+				// run, failed or not, by publishing its summary. Best
+				// effort: it never changes the run's result or stdout.
+				publishAfterLocalRun(cmd, ws, noPublish)
+				return runErr
 			}
 			// Cloud warehouse. compute local → run the whole bundle in the
 			// local docker runner against the cloud warehouse; compute "" /
@@ -725,6 +738,7 @@ else ~/.local/state/clavesa/runs. The run ends with a short phase table;
 	cmd.Flags().BoolVar(&wait, "wait", false, "block until the run terminates (cloud: SFN execution; cloud + --compute local: the local docker bundle)")
 	cmd.Flags().BoolVar(&force, "force", false, "Bypass incremental-skip checks for this run; the runner reads the full source range. Watermarks still advance on success.")
 	cmd.Flags().StringSliceVar(&forceNodes, "force-node", nil, "Bypass incremental-skip for the named node only. Repeatable. Implies --force scoped to that node.")
+	cmd.Flags().BoolVar(&noPublish, "no-publish", false, "do not publish the workspace summary to the hosted UI at the end of this local run (also: CLAVESA_NO_PUBLISH=1)")
 	return cmd
 }
 

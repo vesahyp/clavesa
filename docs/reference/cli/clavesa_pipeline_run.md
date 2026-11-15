@@ -35,6 +35,13 @@ run history dir: $CLAVESA_RUN_HISTORY_DIR, else $XDG_STATE_HOME/clavesa/runs,
 else ~/.local/state/clavesa/runs. The run ends with a short phase table;
 --json carries the record under "timing".
 
+A local-warehouse workspace that has joined a hosted UI (clavesa workspace
+hosted enable) ends every local run, failed or not, by publishing its
+summary to the hosted UI (as clavesa workspace summary --publish does).
+This is best effort: a failed publish prints one line on stderr and never
+changes the run's exit code or output. --no-publish or CLAVESA_NO_PUBLISH=1
+turns it off.
+
 Pipeline directory:
   Pass the pipeline directory as the first argument, relative to the
   workspace root (e.g. "my-pipeline") or as an absolute path. Omit it to
@@ -55,6 +62,7 @@ clavesa pipeline run <pipeline-dir> [flags]
       --force                Bypass incremental-skip checks for this run; the runner reads the full source range. Watermarks still advance on success.
       --force-node strings   Bypass incremental-skip for the named node only. Repeatable. Implies --force scoped to that node.
       --json                 emit machine-readable output
+      --no-publish           do not publish the workspace summary to the hosted UI at the end of this local run (also: CLAVESA_NO_PUBLISH=1)
       --wait                 block until the run terminates (cloud: SFN execution; cloud + --compute local: the local docker bundle)
       --warehouse string     override the workspace warehouse for this run: local | cloud
 ```

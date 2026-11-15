@@ -39,6 +39,9 @@ type WorkspaceDeps struct {
 	Restart func()
 	// ReadOnly wraps the mux in ReadOnlyGuard.
 	ReadOnly bool
+	// SummaryOnly marks a hosted local-warehouse workspace served from
+	// its published summary (ADR-032); GET /workspace reports it.
+	SummaryOnly bool
 }
 
 // BuildWorkspaceMux returns the /api handler set for ONE workspace, with
@@ -74,7 +77,7 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 		WithNodeAdder(nodeAdderBridge{svc: svc}).
 		WithExternalTableAttacher(svc).
 		WithInputDetacher(svc)
-	workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc)
+	workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithSummaryOnly(d.SummaryOnly)
 	if d.Restart != nil {
 		workspaceHandler = workspaceHandler.WithRestart(d.Restart)
 	}

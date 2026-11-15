@@ -31,6 +31,17 @@ type WorkspaceHandler struct {
 	// so a second request (a double click, a second tab) is refused
 	// instead of running a second state migration beside the first.
 	migrating sync.Mutex
+	// summaryOnly marks a hosted local-warehouse workspace, served from
+	// its published summary (ADR-032): GET /workspace says so, and the
+	// UI skips the reads the summary does not keep.
+	summaryOnly bool
+}
+
+// WithSummaryOnly marks the workspace as served from its published
+// summary (the hosted UI's local-warehouse workspaces, ADR-032).
+func (wh *WorkspaceHandler) WithSummaryOnly(on bool) *WorkspaceHandler {
+	wh.summaryOnly = on
+	return wh
 }
 
 // NewWorkspaceHandler returns a handler rooted at root.
@@ -134,13 +145,17 @@ type workspaceInfo struct {
 	Exists  bool   `json:"exists"`
 	Name    string `json:"name,omitempty"`
 	Catalog string `json:"catalog,omitempty"`
+	// SummaryOnly is true for a hosted local-warehouse workspace, which
+	// the hosted UI serves from its published summary alone (ADR-032):
+	// only the routes the summary backs answer; the rest are 404.
+	SummaryOnly bool `json:"summary_only,omitempty"`
 }
 
 // GetWorkspace returns the server's workspace root and whether an
 // clavesa.json manifest exists there. The UI uses `exists` to decide
 // between the first-launch create-workspace screen and the normal app.
 func (wh *WorkspaceHandler) GetWorkspace(w http.ResponseWriter, _ *http.Request) {
-	info := workspaceInfo{Root: wh.root}
+	info := workspaceInfo{Root: wh.root, SummaryOnly: wh.summaryOnly}
 	if m, _ := workspace.Load(wh.root); m != nil {
 		info.Exists = true
 		info.Name = m.Name

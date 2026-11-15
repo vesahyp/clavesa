@@ -10,7 +10,9 @@
 #                    and refreshes the summary on its run events.
 #                    "local": the Mac publishes the summary through the
 #                    publisher role (clavesa workspace summary --publish).
-#   account, region  where the workspace lives
+#   account, region  cloud only: where the workspace lives (a local
+#                    entry is just name and kind; its summary names its
+#                    region)
 #   reader_role_arn  cloud only: clavesa-ui-reader-<name> (the workspace
 #                    deploy creates it; `clavesa workspace hosted show`)
 #   bucket           cloud only: the workspace's pipeline bucket
@@ -29,18 +31,46 @@ locals {
       reader_role_arn = "arn:aws:iam::699166197771:role/clavesa-ui-reader-smoke2"
       bucket          = "smoke2-clavesa"
     },
+    {
+      name            = "ucpub"
+      kind            = "cloud"
+      account         = "699166197771"
+      region          = "us-east-2"
+      reader_role_arn = "arn:aws:iam::699166197771:role/clavesa-ui-reader-ucpub"
+      bucket          = "ucpub-clavesa"
+    },
+    {
+      name            = "ucguide"
+      kind            = "cloud"
+      account         = "699166197771"
+      region          = "us-east-2"
+      reader_role_arn = "arn:aws:iam::699166197771:role/clavesa-ui-reader-ucguide"
+      bucket          = "ucguide-clavesa"
+    },
+    # The nightly site-traffic pipelines on the main Mac (local warehouse).
+    # Each run publishes summaries/<name>.json through the publisher role
+    # (hosted/README.md, "Adding a local workspace").
+    { name = "site-traffic", kind = "local" },
+    { name = "omatienoo-traffic", kind = "local" },
+    { name = "podbay-traffic", kind = "local" },
+    { name = "kivikko-traffic", kind = "local" },
+    { name = "keitos-traffic", kind = "local" },
+    { name = "vinkki-traffic", kind = "local" },
+    { name = "rakka-traffic", kind = "local" },
   ]
 
-  workspace_accounts = distinct([for w in local.workspaces : w.account])
+  # Only cloud workspaces send events, so only their accounts may put
+  # events on the bus.
+  workspace_accounts = distinct([for w in local.workspaces : w.account if w.kind == "cloud"])
   local_workspaces   = [for w in local.workspaces : w.name if w.kind == "local"]
 
-  # A local entry may leave reader_role_arn and bucket out; they reach
-  # the Lambda as "".
+  # A local entry leaves account, region, reader_role_arn and bucket out;
+  # they reach the Lambda as "".
   registry_json = jsonencode([for w in local.workspaces : {
     name            = w.name
     kind            = w.kind
-    account         = w.account
-    region          = w.region
+    account         = try(w.account, "")
+    region          = try(w.region, "")
     reader_role_arn = try(w.reader_role_arn, "")
     bucket          = try(w.bucket, "")
   }])

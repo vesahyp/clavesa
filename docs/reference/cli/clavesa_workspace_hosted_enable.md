@@ -8,7 +8,10 @@ clavesa deploy to create the reader role and the workgroup and to upload
 the tree copy.
 
 The hosted UI Lambda's role (the reader principal) and its event bus are
-read from <url>/.well-known/clavesa.json. --reader-principal adds more
+read from <url>/.well-known/clavesa.json. For a local-warehouse
+workspace the command records the publisher role, the data bucket and its
+region from that document instead; nothing is deployed, and
+--reader-principal and --event-bus-arn do not apply. --reader-principal adds more
 principals that may assume the reader role, kept beside the Lambda's
 (repeat it for more than one; for example the IAM user that runs the
 smoke gate's reader leg). --event-bus-arn overrides the bus.

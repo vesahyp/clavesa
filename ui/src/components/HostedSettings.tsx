@@ -128,20 +128,39 @@ export function HostedSettings() {
                     <dt className="text-muted-foreground">URL</dt>
                     <dd className="font-mono">{block.url}</dd>
                   </div>
-                  <div>
-                    <dt className="text-muted-foreground">Reader principals</dt>
-                    {block.reader_principals.map((p) => (
-                      <dd key={p} className="break-all font-mono">
-                        {p}
-                      </dd>
-                    ))}
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">Event bus</dt>
-                    <dd className="break-all font-mono">
-                      {block.event_bus_arn || "none"}
-                    </dd>
-                  </div>
+                  {info?.kind === "local" ? (
+                    <>
+                      <div>
+                        <dt className="text-muted-foreground">Kind</dt>
+                        <dd>Local warehouse: every local pipeline run publishes the summary</dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">Publisher role</dt>
+                        <dd className="break-all font-mono">{block.publisher_role_arn}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">Summary</dt>
+                        <dd className="break-all font-mono">{info.summary_uri}</dd>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <dt className="text-muted-foreground">Reader principals</dt>
+                        {block.reader_principals.map((p) => (
+                          <dd key={p} className="break-all font-mono">
+                            {p}
+                          </dd>
+                        ))}
+                      </div>
+                      <div>
+                        <dt className="text-muted-foreground">Event bus</dt>
+                        <dd className="break-all font-mono">
+                          {block.event_bus_arn || "none"}
+                        </dd>
+                      </div>
+                    </>
+                  )}
                 </dl>
               ) : (
                 <p data-testid="hosted-summary">Not hosted.</p>
@@ -150,7 +169,9 @@ export function HostedSettings() {
             {changed && (
               <p className="text-xs text-muted-foreground" data-testid="hosted-note">
                 {changed === "enabled"
-                  ? "The next `clavesa deploy` creates the reader role."
+                  ? info?.kind === "local"
+                    ? "The next local pipeline run publishes the summary."
+                    : "The next `clavesa deploy` creates the reader role."
                   : "The next `clavesa deploy` removes the reader role."}
               </p>
             )}

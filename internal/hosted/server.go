@@ -25,6 +25,18 @@ type SummaryStore interface {
 	Put(ctx context.Context, name string, body []byte) error
 }
 
+// StatsKey is the data-bucket key of the hosted UI's own traffic rollup:
+// one JSON array of per-day rows, written by the site-traffic workspace's
+// `traffic` pipeline (node ui_json, site/analytics/clavesa) from the
+// distribution's CloudFront logs. GET /api/stats serves it unchanged.
+const StatsKey = "stats/ui.json"
+
+// StatsReader reads the stored traffic rollup; (nil, nil) when there is
+// none yet.
+type StatsReader interface {
+	GetStats(ctx context.Context) ([]byte, error)
+}
+
 // Workspace is one opened cloud workspace: its tree copy on local disk,
 // its read-only API and its service (for the summary refresh). Every AWS
 // client behind both reads through the workspace's reader role.
@@ -50,11 +62,24 @@ type Server struct {
 	opener    Opener
 	handler   http.Handler
 
+	// Stats reads stats/ui.json for GET /api/stats; nil answers an empty
+	// list.
+	Stats StatsReader
+
 	// RetryWait is the pause between summary attempts while a finished
 	// run is not in the summary yet; RetryAttempts how many attempts.
 	RetryWait     time.Duration
 	RetryAttempts int
 	Logf          func(format string, args ...any)
+	// Now is the clock of the staleness check; nil is time.Now.
+	Now func() time.Time
+}
+
+func (s *Server) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 // NewServer returns the server over the registry.
@@ -82,6 +107,7 @@ func NewServer(reg []Entry, wk service.HostedWellKnown, store SummaryStore, open
 //
 //	GET /.well-known/clavesa.json   the join settings (public)
 //	GET /api/workspaces             the registry with the stored summaries
+//	GET /api/stats                  the hosted UI's traffic rollup (stats/ui.json)
 //	/w/<name>/api/workspace/summary the stored summary; ?live=1 computes it
 //	/w/<name>/api/...               that workspace's BuildWorkspaceMux
 //
@@ -100,6 +126,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/workspaces":
 		s.serveWorkspaces(w, r)
 		return
+	case path == "/api/stats":
+		s.serveStats(w, r)
+		return
 	}
 	name, rest, ok := splitWorkspacePath(path)
 	if !ok || !(rest == "/api" || strings.HasPrefix(rest, "/api/")) {
@@ -111,7 +140,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, "unknown workspace: "+name)
 		return
 	}
-	if rest == "/api/workspace/summary" && r.URL.Query().Get("live") != "1" {
+	// A local workspace has only its stored summary: ?live=1 reads it too.
+	if rest == "/api/workspace/summary" && (r.URL.Query().Get("live") != "1" || e.Kind == KindLocal) {
 		if body, err := s.store.Get(r.Context(), name); err == nil && body != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -121,13 +151,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			s.Logf("summary %s: read stored: %v", name, err)
 		}
 		// No stored summary yet: a cloud workspace computes it live.
-	}
-	if e.Kind != KindCloud {
-		httputil.WriteError(w, http.StatusNotFound,
-			"workspace "+name+" is a local-warehouse workspace: the hosted UI has only its published summary")
-		return
+		if e.Kind == KindLocal {
+			httputil.WriteError(w, http.StatusNotFound, "workspace "+name+": "+ErrNoSummary.Error())
+			return
+		}
 	}
 	ws, err := s.opener.Open(r.Context(), e)
+	if errors.Is(err, ErrNoSummary) || errors.Is(err, ErrNoDrill) {
+		httputil.WriteError(w, http.StatusNotFound, "workspace "+name+": "+err.Error())
+		return
+	}
 	if err != nil {
 		s.Logf("open %s: %v", name, err)
 		httputil.WriteError(w, http.StatusBadGateway, "workspace "+name+": "+err.Error())
@@ -174,6 +207,48 @@ type WorkspaceCard struct {
 	APIBase      string          `json:"api_base"`
 	Summary      json.RawMessage `json:"summary"`
 	SummaryError string          `json:"summary_error,omitempty"`
+	// SummaryStale is set for a local workspace whose stored summary is
+	// older than its expected interval plus a quarter of it: the Mac did
+	// not run (or could not publish). The card turns amber and says
+	// "No summary from the Mac since <generated_at>".
+	// SummaryIntervalSeconds is that expected interval: the shortest
+	// pipeline trigger_schedule interval, else one day.
+	SummaryStale           bool  `json:"summary_stale,omitempty"`
+	SummaryIntervalSeconds int64 `json:"summary_interval_seconds,omitempty"`
+}
+
+// DefaultLocalInterval is the expected interval of a local workspace
+// whose pipelines declare no trigger_schedule: the nightly cron.
+const DefaultLocalInterval = 24 * time.Hour
+
+// LocalSummaryStale reports whether a local workspace's stored summary
+// is overdue at now, and the expected interval it was measured against:
+// the shortest pipeline interval (DefaultLocalInterval when none
+// declares one) plus a quarter of it as grace, the same grace as a
+// pipeline's "no run inside the expected interval".
+func LocalSummaryStale(body []byte, now time.Time) (bool, time.Duration) {
+	var v struct {
+		GeneratedAt string `json:"generated_at"`
+		Pipelines   []struct {
+			ExpectedIntervalSeconds int64 `json:"expected_interval_seconds"`
+		} `json:"pipelines"`
+	}
+	interval := time.Duration(0)
+	if json.Unmarshal(body, &v) == nil {
+		for _, p := range v.Pipelines {
+			if d := time.Duration(p.ExpectedIntervalSeconds) * time.Second; d > 0 && (interval == 0 || d < interval) {
+				interval = d
+			}
+		}
+	}
+	if interval == 0 {
+		interval = DefaultLocalInterval
+	}
+	g, err := time.Parse(time.RFC3339, v.GeneratedAt)
+	if err != nil {
+		return true, interval
+	}
+	return now.Sub(g) > interval+interval/4, interval
 }
 
 func (s *Server) serveWorkspaces(w http.ResponseWriter, r *http.Request) {
@@ -183,7 +258,7 @@ func (s *Server) serveWorkspaces(w http.ResponseWriter, r *http.Request) {
 		cards[i] = WorkspaceCard{Name: e.Name, Slug: e.Name, Kind: e.Kind, Account: e.Account,
 			Region: e.Region, APIBase: "/w/" + e.Name + "/api", Summary: json.RawMessage("null")}
 		wg.Add(1)
-		go func(i int, name string) {
+		go func(i int, name, kind string) {
 			defer wg.Done()
 			body, err := s.store.Get(r.Context(), name)
 			switch {
@@ -192,11 +267,37 @@ func (s *Server) serveWorkspaces(w http.ResponseWriter, r *http.Request) {
 				s.Logf("summary %s: read stored: %v", name, err)
 			case body != nil && json.Valid(body):
 				cards[i].Summary = body
+				if kind == KindLocal {
+					stale, interval := LocalSummaryStale(body, s.now())
+					cards[i].SummaryStale = stale
+					cards[i].SummaryIntervalSeconds = int64(interval / time.Second)
+				}
 			}
-		}(i, e.Name)
+		}(i, e.Name, e.Kind)
 	}
 	wg.Wait()
 	httputil.WriteJSON(w, http.StatusOK, map[string]any{"workspaces": cards})
+}
+
+// serveStats answers the stored rollup as it is, or [] when none is
+// stored yet. Only the data bucket is read: no Athena, no workspace.
+func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {
+	var body []byte
+	if s.Stats != nil {
+		b, err := s.Stats.GetStats(r.Context())
+		if err != nil {
+			s.Logf("stats: read stored: %v", err)
+			httputil.WriteError(w, http.StatusBadGateway, "could not read the stored stats")
+			return
+		}
+		body = b
+	}
+	if body == nil || !json.Valid(body) {
+		body = []byte("[]")
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // splitWorkspacePath splits "/w/<name>/<rest>" into name and "/<rest>".

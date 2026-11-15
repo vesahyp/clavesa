@@ -9,6 +9,7 @@ import { z } from "zod";
 import { apiFetch } from "@/api/client";
 import { requestParsed, requestVoid } from "./core";
 import { runtimeConfig } from "@/lib/runtimeConfig";
+import { useSummaryOnly } from "@/hooks/useSummaryOnly";
 
 const BackfillRun = z.object({
   run_id: z.string(),
@@ -76,9 +77,11 @@ export type BackfillDedupCheckResult = z.infer<typeof BackfillDedupCheckResult>;
  * an operating action the read-only hosted pages do not offer (ADR-032).
  */
 export function useBackfills(dir: string) {
+  // Not kept in a local workspace's published summary (ADR-032).
+  const summaryOnly = useSummaryOnly();
   return useQuery({
     queryKey: ["backfills", dir],
-    enabled: Boolean(dir) && runtimeConfig.mode !== "hosted",
+    enabled: Boolean(dir) && runtimeConfig.mode !== "hosted" && !summaryOnly,
     retry: false,
     staleTime: 30_000,
     queryFn: () =>

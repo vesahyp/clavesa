@@ -106,6 +106,10 @@ type Options struct {
 	// AWSProfile selects a shared-config profile for this workspace's AWS
 	// clients. Empty uses the default chain.
 	AWSProfile string
+	// LocalProvider replaces the local-warehouse observability provider.
+	// The hosted UI sets it for a local-warehouse workspace, whose runs it
+	// reads from the published summary (ADR-032). Nil: the real one.
+	LocalProvider observability.Provider
 }
 
 // Deps is the fully-wired Service plus the individual pieces the surfaces
@@ -129,7 +133,10 @@ func New(ctx context.Context, root string, opts Options) *Deps {
 	clients := LoadAWSClients(ctx, root, opts.AWSProfile)
 	cloud := clients.CloudProvider()
 	warm := observability.NewPersistentQueryRunner(root)
-	local := observability.NewLocalProvider(root).WithQueryRunner(warm)
+	var local observability.Provider = observability.NewLocalProvider(root).WithQueryRunner(warm)
+	if opts.LocalProvider != nil {
+		local = opts.LocalProvider
+	}
 	resolver := observability.NewResolver(root, cloud, local)
 	sidecar := observability.NewTranspileSidecar(root)
 	transpiler := servingsql.NewCachedTranspiler(filepath.Join(root, ".clavesa", "cache", "transpile"), sidecar.ToServing)

@@ -44,26 +44,57 @@ export function expectedIntervalSeconds(s: WorkspaceSummary): number {
 }
 
 /**
+ * summaryOverdue reports whether a stored summary is older than the
+ * expected interval plus a quarter of it as grace (the grace a pipeline's
+ * "no run inside the expected interval" gets). The hosted server computes
+ * the same for a local workspace (`summary_stale` on GET /api/workspaces,
+ * internal/hosted LocalSummaryStale); when it sends that, it wins.
+ */
+export function summaryOverdue(
+  s: WorkspaceSummary,
+  now: number = Date.now(),
+  entry?: { summary_stale?: boolean },
+): boolean {
+  if (entry?.summary_stale !== undefined) return entry.summary_stale;
+  const generated = Date.parse(s.generated_at);
+  if (Number.isNaN(generated)) return true;
+  const iv = expectedIntervalSeconds(s);
+  return (now - generated) / 1000 > iv + iv / 4;
+}
+
+/** The time a card names: "14.11 08:02" in the viewer's own zone. */
+function stampTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getDate()}.${d.getMonth() + 1} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
  * cardStatus is the status a workspace card shows: the summary's status,
- * raised to warn when the summary is older than the expected interval (a
- * stored summary that stopped refreshing). A live-computed summary is
- * always fresh, so this only bites on stored ones.
+ * raised to warn when the summary is overdue (a stored summary that
+ * stopped refreshing). A live-computed summary is always fresh, so this
+ * only bites on stored ones. A local-warehouse workspace's summary comes
+ * from the Mac at run end, so an overdue one says that in plain words.
  */
 export function cardStatus(
   s: WorkspaceSummary,
   now: number = Date.now(),
-): { status: SummaryStatus; reasons: string[] } {
+  entry?: { kind?: string; summary_stale?: boolean },
+): { status: SummaryStatus; reasons: string[]; overdue: boolean } {
   const reasons = [...s.status_reasons];
   let status = s.status;
-  const generated = Date.parse(s.generated_at);
-  if (!Number.isNaN(generated)) {
-    const ageS = (now - generated) / 1000;
-    if (ageS > expectedIntervalSeconds(s)) {
-      reasons.push(`summary is ${formatAge(ageS)} old`);
-      if (status === "ok") status = "warn";
+  const overdue = summaryOverdue(s, now, entry);
+  if (overdue) {
+    if (entry?.kind === "local" || s.kind === "local") {
+      reasons.unshift(`No summary from the Mac since ${stampTime(s.generated_at)}`);
+    } else {
+      const ageS = (now - Date.parse(s.generated_at)) / 1000;
+      reasons.push(`summary is ${Number.isNaN(ageS) ? "of unknown age" : `${formatAge(ageS)} old`}`);
     }
+    if (status === "ok") status = "warn";
   }
-  return { status, reasons };
+  return { status, reasons, overdue };
 }
 
 /**

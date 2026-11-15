@@ -21,10 +21,9 @@ import { useMemo } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 
-import { SignOutButton } from "@/components/SignOutButton";
+import { RootHeader, RootNav, hasStats } from "@/components/RootNav";
 import { WorkspaceCard } from "@/components/WorkspaceCard";
 import { WorkspaceSummary, requestParsed, useWorkspaces } from "@/lib/queries";
-import { runtimeConfig } from "@/lib/runtimeConfig";
 import { STATUS_RANK, cardStatus } from "@/lib/summary";
 
 export function Workspaces() {
@@ -63,7 +62,7 @@ export function Workspaces() {
       const data = stored[i] ?? summaries[i].data;
       if (!stored[i] && summaries[i].isLoading) return 3;
       if ((!stored[i] && summaries[i].error) || !data) return STATUS_RANK.fail;
-      return STATUS_RANK[cardStatus(data).status];
+      return STATUS_RANK[cardStatus(data, Date.now(), list[i]).status];
     };
     return list
       .map((ws, i) => ({ ws, i, r: rank(i) }))
@@ -72,24 +71,16 @@ export function Workspaces() {
 
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <header className="flex h-14 items-center gap-3 border-b border-border px-4 pt-[env(safe-area-inset-top)] md:px-6">
-        <span className="text-base font-semibold tracking-tight">Clavesλ</span>
-        <span className="text-sm text-muted-foreground">Workspaces</span>
-        <div className="ml-auto flex items-center gap-2">
-          {runtimeConfig.readOnly && (
-            <span
-              data-testid="read-only-badge"
-              className="rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground"
-            >
-              Read-only
-            </span>
-          )}
-          <SignOutButton compact />
-        </div>
-      </header>
+      <RootHeader title="Workspaces" />
       <main
         data-testid="workspaces-page"
-        className="mx-auto grid max-w-5xl grid-cols-1 gap-4 px-4 py-4 pb-[calc(1rem+env(safe-area-inset-bottom))] md:grid-cols-2 md:px-6 md:py-6"
+        className={
+          "mx-auto grid max-w-5xl grid-cols-1 gap-4 px-4 py-4 md:grid-cols-2 md:px-6 md:py-6 " +
+          // Room for RootNav below md (hosted), else for the home indicator.
+          (hasStats
+            ? "pb-[calc(4.75rem+env(safe-area-inset-bottom))] md:pb-6"
+            : "pb-[calc(1rem+env(safe-area-inset-bottom))]")
+        }
       >
         {isLoading && (
           <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
@@ -114,6 +105,7 @@ export function Workspaces() {
           />
         ))}
       </main>
+      <RootNav />
     </div>
   );
 }

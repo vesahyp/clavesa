@@ -7,12 +7,17 @@
 #                       noindex meta. no-cache.
 #   assets/*            Vite-hashed, immutable.
 #   robots.txt          Disallow everything.
+#   tracker.js          the canonical web-tracker/tracker.js, copied
+#                       byte for byte (no fork). no-cache.
+#   tracker-config.js   hosted/static: spa + sanitize. no-cache.
+#   t.gif               the beacon pixel. no-store: a cached pixel never
+#                       reaches CloudFront and is never logged.
 #
 # /api/*, /w/*/api/* and /.well-known/* are the HTTP API (CloudFront
 # behaviours in hosted/infra/spa.tf), never objects in this bucket.
 #
-# Then invalidates /index.html (the only mutable key a browser asks for
-# by name). AWS profile: $AWS_PROFILE, default "personal".
+# Then invalidates /index.html and the tracker files (the mutable keys a
+# browser asks for by name). AWS profile: $AWS_PROFILE, default "personal".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -38,18 +43,24 @@ rm -f "$OUT/.gitkeep"
 node "$ROOT/hosted/scripts/render-index.mjs" "$DIST/index.html" "$OUT/index.html" \
   "$REGION" "$(out user_pool_id)" "$(out spa_client_id)" "$(out cognito_domain)" "$(out google_enabled)"
 cp "$ROOT/hosted/static/robots.txt" "$OUT/robots.txt"
+cp "$ROOT/web-tracker/tracker.js" "$OUT/tracker.js"
+cp "$ROOT/hosted/static/tracker-config.js" "$OUT/tracker-config.js"
+cmp -s "$ROOT/web-tracker/tracker.js" "$OUT/tracker.js" || { echo "tracker.js differs from web-tracker/tracker.js" >&2; exit 1; }
 
 echo "→ s3://$BUCKET"
 aws s3 sync "$OUT" "s3://$BUCKET" --delete --region "$REGION" \
-  --exclude "index.html" --exclude "assets/*" \
+  --exclude "index.html" --exclude "assets/*" --exclude "t.gif" \
   --cache-control "public,no-cache"
 aws s3 sync "$OUT/assets" "s3://$BUCKET/assets" --delete --region "$REGION" \
   --cache-control "public,max-age=31536000,immutable"
+aws s3 cp "$ROOT/hosted/static/t.gif" "s3://$BUCKET/t.gif" --region "$REGION" \
+  --content-type "image/gif" --cache-control "no-store"
 # index.html last, so it never names an asset that is not there yet.
 aws s3 cp "$OUT/index.html" "s3://$BUCKET/index.html" --region "$REGION" \
   --content-type "text/html; charset=utf-8" --cache-control "no-cache"
 
-echo "→ invalidating /index.html on $DIST_ID"
+echo "→ invalidating /index.html and the tracker on $DIST_ID"
 aws cloudfront create-invalidation --distribution-id "$DIST_ID" \
-  --paths "/index.html" "/" --query "Invalidation.Id" --output text
+  --paths "/index.html" "/" "/tracker.js" "/tracker-config.js" "/t.gif" \
+  --query "Invalidation.Id" --output text
 echo "deployed: $(out ui_url)"

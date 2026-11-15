@@ -12,6 +12,15 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.0] — 2026-11-16
+
+### Added
+- **Local-warehouse workspaces join the hosted UI** (ADR-032 slice 8). `clavesa workspace hosted enable --url <url>` on a local-warehouse workspace records the hosted UI's publisher role, data bucket and region (from `<url>/.well-known/clavesa.json`) and writes no `hosted.tf`: nothing is deployed. Every local `clavesa pipeline run` in such a workspace, failed or not, then ends by publishing the workspace summary through the publisher role. A failed publish is one stderr line and never changes the run's exit code or output; `--no-publish` or `CLAVESA_NO_PUBLISH=1` turns it off. The published summary carries a bounded drill-down (`drill`: the tree's `clavesa.json` and pipeline `.tf` files, the newest 50 runs, the node rows of the newest 10 runs, 20 run-timing records, the last 50 log lines of failed runs; no Mac paths), and the hosted Lambda serves a local workspace's Workspace, Pipeline and Run pages from it with the same handlers and JSON shapes as a live workspace. Routes the summary does not keep answer a JSON 404 and the pages skip them. Registry entries for local workspaces are `{name, kind: "local"}`. A local workspace's card turns amber and says "No summary from the Mac since <time>" when its summary is older than its expected interval plus a quarter. `make hosted-local SUMMARIES=<dir>` serves summary files the way the Lambda does, and `make ui-phone-shots BASE_URL=<url>` takes the phone shots against it.
+- **Hosted UI tracking, error reports and a `/stats` page** (ADR-032 slice 7). The hosted index.html loads the canonical `web-tracker/tracker.js` unchanged (`spa: true`, and a `sanitize` in `hosted/static/tracker-config.js` that replaces run ids, execution ARNs, tokens and email addresses); the local `clavesa ui` loads no tracker and sends nothing. A top-level error boundary sends `error` with `type=boundary` and shows a reload screen. The distribution writes standard access logs under `ui/` (`logs_bucket_name`, `logs_prefix`). `GET /api/stats` serves the data bucket's `stats/ui.json`, drawn as charts on `/stats` (sessions, page views, top pages, devices, vitals, errors per day and the distinct errors). `make errors` prints the last 7 days of errors; `make hosted-tracking-check` proves an error beacon leaves the page.
+
+### Fixed
+- **`clavesa workspace hosted enable` on a workspace pinned to an older module version** wrote a `hosted.tf` that pointed at `.clavesa/modules/<pinned>/hosted-reader`, which does not exist before v2.26.0, so `terraform init` failed with "Unreadable module directory". `hosted.tf` now uses the hosted-reader module of the running clavesa, extracted to `.clavesa/modules/<version>/` when missing; the workspace keeps its pin, and `workspace upgrade` still re-syncs it.
+
 ## [v2.26.0] — 2026-11-15
 
 ### Added

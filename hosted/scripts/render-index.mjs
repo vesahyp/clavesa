@@ -6,6 +6,13 @@
 // a noindex meta. basename and apiBase are left out on purpose: one
 // static index.html serves every path, and the SPA derives them from the
 // path (ui/src/lib/runtimeConfig.ts).
+//
+// Then the tracker (ADR-032 section 4, "Tracking and errors"):
+// /tracker-config.js (hosted/static: spa, sanitize) and /tracker.js (the
+// canonical web-tracker/tracker.js). Plain blocking scripts after the
+// config, so the tracker is up before the app bundle (a deferred module)
+// runs and sees its errors too. Only this hosted index.html has them; the
+// local `clavesa ui` never loads the tracker.
 import { readFileSync, writeFileSync } from "node:fs";
 
 const [input, output, region, userPoolId, clientId, domain, google] =
@@ -31,7 +38,9 @@ const config = {
 const json = JSON.stringify(config).replace(/</g, "\\u003c");
 const tags =
   `<meta name="robots" content="noindex, nofollow" />` +
-  `<script>window.__CLAVESA__=${json};</script>`;
+  `<script>window.__CLAVESA__=${json};</script>` +
+  `<script src="/tracker-config.js"></script>` +
+  `<script src="/tracker.js"></script>`;
 
 const html = readFileSync(input, "utf8");
 if (!html.includes("</head>")) {

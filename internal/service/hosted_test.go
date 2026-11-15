@@ -42,7 +42,9 @@ func hostedWorkspace(t *testing.T) string {
 	write("terraform.tfstate.pre-migrate", `{"secret":"state"}`)
 	write(".env", "AWS_SECRET_ACCESS_KEY=x\n")
 	write(".clavesa/aws-profile.json", `{"profile":"personal"}`)
-	write(".clavesa/environment.json", `{"warehouse":"local","mode":"local"}`)
+	// A cloud-warehouse workspace whose developer runs in cloud-local
+	// mode: the tree copy must still say cloud.
+	write(".clavesa/environment.json", `{"warehouse":"cloud","mode":"local"}`)
 	write(".clavesa/credentials/api.json", `{"name":"api","secret":"env:API"}`)
 	write(".clavesa/credentials/api.secret", "s3cret\n")
 	write(".clavesa/sources/raw.json", `{"name":"raw"}`)
@@ -156,7 +158,7 @@ func TestEnableHosted(t *testing.T) {
 		t.Errorf("manifest hosted = %+v", m.Hosted)
 	}
 	tf, err := os.ReadFile(filepath.Join(ws, workspace.HostedTFFile))
-	if err != nil || !strings.Contains(string(tf), "v9.9.9/hosted-reader/aws") || !strings.Contains(string(tf), `"clavesa-smoke2-*"`) {
+	if err != nil || !strings.Contains(string(tf), ModuleVersion+"/hosted-reader/aws") || !strings.Contains(string(tf), `"clavesa-smoke2-*"`) {
 		t.Errorf("hosted.tf = %s, %v", tf, err)
 	}
 	if _, err := svc.DisableHosted(); err != nil {
@@ -266,5 +268,84 @@ func TestWorkspaceSummaryAccountFromDeployed(t *testing.T) {
 	}
 	if sum.Account != "111122223333" {
 		t.Errorf("account = %q", sum.Account)
+	}
+}
+
+// A workspace pinned to a module version older than hosted-reader (new in
+// v2.26.0) joins without a workspace upgrade: hosted.tf points at the
+// binary's version, whose module tree is extracted when missing, and
+// main.tf keeps its pin. `workspace upgrade` passes its own target.
+func TestEnableHostedOlderPinnedWorkspace(t *testing.T) {
+	ws := hostedWorkspace(t)
+	m, _ := workspace.Load(ws)
+	if err := os.WriteFile(filepath.Join(ws, "main.tf"), []byte(workspace.WorkspaceMainTF(m, "v2.22.0")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(ws)
+	stubWellKnown(t, HostedWellKnown{ReaderPrincipal: hostedTestPrincipal, EventBusARN: hostedTestBus}, nil)
+	if _, err := svc.EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev"}); err != nil {
+		t.Fatal(err)
+	}
+	tf, err := os.ReadFile(filepath.Join(ws, workspace.HostedTFFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"./.clavesa/modules/` + ModuleVersion + `/hosted-reader/aws"`
+	if !strings.Contains(string(tf), want) {
+		t.Errorf("hosted.tf source: want %s in\n%s", want, tf)
+	}
+	if _, err := os.Stat(filepath.Join(ws, ".clavesa", "modules", ModuleVersion, "hosted-reader", "aws", "main.tf")); err != nil {
+		t.Errorf("hosted-reader module not extracted at the binary's version: %v", err)
+	}
+	if v, _ := workspace.CurrentModuleVersion(ws); v != "v2.22.0" {
+		t.Errorf("main.tf pin = %q, want v2.22.0 kept", v)
+	}
+	// The upgrade path: an explicit version wins.
+	if err := svc.SyncHostedTF("v8.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	tf, _ = os.ReadFile(filepath.Join(ws, workspace.HostedTFFile))
+	if !strings.Contains(string(tf), `"./.clavesa/modules/v8.0.0/hosted-reader/aws"`) {
+		t.Errorf("SyncHostedTF(v8.0.0) wrote\n%s", tf)
+	}
+}
+
+// A local-warehouse workspace's block: URL, publisher role, data bucket
+// and region from the well-known document; no reader principals, no
+// hosted.tf, and no tree copy on deploy.
+func TestEnableHostedLocal(t *testing.T) {
+	ws := hostedWorkspace(t)
+	if err := os.WriteFile(filepath.Join(ws, ".clavesa", "environment.json"), []byte(`{"warehouse":"local","mode":"local"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(ws)
+	const pub = "arn:aws:iam::111122223333:role/clavesa-ui-publisher"
+	stubWellKnown(t, HostedWellKnown{ReaderPrincipal: hostedTestPrincipal, EventBusARN: hostedTestBus}, nil)
+	if _, err := svc.EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev"}); err == nil || !strings.Contains(err.Error(), "publisher role") {
+		t.Errorf("no publisher role in the well-known: err = %v", err)
+	}
+	stubWellKnown(t, HostedWellKnown{ReaderPrincipal: hostedTestPrincipal, EventBusARN: hostedTestBus,
+		PublisherRoleARN: pub, DataBucket: "clavesa-ui-data-111122223333", Region: "eu-north-1"}, nil)
+	if _, err := svc.EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{hostedTestPrincipal}}); err == nil {
+		t.Error("a reader principal on a local workspace must be refused")
+	}
+	st, err := svc.EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Kind != "local" || st.Hosted.PublisherRoleARN != pub || st.Hosted.DataBucket != "clavesa-ui-data-111122223333" ||
+		st.Hosted.Region != "eu-north-1" || len(st.Hosted.ReaderPrincipals) != 0 || st.Hosted.EventBusARN != "" ||
+		st.SummaryURI != "s3://clavesa-ui-data-111122223333/summaries/smoke2.json" || st.ReaderRoleName != "" {
+		t.Errorf("status = %+v hosted %+v", st, st.Hosted)
+	}
+	if _, err := os.Stat(filepath.Join(ws, workspace.HostedTFFile)); !os.IsNotExist(err) {
+		t.Errorf("a local workspace must get no hosted.tf: %v", err)
+	}
+	m, err := workspace.Load(ws)
+	if err != nil || !m.Hosted.IsLocal() {
+		t.Fatalf("manifest = %+v, %v", m, err)
+	}
+	if res, err := svc.UploadHostedTree(context.Background()); err != nil || res != nil {
+		t.Errorf("tree copy of a local workspace = %+v, %v; want nothing", res, err)
 	}
 }

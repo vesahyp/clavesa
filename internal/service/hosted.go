@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"github.com/vesahyp/clavesa/internal/modules"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -38,6 +39,11 @@ type HostedStatus struct {
 	// TreeURI is where `clavesa deploy` uploads the read-only tree copy;
 	// empty until the workspace is deployed.
 	TreeURI string `json:"tree_uri,omitempty"`
+	// Kind is "cloud" (read through the reader role) or "local" (the
+	// summary is published from this machine at run end); empty when
+	// not hosted. SummaryURI is where a local workspace's summary goes.
+	Kind       string `json:"kind,omitempty"`
+	SummaryURI string `json:"summary_uri,omitempty"`
 }
 
 // HostedTreePrefix is the key prefix of the tree copy in the pipeline
@@ -108,7 +114,15 @@ func (s *Service) GetHosted() (HostedStatus, error) {
 		return HostedStatus{}, err
 	}
 	st := HostedStatus{Enabled: m.Hosted != nil, Hosted: m.Hosted}
+	if m.Hosted.IsLocal() {
+		// A local-warehouse workspace has no reader role, workgroup or
+		// tree copy: its Mac publishes the summary at run end.
+		st.Kind = "local"
+		st.SummaryURI = "s3://" + m.Hosted.DataBucket + "/" + HostedSummaryKey(m.Name)
+		return st, nil
+	}
 	if m.Hosted != nil {
+		st.Kind = "cloud"
 		st.ReaderRoleName = workspace.HostedReaderRoleName(m.Name)
 		st.WorkGroup = workspace.HostedWorkGroupName(m.Name)
 		if b := workspace.PipelineBucket(s.workspace); b != "" {
@@ -137,6 +151,9 @@ func (s *Service) EnableHosted(ctx context.Context, in HostedInput) (HostedStatu
 	if err != nil {
 		return HostedStatus{}, err
 	}
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
+		return s.enableHostedLocal(m, u, in, wk)
+	}
 	in.ReaderPrincipals = cleanPrincipals(append([]string{wk.ReaderPrincipal}, in.ReaderPrincipals...))
 	if strings.TrimSpace(in.EventBusARN) == "" {
 		in.EventBusARN = wk.EventBusARN
@@ -151,6 +168,34 @@ func (s *Service) EnableHosted(ctx context.Context, in HostedInput) (HostedStatu
 	}
 	if err := s.SyncHostedTF(""); err != nil {
 		return HostedStatus{}, fmt.Errorf("write %s: %w", workspace.HostedTFFile, err)
+	}
+	return s.GetHosted()
+}
+
+// enableHostedLocal records the block of a local-warehouse workspace
+// (ADR-032 section 2, "pushed from the Mac"): the URL and, from the
+// well-known document, the publisher role, the data bucket and its
+// region. No reader principals, no event bus and no hosted.tf: the
+// workspace has no stack, so nothing is deployed. The publisher role can
+// write summaries/<name>.json only after the name is registered as a
+// local workspace in the hosted UI's hosted/infra/workspaces.tf.
+func (s *Service) enableHostedLocal(m *workspace.Manifest, u string, in HostedInput, wk HostedWellKnown) (HostedStatus, error) {
+	if len(cleanPrincipals(in.ReaderPrincipals)) > 0 || strings.TrimSpace(in.EventBusARN) != "" {
+		return HostedStatus{}, fmt.Errorf("this is a local-warehouse workspace: it has no reader role or event rule, so reader principals and an event bus do not apply")
+	}
+	if wk.PublisherRoleARN == "" || wk.DataBucket == "" {
+		return HostedStatus{}, fmt.Errorf("%s%s names no publisher role or data bucket, which a local-warehouse workspace needs", u, HostedWellKnownPath)
+	}
+	h := &workspace.Hosted{URL: u, PublisherRoleARN: wk.PublisherRoleARN, DataBucket: wk.DataBucket, Region: wk.Region}
+	if err := h.Validate(); err != nil {
+		return HostedStatus{}, err
+	}
+	m.Hosted = h
+	if err := workspace.SaveManifest(s.workspace, m); err != nil {
+		return HostedStatus{}, fmt.Errorf("write clavesa.json: %w", err)
+	}
+	if err := s.SyncHostedTF(""); err != nil {
+		return HostedStatus{}, fmt.Errorf("remove %s: %w", workspace.HostedTFFile, err)
 	}
 	return s.GetHosted()
 }
@@ -174,21 +219,30 @@ func (s *Service) DisableHosted() (HostedStatus, error) {
 }
 
 // SyncHostedTF makes hosted.tf match clavesa.json: written while the
-// workspace is hosted, removed otherwise. version "" means the version
-// main.tf already pins. Deploy calls it before the workspace plan so the
-// legacy per-pipeline name list stays current.
+// workspace is hosted, removed otherwise. Deploy calls it before the
+// workspace plan so the legacy per-pipeline name list stays current.
+//
+// version "" means the binary's ModuleVersion, not the version main.tf
+// pins: the hosted-reader module is self-contained and new in v2.26.0, so
+// a workspace pinned to an older module version joins without a full
+// `workspace upgrade` (which would rewrite its pipelines). The embedded
+// module tree is extracted to .clavesa/modules/<version>/ when it is not
+// there yet. `workspace upgrade` passes its target, whose tree it has
+// just extracted.
 func (s *Service) SyncHostedTF(version string) error {
 	m, err := s.loadManifest()
 	if err != nil {
 		return err
 	}
-	if m.Hosted == nil {
+	if m.Hosted == nil || m.Hosted.IsLocal() {
+		// A local-warehouse workspace has no stack: nothing to deploy.
 		return workspace.SyncHostedTF(s.workspace, m, "", nil)
 	}
 	if version == "" {
-		if version, err = workspace.CurrentModuleVersion(s.workspace); err != nil {
-			return err
-		}
+		version = ModuleVersion
+	}
+	if err := modules.Extract(s.workspace, version); err != nil {
+		return fmt.Errorf("extract modules %s: %w", version, err)
 	}
 	pipes, err := s.ListPipelines()
 	if err != nil {
@@ -403,7 +457,7 @@ func (s *Service) UploadHostedTree(ctx context.Context) (*HostedTreeResult, erro
 	if err != nil {
 		return nil, err
 	}
-	if m.Hosted == nil {
+	if m.Hosted == nil || m.Hosted.IsLocal() {
 		return nil, nil
 	}
 	// The apply just changed the outputs; read them fresh.

@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda hosted-tracking-check errors
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -214,9 +214,17 @@ shadow-compare: ## Shadow mode: compare the Databricks step's table with clavesa
 	  $(if $(WHERE),--where "$(WHERE)",$(if $(DAYS),--where "$(PARTITION) >= date_sub(current_date(), $(DAYS))")) \
 	  $(if $(JSON),--json)
 
-ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; AWS_PROFILE passes through)
+ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; BASE_URL=<a running server, e.g. make hosted-local> instead of starting clavesa ui; AWS_PROFILE passes through)
 	cd ui && npx playwright install chromium
 	node ui/scripts/phone-shots.mjs
+
+# The hosted Lambda's API over summary files on disk, with the SPA in
+# front (cmd/clavesa-hosted-local): the test bench for local-warehouse
+# workspaces, served from their published summary (ADR-032 slice 8).
+# SUMMARIES is a directory of <name>.json; ADDR defaults to 127.0.0.1:8090.
+hosted-local: build-ui ## Serve <SUMMARIES>/<name>.json the way the hosted Lambda serves a local workspace, with the SPA (ADDR=127.0.0.1:8090)
+	@test -n "$(SUMMARIES)" || { echo "usage: make hosted-local SUMMARIES=<dir of <name>.json>"; exit 2; }
+	go run ./cmd/clavesa-hosted-local -summaries "$(SUMMARIES)" -addr "$(or $(ADDR),127.0.0.1:8090)"
 
 # Hosted read-only UI (ADR-032): hosted/infra/ and its SPA deploy. A copy
 # in another account passes its backend with HOSTED_BACKEND_FLAGS and its
@@ -256,6 +264,19 @@ hosted-add-user: hosted/infra/.terraform ## Hosted UI: create a confirmed user t
 
 hosted/infra/.terraform:
 	$(HOSTED_TF) init -input=false $(HOSTED_BACKEND_FLAGS)
+
+hosted-tracking-check: build-ui ## Hosted UI: a ?__throw=1 build sends the e=error type=boundary beacon (sanitized), no beacon carries the session, the local UI loads no tracker (LIVE_URL=https://ui.clavesa.dev checks the deployed site)
+	cd ui && npx playwright install chromium
+	node ui/scripts/hosted-tracking-check.mjs
+
+# The hosted UI's errors of the last 7 days from the data bucket's
+# stats/ui.json (written by the site-traffic traffic pipeline, node
+# ui_json): one line per msg + path + type, with the count.
+ERRORS_BUCKET ?= clavesa-ui-data-699166197771
+ERRORS_DAYS   ?= 7
+
+errors: ## Hosted UI: the last 7 days of client errors from s3://<data bucket>/stats/ui.json, one line per msg+path with counts (ERRORS_DAYS, ERRORS_BUCKET; AWS_PROFILE default personal)
+	@bash hosted/scripts/errors.sh "$(ERRORS_BUCKET)" "$(ERRORS_DAYS)"
 
 screenshots-unity-catalog: ## Screenshot + assert the Unity Catalog page and a run's Databricks card (needs a running `clavesa ui` on a connected workspace; UC_RUN=<run id>, see the script)
 	bash scripts/uc-screenshots.sh

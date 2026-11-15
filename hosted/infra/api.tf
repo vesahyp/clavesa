@@ -5,7 +5,8 @@
 #
 #   CloudFront ──> HTTP API ──JWT──> Lambda ──AssumeRole──> clavesa-ui-reader-<ws>
 #                                      │
-#                                      └──> s3://<data bucket>/summaries/<ws>.json
+#                                      ├──> s3://<data bucket>/summaries/<ws>.json
+#                                      └──> s3://<data bucket>/stats/ui.json (read)
 #
 # The Lambda zip is hosted/infra/.build/lambda/bootstrap, built by
 # make hosted-build-lambda (make hosted-plan runs it first).
@@ -99,6 +100,14 @@ resource "aws_iam_role_policy" "api" {
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]
         Resource = "${aws_s3_bucket.data.arn}/summaries/*"
+      },
+      {
+        # GET /api/stats: the UI's own traffic rollup, written from the
+        # Mac by the site-traffic workspace's traffic pipeline. Read only.
+        Sid      = "Stats"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${aws_s3_bucket.data.arn}/stats/*"
       },
     ]
   })

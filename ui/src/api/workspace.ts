@@ -42,6 +42,9 @@ export interface WorkspaceInfo {
   exists: boolean;
   name?: string;
   catalog?: string;
+  /** A hosted local-warehouse workspace, served from its published
+   * summary (ADR-032): see useSummaryOnly. */
+  summary_only?: boolean;
 }
 
 /** GET /workspace — root path + whether a workspace exists there. */

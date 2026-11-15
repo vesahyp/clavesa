@@ -102,19 +102,27 @@ func TestParseRegistry(t *testing.T) {
 	if len(reg) != 2 || reg[0].Name != "site-traffic" || reg[1].Name != "smoke2" || reg[1].Bucket != "smoke2-clavesa" {
 		t.Errorf("registry = %+v", reg)
 	}
+	// A local entry is just {name, kind}: it lives on a Mac, not in an
+	// account. What hosted/infra/workspaces.tf emits for one: "" fields.
+	local, err := ParseRegistry([]byte(`[{"name":"kivikko-traffic","kind":"local"},` +
+		`{"name":"rakka-traffic","kind":"local","account":"","region":"","reader_role_arn":"","bucket":""}]`))
+	if err != nil || len(local) != 2 || local[0].Kind != KindLocal {
+		t.Errorf("local entries: %+v, %v", local, err)
+	}
 	if reg, err := ParseRegistry(nil); err != nil || len(reg) != 0 {
 		t.Errorf("empty: %v %v", reg, err)
 	}
 	bad := map[string]string{
-		"not json":       `{`,
-		"bad kind":       `[{"name":"a","kind":"x","account":"699166197771","region":"r"}]`,
-		"bad name":       `[{"name":"../a","kind":"local","account":"699166197771","region":"r"}]`,
-		"bad account":    `[{"name":"a","kind":"local","account":"1","region":"r"}]`,
-		"no region":      `[{"name":"a","kind":"local","account":"699166197771"}]`,
-		"cloud no role":  `[{"name":"a","kind":"cloud","account":"699166197771","region":"r","bucket":"b-b"}]`,
-		"cloud no bkt":   `[{"name":"a","kind":"cloud","account":"699166197771","region":"r","reader_role_arn":"arn:aws:iam::699166197771:role/x"}]`,
-		"local has role": `[{"name":"a","kind":"local","account":"699166197771","region":"r","reader_role_arn":"arn:aws:iam::699166197771:role/x"}]`,
-		"duplicate":      `[{"name":"a","kind":"local","account":"699166197771","region":"r"},{"name":"a","kind":"local","account":"699166197771","region":"r"}]`,
+		"not json":         `{`,
+		"bad kind":         `[{"name":"a","kind":"x","account":"699166197771","region":"r"}]`,
+		"bad name":         `[{"name":"../a","kind":"local","account":"699166197771","region":"r"}]`,
+		"bad account":      `[{"name":"a","kind":"local","account":"1","region":"r"}]`,
+		"cloud no region":  `[{"name":"a","kind":"cloud","account":"699166197771","reader_role_arn":"arn:aws:iam::699166197771:role/x","bucket":"b-b"}]`,
+		"cloud no account": `[{"name":"a","kind":"cloud","region":"r","reader_role_arn":"arn:aws:iam::699166197771:role/x","bucket":"b-b"}]`,
+		"cloud no role":    `[{"name":"a","kind":"cloud","account":"699166197771","region":"r","bucket":"b-b"}]`,
+		"cloud no bkt":     `[{"name":"a","kind":"cloud","account":"699166197771","region":"r","reader_role_arn":"arn:aws:iam::699166197771:role/x"}]`,
+		"local has role":   `[{"name":"a","kind":"local","account":"699166197771","region":"r","reader_role_arn":"arn:aws:iam::699166197771:role/x"}]`,
+		"duplicate":        `[{"name":"a","kind":"local","account":"699166197771","region":"r"},{"name":"a","kind":"local","account":"699166197771","region":"r"}]`,
 	}
 	for name, in := range bad {
 		if _, err := ParseRegistry([]byte(in)); err == nil {
@@ -389,6 +397,48 @@ func TestServerRoutes(t *testing.T) {
 	// A local workspace has no live API.
 	if res := invokeHTTP(t, s, http.MethodGet, "/w/site-traffic/api/pipelines"); res.StatusCode != 404 {
 		t.Errorf("local workspace live read: %d", res.StatusCode)
+	}
+}
+
+type fakeStats struct {
+	body []byte
+	err  error
+}
+
+func (f fakeStats) GetStats(context.Context) ([]byte, error) { return f.body, f.err }
+
+// TestServerStats: GET /api/stats answers stats/ui.json as stored, [] with
+// none stored (or no reader), a JSON 502 on a read error, and refuses a
+// write like every other route. It never opens a workspace.
+func TestServerStats(t *testing.T) {
+	reg, _ := ParseRegistry([]byte(smoke2Registry))
+	op := &fakeOpener{}
+	s := NewServer(reg, service.HostedWellKnown{}, newMemStore(), op)
+
+	if res := invokeHTTP(t, s, http.MethodGet, "/api/stats"); res.StatusCode != 200 || res.Body != "[]" {
+		t.Errorf("no reader: %d %q, want 200 []", res.StatusCode, res.Body)
+	}
+	s.Stats = fakeStats{}
+	if res := invokeHTTP(t, s, http.MethodGet, "/api/stats"); res.StatusCode != 200 || res.Body != "[]" {
+		t.Errorf("none stored: %d %q, want 200 []", res.StatusCode, res.Body)
+	}
+	stored := `[{"date":"2026-11-15","sessions":2,"pageviews":5,"errors":1}]`
+	s.Stats = fakeStats{body: []byte(stored)}
+	res := invokeHTTP(t, s, http.MethodGet, "/api/stats")
+	if res.StatusCode != 200 || res.Body != stored || res.Headers["Content-Type"] != "application/json" {
+		t.Errorf("stored: %d %q %v", res.StatusCode, res.Body, res.Headers)
+	}
+	s.Stats = fakeStats{err: errors.New("AccessDenied")}
+	res = invokeHTTP(t, s, http.MethodGet, "/api/stats")
+	var body map[string]string
+	if res.StatusCode != http.StatusBadGateway || json.Unmarshal([]byte(res.Body), &body) != nil || body["error"] == "" {
+		t.Errorf("read error: %d %q, want a JSON 502", res.StatusCode, res.Body)
+	}
+	if res := invokeHTTP(t, s, http.MethodPost, "/api/stats"); res.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /api/stats: %d, want 405", res.StatusCode)
+	}
+	if op.opens != 0 {
+		t.Error("GET /api/stats opened a workspace")
 	}
 }
 

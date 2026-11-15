@@ -78,8 +78,13 @@ func (s *Service) PublishSummary(ctx context.Context, sum *WorkspaceSummary) (*P
 	if m.Hosted == nil {
 		return nil, fmt.Errorf("the workspace is not hosted: run clavesa workspace hosted enable --url <url> first")
 	}
-	wk, err := hostedWellKnown(ctx, m.Hosted.URL)
-	if err != nil {
+	// A local workspace's block records the publisher role and the data
+	// bucket at enable time; any other block reads them from the
+	// well-known document.
+	var wk HostedWellKnown
+	if m.Hosted.IsLocal() {
+		wk = HostedWellKnown{PublisherRoleARN: m.Hosted.PublisherRoleARN, DataBucket: m.Hosted.DataBucket, Region: m.Hosted.Region}
+	} else if wk, err = hostedWellKnown(ctx, m.Hosted.URL); err != nil {
 		return nil, err
 	}
 	if wk.PublisherRoleARN == "" || wk.DataBucket == "" {
@@ -88,6 +93,14 @@ func (s *Service) PublishSummary(ctx context.Context, sum *WorkspaceSummary) (*P
 	name := sum.Name
 	if name == "" {
 		name = m.Name
+	}
+	// A local-warehouse workspace has no live read path from the hosted
+	// UI: its published summary carries the drill-down the Pipeline and
+	// Run pages draw from (ADR-032 section 2).
+	if sum.Kind == "local" && sum.Drill == nil {
+		withDrill := *sum
+		withDrill.Drill = s.SummaryDrill(ctx, sum)
+		sum = &withDrill
 	}
 	body, err := json.Marshal(sum)
 	if err != nil {
@@ -115,4 +128,30 @@ func sessionSafe(s string) string {
 		}
 	}
 	return string(out)
+}
+
+// RunEndPublishTimeout bounds the summary and the upload at the end of a
+// run, so a slow network never holds up a nightly job for long.
+const RunEndPublishTimeout = 30 * time.Second
+
+// PublishAfterRun computes the workspace summary and publishes it when
+// the workspace is a local-warehouse workspace with a hosted block
+// (ADR-032 section 2, "pushed from the Mac"). It returns (nil, nil) when
+// there is nothing to publish. `clavesa pipeline run` calls it after a
+// local run, failed or not; its error never changes the run's result.
+func (s *Service) PublishAfterRun(ctx context.Context) (*PublishResult, error) {
+	m, err := s.loadManifest()
+	if err != nil || m == nil || !m.Hosted.IsLocal() {
+		return nil, nil
+	}
+	if workspace.LoadWarehouse(s.workspace) != workspace.WarehouseLocal {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, RunEndPublishTimeout)
+	defer cancel()
+	sum, err := s.WorkspaceSummary(ctx, WorkspaceSummaryQuery{})
+	if err != nil {
+		return nil, err
+	}
+	return s.PublishSummary(ctx, sum)
 }

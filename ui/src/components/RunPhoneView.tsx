@@ -23,6 +23,7 @@ import {
   type NodeRun,
 } from "@/lib/queries";
 import { runIsFailed } from "@/lib/runStatus";
+import { useSummaryOnly } from "@/hooks/useSummaryOnly";
 import { cn } from "@/lib/utils";
 import { FAILED_COLOR, Legend, RUNNING_COLOR, SUCCEEDED_COLOR } from "./MiniCharts";
 
@@ -38,6 +39,12 @@ export function RunPhoneView({ dir, runId }: { dir: string; runId: string }) {
   const pipelineName = dir.split("/").pop() ?? dir;
   const wh = useWarehouse();
   const isLocal = wh.data?.warehouse === "local";
+  // A hosted local workspace keeps node rows for its newest runs only
+  // (ADR-032): say so instead of "none recorded".
+  const summaryOnly = useSummaryOnly();
+  const noNodes = summaryOnly
+    ? "Node timings are kept for the 10 newest runs of a local workspace."
+    : "No node runs recorded for this run.";
 
   const states = useExecutionStates({ dir, run: runId });
   const isRunning = states.data?.status === "RUNNING";
@@ -131,7 +138,7 @@ export function RunPhoneView({ dir, runId }: { dir: string; runId: string }) {
           ) : nodeRuns.isLoading || !settled ? (
             <Skeleton className="h-16 w-full" />
           ) : rows.length === 0 ? (
-            <p className="text-xs text-muted-foreground">No node runs recorded for this run.</p>
+            <p data-testid="run-phone-no-nodes" className="text-xs text-muted-foreground">{noNodes}</p>
           ) : (
             <>
               <Timeline rows={rows} />
@@ -153,7 +160,7 @@ export function RunPhoneView({ dir, runId }: { dir: string; runId: string }) {
         <CardContent className="p-0">
           {rows.length === 0 ? (
             <p className="p-4 pt-0 text-xs text-muted-foreground">
-              {nodeRuns.isLoading || !settled ? "Loading…" : "No node runs."}
+              {nodeRuns.isLoading || !settled ? "Loading…" : summaryOnly ? noNodes : "No node runs."}
             </p>
           ) : (
             <ul className="divide-y divide-border">

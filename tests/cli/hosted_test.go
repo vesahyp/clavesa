@@ -4,6 +4,7 @@ package integration
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,9 @@ func TestWorkspaceHosted(t *testing.T) {
 	ws := newWorkspace(t)
 	run(t, "workspace", "init", "hosted-ws", "--workspace", ws)
 	run(t, "pipeline", "create", "orders", "--workspace", ws)
+	// A cloud-warehouse workspace: the reader role and hosted.tf. The
+	// local-warehouse kind is TestWorkspaceHostedLocal.
+	run(t, "workspace", "use", "--warehouse", "cloud", "--workspace", ws)
 	tfPath := filepath.Join(ws, "hosted.tf")
 
 	// A stand-in for the hosted UI's well-known document (ADR-032 slice 6).
@@ -113,5 +117,72 @@ func TestWorkspaceHosted(t *testing.T) {
 	manifest, _ = os.ReadFile(filepath.Join(ws, "clavesa.json"))
 	if strings.Contains(string(manifest), `"hosted"`) {
 		t.Errorf("disable left the block:\n%s", manifest)
+	}
+}
+
+// TestWorkspaceHostedLocal: `workspace hosted enable` on a local-warehouse
+// workspace records the publisher role and the data bucket, writes no
+// hosted.tf, and a local `pipeline run` then tries to publish its summary:
+// a failed publish is one stderr line and leaves the run's exit code and
+// stdout as they are with --no-publish.
+func TestWorkspaceHostedLocal(t *testing.T) {
+	ws := newWorkspace(t)
+	run(t, "workspace", "init", "hosted-local", "--workspace", ws)
+	run(t, "pipeline", "create", "orders", "--workspace", ws)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"reader_principal":"arn:aws:iam::111122223333:role/clavesa-ui-api",` +
+			`"event_bus_arn":"arn:aws:events:eu-north-1:111122223333:event-bus/clavesa-ui",` +
+			`"publisher_role_arn":"arn:aws:iam::111122223333:role/clavesa-ui-publisher",` +
+			`"data_bucket":"clavesa-ui-data-111122223333","region":"eu-north-1"}`))
+	}))
+	defer srv.Close()
+
+	out := run(t, "workspace", "hosted", "enable", "--url", srv.URL, "--workspace", ws)
+	for _, want := range []string{"local warehouse", "role/clavesa-ui-publisher", "s3://clavesa-ui-data-111122223333/summaries/hosted-local.json", "kind \"local\""} {
+		if !strings.Contains(out, want) {
+			t.Errorf("enable output lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(ws, "hosted.tf")); !os.IsNotExist(err) {
+		t.Errorf("a local workspace got hosted.tf: %v", err)
+	}
+	cmd := exec.Command(binPath, "workspace", "hosted", "enable", "--url", srv.URL, "--reader-principal", "arn:aws:iam::111122223333:role/a", "--workspace", ws)
+	if b, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(b), "local-warehouse workspace") {
+		t.Errorf("--reader-principal on a local workspace: %v\n%s", err, b)
+	}
+
+	// A run with no AWS credentials at all: the publish fails at once.
+	// The pipeline has no nodes, so the run needs no docker.
+	runPipeline := func(extra ...string) (stdout, stderr string, code int) {
+		t.Helper()
+		c := exec.Command(binPath, append([]string{"pipeline", "run", "orders", "--json", "--workspace", ws}, extra...)...)
+		c.Env = append(os.Environ(), "AWS_PROFILE=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "AWS_SESSION_TOKEN=",
+			"AWS_CONFIG_FILE="+filepath.Join(ws, "no-aws-config"), "AWS_SHARED_CREDENTIALS_FILE="+filepath.Join(ws, "no-aws-credentials"),
+			"AWS_EC2_METADATA_DISABLED=true", "CLAVESA_NO_PUBLISH=")
+		var so, se strings.Builder
+		c.Stdout, c.Stderr = &so, &se
+		err := c.Run()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return so.String(), se.String(), code
+	}
+	offOut, offErr, offCode := runPipeline("--no-publish")
+	onOut, onErr, onCode := runPipeline()
+	if strings.Contains(offErr, "Hosted:") {
+		t.Errorf("--no-publish still published:\n%s", offErr)
+	}
+	if strings.Count(onErr, "Hosted: summary not published") != 1 {
+		t.Errorf("want one stderr line for the failed publish:\n%s", onErr)
+	}
+	if onCode != offCode {
+		t.Errorf("exit code with the failed publish = %d, without the publish = %d", onCode, offCode)
+	}
+	if (offOut == "") != (onOut == "") || (offOut != "" && !json.Valid([]byte(onOut))) {
+		t.Errorf("stdout changed by the publish:\n--no-publish: %s\npublish: %s", offOut, onOut)
 	}
 }

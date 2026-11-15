@@ -192,6 +192,19 @@ resource "aws_cloudfront_distribution" "ui" {
   comment             = "clavesa hosted UI (${var.ui_domain})"
   aliases             = [var.ui_domain]
 
+  # Legacy standard access logs, gzipped TSV, as site/infra writes them:
+  # the /t.gif beacons of tracker.js ride in cs-uri-query, and the
+  # site-traffic workspace's traffic pipeline reads the prefix as its
+  # second host. The bucket and its 90-day expiry are site/infra's.
+  dynamic "logging_config" {
+    for_each = var.logs_bucket_name == "" ? [] : [1]
+    content {
+      bucket          = "${var.logs_bucket_name}.s3.amazonaws.com"
+      prefix          = var.logs_prefix
+      include_cookies = false
+    }
+  }
+
   origin {
     domain_name              = aws_s3_bucket.spa.bucket_regional_domain_name
     origin_id                = local.spa_origin_id

@@ -3,6 +3,7 @@ package hosted
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +51,23 @@ func (s S3SummaryStore) Get(ctx context.Context, name string) ([]byte, error) {
 	return io.ReadAll(out.Body)
 }
 
+// GetStats reads stats/ui.json (StatsReader); (nil, nil) when it is not
+// there yet.
+func (s S3SummaryStore) GetStats(ctx context.Context) ([]byte, error) {
+	out, err := s.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.Bucket), Key: aws.String(StatsKey),
+	})
+	if err != nil {
+		var nsk *s3types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer out.Body.Close()
+	return io.ReadAll(out.Body)
+}
+
 func (s S3SummaryStore) Put(ctx context.Context, name string, body []byte) error {
 	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:       aws.String(s.Bucket),
@@ -85,6 +103,9 @@ const treeCheckInterval = 30 * time.Second
 type Workspaces struct {
 	Base aws.Config
 	Root string
+	// Store reads the stored summaries a local-warehouse workspace is
+	// served from (OpenLocal). Nil: local workspaces cannot be opened.
+	Store SummaryStore
 
 	mu    sync.Mutex
 	cache map[string]*openWorkspace
@@ -97,6 +118,9 @@ type openWorkspace struct {
 	s3      *s3.Client
 	etag    string
 	checked time.Time
+	// sum is the hash of the stored summary a local workspace was built
+	// from.
+	sum [32]byte
 }
 
 // NewWorkspaces returns the opener; base is the Lambda's own config (the
@@ -126,6 +150,9 @@ func (w *Workspaces) readerConfig(e Entry) aws.Config {
 
 // Open returns the workspace, syncing its tree copy when it changed.
 func (w *Workspaces) Open(ctx context.Context, e Entry) (*Workspace, error) {
+	if e.Kind == KindLocal {
+		return w.openLocal(ctx, e)
+	}
 	if e.Kind != KindCloud {
 		return nil, fmt.Errorf("workspace %s is not a cloud workspace", e.Name)
 	}
@@ -183,6 +210,45 @@ func (w *Workspaces) Open(ctx context.Context, e Entry) (*Workspace, error) {
 		}),
 	}
 	return ow.ws, nil
+}
+
+// openLocal returns the summary-backed workspace of a local-warehouse
+// entry, rebuilt when the stored summary changed (checked at most every
+// treeCheckInterval).
+func (w *Workspaces) openLocal(ctx context.Context, e Entry) (*Workspace, error) {
+	if w.Store == nil {
+		return nil, fmt.Errorf("workspace %s: no summary store", e.Name)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ow := w.cache[e.Name]
+	if ow != nil && ow.ws != nil && time.Since(ow.checked) < treeCheckInterval {
+		return ow.ws, nil
+	}
+	body, err := w.Store.Get(ctx, e.Name)
+	if err != nil {
+		if ow != nil && ow.ws != nil {
+			return ow.ws, nil // keep serving what we have
+		}
+		return nil, fmt.Errorf("read the stored summary: %w", err)
+	}
+	if body == nil {
+		return nil, ErrNoSummary
+	}
+	h := sha256.Sum256(body)
+	if ow != nil && ow.ws != nil && ow.sum == h {
+		ow.checked = time.Now()
+		return ow.ws, nil
+	}
+	ws, deps, err := OpenLocal(ctx, filepath.Join(w.Root, e.Name), e, body)
+	if err != nil {
+		return nil, err
+	}
+	if ow != nil && ow.deps != nil {
+		ow.deps.Close()
+	}
+	w.cache[e.Name] = &openWorkspace{ws: ws, deps: deps, sum: h, checked: time.Now()}
+	return ws, nil
 }
 
 // syncTree replaces root with the tree copy under _clavesa/tree/.

@@ -7,7 +7,8 @@
 // Environment (set by hosted/infra/api.tf):
 //
 //	REGISTRY            JSON array of workspaces (hosted/infra/workspaces.tf)
-//	DATA_BUCKET         the private bucket of summaries/<name>.json
+//	DATA_BUCKET         the private bucket of summaries/<name>.json and
+//	                    stats/ui.json (GET /api/stats)
 //	READER_PRINCIPAL    this function's role ARN (the well-known document)
 //	EVENT_BUS_ARN       the clavesa-ui bus
 //	PUBLISHER_ROLE_ARN  the role local workspaces publish through
@@ -50,6 +51,9 @@ func main() {
 		Region:           cfg.Region,
 	}
 	store := hosted.S3SummaryStore{Client: s3.NewFromConfig(cfg), Bucket: wk.DataBucket}
-	srv := hosted.NewServer(reg, wk, store, hosted.NewWorkspaces(cfg, root))
+	opener := hosted.NewWorkspaces(cfg, root)
+	opener.Store = store
+	srv := hosted.NewServer(reg, wk, store, opener)
+	srv.Stats = store
 	lambda.StartWithOptions(srv.Invoke, lambda.WithContext(ctx))
 }

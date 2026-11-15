@@ -13,6 +13,13 @@ deploy also uploads a read-only copy of the workspace tree (clavesa.json,
 the pipeline .tf files and deployed.json, never Terraform state,
 .env files or credentials) to s3://<pipeline_bucket>/_clavesa/tree/.
 
+A local-warehouse workspace has no stack and no reader role. Its hosted
+block names the hosted UI's publisher role and data bucket instead, and
+every clavesa pipeline run ends by publishing the workspace summary to
+summaries/<workspace>.json through that role (turn it off for one run
+with --no-publish or CLAVESA_NO_PUBLISH=1). The name must be registered
+as a local workspace in the hosted UI's registry first.
+
   clavesa workspace hosted enable --url https://ui.clavesa.dev
   clavesa workspace hosted show
   clavesa workspace hosted disable

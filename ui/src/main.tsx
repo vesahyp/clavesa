@@ -1,6 +1,6 @@
 import "modern-normalize";
 import "./index.css";
-import { StrictMode, Suspense, lazy } from "react";
+import { StrictMode, Suspense, lazy, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BrowserRouter,
@@ -45,6 +45,21 @@ const Dashboard = lazy(() =>
 // Hosted mode (ADR-032) only: the sign-in gate and its Cognito client.
 // Lazy, so the local and multi-workspace UIs never download it.
 const HostedGate = lazy(() => import("@/hosted/HostedGate"));
+// Hosted mode only: the crash boundary that reports to the tracker, and
+// the Stats page (recharts, so lazy like the dashboards).
+const HostedCrash = lazy(() =>
+  import("@/hosted/CrashBoundary").then((m) => ({
+    default: ({ children }: { children: ReactNode }) => (
+      <m.CrashBoundary>
+        <m.ThrowProbe />
+        {children}
+      </m.CrashBoundary>
+    ),
+  })),
+);
+const Stats = lazy(() =>
+  import("@/pages/Stats").then((m) => ({ default: m.Stats })),
+);
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -87,6 +102,16 @@ const app = (
     {atWorkspacesRoot ? (
       <Routes>
         <Route path="/" element={<Workspaces />} />
+        {runtimeConfig.mode === "hosted" && (
+          <Route
+            path="/stats"
+            element={
+              <Suspense fallback={null}>
+                <Stats />
+              </Suspense>
+            }
+          />
+        )}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     ) : (
@@ -170,10 +195,14 @@ createRoot(root).render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={200}>
         <SidebarProvider>
-          {/* Hosted (ADR-032): no page renders before sign-in. */}
+          {/* Hosted (ADR-032): no page renders before sign-in, and a
+              crash reports to the tracker (tracker.js, loaded by the
+              hosted index.html only) and shows a reload screen. */}
           {runtimeConfig.mode === "hosted" ? (
             <Suspense fallback={null}>
-              <HostedGate>{app}</HostedGate>
+              <HostedCrash>
+                <HostedGate>{app}</HostedGate>
+              </HostedCrash>
             </Suspense>
           ) : (
             app

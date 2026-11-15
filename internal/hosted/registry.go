@@ -21,8 +21,10 @@ const (
 // reaches the Lambda as the JSON array in the REGISTRY environment
 // variable.
 type Entry struct {
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	// Account and Region are required for a cloud workspace and optional
+	// for a local one ({name, kind:"local"} is a whole local entry).
 	Account string `json:"account"`
 	Region  string `json:"region"`
 	// ReaderRoleARN and Bucket (the pipeline bucket) are set for a cloud
@@ -71,10 +73,13 @@ func (e Entry) validate() error {
 	if !entryNameRE.MatchString(e.Name) {
 		return fmt.Errorf("name must match %s", entryNameRE)
 	}
-	if !accountRE.MatchString(e.Account) {
+	// A local workspace lives on a Mac, not in an account: account and
+	// region are optional there (its summary names its region).
+	optional := e.Kind == KindLocal
+	if !(optional && e.Account == "") && !accountRE.MatchString(e.Account) {
 		return fmt.Errorf("account must be a 12-digit AWS account id")
 	}
-	if e.Region == "" {
+	if e.Region == "" && !optional {
 		return fmt.Errorf("region is required")
 	}
 	switch e.Kind {

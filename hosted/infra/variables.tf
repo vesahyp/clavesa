@@ -84,6 +84,18 @@ variable "data_bucket_name" {
   default     = null
 }
 
+variable "logs_bucket_name" {
+  description = "Existing S3 bucket for the distribution's standard access logs (legacy, gzipped TSV), the input of the traffic pipeline. It must have ACLs enabled (BucketOwnerPreferred): legacy logging grants the log-delivery account by ACL. Its lifecycle is the bucket owner's. Empty = no access logs."
+  type        = string
+  default     = "clavesa-cloudfront-logs"
+}
+
+variable "logs_prefix" {
+  description = "Key prefix of the access logs in logs_bucket_name."
+  type        = string
+  default     = "ui/"
+}
+
 variable "publisher_principals" {
   description = "IAM principals that may assume the publisher role to write local-warehouse summaries: the Mac's existing identity. Not an email address."
   type        = list(string)

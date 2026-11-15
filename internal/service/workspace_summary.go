@@ -96,6 +96,9 @@ type WorkspaceSummary struct {
 	// Problems are the pipelines' read problems, one entry per distinct
 	// problem with the pipelines that share it.
 	Problems []SummaryProblemGroup `json:"problems"`
+	// Drill is the drill-down a local-warehouse workspace publishes to
+	// the hosted UI (PublishSummary); nil in every other summary.
+	Drill *SummaryDrill `json:"drill,omitempty"`
 }
 
 // PipelineSummary is one pipeline's part of a WorkspaceSummary.

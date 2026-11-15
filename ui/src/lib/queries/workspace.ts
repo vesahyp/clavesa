@@ -286,11 +286,17 @@ const HostedStatus = z.object({
       url: z.string(),
       reader_principals: z.array(z.string()).nullish().transform((v) => v ?? []),
       event_bus_arn: z.string().optional().default(""),
+      // A local-warehouse workspace's block: the role its runs publish
+      // the summary through.
+      publisher_role_arn: z.string().optional().default(""),
     })
     .nullish(),
   reader_role_name: z.string().optional().default(""),
   workgroup: z.string().optional().default(""),
   tree_uri: z.string().optional().default(""),
+  // "cloud" or "local" (summary published at run end); "" when not hosted.
+  kind: z.string().optional().default(""),
+  summary_uri: z.string().optional().default(""),
 });
 export type HostedStatus = z.infer<typeof HostedStatus>;
 
@@ -812,6 +818,10 @@ export const WorkspaceEntry = z.object({
   // one stored summary of an older shape cannot fail the whole list.
   summary: z.unknown().optional(),
   summary_error: z.string().optional(),
+  // Hosted, local-warehouse only: the stored summary is older than the
+  // expected interval plus grace (the Mac did not run or publish).
+  summary_stale: z.boolean().optional(),
+  summary_interval_seconds: z.number().optional(),
 });
 export type WorkspaceEntry = z.infer<typeof WorkspaceEntry>;
 

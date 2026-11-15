@@ -34,6 +34,12 @@ What `hosted/infra/` creates (all names are variables in
   accepts events only from the registry's accounts, a rule on it to the
   Lambda, a daily schedule (05:00 UTC), and the publisher role.
 - Alarms (`infra/alarms.tf`) to the `jeeves-push` SNS topic.
+- Access logs of the distribution (legacy standard logs, gzipped TSV,
+  no cookies) to an existing bucket, `logs_bucket_name` under
+  `logs_prefix` (default `clavesa-cloudfront-logs`, `ui/`). The bucket
+  must have ACLs enabled, and its lifecycle is its owner's: for
+  ui.clavesa.dev that is `site/infra`, which expires `ui/` after 90
+  days. Set `logs_bucket_name = ""` for no logs.
 
 ## The API
 
@@ -46,9 +52,10 @@ read (ADR-032 section 2).
 | Path | What |
 |------|------|
 | `GET /.well-known/clavesa.json` | Public. `reader_principal` (the Lambda's role), `event_bus_arn`, `publisher_role_arn`, `data_bucket`, `region`. `clavesa workspace hosted enable --url` reads it. |
-| `GET /api/workspaces` | The registry, each entry with its stored summary (`summary`, null until one is stored). Reads only the data bucket: no Athena. |
-| `GET /w/<name>/api/workspace/summary` | The stored summary. `?live=1` computes it live through the reader role (Athena, some seconds); so does a cloud workspace with no stored summary yet. |
-| `GET /w/<name>/api/...` | The same routes as `clavesa ui` (`ui.BuildWorkspaceMux`), read live through the workspace's reader role. Cloud workspaces only. |
+| `GET /api/stats` | The UI's own traffic rollup, `s3://<data bucket>/stats/ui.json` as stored (`[]` until one is). See "Tracking and errors". |
+| `GET /api/workspaces` | The registry, each entry with its stored summary (`summary`, null until one is stored). Reads only the data bucket: no Athena. A local workspace's entry also has `summary_stale` (true when its summary is older than its expected interval plus a quarter of it) and `summary_interval_seconds`. |
+| `GET /w/<name>/api/workspace/summary` | The stored summary. `?live=1` computes it live through the reader role (Athena, some seconds); so does a cloud workspace with no stored summary yet. A local workspace has only the stored one. |
+| `GET /w/<name>/api/...` | The same routes as `clavesa ui` (`ui.BuildWorkspaceMux`). A cloud workspace is read live through its reader role; a local workspace is served from its stored summary (see "Adding a local workspace"). |
 
 Anything else is a JSON 404. A cloud workspace is read like this: the
 Lambda assumes `clavesa-ui-reader-<name>` (ExternalId = the name, 15
@@ -90,15 +97,99 @@ A cloud workspace joins like this:
 The card fills on the next run (the Step Functions status change reaches
 the Lambda, which stores `summaries/<name>.json`) or at 05:00 UTC.
 
-A local-warehouse workspace has no reader role: add it with `kind =
-"local"`, and publish from the Mac with `clavesa workspace summary
---publish` (it assumes the publisher role, which may write only the
-local names in the registry). Publishing at the end of every run is
-ADR-032 slice 8.
+### Adding a local workspace
+
+A local-warehouse workspace (its runs are on a Mac) has no reader role
+and nothing to deploy. Its Mac pushes the summary instead:
+
+1. Add `{ name = "<name>", kind = "local" }` to `infra/workspaces.tf`
+   (the name in its `clavesa.json`), then `make hosted-plan` and `make
+   hosted-apply`. That lets the publisher role write
+   `summaries/<name>.json` and nothing else.
+2. On the Mac: `clavesa workspace hosted enable --url https://<ui_domain>
+   --workspace <dir>`. It records the URL, the publisher role, the data
+   bucket and its region from the well-known document in `clavesa.json`.
+   No `hosted.tf`, no reader principals.
+3. From then on every local `clavesa pipeline run` in that workspace,
+   failed or not, ends by publishing the summary through the publisher
+   role, with the Mac's own AWS identity (the profile the workspace
+   uses; no new key). Best effort: a failed publish prints one line on
+   stderr (`Hosted: summary not published ...`) and never changes the
+   run's exit code or its output. `--no-publish` or
+   `CLAVESA_NO_PUBLISH=1` turns it off for a run. `clavesa workspace
+   summary --publish` publishes by hand.
+
+The published file carries a drill-down beside the summary
+(`drill`): the workspace's `clavesa.json` and pipeline `.tf` files, the
+newest 50 runs of each pipeline, the node rows of the newest 10 runs, the
+newest 20 run-timing records, and the last 50 log lines of each failed
+run among the newest 10. No path on the Mac, no state, no `.env` files.
+About 100 to 160 KB for the site-traffic pipelines. The Lambda writes
+that tree to `/tmp/ws/<name>/` and serves it with the same handlers as
+any workspace, with the runs read from the drill, so the Pipeline and
+Run pages draw from it with no live call. Only those pages' routes
+answer; table state, catalog tables, lineage, backfills and the rest
+are a JSON 404 ("not kept for local workspaces"), and the pages skip
+them (`GET /workspace` says `summary_only`). An older run says that node
+timings are kept for the 10 newest runs only.
+
+The card turns amber and says "No summary from the Mac since <time>"
+when the stored summary is older than the shortest pipeline interval
+(one day when no pipeline has a `trigger_schedule`) plus a quarter of
+it: the Mac did not run or could not publish.
+
+To see what the Lambda serves without deploying: put published
+summaries in a directory as `<name>.json` and run `make hosted-local
+SUMMARIES=<dir>` (the API over those files with the SPA in front, no
+sign-in), then `BASE_URL=http://127.0.0.1:8090 WS_NAME=<name>
+PIPELINE=<dir> make ui-phone-shots`.
 
 If the Lambda's role is ever replaced (a destroy and create), every
 reader role's trust must be refreshed: `clavesa workspace deploy` in
 each workspace.
+
+## Tracking and errors
+
+The hosted UI tracks its own use and its client errors with the
+canonical tracker (`web-tracker/tracker.js`, ADR-032 section 4). Only
+the hosted `index.html` loads it: `scripts/render-index.mjs` adds
+`/tracker-config.js` and `/tracker.js`, and `make hosted-deploy-spa`
+uploads `web-tracker/tracker.js` byte for byte (no-cache),
+`static/tracker-config.js` (no-cache) and `static/t.gif` (`no-store`).
+The local `clavesa ui` serves its own `index.html` and sends nothing.
+
+- Every event is a `/t.gif` beacon; the data rides in the query string
+  and lands in the distribution's access log under `ui/`. `spa: true`
+  counts each client-side route as a page view.
+- `sanitize` (`static/tracker-config.js`) runs over the path and every
+  value: execution ARNs and run ids become `:run`, JWTs and other long
+  token strings `:token`, email addresses `:email`. Workspace names
+  stay. The tracker never reads the session in sessionStorage, and no
+  beacon says who is signed in.
+- Errors: tracker.js reports uncaught errors (`type=js`) and rejections
+  (`type=promise`); the top-level boundary (`ui/src/hosted/
+  CrashBoundary.tsx`) reports render crashes (`type=boundary`, msg cut
+  to 200 characters) and shows a reload screen. `?__throw=1` throws one
+  test error, in hosted mode only.
+- The rollup: the `traffic` pipeline of the site-traffic workspace
+  (`site/analytics/clavesa`, nightly on the Mac) reads `ui/` as its
+  second host and writes `stats/ui.json` to the data bucket, one row per
+  Helsinki day: sessions, page views, page views per path, sessions per
+  device, LCP/INP/CLS p75, errors with the list of distinct msg + path +
+  type, and bot counts. Bots and headless check runs are left out of the
+  human numbers.
+- `/stats` in the signed-in app (beside Workspaces; "Stats" in the
+  bottom nav on a phone) draws it: sessions, page views, top pages,
+  devices, vitals and errors per day as charts, plus the distinct errors
+  as a list to act on. Window 7, 30 or 90 days.
+- `make errors` prints the last 7 days of errors from `stats/ui.json`,
+  one line per msg + path + type with its count (`ERRORS_DAYS=30` for
+  more).
+- `make hosted-tracking-check` is the proof: it serves the hosted build
+  locally and sees the `e=error&type=boundary` beacon leave the page with
+  a sanitized msg, sees no beacon carry the session token or email, and
+  sees the local build load no tracker. `LIVE_URL=https://ui.clavesa.dev`
+  runs the error check against the deployed site.
 
 ## Alarms
 
@@ -188,5 +279,9 @@ Google redirect URI.
   hosted `index.html` (`window.__CLAVESA__ = {mode: "hosted", readOnly:
   true, cognito: {...}}`) and upload the build.
 - `scripts/add-user.sh` the user that `make hosted-add-user` creates.
+- `static/tracker-config.js`, `static/t.gif` the tracker's settings
+  and pixel; `scripts/errors.sh` is `make errors`;
+  `../ui/scripts/hosted-tracking-check.mjs` is `make
+  hosted-tracking-check`.
 - The sign-in screen and the session are in `ui/src/hosted/`; the local
   UI never loads them.

@@ -1,13 +1,13 @@
 /**
  * PhoneNav — the bottom navigation below the md breakpoint (ADR-032
  * section 3), where the sidebar is hidden: all workspaces, this
- * workspace's home and its pipelines. The local UI has no Workspaces
- * page, so its first item is the Catalog. Padded for the home indicator
- * (safe-area-inset-bottom).
+ * workspace's home and its pipelines, and in the hosted UI the Stats page
+ * of the UI itself. The local UI has no Workspaces page, so its first item
+ * is the Catalog. Padded for the home indicator (safe-area-inset-bottom).
  */
 
 import { NavLink, useLocation } from "react-router-dom";
-import { Activity, Database, LayoutGrid, Workflow } from "lucide-react";
+import { Activity, ChartColumn, Database, LayoutGrid, Workflow } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { homePath, runtimeConfig } from "@/lib/runtimeConfig";
@@ -67,6 +67,12 @@ export function PhoneNav() {
       >
         <Inner icon={Workflow} label="Pipelines" />
       </NavLink>
+      {runtimeConfig.mode === "hosted" && (
+        // "/stats" is outside this workspace's basename: a full page load.
+        <a href="/stats" data-testid="phone-nav-stats" className={cn(item, tone(false))}>
+          <Inner icon={ChartColumn} label="Stats" />
+        </a>
+      )}
     </nav>
   );
 }

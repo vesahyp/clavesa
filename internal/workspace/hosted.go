@@ -28,6 +28,20 @@ type Hosted struct {
 	// EventBusARN is the hosted clavesa-ui event bus. Empty: no
 	// forwarding rule.
 	EventBusARN string `json:"event_bus_arn,omitempty"`
+	// PublisherRoleARN, DataBucket and Region are set for a
+	// local-warehouse workspace, which has no reader principals: the role
+	// it assumes to write summaries/<name>.json to the data bucket at the
+	// end of every `clavesa pipeline run` (ADR-032 section 2).
+	PublisherRoleARN string `json:"publisher_role_arn,omitempty"`
+	DataBucket       string `json:"data_bucket,omitempty"`
+	Region           string `json:"region,omitempty"`
+}
+
+// IsLocal reports whether the block is a local-warehouse workspace's:
+// a publisher role and no reader principals. Such a workspace has no
+// stack, so no hosted.tf and nothing to deploy.
+func (h *Hosted) IsLocal() bool {
+	return h != nil && len(h.ReaderPrincipals) == 0 && h.PublisherRoleARN != ""
 }
 
 var (
@@ -63,8 +77,17 @@ func (h *Hosted) Validate() error {
 	if _, err := NormalizeHostedURL(h.URL); err != nil {
 		return err
 	}
+	if h.PublisherRoleARN != "" && !principalARNRE.MatchString(h.PublisherRoleARN) {
+		return fmt.Errorf("hosted.publisher_role_arn: %q is not an IAM role ARN", h.PublisherRoleARN)
+	}
+	if h.IsLocal() {
+		if h.DataBucket == "" {
+			return fmt.Errorf("hosted.data_bucket is required with hosted.publisher_role_arn")
+		}
+		return nil
+	}
 	if len(h.ReaderPrincipals) == 0 {
-		return fmt.Errorf("hosted.reader_principals needs at least one IAM principal ARN (the hosted UI's Lambda role)")
+		return fmt.Errorf("hosted.reader_principals needs at least one IAM principal ARN (the hosted UI's Lambda role), or a local-warehouse workspace's hosted.publisher_role_arn")
 	}
 	for _, p := range h.ReaderPrincipals {
 		if !principalARNRE.MatchString(p) {
@@ -200,10 +223,11 @@ output "hosted_workgroup" {
 }
 
 // SyncHostedTF makes hosted.tf match the manifest: written when m.Hosted
-// is set, removed when it is not.
+// is set, removed when it is not or when it is a local-warehouse
+// workspace's block (no stack, no reader role).
 func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines []string) error {
 	path := filepath.Join(root, HostedTFFile)
-	if m.Hosted == nil {
+	if m.Hosted == nil || m.Hosted.IsLocal() {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

@@ -28,6 +28,13 @@ deploy also uploads a read-only copy of the workspace tree (clavesa.json,
 the pipeline .tf files and deployed.json, never Terraform state,
 .env files or credentials) to s3://<pipeline_bucket>/_clavesa/tree/.
 
+A local-warehouse workspace has no stack and no reader role. Its hosted
+block names the hosted UI's publisher role and data bucket instead, and
+every clavesa pipeline run ends by publishing the workspace summary to
+summaries/<workspace>.json through that role (turn it off for one run
+with --no-publish or CLAVESA_NO_PUBLISH=1). The name must be registered
+as a local workspace in the hosted UI's registry first.
+
   clavesa workspace hosted enable --url https://ui.clavesa.dev
   clavesa workspace hosted show
   clavesa workspace hosted disable`,
@@ -49,7 +56,10 @@ clavesa deploy to create the reader role and the workgroup and to upload
 the tree copy.
 
 The hosted UI Lambda's role (the reader principal) and its event bus are
-read from <url>/.well-known/clavesa.json. --reader-principal adds more
+read from <url>/.well-known/clavesa.json. For a local-warehouse
+workspace the command records the publisher role, the data bucket and its
+region from that document instead; nothing is deployed, and
+--reader-principal and --event-bus-arn do not apply. --reader-principal adds more
 principals that may assume the reader role, kept beside the Lambda's
 (repeat it for more than one; for example the IAM user that runs the
 smoke gate's reader leg). --event-bus-arn overrides the bus.`,
@@ -67,6 +77,10 @@ smoke gate's reader leg). --event-bus-arn overrides the bus.`,
 				return printJSON(os.Stdout, st)
 			}
 			printHostedStatus(os.Stdout, st)
+			if st.Kind == "local" {
+				fmt.Println("Next: register the workspace as kind \"local\" in the hosted UI's registry; the next pipeline run publishes its summary (or: clavesa workspace summary --publish).")
+				return nil
+			}
 			fmt.Println("Next: clavesa deploy, to create the reader role and upload the tree copy.")
 			return nil
 		},
@@ -135,6 +149,12 @@ func printHostedStatus(w io.Writer, st tuiservice.HostedStatus) {
 	}
 	h := st.Hosted
 	fmt.Fprintf(w, "Hosted at:         %s\n", h.URL)
+	if st.Kind == "local" {
+		fmt.Fprintln(w, "Kind:              local warehouse (summary published at run end)")
+		fmt.Fprintf(w, "Publisher role:    %s\n", h.PublisherRoleARN)
+		fmt.Fprintf(w, "Summary:           %s\n", st.SummaryURI)
+		return
+	}
 	fmt.Fprintf(w, "Reader principals: %s\n", strings.Join(h.ReaderPrincipals, ", "))
 	bus := h.EventBusARN
 	if bus == "" {

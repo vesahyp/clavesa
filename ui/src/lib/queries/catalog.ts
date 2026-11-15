@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { request } from "@/api/client";
 import { ServedInfo, isQueryableIdentifier, requestParsed } from "./core";
+import { useSummaryOnly } from "@/hooks/useSummaryOnly";
 
 // ---------------------------------------------------------------------------
 // Schemas (boundary-of-trust for API responses)
@@ -99,8 +100,11 @@ export type SnapshotsResult = z.infer<typeof SnapshotsResult>;
 
 /** GET /api/workspace/tables — every Delta table in the workspace catalog. */
 export function useCatalogTables() {
+  // Not kept in a local workspace's published summary (ADR-032).
+  const summaryOnly = useSummaryOnly();
   return useQuery({
     queryKey: ["catalog", "tables"],
+    enabled: !summaryOnly,
     queryFn: async () => {
       const raw = await request<unknown>("/workspace/tables");
       return CatalogResponse.parse(raw);
@@ -290,7 +294,9 @@ export function useTablesState(
 ) {
   const limit = opts.limit ?? 50;
   const dir = opts.dir ?? "";
-  const enabled = (opts.enabled ?? true) && Boolean(pipeline);
+  // Not kept in a local workspace's published summary (ADR-032).
+  const summaryOnly = useSummaryOnly();
+  const enabled = (opts.enabled ?? true) && Boolean(pipeline) && !summaryOnly;
   return useQuery({
     queryKey: ["tables-state", pipeline, dir, limit],
     enabled,

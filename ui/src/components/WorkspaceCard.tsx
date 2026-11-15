@@ -77,7 +77,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
   }
 
   const s = summary;
-  const { status, reasons } = cardStatus(s);
+  const { status, reasons, overdue } = cardStatus(s, Date.now(), entry);
   const last = s.last_run;
   const strip = s.runs_per_day_14d;
   const cost = s.cost_per_day_30d;
@@ -190,7 +190,8 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
 
       <div
         data-testid="workspace-card-generated-at"
-        className="mt-1 text-[11px] text-muted-foreground"
+        data-overdue={overdue ? "true" : undefined}
+        className={cn("mt-1 text-[11px]", overdue ? "text-status-running" : "text-muted-foreground")}
         title={s.generated_at}
       >
         Summary from {formatRelative(s.generated_at)}

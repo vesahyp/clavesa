@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { request } from "@/api/client";
 import { requestParsed } from "./core";
+import { useSummaryOnly } from "@/hooks/useSummaryOnly";
 
 const PipelineInfo = z.object({
   name: z.string(),
@@ -85,9 +86,11 @@ export type LineageResponse = z.infer<typeof LineageResponse>;
  * change between .tf edits, so the page transition is instant.
  */
 export function useLineage(dir: string) {
+  // Not kept in a local workspace's published summary (ADR-032).
+  const summaryOnly = useSummaryOnly();
   return useQuery({
     queryKey: ["pipeline", "lineage", dir],
-    enabled: Boolean(dir),
+    enabled: Boolean(dir) && !summaryOnly,
     staleTime: 60_000,
     retry: false,
     queryFn: () =>
