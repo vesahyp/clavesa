@@ -287,3 +287,51 @@ func (c *Client) EffectivePrivileges(ctx context.Context, securableType, fullNam
 	}
 	return set, nil
 }
+
+// ExternalMetadata is one external lineage object (Public Preview API,
+// ADR-027 section 5): the runner creates one per clavesa step ("clavesa
+// transform") and one per non-table input ("clavesa source (<kind>)"),
+// each with the properties clavesa.pipeline and clavesa.node or
+// clavesa.input.
+type ExternalMetadata struct {
+	Name       string            `json:"name"`
+	EntityType string            `json:"entity_type"`
+	Owner      string            `json:"owner"`
+	Properties map[string]string `json:"properties"`
+}
+
+// ListExternalMetadata lists every external metadata object the caller
+// can see, following the page tokens.
+func (c *Client) ListExternalMetadata(ctx context.Context) ([]ExternalMetadata, error) {
+	var all []ExternalMetadata
+	token := ""
+	for {
+		path := "/api/2.0/lineage-tracking/external-metadata?page_size=100"
+		if token != "" {
+			path += "&page_token=" + url.QueryEscape(token)
+		}
+		var out struct {
+			ExternalMetadata []ExternalMetadata `json:"external_metadata"`
+			NextPageToken    string             `json:"next_page_token"`
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return all, err
+		}
+		all = append(all, out.ExternalMetadata...)
+		if out.NextPageToken == "" || out.NextPageToken == token {
+			return all, nil
+		}
+		token = out.NextPageToken
+	}
+}
+
+// DeleteExternalMetadata deletes one external metadata object. Only its
+// owner (or a principal with MANAGE on it) may. An object that is already
+// gone is not an error.
+func (c *Client) DeleteExternalMetadata(ctx context.Context, name string) error {
+	err := c.do(ctx, http.MethodDelete, "/api/2.0/lineage-tracking/external-metadata/"+url.PathEscape(name), nil, nil)
+	if IsNotFound(err) {
+		return nil
+	}
+	return err
+}

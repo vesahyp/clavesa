@@ -153,6 +153,7 @@ func deployAll(cmd *cobra.Command, autoApprove, planOnly bool) error {
 			BuildRunnerImage: false,
 			AutoApprove:      autoApprove,
 			PlanOnly:         planOnly,
+			AfterApply:       pruneLineageAfterApply(cmd, root, absDir),
 		}).Run(); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "Pipeline %s failed: %v\n", info.Name, err)
 			failures = append(failures, fmt.Sprintf("%s: %v", info.Name, err))

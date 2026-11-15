@@ -7,8 +7,10 @@ clavesa pipeline, after the runner-created Glue tables of the pipeline
 are swept, as clavesa pipeline destroy does. The tables the job's code
 wrote in its own Glue databases, and the shadow tables in Unity Catalog,
 stay: they are data, not infrastructure; the command lists the shadow
-tables with the SQL that drops them. The job on Databricks is not
-touched (databricks bundle destroy -t <target> does that).
+tables with the SQL that drops them. The lineage objects the runs
+created in Unity Catalog are deleted, as clavesa's service principal. The
+job on Databricks is not touched (databricks bundle destroy -t <target>
+does that).
 
   clavesa bundle destroy -t aws --job daily_sales --yes
 

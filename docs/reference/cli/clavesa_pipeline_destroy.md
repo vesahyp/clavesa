@@ -11,6 +11,11 @@ The sweep targets the pipeline's own Glue DB (default:
 <workspace_catalog>__sanitize(<pipeline_name>)). Pass --glue-db <name>
 if the pipeline's var.schema was overridden from its default.
 
+With a Databricks connection, the lineage objects the pipeline's runs
+created in Unity Catalog (external metadata with clavesa.pipeline = this
+pipeline, and their lineage relationships) are deleted after terraform
+destroy, as clavesa's service principal, which owns them.
+
 Workspace system-DB row cleanup (runs / node_runs / tables rows where
 pipeline = <this pipeline>) is not done here — those rows live inside
 shared Delta tables and need an Athena DELETE through the workspace

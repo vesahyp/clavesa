@@ -12,10 +12,13 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.25.3] — 2026-11-15
+
 ### Added
 - **[docs/databricks/bundles.md](docs/databricks/bundles.md)**, the user guide for `clavesa bundle`: plan, deploy, run, compare, switch, destroy, mixed jobs, Unity Catalog shadow tables, lineage in Catalog Explorer (Databricks external lineage, Public Preview; the grants it needs) and table maintenance (`clavesa pipeline optimize --vacuum`, or OPTIMIZE and VACUUM in a `sql_task`), with the results of the end-to-end test.
 
 ### Fixed
+- **`clavesa pipeline destroy` and `clavesa bundle destroy` delete the pipeline's lineage objects in Unity Catalog** ([GH #108](https://github.com/vesahyp/clavesa/issues/108)): the external metadata whose `clavesa.pipeline` property is the pipeline, and with it its lineage relationships, after `terraform destroy`. They stayed, and only clavesa's service principal could delete them: a workspace admin gets "does not have MANAGE". The calls run as the service principal, with the workspace connection's credential. `pipeline deploy`, `bundle deploy` and `deploy` delete the `clavesa transform` objects of nodes the pipeline no longer has (a task taken out of a job); a failure there is a warning.
 - `clavesa bundle run --help` gave the generated pipeline's folder as `bundles/<bundle>_<job>/`. It is `<bundle>_<target>_<job>/`.
 
 ## [v2.25.2] — 2026-11-15

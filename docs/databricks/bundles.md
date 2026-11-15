@@ -109,7 +109,7 @@ clavesa bundle run --bundle . -t aws --job default_sql_sql_job --wait
 - The generated pipeline is read-only. To change it, change the bundle and deploy again.
 - A paused schedule (`trigger_pause_status: PAUSED`) is deployed as a disabled EventBridge Scheduler schedule. Nothing runs until you run it or unpause it.
 - The workspace must be deployed first (`clavesa workspace deploy`). After a clavesa upgrade, deploy the workspace again so that the runner image of the new version is in ECR.
-- `clavesa bundle destroy -t aws --yes` removes the AWS side. The tables stay, because they are data. It prints the SQL that drops the shadow tables. It does not remove the lineage objects in Unity Catalog ([GH #108](https://github.com/vesahyp/clavesa/issues/108)): section 8 has the command.
+- `clavesa bundle destroy -t aws --yes` removes the AWS side. The tables stay, because they are data. It prints the SQL that drops the shadow tables. Since v2.25.3 it also deletes the pipeline's lineage objects in Unity Catalog (section 8).
 
 ## 5. Unity Catalog and shadow tables
 
@@ -159,13 +159,19 @@ Read the edges of a table with the Databricks CLI:
 databricks api get "/api/2.0/lineage-tracking/external-lineage?object_info.table.name=team_ucpub.sales.orders_daily_clavesa&lineage_direction=UPSTREAM"
 ```
 
-Destroy does not remove the objects yet ([GH #108](https://github.com/vesahyp/clavesa/issues/108)). Remove an object, and with it its edges:
+Clavesa removes its objects (since v2.25.3, [GH #108](https://github.com/vesahyp/clavesa/issues/108)):
 
-```bash
-databricks api delete /api/2.0/lineage-tracking/external-metadata/clavesa_<pipeline>_<task>
+- `clavesa pipeline destroy` and `clavesa bundle destroy` delete every object of the pipeline, after `terraform destroy`. An object is the pipeline's when its property `clavesa.pipeline` is the pipeline's name.
+- `clavesa pipeline deploy` and `clavesa bundle deploy` delete the `clavesa transform` objects of tasks that are no longer in the pipeline, for example a task taken out of the job.
+- Deleting an object also deletes its edges.
+
+These calls run as clavesa's service principal, with the credential of the workspace connection. The service principal created the objects, so it owns them. A person, also a workspace admin, gets `User does not have MANAGE on External Metadata '<name>'`. In the end-to-end test on 2026-11-15, the destroy of the v2.25.0 pipeline deleted its two objects, and the next deploy deleted the object of a removed task:
+
 ```
-
-Clavesa's service principal creates the objects, so it owns them. Run the call as the service principal (a Databricks CLI profile with its OAuth client ID and secret). A workspace admin without `MANAGE` on the object gets `User does not have MANAGE on External Metadata '<name>'`.
+Unity Catalog: deleted lineage object clavesa_default_sql_default_sql_sql_job_orders_daily
+Unity Catalog: deleted lineage object clavesa_default_sql_default_sql_sql_job_orders_raw
+Unity Catalog: deleted lineage object clavesa_default_sql_aws_default_sql_sql_job_compact (its node is no longer in the pipeline)
+```
 
 A metastore holds at most 10,000 external metadata objects and 100,000 external lineage relationships.
 
@@ -200,7 +206,7 @@ VACUUM orders_daily;
 
 In shadow mode the statements act on the shadow table (`orders_daily` becomes `orders_daily_clavesa`, as for every table the job writes). The plan refuses the task until its table is listed in `clavesa.tables.<task>.writes`. In the cloud run, the Delta log of `orders_daily_clavesa` got a new version with operation `OPTIMIZE` and `zOrderBy: ["order_date"]`, and the runner log shows the VACUUM. The local test is `TestBundleRunScriptMode` with the bundle [`testdata/bundles/orders_sql`](../../testdata/bundles/orders_sql) (its `compact` task).
 
-Clavesa treats such a task as a writer of the table ([GH #109](https://github.com/vesahyp/clavesa/issues/109)). After the run, the table's `clavesa.node` property names the maintenance task, and the Lineage graph shows the task as a second `clavesa transform` into the table, with no inputs. Until that is fixed, use `clavesa pipeline optimize`, which changes neither.
+Clavesa treats such a task as a writer of the table ([GH #109](https://github.com/vesahyp/clavesa/issues/109)). After the run, the table's `clavesa.node` property names the maintenance task, and the Lineage graph shows the task as a second `clavesa transform` into the table, with no inputs. Until that is fixed, use `clavesa pipeline optimize`, which changes neither. When you take such a task out of the job, the next deploy deletes its lineage object.
 
 - **Databricks predictive optimization does not cover the `_clavesa` tables.** Predictive optimization runs only on Unity Catalog managed tables ([Databricks docs](https://docs.databricks.com/aws/en/optimizations/predictive-optimization)), and the shadow tables are external. Compact and vacuum them yourself, with a task or with `clavesa pipeline optimize`.
 - **Scheduled OPTIMIZE and VACUUM are not built yet** ([GH #26](https://github.com/vesahyp/clavesa/issues/26)). Run `clavesa pipeline optimize` by hand or from cron, or put the statements in a task of the job.

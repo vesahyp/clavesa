@@ -418,6 +418,11 @@ The sweep targets the pipeline's own Glue DB (default:
 <workspace_catalog>__sanitize(<pipeline_name>)). Pass --glue-db <name>
 if the pipeline's var.schema was overridden from its default.
 
+With a Databricks connection, the lineage objects the pipeline's runs
+created in Unity Catalog (external metadata with clavesa.pipeline = this
+pipeline, and their lineage relationships) are deleted after terraform
+destroy, as clavesa's service principal, which owns them.
+
 Workspace system-DB row cleanup (runs / node_runs / tables rows where
 pipeline = <this pipeline>) is not done here — those rows live inside
 shared Delta tables and need an Athena DELETE through the workspace
@@ -1004,8 +1009,9 @@ func newOrchestrationSyncCmd() *cobra.Command {
 }
 
 // destroyPipeline sweeps the runner-created Glue tables, unregisters the
-// pipeline's own Unity Catalog tables and runs terraform destroy (pipeline
-// destroy and bundle destroy).
+// pipeline's own Unity Catalog tables, runs terraform destroy and deletes
+// the pipeline's lineage objects in Unity Catalog (pipeline destroy and
+// bundle destroy).
 func destroyPipeline(cmd *cobra.Command, dir, ws string, skipSweep bool, glueDB string, autoApprove bool) error {
 	pipelineName := filepath.Base(dir)
 	printTargetContext("destroy "+pipelineName, ws, "")
@@ -1046,5 +1052,17 @@ func destroyPipeline(cmd *cobra.Command, dir, ws string, skipSweep bool, glueDB 
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	c.Stdin = os.Stdin
-	return c.Run()
+	if err := c.Run(); err != nil {
+		return err
+	}
+	// GH #108: the lineage objects the runs created in Unity Catalog go
+	// with the pipeline. Only clavesa's service principal owns them.
+	removed, err := service.New(ws).RemovePipelineLineage(cmd.Context(), dir, nil)
+	for _, n := range removed {
+		fmt.Printf("Unity Catalog: deleted lineage object %s\n", n)
+	}
+	if err != nil {
+		return fmt.Errorf("the pipeline is destroyed, but its lineage in Unity Catalog is not removed: %w (run the destroy again to retry)", err)
+	}
+	return nil
 }

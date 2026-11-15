@@ -85,7 +85,27 @@ func newDeployFlow(cmd *cobra.Command, root, tfDir string) (deployFlow, error) {
 	if err != nil {
 		return deployFlow{}, err
 	}
-	return deployFlow{WorkspaceRoot: root, TfDir: tfDir, Env: env}, nil
+	flow := deployFlow{WorkspaceRoot: root, TfDir: tfDir, Env: env}
+	if filepath.Clean(tfDir) != filepath.Clean(root) {
+		flow.AfterApply = pruneLineageAfterApply(cmd, root, tfDir)
+	}
+	return flow, nil
+}
+
+// pruneLineageAfterApply removes the Unity Catalog lineage objects of
+// nodes a pipeline no longer has (a task taken out of a bundle job) once
+// its deploy applied. A failure is a warning: the deploy itself is done.
+func pruneLineageAfterApply(cmd *cobra.Command, root, tfDir string) func() error {
+	return func() error {
+		removed, err := tuiservice.New(root).PruneStaleLineage(cmd.Context(), tfDir)
+		for _, n := range removed {
+			fmt.Fprintf(cmd.OutOrStdout(), "Unity Catalog: deleted lineage object %s (its node is no longer in the pipeline)\n", n)
+		}
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: stale lineage objects in Unity Catalog not removed: %v\n", err)
+		}
+		return nil
+	}
 }
 
 // terraformOutput reads one string output of the stack in dir. A null
