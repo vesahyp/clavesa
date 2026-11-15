@@ -153,6 +153,10 @@ With `push_lineage` on (the default of `clavesa workspace connect databricks`), 
 2. **In the Lineage graph, each clavesa task is an external object of type `clavesa transform`, between the tables.** Its name is `clavesa_<pipeline>_<task>`, for example `clavesa_default_sql_aws_default_sql_sql_job_orders_daily`. The edge from the task to the table it writes has a column mapping: each column of the table comes from the column of the same name on the task. The edges from the input tables to the task have no column mapping. The task is not shown as a Databricks job, because it does not run in Databricks. The table lineage API (`GET /api/2.0/lineage-tracking/table-lineage`) returns nothing for a clavesa table: for `team_ucpub.sales.orders_daily_clavesa` it returned `{}` on 2026-11-15. Only the external lineage API (`GET /api/2.0/lineage-tracking/external-lineage`) returns the edges. Databricks also does not write external lineage to the lineage system tables (`system.access.table_lineage`, `system.access.column_lineage`).
 3. **It needs `CREATE EXTERNAL METADATA` on the metastore, and `MODIFY` on each table it writes**, for clavesa's service principal. The preflight (`clavesa workspace databricks preflight`, [getting-started](getting-started.md) step 4) checks the first and prints the GRANT for the admin.
 
+The Lineage graph of `orders_daily_clavesa` in the end-to-end test (2026-11-15):
+
+![Catalog Explorer lineage graph: orders_raw_clavesa, the clavesa task as an external object of type clavesa transform, orders_daily_clavesa](https://clavesa.dev/img/databricks/bundle-lineage.png)
+
 Read the edges of a table with the Databricks CLI:
 
 ```bash
