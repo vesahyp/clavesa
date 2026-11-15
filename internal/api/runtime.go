@@ -48,7 +48,7 @@ func NewRuntimeHandler(workers WorkerLister, identity AWSIdentity) *RuntimeHandl
 }
 
 // RegisterRoutes mounts the runtime routes on mux.
-func (h *RuntimeHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *RuntimeHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /runtime/workers", h.listWorkers)
 	mux.HandleFunc("GET /runtime/identity", h.getIdentity)
 }

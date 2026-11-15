@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 
 	"github.com/vesahyp/clavesa/internal/bundle"
@@ -157,7 +156,7 @@ func (s *Service) OptimizeTable(ctx context.Context, req OptimizeRequest) ([]Opt
 			return err
 		}
 	} else {
-		cfg, err := awsconfig.LoadDefaultConfig(ctx)
+		cfg, err := s.loadAWSConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load AWS config: %w", err)
 		}

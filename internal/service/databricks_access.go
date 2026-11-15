@@ -10,13 +10,13 @@ import (
 	"sort"
 	"strings"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/vesahyp/clavesa/internal/databricks"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/sources"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // DatabricksAccessFile is the clavesa-owned tfvars file holding the
@@ -44,8 +44,8 @@ var newDatabricksTableGetter = func(host, clientID, secret string) tableGetter {
 
 // bucketKMSKey returns the bucket's default SSE-KMS key ARN, "" for
 // SSE-S3 or none. A variable so tests can replace it.
-var bucketKMSKey = func(ctx context.Context, bucket string) (string, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+var bucketKMSKey = func(ctx context.Context, root, bucket string) (string, error) {
+	cfg, err := workspace.LoadAWSConfig(ctx, root)
 	if err != nil {
 		return "", err
 	}
@@ -202,7 +202,7 @@ func (s *Service) ResolveDatabricksAccess(ctx context.Context, dir string) (Data
 	}
 	keys := map[string]bool{}
 	for bk := range buckets {
-		key, err := bucketKMSKey(ctx, bk)
+		key, err := bucketKMSKey(ctx, s.workspace, bk)
 		if err != nil {
 			acc.Notes = append(acc.Notes, fmt.Sprintf("bucket %s: could not read its encryption (%v); if it uses SSE-KMS, the runner role also needs kms:Decrypt and kms:GenerateDataKey on its key", bk, err))
 			continue

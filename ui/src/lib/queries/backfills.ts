@@ -6,8 +6,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { z } from "zod";
 
-import { BASE_URL } from "@/api/client";
+import { apiFetch } from "@/api/client";
 import { requestParsed, requestVoid } from "./core";
+import { runtimeConfig } from "@/lib/runtimeConfig";
 
 const BackfillRun = z.object({
   run_id: z.string(),
@@ -69,11 +70,15 @@ export type BackfillDedupCheckResult = z.infer<typeof BackfillDedupCheckResult>;
  * (ADR-014). Same response shape. Errors are non-fatal — the dashboard
  * card swallows them and renders the empty state so an undeployed
  * pipeline doesn't break the page.
+ *
+ * Not fetched in the hosted UI: the hosted reader role cannot read the
+ * runner Lambda's configuration the cloud backend needs, and staging is
+ * an operating action the read-only hosted pages do not offer (ADR-032).
  */
 export function useBackfills(dir: string) {
   return useQuery({
     queryKey: ["backfills", dir],
-    enabled: Boolean(dir),
+    enabled: Boolean(dir) && runtimeConfig.mode !== "hosted",
     retry: false,
     staleTime: 30_000,
     queryFn: () =>
@@ -137,7 +142,7 @@ export async function stageBackfill(body: {
    * work in a local docker container against the cloud warehouse. */
   compute?: "local";
 }): Promise<BackfillRun> {
-  const res = await fetch(`${BASE_URL}/backfills/stage`, {
+  const res = await apiFetch(`/backfills/stage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

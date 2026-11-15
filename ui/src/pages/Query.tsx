@@ -9,7 +9,7 @@
  */
 
 import { useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { useChrome } from "@/components/PageChrome";
 import { AdhocQuery } from "@/components/AdhocQuery";
@@ -48,9 +48,9 @@ export function Query() {
           dashboards. It runs on Athena (transpiled to Trino) on a cloud
           warehouse and on Spark locally. Single-shot and not saved; for
           multi-cell Spark exploration with persistent Python state, use{" "}
-          <a className="text-primary underline" href="/notebooks">
+          <Link className="text-primary underline" to="/notebooks">
             Notebooks
-          </a>
+          </Link>
           .
         </p>
       </div>

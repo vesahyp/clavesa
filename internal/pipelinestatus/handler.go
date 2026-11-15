@@ -19,7 +19,6 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
@@ -178,7 +177,7 @@ func (h *Handler) WithCloudLocalRunner(r CloudLocalPipelineRunner) *Handler {
 }
 
 // RegisterRoutes wires the handler into mux.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+func (h *Handler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /pipeline/status", h.GetStatus)
 	mux.HandleFunc("GET /pipeline/execution", h.GetExecutionDetail)
 	mux.HandleFunc("GET /pipeline/execution/states", h.GetExecutionStates)
@@ -195,7 +194,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 // missing AWS credentials chain produces one error, not three.
 func (h *Handler) ensureAWS(ctx context.Context) {
 	h.awsOnce.Do(func() {
-		cfg, err := awsconfig.LoadDefaultConfig(ctx)
+		cfg, err := workspace.LoadAWSConfig(ctx, h.root)
 		if err != nil {
 			h.awsErr = err
 			return

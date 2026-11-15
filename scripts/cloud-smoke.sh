@@ -20,7 +20,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # ---------------------------------------------------------------------------
 # Config (env-overridable)
 # ---------------------------------------------------------------------------
-SMOKE_WS="${SMOKE_WS:-$HOME/clavesa-workspaces/smoke}"
+SMOKE_WS="${SMOKE_WS:-$HOME/clavesa-workspaces/smoke2}"
 SMOKE_PIPELINE="${SMOKE_PIPELINE:-taxi}"
 SMOKE_NODES="${SMOKE_NODES:-trips,revenue_by_payment}"
 SMOKE_STATS_NODE="${SMOKE_STATS_NODE:-trips}"
@@ -169,6 +169,137 @@ free_port() {
 
 module_version() {
   grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' "$REPO_ROOT/internal/version/version.go" | head -1
+}
+
+# ---------------------------------------------------------------------------
+# hosted leg (ADR-032) — only when clavesa.json has a `hosted` block
+# ---------------------------------------------------------------------------
+
+# reader_env runs a command with the reader role's session credentials
+# (READER_* set by hosted_leg) and no profile.
+reader_env() {
+  env -u AWS_PROFILE \
+    AWS_ACCESS_KEY_ID="$READER_KEY" AWS_SECRET_ACCESS_KEY="$READER_SECRET" \
+    AWS_SESSION_TOKEN="$READER_TOKEN" AWS_REGION="$AWS_REGION" "$@"
+}
+
+# simulate_denied <action> <resource arn>: the reader's identity policy
+# must not allow it (implicitDeny or explicitDeny).
+simulate_denied() {
+  local decision
+  decision="$(aws iam simulate-principal-policy --policy-source-arn "$READER_ROLE_ARN" \
+    --action-names "$1" --resource-arns "$2" \
+    --query 'EvaluationResults[0].EvalDecision' --output text)" \
+    || { fail "simulate-principal-policy $1 on $2 failed"; return; }
+  if [[ "$decision" == "implicitDeny" || "$decision" == "explicitDeny" ]]; then
+    pass "reader: $1 on $2 → $decision"
+  else
+    fail "reader: $1 on $2 → $decision, expected a deny"
+  fi
+}
+
+# hosted_leg <exec_arn> <state_bucket> <state_key_prefix>: the read-only
+# reader the workspace stack creates (ADR-032 section 2). Assumes the role
+# with ExternalId = workspace name for 15 minutes and reads what the hosted
+# UI reads: a run through the clavesa-ui workgroup, the execution, the
+# runner log group and the tree copy. Then the reader's policy must deny
+# every write that matters, and `workspace summary` on the tree copy
+# synced into a temp dir must give the same numbers as on the real tree.
+hosted_leg() {
+  local exec_arn="$1" state_bucket="$2" state_prefix="$3"
+  banner "hosted reader (ADR-032): assume role, read, simulate denies, tree copy"
+  local show_json bucket workgroup role_name creds sm_name sm_arn
+  show_json="$("$BIN" workspace hosted show --json --workspace "$SMOKE_WS")" \
+    || die "workspace hosted show failed"
+  role_name="$(echo "$show_json" | jq -r .reader_role_name)"
+  workgroup="$(echo "$show_json" | jq -r .workgroup)"
+  bucket="$(terraform -chdir="$SMOKE_WS" output -raw pipeline_bucket)" \
+    || die "could not read pipeline_bucket terraform output from $SMOKE_WS"
+  READER_ROLE_ARN="$(aws iam get-role --role-name "$role_name" --query Role.Arn --output text)" \
+    || die "reader role $role_name not found — did deploy apply hosted.tf?"
+  creds="$(aws sts assume-role --role-arn "$READER_ROLE_ARN" --role-session-name clavesa-smoke-hosted \
+    --external-id "$WS_NAME" --duration-seconds 900 --query Credentials --output json)" \
+    || die "sts:AssumeRole on $READER_ROLE_ARN with ExternalId $WS_NAME failed"
+  READER_KEY="$(echo "$creds" | jq -r .AccessKeyId)"
+  READER_SECRET="$(echo "$creds" | jq -r .SecretAccessKey)"
+  READER_TOKEN="$(echo "$creds" | jq -r .SessionToken)"
+  pass "assumed $READER_ROLE_ARN (ExternalId $WS_NAME, 900 s)"
+  if aws sts assume-role --role-arn "$READER_ROLE_ARN" --role-session-name clavesa-smoke-hosted \
+      --external-id "not-$WS_NAME" --duration-seconds 900 >/dev/null 2>&1; then
+    fail "assume-role with a wrong ExternalId succeeded"
+  else
+    pass "assume-role with a wrong ExternalId is refused"
+  fi
+
+  # Reads, as the reader.
+  local qid state count
+  qid="$(reader_env aws athena start-query-execution --work-group "$workgroup" \
+    --query-string "SELECT count(*) FROM \"$SYSTEM_DB\".\"runs\" WHERE pipeline = '$SMOKE_PIPELINE'" \
+    --query QueryExecutionId --output text)" \
+    || die "reader: athena start-query-execution in $workgroup failed"
+  while :; do
+    state="$(reader_env aws athena get-query-execution --query-execution-id "$qid" --query QueryExecution.Status.State --output text)"
+    case "$state" in SUCCEEDED|FAILED|CANCELLED) break ;; *) sleep 2 ;; esac
+  done
+  if [[ "$state" == "SUCCEEDED" ]]; then
+    count="$(reader_env aws athena get-query-results --query-execution-id "$qid" --query 'ResultSet.Rows[1].Data[0].VarCharValue' --output text)"
+    pass "reader: runs of $SMOKE_PIPELINE through workgroup $workgroup = $count"
+  else
+    fail "reader: Athena query in $workgroup $state: $(reader_env aws athena get-query-execution --query-execution-id "$qid" --query QueryExecution.Status.StateChangeReason --output text)"
+  fi
+  if reader_env aws athena start-query-execution --work-group primary --query-string "SELECT 1" >/dev/null 2>&1; then
+    fail "reader: could start a query in the primary workgroup"
+  else
+    pass "reader: the primary workgroup is refused"
+  fi
+  if reader_env aws stepfunctions describe-execution --execution-arn "$exec_arn" --query status --output text >/dev/null; then
+    pass "reader: DescribeExecution $exec_arn"
+  else
+    fail "reader: DescribeExecution $exec_arn denied"
+  fi
+  # arn:aws:states:<region>:<account>:execution:<state machine>:<id>
+  sm_name="$(echo "$exec_arn" | cut -d: -f7)"
+  sm_arn="$(echo "$exec_arn" | cut -d: -f1-5):stateMachine:$sm_name"
+  if reader_env aws logs filter-log-events --log-group-name "/aws/lambda/$sm_name-runner" --limit 1 >/dev/null; then
+    pass "reader: FilterLogEvents on /aws/lambda/$sm_name-runner"
+  else
+    fail "reader: FilterLogEvents on /aws/lambda/$sm_name-runner denied"
+  fi
+  if reader_env aws s3 cp "s3://$bucket/_clavesa/tree/deployed.json" - >/dev/null; then
+    pass "reader: GetObject s3://$bucket/_clavesa/tree/deployed.json"
+  else
+    fail "reader: GetObject on the tree copy's deployed.json denied"
+  fi
+
+  # Writes and state, by the policy simulator (no write is attempted).
+  simulate_denied states:StartExecution "$sm_arn"
+  simulate_denied s3:PutObject "arn:aws:s3:::$bucket/$SMOKE_PIPELINE/smoke-hosted-probe"
+  simulate_denied s3:DeleteObject "arn:aws:s3:::$bucket/athena-results/clavesa-ui/smoke-hosted-probe"
+  simulate_denied glue:UpdateTable "arn:aws:glue:$AWS_REGION:$(echo "$exec_arn" | cut -d: -f5):table/$SYSTEM_DB/runs"
+  simulate_denied s3:GetObject "arn:aws:s3:::$state_bucket/${state_prefix}$WS_NAME/workspace.tfstate"
+
+  # The tree copy serves the read paths with no state: same numbers.
+  local tree real_sum tree_sum
+  tree="$(mktemp -d /tmp/clavesa-smoke-tree.XXXXXX)"
+  reader_env aws s3 sync --only-show-errors "s3://$bucket/_clavesa/tree/" "$tree/" \
+    || die "reader: sync of the tree copy failed"
+  local leaked
+  leaked="$(find "$tree" -name '*.tfstate*' -o -name '.env*' -o -name 'tfplan' -o -path '*credentials*' -o -path '*/.terraform/*')"
+  if [[ -n "$leaked" ]]; then
+    fail "tree copy holds state, .env or credential files: $(echo "$leaked" | tr '\n' ' ')"
+  else
+    pass "tree copy: $(find "$tree" -type f | wc -l | tr -d ' ') file(s), no state, .env or credentials"
+  fi
+  real_sum="$("$BIN" workspace summary --json --workspace "$SMOKE_WS" | jq -c -f "$REPO_ROOT/scripts/hosted-summary-key.jq")" \
+    || die "workspace summary on $SMOKE_WS failed"
+  tree_sum="$(reader_env "$BIN" workspace summary --json --workspace "$tree" | jq -c -f "$REPO_ROOT/scripts/hosted-summary-key.jq")" \
+    || die "reader: workspace summary on the tree copy failed"
+  if [[ "$real_sum" == "$tree_sum" ]]; then
+    pass "summary on the tree copy as the reader = summary on $SMOKE_WS ($real_sum)"
+  else
+    fail "summary differs: real $real_sum, tree copy $tree_sum"
+  fi
+  rm -rf "$tree"
 }
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1002,13 @@ EOF
     pass "run after lease removal SUCCEEDED (lock release/removal unblocks)"
   else
     fail "expected SUCCEEDED after lease removal, observed '$unlock_status'"
+  fi
+
+  # ----- 9b. hosted reader (ADR-032) ------------------------------------------
+  if jq -e '.hosted' "$SMOKE_WS/clavesa.json" >/dev/null; then
+    hosted_leg "$exec_arn" "$state_bucket" "$(echo "$backend_json" | jq -r '.key_prefix // "clavesa/"')"
+  else
+    echo "  (hosted leg skipped: $SMOKE_WS/clavesa.json has no hosted block)"
   fi
 
   # ----- 10. summary / stamp ------------------------------------------------

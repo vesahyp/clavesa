@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
@@ -104,7 +103,7 @@ func (s *Service) prepareCloudLocalRun(ctx context.Context, dir string, opts Run
 	pipelineName := filepath.Base(abs)
 	workspaceRoot := filepath.Dir(abs)
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
@@ -303,7 +302,7 @@ func (s *Service) recordCloudLocalRun(ctx context.Context, lambdaEnv map[string]
 	}
 	// Host AWS credentials + ~/.aws mount — the container reaches the cloud
 	// catalog + S3 through these (same as the dispatcher).
-	args = append(args, runner.AWSEnvDockerArgs(ctx)...)
+	args = append(args, runner.AWSEnvDockerArgs(ctx, workspace.AWSConfigOptions(ctx, s.workspace)...)...)
 	args = append(args, image)
 
 	execRecordRunContainer(ctx, args, body)

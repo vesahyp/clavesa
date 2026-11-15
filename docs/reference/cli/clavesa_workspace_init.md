@@ -16,6 +16,11 @@ enabled — see docs/remote-state.md. For an existing local-state
 workspace, use `clavesa workspace set-backend` followed by
 `clavesa workspace migrate-state` instead.
 
+Pass --region <r> to record the AWS region the workspace deploys to.
+Without it, the first `clavesa workspace deploy` records the region it
+applied in (AWS_REGION or the profile's region). Every later AWS call
+and Terraform run of the workspace uses the recorded region.
+
 ## Usage
 
 ```
@@ -28,6 +33,7 @@ clavesa workspace init <name> [flags]
       --backend string            remote Terraform backend type (ADR-025; only "s3" is supported)
       --catalog string            three-level-namespace catalog identifier (default: clavesa_<sanitize(name)>)
       --cloud string              cloud provider (aws) (default "aws")
+      --region string             AWS region the workspace deploys to (default: recorded at the first deploy)
       --state-bucket string       S3 bucket the backend stores state in (required with --backend)
       --state-key-prefix string   key prefix inside the bucket (default "clavesa/")
       --state-region string       AWS region of the state bucket (required with --backend)

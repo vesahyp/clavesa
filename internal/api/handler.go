@@ -162,7 +162,7 @@ func (h *Handler) syncOrchestration(dir string) {
 
 // RegisterRoutes registers all PIPELINE-API routes on mux.
 // Requires Go 1.22+ net/http for method-qualified patterns and {id} params.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+func (h *Handler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /pipeline", h.GetPipeline)
 	mux.HandleFunc("POST /pipeline/nodes", h.AddNode)
 	mux.HandleFunc("POST /pipeline/typed-nodes", h.TypedAddNode)

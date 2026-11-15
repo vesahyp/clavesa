@@ -149,7 +149,7 @@ func (h *DashboardsHandler) WithQueryService(fn QueryFunc) *DashboardsHandler {
 }
 
 // RegisterRoutes mounts the dashboards endpoints under the api mux.
-func (h *DashboardsHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *DashboardsHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /dashboards", h.list)
 	mux.HandleFunc("POST /dashboards", h.create)
 	mux.HandleFunc("GET /dashboards/{slug}", h.get)

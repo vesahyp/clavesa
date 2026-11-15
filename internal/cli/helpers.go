@@ -10,19 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/athena"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go-v2/service/glue"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/spf13/cobra"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/service"
-	"github.com/vesahyp/clavesa/internal/servingsql"
 	wspkg "github.com/vesahyp/clavesa/internal/workspace"
+	"github.com/vesahyp/clavesa/internal/wsdeps"
 )
 
 // setFlags accumulates multiple --set key=value flags.
@@ -109,10 +102,37 @@ func resolveWorkspaceRoot(cmd *cobra.Command) (string, error) {
 // applies. The file is authoritative: when set it overrides an exported
 // AWS_PROFILE, matching the UI's behaviour. No-op when no profile is
 // persisted.
+//
+// The workspace's recorded region (GH #107, wspkg.ResolveRegion) becomes
+// AWS_REGION and AWS_DEFAULT_REGION the same way, so every AWS client and
+// every Terraform run of the command uses the region the workspace lives
+// in. It wins over an exported AWS_REGION (see internal/workspace/region.go
+// for why); when the two differ the command says so on stderr.
 func applyWorkspaceAWSProfile(root string) {
 	if p := wspkg.LoadAWSProfile(root); p != "" {
 		os.Setenv("AWS_PROFILE", p)
 	}
+	r := wspkg.ResolveRegion(context.Background(), root)
+	if r == "" {
+		return
+	}
+	if cur, src := explicitEnvRegion(); cur != "" && cur != r {
+		fmt.Fprintf(os.Stderr, "clavesa: using the workspace region %s, not %s=%s (the workspace is deployed in %s; to change it, edit \"region\" in clavesa.json)\n", r, src, cur, r)
+	}
+	os.Setenv("AWS_REGION", r)
+	os.Setenv("AWS_DEFAULT_REGION", r)
+}
+
+// explicitEnvRegion returns the region exported in the environment and the
+// variable it came from: AWS_REGION first, then AWS_DEFAULT_REGION.
+func explicitEnvRegion() (string, string) {
+	if v := strings.TrimSpace(os.Getenv("AWS_REGION")); v != "" {
+		return v, "AWS_REGION"
+	}
+	if v := strings.TrimSpace(os.Getenv("AWS_DEFAULT_REGION")); v != "" {
+		return v, "AWS_DEFAULT_REGION"
+	}
+	return "", ""
 }
 
 // printTargetContext writes a short summary — resolved workspace,
@@ -136,6 +156,9 @@ func printTargetContext(action, workspaceRoot string, warehouse wspkg.Warehouse)
 	profile := os.Getenv("AWS_PROFILE")
 	if profile == "" {
 		profile = "default credential chain"
+	}
+	if r, _ := explicitEnvRegion(); r != "" {
+		profile += " · region: " + r
 	}
 	if warehouse != "" {
 		fmt.Fprintf(os.Stderr, "%s · warehouse: %s · aws profile: %s\n", action, warehouse, profile)
@@ -277,79 +300,17 @@ func releaseMetastores(cmd *cobra.Command) {
 	_ = observability.ReleaseCreatedMetastores(ctx)
 }
 
-// awsClients bundles the AWS SDK clients (and the derived Athena output
-// bucket) the CLI wires into the cloud observability provider — and that
-// `clavesa ui` additionally hands to its HTTP handlers. All clients are
-// nil when the default AWS config can't load (local-only mode); Err
-// carries the load failure for surfaces that want to explain it.
-type awsClients struct {
-	Config aws.Config
-	Err    error // non-nil ⇔ config load failed ⇔ every client below is nil
-	S3     *s3.Client
-	Athena *athena.Client
-	Glue   *glue.Client
-	SFN    *sfn.Client
-	CWL    *cloudwatchlogs.Client
-	// AthenaOutputBucket: explicit $ATHENA_OUTPUT_BUCKET wins; otherwise
-	// auto-derived from the workspace's terraform.tfstate
-	// (`pipeline_bucket` output, the same bucket the Athena workgroup uses
-	// for `athena-results/`). Empty in local-only or pre-deploy mode —
-	// Athena calls would fail anyway, the resolver routes those requests
-	// to the local provider.
-	AthenaOutputBucket string
-}
-
-// loadAWSClients resolves the AWS config once and constructs the client
-// set. Cheap: LoadDefaultConfig only parses local config files, and client
-// construction opens no connections — the network is touched only when a
-// cloud dispatch actually calls one.
-func loadAWSClients(ctx context.Context, workspaceRoot string) awsClients {
-	bucket := os.Getenv("ATHENA_OUTPUT_BUCKET")
-	if bucket == "" {
-		bucket = wspkg.PipelineBucket(workspaceRoot)
-	}
-	c := awsClients{AthenaOutputBucket: bucket}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		c.Err = err
-		return c
-	}
-	c.Config = cfg
-	c.S3 = s3.NewFromConfig(cfg)
-	c.Athena = athena.NewFromConfig(cfg)
-	c.Glue = glue.NewFromConfig(cfg)
-	c.SFN = sfn.NewFromConfig(cfg)
-	c.CWL = cloudwatchlogs.NewFromConfig(cfg)
-	return c
-}
-
-// cloudProvider builds the full-client cloud observability provider, or
-// nil when AWS config didn't load (the resolver then routes everything to
-// the local provider and surfaces a clear error on an attempted cloud
-// dispatch). Glue+S3 ride along for the ADR-018 Delta `_delta_log/` reads
-// (snapshot timelines, real schemas behind Glue's Delta stubs).
-func (c awsClients) cloudProvider() observability.Provider {
-	if c.Err != nil {
-		return nil
-	}
-	return observability.NewCloudProvider(c.Athena, c.AthenaOutputBucket, c.SFN, c.CWL).
-		WithGlue(c.Glue).
-		WithS3(c.S3)
-}
-
 // serviceDeps is what newServiceDeps assembles: the fully-wired Service
 // plus the individual pieces the commands with extra wiring need beyond
-// the Service itself (`clavesa ui` hands the clients/resolver/warm runner
-// to its HTTP handlers and layers the notebook runner on top; `clavesa
-// query` and `clavesa notebook` eagerly warm the local worker). Everything
-// is lazy — no container spawns, no network calls — until a command
-// actually uses a piece.
+// the Service itself (`clavesa ui` hands the whole set to
+// ui.BuildWorkspaceMux and layers the notebook runner on top; `clavesa
+// query` and `clavesa notebook` eagerly warm the local worker). The
+// recipe itself is wsdeps.New, shared with the multi-workspace UI.
 type serviceDeps struct {
 	svc       *service.Service
 	workspace string
-	clients   awsClients
 	warm      *observability.PersistentQueryRunner
-	resolver  *observability.Resolver
+	full      *wsdeps.Deps
 }
 
 // reapOrphansOnce gates the GH #59 orphan reaper to once per process —
@@ -358,18 +319,13 @@ type serviceDeps struct {
 var reapOrphansOnce sync.Once
 
 // newServiceDeps is the single CLI service constructor (2026-07-02 session
-// I P2-1; GH #76). Every command-side service.Service is built here with
-// the FULL option set — resolver, SQL parser, transpiler, metastore
-// ensurer — so no per-command recipe can silently drop a seam again (the
-// dashboards constructor once omitted the metastore ensurer, putting CLI
-// `pipeline optimize` on embedded Derby while every other local dispatch
-// used the shared metastore). Unused pieces cost nothing:
-//   - the SQL parser's persistent runner only spawns a docker container on
-//     first Parse (node edit, node preview, dashboards apply, sql lint pay
-//     one ~30s cold spawn per invocation; everything else stays docker-free),
-//   - the transpile sidecar spawns on first ToServing,
-//   - the AWS clients open no connections until a cloud dispatch,
-//   - the metastore ensurer runs only when a local runner container launches.
+// I P2-1; GH #76). Every command-side service.Service is built by
+// wsdeps.New with the FULL option set — resolver, SQL parser, transpiler,
+// metastore ensurer — so no per-command recipe can silently drop a seam.
+// Unused pieces cost nothing: the SQL parser's runner spawns a container
+// only on first Parse, the transpile sidecar on first ToServing, the AWS
+// clients open no connections until a cloud dispatch, and the metastore
+// ensurer runs only when a local runner container launches.
 //
 // Teardown is uniform too: the warm runner and sidecar are registered as
 // closeables and stopped by runCloseables() when the root command exits.
@@ -379,7 +335,7 @@ func newServiceDeps(cmd *cobra.Command) (*serviceDeps, error) {
 		return nil, fmt.Errorf("resolve workspace: %w", err)
 	}
 	// Reap helper containers orphaned by DELETED workspaces (GH #59) — the
-	// per-root sweeps above/in ui.go only see the current workspace, so
+	// per-root sweeps in ui.go only see the current workspace, so
 	// metastores and warm workers from removed tempdir workspaces leaked
 	// forever. Once per process, best-effort: docker absent / daemon down is
 	// the normal quiet case, and each docker call inside is short-timeout so
@@ -387,28 +343,15 @@ func newServiceDeps(cmd *cobra.Command) (*serviceDeps, error) {
 	reapOrphansOnce.Do(func() {
 		_, _ = observability.ReapOrphanContainers(cmd.Context())
 	})
-	clients := loadAWSClients(cmd.Context(), workspace)
-	cloud := clients.cloudProvider()
-	warm := observability.NewPersistentQueryRunner(workspace)
-	registerCloseable(warm.Close)
-	local := observability.NewLocalProvider(workspace).WithQueryRunner(warm)
-	resolver := observability.NewResolver(workspace, cloud, local)
-	sidecar := observability.NewTranspileSidecar(workspace)
-	registerCloseable(sidecar.Close)
-	transpiler := servingsql.NewCachedTranspiler(filepath.Join(workspace, ".clavesa", "cache", "transpile"), sidecar.ToServing)
-	svc := service.New(workspace).
-		WithResolver(resolver).
-		// Parser resolves the active warehouse (ADR-024) lazily on first
-		// Parse; cloud + undeployed surfaces an actionable error there.
-		WithSQLParser(warm.SQLParserForWorkspace()).
-		WithTranspiler(transpiler).
-		WithMetastoreEnsurer(metastoreEnsurer())
+	d := wsdeps.New(cmd.Context(), workspace, wsdeps.Options{})
+	for _, fn := range d.Closers {
+		registerCloseable(fn)
+	}
 	return &serviceDeps{
-		svc:       svc,
+		svc:       d.Svc,
 		workspace: workspace,
-		clients:   clients,
-		warm:      warm,
-		resolver:  resolver,
+		warm:      d.Warm,
+		full:      d,
 	}, nil
 }
 
@@ -420,24 +363,6 @@ func newService(cmd *cobra.Command) (*service.Service, string, error) {
 		return nil, "", err
 	}
 	return deps.svc, deps.workspace, nil
-}
-
-// metastoreEnsurer returns the production shared-metastore ensurer wired
-// into the Service via WithMetastoreEnsurer (CLI + UI). It brings up (or
-// reuses) the per-workspace Derby metastore container and returns the
-// (docker network, addr) the run containers attach to. Best-effort: on
-// failure it logs to stderr and returns ("", ""), so the containers fall
-// back to embedded Derby — the exact semantics the run.go call sites had
-// before the seam was extracted.
-func metastoreEnsurer() func(ctx context.Context, workspaceRoot, workspaceName string) (string, string) {
-	return func(ctx context.Context, workspaceRoot, workspaceName string) (string, string) {
-		addr, err := observability.EnsureMetastore(ctx, workspaceRoot, workspaceName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "clavesa: falling back to embedded metastore (shared metastore unavailable): %v\n", err)
-			return "", ""
-		}
-		return observability.MetastoreNetwork(), addr
-	}
 }
 
 // pipelineDirHelp documents the <pipeline-dir> positional shared by every

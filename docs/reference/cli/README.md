@@ -115,10 +115,15 @@ Visual ETL for Terraform pipelines
 | &nbsp;&nbsp;[`clavesa workspace destroy`](clavesa_workspace_destroy.md) | terraform destroy on the workspace (sweeping system-catalog Glue tables first) |
 | &nbsp;&nbsp;[`clavesa workspace disconnect`](clavesa_workspace_disconnect.md) | Remove a connection to an outside catalog |
 | &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace disconnect databricks`](clavesa_workspace_disconnect_databricks.md) | Remove the Databricks connection from clavesa.json |
+| &nbsp;&nbsp;[`clavesa workspace hosted`](clavesa_workspace_hosted.md) | Join or leave the hosted read-only UI |
+| &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace hosted disable`](clavesa_workspace_hosted_disable.md) | Remove the hosted block from clavesa.json |
+| &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace hosted enable`](clavesa_workspace_hosted_enable.md) | Write the hosted block into clavesa.json |
+| &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace hosted show`](clavesa_workspace_hosted_show.md) | Show the hosted block |
 | &nbsp;&nbsp;[`clavesa workspace init`](clavesa_workspace_init.md) | Initialize a new workspace |
 | &nbsp;&nbsp;[`clavesa workspace migrate-state`](clavesa_workspace_migrate-state.md) | Move the workspace's Terraform state onto the configured remote backend |
 | &nbsp;&nbsp;[`clavesa workspace plan`](clavesa_workspace_plan.md) | Run terraform plan on the workspace |
 | &nbsp;&nbsp;[`clavesa workspace set-backend`](clavesa_workspace_set-backend.md) | Configure (or clear) the workspace's remote Terraform backend |
+| &nbsp;&nbsp;[`clavesa workspace summary`](clavesa_workspace_summary.md) | Show the workspace health summary |
 | &nbsp;&nbsp;[`clavesa workspace tables`](clavesa_workspace_tables.md) | List Delta tables in the workspace catalog |
 | &nbsp;&nbsp;[`clavesa workspace upgrade`](clavesa_workspace_upgrade.md) | Upgrade the workspace shell and every pipeline to the binary's module version |
 | &nbsp;&nbsp;[`clavesa workspace use`](clavesa_workspace_use.md) | Switch the current workspace, or set its warehouse / AWS profile |

@@ -7,6 +7,7 @@
  * the editor itself lives at /notebooks/:name.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -26,6 +27,7 @@ import {
 } from "@/lib/queries";
 
 export function Notebooks() {
+  const readOnly = useReadOnly();
   const list = useNotebooks();
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
@@ -42,7 +44,7 @@ export function Notebooks() {
     useMemo(
       () => ({
         breadcrumbs: [{ label: "Notebooks", to: "/notebooks" }],
-        trailing: (
+        trailing: readOnly ? undefined : (
           <Button
             size="sm"
             variant={showForm ? "secondary" : "default"}
@@ -53,7 +55,7 @@ export function Notebooks() {
           </Button>
         ),
       }),
-      [showForm],
+      [showForm, readOnly],
     ),
   );
 
@@ -156,6 +158,7 @@ function NotebookRow({
   onDeleted: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const readOnly = useReadOnly();
 
   async function doDelete() {
     try {
@@ -185,7 +188,7 @@ function NotebookRow({
               {summary.updated_at}
             </p>
           </div>
-          {confirming ? (
+          {readOnly ? null : confirming ? (
             <div className="flex items-center gap-2">
               <Button
                 size="sm"
@@ -219,6 +222,7 @@ function NotebookRow({
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
+  const readOnly = useReadOnly();
   return (
     <Card>
       <CardContent className="py-10 text-center">
@@ -228,10 +232,12 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
           A notebook is a multi-cell scratchpad — SQL and PySpark cells share
           one SparkSession with persistent Python globals, like Databricks.
         </p>
-        <Button className="mt-4" onClick={onAdd}>
-          <Plus className="mr-1 h-4 w-4" />
-          New notebook
-        </Button>
+        {!readOnly && (
+          <Button className="mt-4" onClick={onAdd}>
+            <Plus className="mr-1 h-4 w-4" />
+            New notebook
+          </Button>
+        )}
       </CardContent>
     </Card>
   );

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -438,22 +437,6 @@ Databricks; a person who can run SQL there does those steps.
 	cmd.Flags().StringVar(&dbxTarget, "databricks-target", "", "the bundle target that deploys the job to Databricks (named in the steps)")
 	return cmd
 }
-
-// bundleBridge adapts the service to the /api/bundle handler (the same
-// calls as clavesa bundle plan and bundle list, ADR-015).
-type bundleBridge struct {
-	svc  *service.Service
-	root string
-}
-
-func (b bundleBridge) PlanBundle(ctx context.Context, dir, target string) (any, error) {
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(b.root, dir)
-	}
-	return service.PlanBundle(ctx, service.BundleOptions{Dir: dir, Target: target})
-}
-
-func (b bundleBridge) BundlePipelines() (any, error) { return b.svc.BundlePipelines() }
 
 func newBundleListCmd() *cobra.Command {
 	var jsonOut bool

@@ -21,6 +21,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { cn } from "@/lib/utils";
 import { setWarehouse, useWarehouse, type Warehouse } from "@/lib/queries";
 
@@ -28,6 +29,7 @@ const WAREHOUSES: ReadonlyArray<Warehouse["warehouse"]> = ["local", "cloud"];
 
 export function WarehouseToggle() {
   const qc = useQueryClient();
+  const readOnly = useReadOnly();
   const { data, isLoading } = useWarehouse();
   const mutation = useMutation({
     mutationFn: setWarehouse,
@@ -45,6 +47,18 @@ export function WarehouseToggle() {
 
   const warehouse = data?.warehouse ?? "local";
   const busy = isLoading || mutation.isPending;
+
+  // Read-only (ADR-032): show which warehouse, with no switch.
+  if (readOnly) {
+    return (
+      <span
+        className="text-xs font-medium text-muted-foreground"
+        data-testid="warehouse-label"
+      >
+        Warehouse <span className="capitalize text-foreground">{warehouse}</span>
+      </span>
+    );
+  }
 
   return (
     <Tooltip>

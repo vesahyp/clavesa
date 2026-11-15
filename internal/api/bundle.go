@@ -25,7 +25,7 @@ type BundleHandler struct{ svc BundleService }
 func NewBundleHandler(svc BundleService) *BundleHandler { return &BundleHandler{svc: svc} }
 
 // RegisterRoutes mounts GET /bundle/plan and GET /bundle/pipelines.
-func (h *BundleHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *BundleHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /bundle/plan", h.plan)
 	mux.HandleFunc("GET /bundle/pipelines", h.pipelines)
 }

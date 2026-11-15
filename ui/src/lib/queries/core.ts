@@ -7,7 +7,7 @@
 
 import { z } from "zod";
 
-import { BASE_URL } from "@/api/client";
+import { apiFetch } from "@/api/client";
 
 // isQueryableIdentifier mirrors the server's database/table validation
 // (`[A-Za-z_][A-Za-z0-9_]*`). The Delta/Spark per-table endpoints
@@ -56,7 +56,7 @@ function jsonInit(init: RequestInit): RequestInit {
 
 /**
  * requestParsed — fetch + Zod-parse for the JSON endpoints in the query
- * modules. Prepends BASE_URL and parses the response body through `schema`
+ * modules. Prepends the API base and parses the response body through `schema`
  * at the trust boundary.
  *
  * `errorLabel` preserves each call site's historical error prefix — the
@@ -67,10 +67,12 @@ function jsonInit(init: RequestInit): RequestInit {
 export async function requestParsed<S extends z.ZodTypeAny>(
   path: string,
   schema: S,
-  options: RequestInit & { errorLabel: string },
+  options: RequestInit & { errorLabel: string; apiBase?: string },
 ): Promise<z.infer<S>> {
-  const { errorLabel, ...init } = options;
-  const res = await fetch(`${BASE_URL}${path}`, jsonInit(init));
+  const { errorLabel, apiBase, ...init } = options;
+  // apiBase overrides the page's API base: the Workspaces page reads each
+  // workspace's summary from its own /w/<name>/api.
+  const res = await apiFetch(path, jsonInit(init), apiBase);
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${errorLabel} → ${res.status}: ${text}`);
@@ -88,7 +90,7 @@ export async function requestVoid(
   options: RequestInit & { errorLabel: string; require204?: boolean },
 ): Promise<void> {
   const { errorLabel, require204, ...init } = options;
-  const res = await fetch(`${BASE_URL}${path}`, jsonInit(init));
+  const res = await apiFetch(path, jsonInit(init));
   if (require204 ? res.status === 204 : res.ok) return;
   const text = await res.text().catch(() => res.statusText);
   throw new Error(`${errorLabel} → ${res.status}: ${text}`);
@@ -103,7 +105,7 @@ export async function requestDelete<T>(
   path: string,
   errorLabel: string,
 ): Promise<T | null> {
-  const res = await fetch(`${BASE_URL}${path}`, { method: "DELETE" });
+  const res = await apiFetch(`${path}`, { method: "DELETE" });
   if (res.status === 204) return null;
   if (res.status === 409) return (await res.json()) as T;
   const text = await res.text().catch(() => res.statusText);

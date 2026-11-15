@@ -7,6 +7,7 @@
  * Each non-destination node has a single output handle on the right.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ReactFlow,
@@ -310,7 +311,7 @@ export function PipelineGraph({
   dir,
   onGraphUpdate,
   onError,
-  enableQuickAdd,
+  enableQuickAdd: enableQuickAddProp,
   onNodeClick,
   onEdgeClick,
   nodeSchemas,
@@ -322,6 +323,9 @@ export function PipelineGraph({
   showSources,
   focusNodeId,
 }: PipelineGraphProps) {
+  // Read-only (ADR-032): no quick-add affordances and no edge delete.
+  const readOnly = useReadOnly();
+  const enableQuickAdd = enableQuickAddProp && !readOnly;
   // Source registry — feeds the synthetic source nodes' kind / format /
   // location labels so users see "http · parquet" or "s3 · csv · my-bucket"
   // on the card without having to click it.
@@ -439,7 +443,7 @@ export function PipelineGraph({
   );
 
   useEffect(() => {
-    if (!selectedEdgeId) return;
+    if (!selectedEdgeId || readOnly) return;
     function onKey(e: KeyboardEvent) {
       if (e.key !== "Backspace" && e.key !== "Delete") return;
       // Skip when focus is in any editor surface — INPUT, TEXTAREA,
@@ -458,7 +462,7 @@ export function PipelineGraph({
     // intermittently because of this.
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
-  }, [selectedEdgeId, handleDeleteEdge]);
+  }, [selectedEdgeId, handleDeleteEdge, readOnly]);
 
   const { nodes: baseNodes, edges: rfEdges } = useMemo(() => {
     // ADR-017 registered sources aren't graph nodes — they live in each

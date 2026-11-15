@@ -6,6 +6,7 @@
  * never shows the secret material itself, only the reference (per ADR).
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Plus, Trash2 } from "lucide-react";
@@ -25,6 +26,7 @@ import {
 } from "@/lib/queries";
 
 export function Credentials() {
+  const readOnly = useReadOnly();
   const list = useCredentials();
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
@@ -47,7 +49,7 @@ export function Credentials() {
     useMemo(
       () => ({
         breadcrumbs: [{ label: "Credentials", to: "/credentials" }],
-        trailing: (
+        trailing: readOnly ? undefined : (
           <Button
             size="sm"
             variant={showForm ? "secondary" : "default"}
@@ -58,7 +60,7 @@ export function Credentials() {
           </Button>
         ),
       }),
-      [showForm],
+      [showForm, readOnly],
     ),
   );
 
@@ -253,6 +255,7 @@ function CredentialRow({
   onDeleted: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const readOnly = useReadOnly();
 
   async function remove() {
     setBusy(true);
@@ -300,15 +303,17 @@ function CredentialRow({
               → {spec.secret}
             </code>
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={remove}
-            disabled={busy}
-            aria-label={`Delete credential ${spec.name}`}
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
+          {!readOnly && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={remove}
+              disabled={busy}
+              aria-label={`Delete credential ${spec.name}`}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          )}
         </CardContent>
       </Card>
     </li>
@@ -316,6 +321,7 @@ function CredentialRow({
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
+  const readOnly = useReadOnly();
   return (
     <Card>
       <CardContent className="flex flex-col items-start gap-3 p-6 text-sm">
@@ -332,10 +338,12 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
           </code>
           .
         </p>
-        <Button size="sm" onClick={onAdd}>
-          <Plus className="mr-1 h-4 w-4" />
-          Register credential
-        </Button>
+        {!readOnly && (
+          <Button size="sm" onClick={onAdd}>
+            <Plus className="mr-1 h-4 w-4" />
+            Register credential
+          </Button>
+        )}
       </CardContent>
     </Card>
   );

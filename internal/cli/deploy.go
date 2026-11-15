@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
@@ -197,6 +196,8 @@ func (d deployFlow) Run() error {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 
+	d.recordRegion()
+
 	if d.AfterApply != nil {
 		if err := d.AfterApply(); err != nil {
 			return err
@@ -234,6 +235,14 @@ func (d deployFlow) preflight() error {
 
 	if err := d.checkBackendGuard(); err != nil {
 		return err
+	}
+
+	// ADR-032: hosted.tf follows clavesa.json, and its legacy per-pipeline
+	// name list follows the pipelines, so re-emit it before the plan.
+	if filepath.Clean(d.TfDir) == filepath.Clean(d.WorkspaceRoot) {
+		if err := tuiservice.New(d.WorkspaceRoot).SyncHostedTF(""); err != nil {
+			return fmt.Errorf("write %s: %w", workspace.HostedTFFile, err)
+		}
 	}
 
 	if err := d.verifyAWSCredentials(); err != nil {
@@ -311,7 +320,7 @@ func (d deployFlow) checkBackendGuard() error {
 func (d deployFlow) verifyAWSCredentials() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cfg, err := config.LoadDefaultConfig(ctx)
+	cfg, err := workspace.LoadAWSConfig(ctx, d.WorkspaceRoot)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w (check AWS_PROFILE / AWS_REGION / ~/.aws/credentials)", err)
 	}
@@ -343,7 +352,7 @@ func (d deployFlow) pushRunnerImage() error {
 		return fmt.Errorf("push runner image: %s is not a clavesa workspace", d.WorkspaceRoot)
 	}
 
-	cfg, err := config.LoadDefaultConfig(ctx)
+	cfg, err := workspace.LoadAWSConfig(ctx, d.WorkspaceRoot)
 	if err != nil {
 		return fmt.Errorf("push runner image: load AWS config: %w", err)
 	}
@@ -434,7 +443,7 @@ func dockerLoginECR(ctx context.Context, cfg aws.Config, registry string, errOut
 func (d deployFlow) tf(args ...string) error {
 	c := exec.Command("terraform", args...)
 	c.Dir = d.TfDir
-	c.Env = d.Env
+	c.Env = d.env()
 	c.Stdout = d.stdout()
 	c.Stderr = d.stderr()
 	c.Stdin = d.stdin()
@@ -452,6 +461,51 @@ func tfInit(dir string, stdout, stderr io.Writer) error {
 	c.Stdout = stdout
 	c.Stderr = stderr
 	return c.Run()
+}
+
+// env is the environment terraform runs with: Env (or the process
+// environment) with AWS_REGION and AWS_DEFAULT_REGION set to the
+// workspace's recorded region (GH #107), so both the workspace and the
+// pipeline stacks apply in the region the workspace lives in.
+func (d deployFlow) env() []string {
+	env := d.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	return workspace.SetRegionEnv(env, workspace.ResolveRegion(context.Background(), d.WorkspaceRoot))
+}
+
+// recordRegion writes the region the workspace stack was just applied in
+// to clavesa.json (GH #107), read from the fresh state. Workspace stack
+// only; a failure is a warning, the apply itself is done.
+func (d deployFlow) recordRegion() {
+	if filepath.Clean(d.TfDir) != filepath.Clean(d.WorkspaceRoot) {
+		return
+	}
+	workspace.ForgetCachedState()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	data, err := workspace.ReadStackState(ctx, d.WorkspaceRoot, d.WorkspaceRoot)
+	if err != nil {
+		fmt.Fprintf(d.stderr(), "warning: could not read the workspace state to record its region: %v\n", err)
+		return
+	}
+	region := workspace.RegionFromState(data)
+	if region == "" {
+		return
+	}
+	prev := workspace.RecordedRegion(d.WorkspaceRoot)
+	if prev == region {
+		return
+	}
+	if err := workspace.RecordRegion(d.WorkspaceRoot, region); err != nil {
+		fmt.Fprintf(d.stderr(), "warning: could not record the workspace region %s in clavesa.json: %v\n", region, err)
+		return
+	}
+	if prev != "" {
+		fmt.Fprintf(d.stderr(), "warning: clavesa.json said region %s, but the workspace stack is in %s; recorded %s\n", prev, region, region)
+	}
+	fmt.Fprintf(d.stdout(), "→ Recorded AWS region %s in clavesa.json\n", region)
 }
 
 func (d deployFlow) confirm() error {

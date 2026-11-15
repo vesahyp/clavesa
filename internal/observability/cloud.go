@@ -70,6 +70,19 @@ type CloudProvider struct {
 	// defaults to time.Now (set in NewCloudProvider, and defended against
 	// nil via nowFn for providers built by struct literal).
 	clock func() time.Time
+	// athenaWorkGroup, when set, runs every query in that workgroup and
+	// lets its enforced output location decide where results land. A
+	// hosted tree copy (ADR-032) sets it to clavesa-ui-<workspace>, the
+	// only workgroup the reader role may use. Empty: the account's
+	// default workgroup with results under athena-results/.
+	athenaWorkGroup string
+}
+
+// WithAthenaWorkGroup runs every Athena query in workgroup (see
+// athenaWorkGroup). Empty keeps the default.
+func (c *CloudProvider) WithAthenaWorkGroup(workgroup string) *CloudProvider {
+	c.athenaWorkGroup = workgroup
+	return c
 }
 
 // NewCloudProvider wires a provider against AWS SDK clients. Any subset of
@@ -859,7 +872,7 @@ func (c *CloudProvider) Exec(ctx context.Context, q ExecQuery) error {
 	if q.SQL == "" {
 		return fmt.Errorf("exec: sql is required")
 	}
-	_, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, q.SQL)
+	_, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, c.athenaWorkGroup, q.SQL)
 	return err
 }
 
@@ -1209,7 +1222,7 @@ func StepTimeWindow(events []sfntypes.HistoryEvent, step string) (start, end tim
 // (isAthenaMissingTableErr → empty result) stays with each caller — the
 // methods disagree on it deliberately.
 func (c *CloudProvider) runAthenaSelect(ctx context.Context, sql string, limit int) ([]athenatypes.Row, bool, *athenatypes.ResultSet, error) {
-	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, sql)
+	rs, err := runAthenaQuery(ctx, c.athena, c.athenaOutputBucket, c.athenaWorkGroup, sql)
 	if err != nil {
 		return nil, false, nil, err
 	}
@@ -1225,10 +1238,24 @@ func (c *CloudProvider) runAthenaSelect(ctx context.Context, sql string, limit i
 	return rows, truncated, rs, nil
 }
 
+type freshReadsKey struct{}
+
+// WithFreshReads returns a context whose Athena queries skip result reuse,
+// for a caller that must see a run that finished seconds ago (the hosted
+// summary refresh on a run's end event, ADR-032).
+func WithFreshReads(ctx context.Context) context.Context {
+	return context.WithValue(ctx, freshReadsKey{}, true)
+}
+
+func freshReads(ctx context.Context) bool {
+	v, _ := ctx.Value(freshReadsKey{}).(bool)
+	return v
+}
+
 // runAthenaQuery starts a query, polls for completion, and returns the result
 // set. Shared across NodeRuns/Runs/Snapshots.
-func runAthenaQuery(ctx context.Context, ac AthenaClient, outputBucket, sql string) (*athenatypes.ResultSet, error) {
-	startOut, err := ac.StartQueryExecution(ctx, &athena.StartQueryExecutionInput{
+func runAthenaQuery(ctx context.Context, ac AthenaClient, outputBucket, workgroup, sql string) (*athenatypes.ResultSet, error) {
+	in := &athena.StartQueryExecutionInput{
 		QueryString: aws.String(sql),
 		ResultConfiguration: &athenatypes.ResultConfiguration{
 			OutputLocation: aws.String("s3://" + outputBucket + "/athena-results/"),
@@ -1247,7 +1274,16 @@ func runAthenaQuery(ctx context.Context, ac AthenaClient, outputBucket, sql stri
 				MaxAgeInMinutes: aws.Int32(athenaResultReuseMinutes),
 			},
 		},
-	})
+	}
+	if freshReads(ctx) {
+		in.ResultReuseConfiguration = nil
+	}
+	if workgroup != "" {
+		// The workgroup enforces its own output location (ADR-032).
+		in.WorkGroup = aws.String(workgroup)
+		in.ResultConfiguration = nil
+	}
+	startOut, err := ac.StartQueryExecution(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("StartQueryExecution: %w", err)
 	}

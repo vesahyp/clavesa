@@ -60,14 +60,33 @@ func readTFVars(dir string) (map[string]string, error) {
 				continue
 			}
 			key := strings.TrimSpace(k)
-			val := strings.TrimSpace(v)
-			if len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"' {
-				val = val[1 : len(val)-1]
-			}
-			result[key] = val
+			result[key] = tfvarValue(strings.TrimSpace(v))
 		}
 	}
 	return result, nil
+}
+
+// tfvarValue reads the value side of a `key = value` tfvars line: the
+// text inside the quotes of a quoted string (a trailing `# comment` or
+// `// comment` dropped), or the bare value with such a comment dropped.
+func tfvarValue(val string) string {
+	if strings.HasPrefix(val, `"`) {
+		for i := 1; i < len(val); i++ {
+			switch val[i] {
+			case '\\':
+				i++
+			case '"':
+				return val[1:i]
+			}
+		}
+		return val
+	}
+	for _, marker := range []string{" #", " //"} {
+		if i := strings.Index(val, marker); i >= 0 {
+			val = strings.TrimSpace(val[:i])
+		}
+	}
+	return val
 }
 
 func writeTFVars(path string, vars map[string]string) error {

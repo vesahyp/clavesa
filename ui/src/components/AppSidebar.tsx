@@ -8,12 +8,14 @@
 
 import { NavLink, useLocation } from "react-router-dom";
 import {
+  Activity,
   BookOpen,
   Boxes,
   Database,
   FileInput,
   KeyRound,
   LayoutDashboard,
+  LayoutGrid,
   Package2,
   PanelLeftClose,
   PanelLeftOpen,
@@ -23,8 +25,10 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
+import { runtimeConfig } from "@/lib/runtimeConfig";
 import { cn } from "@/lib/utils";
 import { useSidebar } from "./SidebarContext";
+import { SignOutButton } from "./SignOutButton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface NavItem {
@@ -38,8 +42,25 @@ interface NavItem {
 // Order: the three things you spend time *in* — the data front door,
 // where you build, where you watch — then the two registries that feed
 // them. Grouping beats interleaving config between the work surfaces.
+//
+// Inside a workspace of a multi-workspace or hosted server (ADR-032) the
+// workspace home leads and the Catalog moves to /catalog; the local UI's
+// list is unchanged.
+const HOME_ITEMS: NavItem[] =
+  runtimeConfig.mode === "local"
+    ? [{ to: "/", label: "Catalog", icon: Database, match: (p) => p === "/" || p.startsWith("/tables") }]
+    : [
+        { to: "/", label: "Overview", icon: Activity, match: (p) => p === "/" || p === "/overview" },
+        {
+          to: "/catalog",
+          label: "Catalog",
+          icon: Database,
+          match: (p) => p.startsWith("/catalog") || p.startsWith("/tables"),
+        },
+      ];
+
 const NAV: NavItem[] = [
-  { to: "/", label: "Catalog", icon: Database, match: (p) => p === "/" || p.startsWith("/tables") },
+  ...HOME_ITEMS,
   {
     to: "/pipelines",
     label: "Pipelines",
@@ -66,7 +87,8 @@ export function AppSidebar() {
   return (
     <aside
       className={cn(
-        "flex h-full shrink-0 flex-col border-r border-border bg-card transition-[width] duration-150",
+        // Phone (below md): hidden; PhoneNav is the bottom navigation.
+        "hidden h-full shrink-0 flex-col border-r border-border bg-card transition-[width] duration-150 md:flex",
         collapsed ? "w-14" : "w-56",
       )}
     >
@@ -89,6 +111,31 @@ export function AppSidebar() {
 
       {/* Nav */}
       <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
+        {/* Multi-workspace / hosted (ADR-032): back to the Workspaces
+            list. A plain <a>: "/" is outside this workspace's basename,
+            so it is a full page load with the root's runtime config. */}
+        {runtimeConfig.mode !== "local" && (
+          <a
+            href="/"
+            aria-label="All workspaces"
+            title={collapsed ? "All workspaces" : undefined}
+            data-testid="nav-all-workspaces"
+            className={cn(
+              "mb-1 flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground",
+              collapsed && "justify-center px-0",
+            )}
+          >
+            <LayoutGrid className="h-4 w-4 shrink-0" />
+            {!collapsed && (
+              <span className="truncate">
+                All workspaces
+                <span className="block truncate font-mono text-[11px] font-normal">
+                  {runtimeConfig.workspace}
+                </span>
+              </span>
+            )}
+          </a>
+        )}
         {NAV.map((item) => {
           const active = item.match(pathname);
           const Icon = item.icon;
@@ -119,8 +166,9 @@ export function AppSidebar() {
         })}
       </nav>
 
-      {/* Collapse toggle */}
+      {/* Collapse toggle (and Sign out in hosted mode) */}
       <div className="shrink-0 border-t border-border p-2">
+        <SignOutButton compact={collapsed} className="w-full font-medium" />
         <button
           type="button"
           onClick={toggle}

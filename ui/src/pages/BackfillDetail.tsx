@@ -15,6 +15,7 @@
  * response shape either way, so this page is environment-agnostic.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -53,6 +54,7 @@ function defaultDedupColumn(columns: { name: string }[]): string {
 }
 
 export function BackfillDetail() {
+  const readOnly = useReadOnly();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
@@ -308,7 +310,8 @@ export function BackfillDetail() {
           </CardContent>
         </Card>
 
-        {/* Promote / Discard */}
+        {/* Promote / Discard — an action card, hidden in read-only. */}
+        {!readOnly && (
         <Card className="mt-6">
           <CardHeader className="pb-3">
             <CardTitle>Promote into canonical</CardTitle>
@@ -478,6 +481,7 @@ export function BackfillDetail() {
             </div>
           </CardContent>
         </Card>
+        )}
     </div>
   );
 }

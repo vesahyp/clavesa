@@ -448,7 +448,7 @@ func (p *PersistentQueryRunner) spawn(ctx context.Context, warehouse string) (st
 	}
 	var awsArgs []string
 	if isS3 {
-		awsArgs = runner.AWSEnvDockerArgs(ctx)
+		awsArgs = runner.AWSEnvDockerArgs(ctx, workspace.AWSConfigOptions(ctx, p.workspaceRoot)...)
 	}
 	args := warmWorkerRunArgs(p.labelKV, p.wsLabelKV, warehouse, p.resolveImage(), catalog, systemCatalog, metastoreNetwork, metastoreAddr, awsArgs)
 

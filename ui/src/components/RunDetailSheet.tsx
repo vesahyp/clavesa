@@ -14,7 +14,9 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { useIsPhone } from "@/hooks/useIsPhone";
 import { RunDetailView } from "./RunDetailView";
+import { RunPhoneView } from "./RunPhoneView";
 
 export interface RunDetailSheetProps {
   dir: string;
@@ -23,6 +25,7 @@ export interface RunDetailSheetProps {
 }
 
 export function RunDetailSheet({ dir, runId, onClose }: RunDetailSheetProps) {
+  const isPhone = useIsPhone();
   return (
     <Sheet
       open={!!runId}
@@ -36,11 +39,20 @@ export function RunDetailSheet({ dir, runId, onClose }: RunDetailSheetProps) {
             Run{runId ? ` ${runId.slice(0, 12)}` : ""}
           </SheetTitle>
           <SheetDescription>
-            Drill-down: status, DAG, per-node breakdown.
+            {isPhone
+              ? "Node timeline, rows per node, errors."
+              : "Drill-down: status, DAG, per-node breakdown."}
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1">
-          {runId && <RunDetailView dir={dir} runId={runId} />}
+          {/* Phone (below md, ADR-032): timeline, rows per node and
+              the error with its log tail instead of the DAG. */}
+          {runId &&
+            (isPhone ? (
+              <RunPhoneView dir={dir} runId={runId} />
+            ) : (
+              <RunDetailView dir={dir} runId={runId} />
+            ))}
         </div>
       </SheetContent>
     </Sheet>

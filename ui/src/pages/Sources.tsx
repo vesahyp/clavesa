@@ -7,6 +7,7 @@
  * pipeline; the UI surfaces the dependency list inline).
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Database, Eye, Pencil, Plus, Trash2 } from "lucide-react";
@@ -31,6 +32,7 @@ import {
 import { getRegistrySourcePreview, type PreviewResult } from "@/api/data";
 
 export function Sources() {
+  const readOnly = useReadOnly();
   const list = useSources();
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
@@ -53,7 +55,7 @@ export function Sources() {
     useMemo(
       () => ({
         breadcrumbs: [{ label: "Sources", to: "/sources" }],
-        trailing: (
+        trailing: readOnly ? undefined : (
           <Button
             size="sm"
             variant={showForm ? "secondary" : "default"}
@@ -64,7 +66,7 @@ export function Sources() {
           </Button>
         ),
       }),
-      [showForm],
+      [showForm, readOnly],
     ),
   );
 
@@ -504,6 +506,7 @@ function SourceRow({
 }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
+  const readOnly = useReadOnly();
   const [preview, setPreview] = useState<
     | { kind: "loading" }
     | { kind: "error"; message: string }
@@ -622,24 +625,28 @@ function SourceRow({
           >
             <Eye className="h-4 w-4" />
           </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setEditing(true)}
-            disabled={busy}
-            aria-label={`Edit source ${spec.name}`}
-          >
-            <Pencil className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => remove(false)}
-            disabled={busy}
-            aria-label={`Delete source ${spec.name}`}
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
+          {!readOnly && (
+            <>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setEditing(true)}
+                disabled={busy}
+                aria-label={`Edit source ${spec.name}`}
+              >
+                <Pencil className="h-4 w-4" />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => remove(false)}
+                disabled={busy}
+                aria-label={`Delete source ${spec.name}`}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </>
+          )}
         </CardContent>
         {preview && <SourcePreviewPanel state={preview} />}
       </Card>
@@ -730,6 +737,7 @@ function formatPreviewCell(v: unknown): string {
 }
 
 function EmptyState({ onAdd }: { onAdd: () => void }) {
+  const readOnly = useReadOnly();
   return (
     <Card>
       <CardContent className="flex flex-col items-start gap-3 p-6 text-sm">
@@ -745,10 +753,12 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
           </code>
           .
         </p>
-        <Button size="sm" onClick={onAdd}>
-          <Plus className="mr-1 h-4 w-4" />
-          Register source
-        </Button>
+        {!readOnly && (
+          <Button size="sm" onClick={onAdd}>
+            <Plus className="mr-1 h-4 w-4" />
+            Register source
+          </Button>
+        )}
       </CardContent>
     </Card>
   );

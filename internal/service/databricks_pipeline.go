@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -312,13 +311,13 @@ func (s *Service) GetDatabricksRun(ctx context.Context, pipeline, runID string) 
 		return out, nil
 	}
 	if !strings.HasPrefix(runID, "arn:") && pipeline != "" {
-		arn, err := executionARN(ctx, workspace.PipelineAWSName(m, filepath.Base(pipeline)), runID)
+		arn, err := executionARN(ctx, s.workspace, workspace.PipelineAWSName(m, filepath.Base(pipeline)), runID)
 		if err != nil {
 			return out, err
 		}
 		runID = arn
 	}
-	data, err := readDatabricksRunObject(ctx, m.Name+"-clavesa", "_progress/"+runID+"/_databricks.json")
+	data, err := readDatabricksRunObject(ctx, s.workspace, m.Name+"-clavesa", "_progress/"+runID+"/_databricks.json")
 	if err != nil || data == nil {
 		return out, err
 	}
@@ -337,8 +336,8 @@ func (s *Service) GetDatabricksRun(ctx context.Context, pipeline, runID string) 
 
 // executionARN builds a pipeline run's Step Functions execution ARN from
 // its short ID. A variable so tests can replace it.
-var executionARN = func(ctx context.Context, awsName, id string) (string, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+var executionARN = func(ctx context.Context, root, awsName, id string) (string, error) {
+	cfg, err := workspace.LoadAWSConfig(ctx, root)
 	if err != nil {
 		return "", err
 	}
@@ -351,8 +350,8 @@ var executionARN = func(ctx context.Context, awsName, id string) (string, error)
 
 // readDatabricksRunObject fetches one S3 object; nil, nil when absent.
 // A variable so tests can replace it.
-var readDatabricksRunObject = func(ctx context.Context, bucket, key string) ([]byte, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+var readDatabricksRunObject = func(ctx context.Context, root, bucket, key string) ([]byte, error) {
+	cfg, err := workspace.LoadAWSConfig(ctx, root)
 	if err != nil {
 		return nil, err
 	}

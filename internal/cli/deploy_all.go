@@ -172,6 +172,13 @@ func deployAll(cmd *cobra.Command, autoApprove, planOnly bool) error {
 		return nil
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Workspace %s. %d/%d pipeline(s) %s OK.\n", verb, ok, len(pipelines), verb)
+	if !planOnly {
+		// ADR-032: the hosted tree copy matches what is deployed.
+		if err := uploadHostedTree(cmd, root, cmd.OutOrStdout()); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Hosted tree copy failed: %v\n", err)
+			failures = append(failures, fmt.Sprintf("hosted tree copy: %v", err))
+		}
+	}
 	if len(failures) > 0 {
 		fmt.Fprintf(cmd.ErrOrStderr(), "%d pipeline(s) failed:\n", len(failures))
 		for _, f := range failures {

@@ -19,7 +19,7 @@ Each ADR follows this structure:
 | [002](002-orchestration.md) | Pipeline orchestration engine | Accepted |
 | [003](003-transform-runtime.md) | Transform execution runtime | Accepted (revised by 012) |
 | [004](004-ui-framework.md) | UI framework and DAG library | Accepted |
-| [005](005-deployment-model.md) | Self-hosted deployment model | Withdrawn |
+| [005](005-deployment-model.md) | Self-hosted deployment model | Withdrawn, amended by 032 |
 | [006](006-modules-vs-provider.md) | Terraform modules over custom provider | Accepted |
 | [007](007-storage-format.md) | Apache Iceberg as storage format | Superseded by 018 |
 | [008](008-backend-language.md) | Go backend over Node.js | Accepted |
@@ -46,3 +46,4 @@ Each ADR follows this structure:
 | [029](029-cheaper-sql-on-unity-catalog-tables.md) | Scheduled SQL moves into clavesa transforms; ad hoc SQL stays on a right-sized serverless warehouse; Athena through Glue federation later | Proposed |
 | [030](030-question-agent-over-mcp.md) | Ad hoc questions go to an agent whose queries run in DuckDB on Lambda through MCP, as the asking user; the warehouse stays for dashboards and fallback | Proposed |
 | [031](031-dab-bundles-on-clavesa.md) | One Databricks bundle, two deploy targets: a DAB job deploys to Databricks, to clavesa in the team's AWS account, or mixed per task | Accepted |
+| [032](032-hosted-read-only-ui.md) | A hosted, read-only UI at ui.clavesa.dev shows every workspace on the phone, from the same handlers and pages as `clavesa ui` | Accepted |

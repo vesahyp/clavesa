@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
 
@@ -394,7 +393,14 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 			}
 			flow.AutoApprove = autoApprove
 			flow.PlanOnly = planOnly
-			return flow.Run()
+			if err := flow.Run(); err != nil {
+				return err
+			}
+			if planOnly {
+				return nil
+			}
+			// ADR-032: the hosted tree copy follows each deploy.
+			return uploadHostedTree(cmd, ws, os.Stdout)
 		},
 	}
 	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive 'Apply this plan?' confirmation")
@@ -851,7 +857,7 @@ func runCloudPipeline(cmd *cobra.Command, abs string, jsonOut, wait bool, opts s
 	// Service is intentionally not the right home for the polling loop
 	// (it's a CLI-shell concern; the UI uses the existing
 	// /pipeline/execution/states channel instead).
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := workspace.LoadAWSConfig(ctx, wsRoot)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}

@@ -288,8 +288,12 @@ var terraformStateCmd = func(ctx context.Context, s *Service, dir string, args .
 // connection (ADR-027). The unity-catalog modules configure the provider
 // with host and client ID only; the secret reaches the provider through
 // this variable and never enters a file, a variable or the state.
+//
+// AWS_REGION and AWS_DEFAULT_REGION are set to the workspace's recorded
+// region (GH #107), so the workspace and pipeline stacks apply in the
+// region the workspace lives in, whatever the profile's default is.
 func (s *Service) TerraformEnv(ctx context.Context) ([]string, error) {
-	env := os.Environ()
+	env := workspace.SetRegionEnv(os.Environ(), workspace.ResolveRegion(ctx, s.workspace))
 	m, err := workspace.Load(s.workspace)
 	if err != nil || m == nil || m.Databricks == nil {
 		return env, err

@@ -66,6 +66,7 @@
     "@types/react-simple-maps": "^3.0.6",
     "@types/topojson-client": "^3.1.5",
     "@vitejs/plugin-react": "^4.3.3",
+    "playwright": "^1.65.1",
     "typescript": "^5.7.2",
     "vite": "^7.3.3"
   }

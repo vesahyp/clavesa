@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { catalogPath } from "@/lib/runtimeConfig";
 import { QueryShell } from "@/components/QueryShell";
 import { AdhocQuery } from "@/components/AdhocQuery";
 import { EngineBadge } from "@/components/EngineBadge";
@@ -190,16 +191,16 @@ export function TableDetail() {
       const tableHref = `/tables/${encodeURIComponent(catalogName)}/${encodeURIComponent(schemaName)}/${encodeURIComponent(tableName)}`;
       return {
         breadcrumbs: [
-          { label: "Catalog", to: "/" },
+          { label: "Catalog", to: catalogPath },
           {
             label: catalogName,
-            to: `/?catalog=${encodeURIComponent(catalogName)}`,
+            to: `${catalogPath}?catalog=${encodeURIComponent(catalogName)}`,
           },
           ...(schemaName
             ? [
                 {
                   label: schemaName,
-                  to: `/?catalog=${encodeURIComponent(catalogName)}&schema=${encodeURIComponent(schemaName)}`,
+                  to: `${catalogPath}?catalog=${encodeURIComponent(catalogName)}&schema=${encodeURIComponent(schemaName)}`,
                 },
               ]
             : []),

@@ -19,7 +19,7 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { Loader2, Maximize2, Minimize2, X } from "lucide-react";
 
-import { BASE_URL, request } from "../api/client";
+import { apiFetch, request } from "../api/client";
 import { updateNode, deleteNode, renameNode } from "../api/pipeline";
 import { getVars } from "../api/workspace";
 import type { Column } from "../types/pipeline";
@@ -1047,8 +1047,8 @@ async function fetchLiveData(
   catalogDb: string,
   catalogTable: string,
 ): Promise<LiveDataResult> {
-  const url = `${BASE_URL}/data/table?catalog_db=${encodeURIComponent(catalogDb)}&catalog_table=${encodeURIComponent(catalogTable)}&limit=100`;
-  const res = await fetch(url);
+  const url = `/data/table?catalog_db=${encodeURIComponent(catalogDb)}&catalog_table=${encodeURIComponent(catalogTable)}&limit=100`;
+  const res = await apiFetch(url);
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`GET /data/table → ${res.status}: ${text}`);

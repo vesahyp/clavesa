@@ -31,9 +31,12 @@ import {
 } from "@tanstack/react-table";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
+import { catalogPath } from "@/lib/runtimeConfig";
 import { QueryShell } from "@/components/QueryShell";
 import { Highlight } from "@/components/Highlight";
 import { ListSearch } from "@/components/ListSearch";
+import { WorkspaceHealthCard } from "@/components/WorkspaceHealthCard";
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -470,7 +473,7 @@ function groupByCatalog(tables: CatalogTable[]): CatalogGroup[] {
 }
 
 const CATALOG_CHROME: PageChrome = {
-  breadcrumbs: [{ label: "Catalog", to: "/" }],
+  breadcrumbs: [{ label: "Catalog", to: catalogPath }],
 };
 
 export function Catalog() {
@@ -535,6 +538,7 @@ export function Catalog() {
 
   return (
     <div className="mx-auto w-full max-w-6xl px-6 py-8">
+        <WorkspaceHealthCard />
         <div className="mb-6 flex items-end justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Catalog</h1>
@@ -589,7 +593,7 @@ export function Catalog() {
               </Badge>
             )}
             <Link
-              to="/"
+              to={catalogPath}
               onClick={() => setQuery("")}
               className="text-xs text-primary hover:underline"
             >
@@ -658,7 +662,7 @@ export function Catalog() {
                   <CardContent className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
                     <span>Nothing matches this filter.</span>
                     <Link
-                      to="/"
+                      to={catalogPath}
                       onClick={() => setQuery("")}
                       className="text-xs text-primary hover:underline"
                     >
@@ -690,7 +694,7 @@ function CatalogCard({
         <div className="flex items-center gap-3">
           <CardTitle className="font-mono text-sm">
             <Link
-              to={`/?catalog=${encodeURIComponent(catalog.catalog)}`}
+              to={`${catalogPath}?catalog=${encodeURIComponent(catalog.catalog)}`}
               className="hover:text-primary hover:underline"
             >
               <Highlight text={catalog.catalog} query={query} />
@@ -769,7 +773,7 @@ function SchemaTableSection({
     getCoreRowModel: getCoreRowModel(),
     meta: { query, fileStats },
   });
-  const schemaFilterHref = `/?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema.schema)}`;
+  const schemaFilterHref = `${catalogPath}?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema.schema)}`;
 
   return (
     <div>
@@ -911,6 +915,7 @@ function WelcomeEmptyState({
   hasPipelines: boolean;
   awsAvailable: boolean;
 }) {
+  const readOnly = useReadOnly();
   if (hasPipelines) {
     return (
       <EmptyState
@@ -953,12 +958,14 @@ function WelcomeEmptyState({
         </ol>
 
         <div className="flex flex-wrap items-center justify-center gap-2">
-          <Button asChild size="sm">
-            <Link to="/pipelines">
-              <Plus className="h-4 w-4" />
-              Create a pipeline
-            </Link>
-          </Button>
+          {!readOnly && (
+            <Button asChild size="sm">
+              <Link to="/pipelines">
+                <Plus className="h-4 w-4" />
+                Create a pipeline
+              </Link>
+            </Button>
+          )}
           <Button asChild size="sm" variant="outline">
             <Link to="/sources">
               <Database className="h-4 w-4" />

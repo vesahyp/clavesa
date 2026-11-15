@@ -9,11 +9,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // emptyVersionedBucket pages ListObjectVersions on `bucketName` and
@@ -24,10 +25,10 @@ import (
 // or delete markers remain.
 //
 // Idempotent on a missing bucket (catches NoSuchBucket) — no-op return.
-func emptyVersionedBucket(ctx context.Context, bucketName string, out io.Writer) error {
+func emptyVersionedBucket(ctx context.Context, workspaceRoot, bucketName string, out io.Writer) error {
 	awsCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	cfg, err := config.LoadDefaultConfig(awsCtx)
+	cfg, err := workspace.LoadAWSConfig(awsCtx, workspaceRoot)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
@@ -116,10 +117,10 @@ func emptyVersionedBucket(ctx context.Context, bucketName string, out io.Writer)
 //
 // terraform destroy will then silently drop the gone resource from
 // state. Idempotent: a missing workgroup returns nil.
-func drainAthenaWorkgroup(ctx context.Context, workgroupName string, out io.Writer) error {
+func drainAthenaWorkgroup(ctx context.Context, workspaceRoot, workgroupName string, out io.Writer) error {
 	awsCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	cfg, err := config.LoadDefaultConfig(awsCtx)
+	cfg, err := workspace.LoadAWSConfig(awsCtx, workspaceRoot)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}

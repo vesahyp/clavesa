@@ -73,9 +73,10 @@ func (wh *WorkspaceHandler) WithRestart(restart func()) *WorkspaceHandler {
 }
 
 // RegisterRoutes registers workspace-level routes on mux.
-func (wh *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
+func (wh *WorkspaceHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /workspace", wh.GetWorkspace)
 	mux.HandleFunc("POST /workspace/init", wh.InitWorkspace)
+	mux.HandleFunc("GET /workspace/summary", wh.GetSummary)
 	mux.HandleFunc("GET /workspace/environment", wh.GetEnvironment)
 	mux.HandleFunc("PUT /workspace/environment", wh.SetEnvironment)
 	mux.HandleFunc("GET /workspace/aws-profile", wh.GetAWSProfile)
@@ -88,6 +89,9 @@ func (wh *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /workspace/databricks/check", wh.CheckDatabricks)
 	mux.HandleFunc("DELETE /workspace/databricks", wh.DisconnectDatabricks)
 	mux.HandleFunc("GET /workspace/databricks/tables", wh.DatabricksTables)
+	mux.HandleFunc("GET /workspace/hosted", wh.GetHosted)
+	mux.HandleFunc("PUT /workspace/hosted", wh.EnableHosted)
+	mux.HandleFunc("DELETE /workspace/hosted", wh.DisableHosted)
 	mux.HandleFunc("GET /pipeline/databricks-jobs", wh.GetDatabricksJobs)
 	mux.HandleFunc("PUT /pipeline/databricks-jobs", wh.SetDatabricksJobs)
 	mux.HandleFunc("GET /pipeline/databricks-run", wh.GetDatabricksRun)
@@ -101,6 +105,21 @@ func (wh *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /workspace/upgrade", wh.UpgradeWorkspace)
 	mux.HandleFunc("GET /pipeline/vars", wh.GetVars)
 	mux.HandleFunc("PUT /pipeline/vars", wh.PutVars)
+}
+
+// ---------------------------------------------------------------------------
+// GET /workspace/summary
+// ---------------------------------------------------------------------------
+
+// GetSummary returns Service.WorkspaceSummary, the same call as
+// `clavesa workspace summary --json` (ADR-032, ADR-015).
+func (wh *WorkspaceHandler) GetSummary(w http.ResponseWriter, r *http.Request) {
+	sum, err := wh.service().WorkspaceSummary(r.Context(), service.WorkspaceSummaryQuery{})
+	if err != nil {
+		httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, sum)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +272,47 @@ func (wh *WorkspaceHandler) SetAWSProfile(w http.ResponseWriter, r *http.Request
 	if restarting {
 		go wh.restart()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// /workspace/hosted — the hosted read-only UI (ADR-032)
+// ---------------------------------------------------------------------------
+
+// GetHosted returns the recorded hosted block: the twin of `clavesa
+// workspace hosted show --json`.
+func (wh *WorkspaceHandler) GetHosted(w http.ResponseWriter, _ *http.Request) {
+	st, err := wh.service().GetHosted()
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, st)
+}
+
+// EnableHosted writes the hosted block and hosted.tf: the twin of
+// `clavesa workspace hosted enable`. The next deploy creates the reader.
+func (wh *WorkspaceHandler) EnableHosted(w http.ResponseWriter, r *http.Request) {
+	in, ok := httputil.DecodeJSON[service.HostedInput](w, r)
+	if !ok {
+		return
+	}
+	st, err := wh.service().EnableHosted(r.Context(), in)
+	if err != nil {
+		httputil.WriteServiceError(w, err, http.StatusBadRequest)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, st)
+}
+
+// DisableHosted removes the hosted block and hosted.tf: the twin of
+// `clavesa workspace hosted disable`.
+func (wh *WorkspaceHandler) DisableHosted(w http.ResponseWriter, _ *http.Request) {
+	st, err := wh.service().DisableHosted()
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, st)
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +613,9 @@ func (wh *WorkspaceHandler) MigrateBackend(w http.ResponseWriter, r *http.Reques
 type initWorkspaceRequest struct {
 	Name    string `json:"name"`
 	Catalog string `json:"catalog,omitempty"`
+	// Region is the AWS region the workspace deploys to (GH #107), the
+	// twin of `workspace init --region`. Empty: the first deploy records it.
+	Region string `json:"region,omitempty"`
 }
 
 // InitWorkspace creates a workspace in the server's existing root
@@ -579,9 +642,20 @@ func (wh *WorkspaceHandler) InitWorkspace(w http.ResponseWriter, r *http.Request
 	if !httputil.RequireFields(w, map[string]string{"name": req.Name}) {
 		return
 	}
+	req.Region = strings.TrimSpace(req.Region)
+	if req.Region != "" && !workspace.ValidRegion(req.Region) {
+		httputil.WriteError(w, http.StatusBadRequest, fmt.Sprintf("region %q is not an AWS region name (such as us-east-2)", req.Region))
+		return
+	}
 	if err := workspace.Init(wh.root, req.Name, "aws", req.Catalog, service.ModuleVersion, nil); err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "workspace init: "+err.Error())
 		return
+	}
+	if req.Region != "" {
+		if err := workspace.RecordRegion(wh.root, req.Region); err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, "workspace init: record region: "+err.Error())
+			return
+		}
 	}
 	m, err := workspace.Load(wh.root)
 	if err != nil || m == nil {

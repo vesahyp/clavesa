@@ -27,6 +27,7 @@ import {
   SelectLabel,
   SelectTrigger,
 } from "@/components/ui/select";
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { cn } from "@/lib/utils";
 import {
   setAWSProfile,
@@ -41,6 +42,7 @@ import {
 const AMBIENT = "__ambient__";
 
 export function AwsIdentityChip() {
+  const readOnly = useReadOnly();
   const { data: identity } = useRuntimeIdentity();
   const { data: profileData } = useAWSProfile();
   const [switching, setSwitching] = useState(false);
@@ -59,6 +61,19 @@ export function AwsIdentityChip() {
     ? `${identity?.profile || "default"} · ${identity?.account_id}`
     : "no AWS identity";
   const selected = profileData?.profile ? profileData.profile : AMBIENT;
+
+  // Read-only (ADR-032): the identity, with no profile switcher.
+  if (readOnly) {
+    return (
+      <span
+        data-testid="aws-identity-label"
+        className="flex h-7 items-center gap-1.5 px-2 text-xs text-muted-foreground"
+      >
+        <Cloud className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-mono">{display}</span>
+      </span>
+    );
+  }
 
   async function onChange(value: string) {
     const profile = value === AMBIENT ? "" : value;

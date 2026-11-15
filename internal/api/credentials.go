@@ -60,7 +60,7 @@ func NewCredentialsHandler(svc CredentialRegistry) *CredentialsHandler {
 }
 
 // RegisterRoutes mounts CRUD routes under the api mux.
-func (h *CredentialsHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *CredentialsHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /credentials", h.list)
 	mux.HandleFunc("POST /credentials", h.register)
 	mux.HandleFunc("GET /credentials/{name}", h.get)

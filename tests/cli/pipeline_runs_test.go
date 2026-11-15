@@ -159,6 +159,58 @@ func TestPipelineRunsAndLogs(t *testing.T) {
 		t.Errorf("run id %q extracted from text-mode `pipeline run` output not found in `pipeline runs --json`; rows: %+v", firstRunID, res.Rows)
 	}
 
+	// --- Step 5b: `workspace summary --json` reads the same runs (ADR-032). ---
+
+	var sum struct {
+		Kind      string `json:"kind"`
+		Status    string `json:"status"`
+		Pipelines []struct {
+			Name    string `json:"name"`
+			LastRun struct {
+				RunID      string `json:"run_id"`
+				Result     string `json:"result"`
+				FailedStep string `json:"failed_step"`
+			} `json:"last_run"`
+			LastRunNodes []struct {
+				Node   string `json:"node"`
+				Status string `json:"status"`
+			} `json:"last_run_nodes"`
+			Runs []struct {
+				RunID  string `json:"run_id"`
+				Result string `json:"result"`
+			} `json:"runs"`
+		} `json:"pipelines"`
+		RunsPerDay14d []struct {
+			Succeeded int `json:"succeeded"`
+			Failed    int `json:"failed"`
+		} `json:"runs_per_day_14d"`
+	}
+	sumOut := run(t, "workspace", "summary", "--workspace", ws, "--json")
+	if err := json.Unmarshal([]byte(sumOut), &sum); err != nil {
+		t.Fatalf("parse workspace summary --json: %v\noutput: %s", err, sumOut)
+	}
+	if sum.Kind != "local" || sum.Status != "fail" || len(sum.Pipelines) != 1 {
+		t.Fatalf("workspace summary = kind %q status %q pipelines %d, want local/fail/1\noutput: %s", sum.Kind, sum.Status, len(sum.Pipelines), sumOut)
+	}
+	ps := sum.Pipelines[0]
+	if ps.LastRun.RunID != failedRunID || ps.LastRun.Result != "failed" || ps.LastRun.FailedStep != transformID {
+		t.Errorf("summary last_run = %+v, want failed run %s at %s", ps.LastRun, failedRunID, transformID)
+	}
+	if len(ps.Runs) != len(res.Rows) {
+		t.Errorf("summary runs = %d, `pipeline runs` rows = %d", len(ps.Runs), len(res.Rows))
+	}
+	if len(ps.LastRunNodes) == 0 || ps.LastRunNodes[0].Status != "failed" {
+		t.Errorf("summary last_run_nodes = %+v, want the failed transform", ps.LastRunNodes)
+	}
+	var stripOK, stripFailed int
+	for _, d := range sum.RunsPerDay14d {
+		stripOK += d.Succeeded
+		stripFailed += d.Failed
+	}
+	if stripOK < 2 || stripFailed != 1 {
+		t.Errorf("runs_per_day_14d totals = %d succeeded / %d failed, want >=2 / 1", stripOK, stripFailed)
+	}
+
 	// --- Step 6: text mode flattens the multi-line error onto one row. ---
 
 	runsTextOut := run(t, "pipeline", "runs", "orders", "--workspace", ws)

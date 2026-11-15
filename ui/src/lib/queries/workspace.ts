@@ -7,7 +7,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { z } from "zod";
 
-import { BASE_URL, request } from "@/api/client";
+import { apiFetch, request } from "@/api/client";
 import { requestParsed } from "./core";
 
 // ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ export async function waitForServerReady(timeoutMs = 30_000): Promise<void> {
   await new Promise((r) => setTimeout(r, 800));
   for (;;) {
     try {
-      const res = await fetch(`${BASE_URL}/workspace`, { cache: "no-store" });
+      const res = await apiFetch(`/workspace`, { cache: "no-store" });
       if (res.ok) return;
     } catch {
       // server still down mid-restart — keep polling
@@ -268,11 +268,67 @@ export type MigrateResult = z.infer<typeof MigrateResult>;
  * HTTP status.
  */
 export async function migrateBackend(): Promise<MigrateResult> {
-  const res = await fetch(`${BASE_URL}/workspace/backend/migrate`, {
+  const res = await apiFetch(`/workspace/backend/migrate`, {
     method: "POST",
   });
   const body: unknown = await res.json().catch(() => ({}));
   return MigrateResult.parse(body);
+}
+
+// ---------------------------------------------------------------------------
+// Hosted UI (ADR-032) — the `hosted` block in clavesa.json
+// ---------------------------------------------------------------------------
+
+const HostedStatus = z.object({
+  enabled: z.boolean(),
+  hosted: z
+    .object({
+      url: z.string(),
+      reader_principals: z.array(z.string()).nullish().transform((v) => v ?? []),
+      event_bus_arn: z.string().optional().default(""),
+    })
+    .nullish(),
+  reader_role_name: z.string().optional().default(""),
+  workgroup: z.string().optional().default(""),
+  tree_uri: z.string().optional().default(""),
+});
+export type HostedStatus = z.infer<typeof HostedStatus>;
+
+/** GET /api/workspace/hosted — twin of `clavesa workspace hosted show`. */
+export function useHosted() {
+  return useQuery({
+    queryKey: ["workspace", "hosted"],
+    queryFn: async () => HostedStatus.parse(await request("/workspace/hosted")),
+  });
+}
+
+export interface EnableHostedInput {
+  url: string;
+  readerPrincipals: string[];
+  eventBusArn?: string;
+}
+
+/** PUT /api/workspace/hosted — twin of `clavesa workspace hosted enable`. */
+export async function enableHosted(
+  input: EnableHostedInput,
+): Promise<HostedStatus> {
+  return requestParsed("/workspace/hosted", HostedStatus, {
+    method: "PUT",
+    body: JSON.stringify({
+      url: input.url,
+      reader_principals: input.readerPrincipals,
+      event_bus_arn: input.eventBusArn || undefined,
+    }),
+    errorLabel: "PUT /workspace/hosted",
+  });
+}
+
+/** DELETE /api/workspace/hosted — twin of `clavesa workspace hosted disable`. */
+export async function disableHosted(): Promise<HostedStatus> {
+  return requestParsed("/workspace/hosted", HostedStatus, {
+    method: "DELETE",
+    errorLabel: "DELETE /workspace/hosted",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +396,7 @@ async function databricksCall(
   path: string,
   init: RequestInit,
 ): Promise<DatabricksStatus> {
-  const res = await fetch(`${BASE_URL}${path}`, init);
+  const res = await apiFetch(`${path}`, init);
   const body: unknown = await res.json().catch(() => ({}));
   if (res.ok) return DatabricksStatus.parse(body);
   const msg =
@@ -414,7 +470,7 @@ export async function setDatabricksJobs(
   pipeline: string,
   jobs: number[],
 ): Promise<{ pipeline: string; jobs: number[] }> {
-  const res = await fetch(`${BASE_URL}/pipeline/databricks-jobs`, {
+  const res = await apiFetch(`/pipeline/databricks-jobs`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pipeline, jobs }),
@@ -467,7 +523,7 @@ export interface DatabricksCompareInput {
  * `pipeline databricks-compare <p> --existing … --shadow … --partition …`.
  */
 export async function compareDatabricksTables(input: DatabricksCompareInput): Promise<DatabricksCompareResult> {
-  const res = await fetch(`${BASE_URL}/pipeline/databricks-compare`, {
+  const res = await apiFetch(`/pipeline/databricks-compare`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -506,7 +562,7 @@ export async function runPreflight(input: {
   compute?: string;
   subnets?: string[];
 }): Promise<PreflightResult> {
-  const res = await fetch(`${BASE_URL}/databricks/preflight`, {
+  const res = await apiFetch(`/databricks/preflight`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -608,4 +664,173 @@ export async function setRunnerRequirements(
     body: JSON.stringify({ content }),
   });
   return RunnerRequirementsResponse.parse(raw);
+}
+
+// ---------------------------------------------------------------------------
+// Workspace summary (ADR-032) — the health card on the Catalog page
+// ---------------------------------------------------------------------------
+
+const SummaryRun = z.object({
+  run_id: z.string(),
+  pipeline: z.string(),
+  // "succeeded" | "failed" | "running"; kept open so a new value renders
+  // as unknown instead of failing the whole card.
+  result: z.string(),
+  started_at: z.string(),
+  ended_at: z.string().optional(),
+  duration_ms: z.number(),
+  records: z.number(),
+  cost_usd: z.number(),
+  failed_step: z.string().optional(),
+  error: z.string().optional(),
+});
+export type SummaryRun = z.infer<typeof SummaryRun>;
+
+const SummaryNode = z.object({
+  node: z.string(),
+  status: z.string(),
+  started_at: z.string().optional(),
+  duration_ms: z.number(),
+  output_rows: z.number().optional(),
+  error: z.string().optional(),
+});
+
+const TableFreshness = z.object({
+  table: z.string(),
+  node: z.string(),
+  last_write_at: z.string().optional(),
+  age_seconds: z.number(),
+  sla_seconds: z.number(),
+  stale: z.boolean(),
+});
+
+const SummaryStatus = z.enum(["ok", "warn", "fail"]);
+export type SummaryStatus = z.infer<typeof SummaryStatus>;
+
+// "fresh" only when every table with a freshness_sla was read and is
+// inside it; "no_sla" when none declares one; "unknown" when the history
+// or table state could not be read (freshness_reason says why).
+const FreshnessState = z.enum(["fresh", "stale", "unknown", "no_sla"]);
+export type FreshnessState = z.infer<typeof FreshnessState>;
+
+// Why a pipeline's history could not be read, in one plain line, and
+// what to do. The raw provider error is the pipeline's `error`.
+const SummaryProblem = z.object({
+  code: z.string(),
+  cause: z.string(),
+  action: z.string().optional(),
+});
+export type SummaryProblem = z.infer<typeof SummaryProblem>;
+
+const PipelineSummary = z.object({
+  name: z.string(),
+  dir: z.string(),
+  schedule: z.string().optional(),
+  expected_interval_seconds: z.number().optional(),
+  status: SummaryStatus,
+  status_reasons: z.array(z.string()),
+  last_run: SummaryRun.optional(),
+  last_run_nodes: z.array(SummaryNode),
+  runs: z.array(SummaryRun),
+  freshness: z.array(TableFreshness),
+  freshness_state: FreshnessState,
+  freshness_reason: z.string().optional(),
+  cost_usd_30d: z.number(),
+  records_30d: z.number(),
+  cost_per_billion: z.number(),
+  records_per_sec: z.number(),
+  problem: SummaryProblem.optional(),
+  error: z.string().optional(),
+});
+
+const SummaryDayRuns = z.object({
+  date: z.string(),
+  succeeded: z.number(),
+  failed: z.number(),
+});
+export type SummaryDayRuns = z.infer<typeof SummaryDayRuns>;
+
+const SummaryDayCost = z.object({
+  date: z.string(),
+  cost_usd: z.number(),
+});
+
+export const WorkspaceSummary = z.object({
+  name: z.string(),
+  kind: z.enum(["cloud", "local"]),
+  account: z.string().optional(),
+  region: z.string().optional(),
+  generated_at: z.string(),
+  status: SummaryStatus,
+  status_reasons: z.array(z.string()),
+  last_run: SummaryRun.optional(),
+  pipelines: z.array(PipelineSummary),
+  runs_per_day_14d: z.array(SummaryDayRuns),
+  runs_per_day_30d: z.array(SummaryDayRuns),
+  cost_per_day_30d: z.array(SummaryDayCost),
+  cost_usd_30d: z.number(),
+  records_30d: z.number(),
+  cost_per_billion: z.number(),
+  records_per_sec: z.number(),
+  stale_tables: z.number(),
+  oldest_table_age_seconds: z.number(),
+  freshness_state: FreshnessState,
+  freshness_reason: z.string().optional(),
+  sla_tables: z.number(),
+  problems: z.array(SummaryProblem.extend({ pipelines: z.array(z.string()) })),
+});
+export type WorkspaceSummary = z.infer<typeof WorkspaceSummary>;
+
+/**
+ * GET /api/workspace/summary — the workspace health summary. The CLI twin
+ * is `clavesa workspace summary --json` (ADR-015, ADR-032).
+ */
+export function useWorkspaceSummary(apiBase?: string) {
+  return useQuery({
+    queryKey: ["workspace-summary", apiBase ?? ""],
+    queryFn: () =>
+      requestParsed("/workspace/summary", WorkspaceSummary, {
+        errorLabel: "GET /workspace/summary",
+        apiBase,
+      }),
+    refetchInterval: 60_000,
+  });
+}
+
+/** One workspace of a multi-workspace or hosted server (ADR-032). The
+ * hosted server sends each workspace's stored summary with it
+ * (`summary`, null until one is stored); the local multi-workspace server
+ * sends none, and each card loads its own. */
+export const WorkspaceEntry = z.object({
+  name: z.string(),
+  slug: z.string(),
+  kind: z.string(),
+  account: z.string().optional(),
+  region: z.string().optional(),
+  api_base: z.string(),
+  // Parsed per card (WorkspaceSummary.safeParse in Workspaces.tsx), so
+  // one stored summary of an older shape cannot fail the whole list.
+  summary: z.unknown().optional(),
+  summary_error: z.string().optional(),
+});
+export type WorkspaceEntry = z.infer<typeof WorkspaceEntry>;
+
+const WorkspacesResponse = z.object({ workspaces: z.array(WorkspaceEntry) });
+
+/**
+ * GET /api/workspaces — the workspaces a multi-workspace server serves.
+ * File reads only on the local server, whose cards then load their own
+ * summary from `<api_base>/workspace/summary`; the hosted server sends the
+ * stored summaries in the same response (no Athena on this call).
+ */
+export function useWorkspaces() {
+  return useQuery({
+    queryKey: ["workspaces"],
+    queryFn: async () =>
+      (
+        await requestParsed("/workspaces", WorkspacesResponse, {
+          errorLabel: "GET /workspaces",
+        })
+      ).workspaces,
+  });
 }

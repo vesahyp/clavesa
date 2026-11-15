@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -18,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/vesahyp/clavesa/internal/databricks"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // PreflightInput is `clavesa databricks preflight` and POST
@@ -113,7 +113,7 @@ func (s *Service) Preflight(ctx context.Context, in PreflightInput) (PreflightRe
 	}
 	checks := databricks.Preflight(ctx, g, in.PreflightTarget)
 	if !in.SkipAWS {
-		checks = append(checks, awsPreflight(ctx, g, in)...)
+		checks = append(checks, awsPreflight(ctx, s.workspace, g, in)...)
 	}
 	ready := true
 	for _, c := range checks {
@@ -135,12 +135,12 @@ func normalizeHost(h string) (string, error) {
 // awsPreflight checks the AWS side with the caller's AWS login: who
 // deploys, whether it may create what clavesa deploys, Lake Formation
 // admin, and the buckets of the tables (reachable, encryption, policy).
-func awsPreflight(ctx context.Context, g databricks.Getter, in PreflightInput) []databricks.Check {
+func awsPreflight(ctx context.Context, root string, g databricks.Getter, in PreflightInput) []databricks.Check {
 	t := in.PreflightTarget
 	row := func(title, status, detail, fix string) databricks.Check {
 		return databricks.Check{ID: databricks.PreAWS, Title: title, Status: status, Detail: detail, Fix: fix}
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := workspace.LoadAWSConfig(ctx, root)
 	if err != nil {
 		return []databricks.Check{row("AWS login", databricks.StatusFail, err.Error(), "Log in to the AWS account clavesa deploys into (aws sso login / aws login), or pass --skip-aws.")}
 	}
@@ -239,7 +239,7 @@ func awsPreflight(ctx context.Context, g databricks.Getter, in PreflightInput) [
 			continue
 		}
 		detail := "runner role access: " + access
-		if key, err := bucketKMSKey(ctx, bucket); err == nil && key != "" {
+		if key, err := bucketKMSKey(ctx, root, bucket); err == nil && key != "" {
 			detail += "; SSE-KMS key " + key + " (pipeline deploy grants kms:Decrypt and kms:GenerateDataKey on it; the key policy must allow IAM grants)"
 		}
 		st := databricks.StatusPass

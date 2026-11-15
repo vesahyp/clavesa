@@ -6,6 +6,7 @@
  * tech stack (Tailwind + shadcn + TanStack Query).
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useNavigate } from "react-router-dom";
 import { useMemo, useState } from "react";
 import { ArrowUpCircle, FileWarning, Loader2, Plus, Trash2, Workflow } from "lucide-react";
@@ -94,6 +95,8 @@ function PipelineRuns({ name, dir }: { name: string; dir: string }) {
 
 export function PipelinesList() {
   const navigate = useNavigate();
+  // Read-only (ADR-032): no Upgrade all, New pipeline or delete.
+  const readOnly = useReadOnly();
   const qc = useQueryClient();
   const { data, isLoading, error } = usePipelines();
   const [showNew, setShowNew] = useState(false);
@@ -165,7 +168,7 @@ export function PipelinesList() {
     useMemo(
       () => ({
         breadcrumbs: [{ label: "Pipelines", to: "/pipelines" }],
-        trailing: (
+        trailing: readOnly ? undefined : (
           <div className="flex items-center gap-2">
             <Button
               onClick={() => upgradeAll.mutate()}
@@ -188,7 +191,7 @@ export function PipelinesList() {
           </div>
         ),
       }),
-      [upgradeAll.isPending, upgradeAll],
+      [upgradeAll.isPending, upgradeAll, readOnly],
     ),
   );
 
@@ -253,14 +256,18 @@ export function PipelinesList() {
                 <Workflow className="h-6 w-6" />
               </span>
               <div className="text-base font-semibold">No pipelines yet</div>
-              <p className="max-w-md text-sm text-muted-foreground">
-                Click <strong>New pipeline</strong> to scaffold one. Each pipeline
-                is a directory of <code>.tf</code> files clavesa manages.
-              </p>
-              <Button onClick={() => setShowNew(true)} size="sm" variant="outline">
-                <Plus className="h-4 w-4" />
-                New pipeline
-              </Button>
+              {!readOnly && (
+                <>
+                  <p className="max-w-md text-sm text-muted-foreground">
+                    Click <strong>New pipeline</strong> to scaffold one. Each pipeline
+                    is a directory of <code>.tf</code> files clavesa manages.
+                  </p>
+                  <Button onClick={() => setShowNew(true)} size="sm" variant="outline">
+                    <Plus className="h-4 w-4" />
+                    New pipeline
+                  </Button>
+                </>
+              )}
             </CardContent>
           </Card>
               )}
@@ -329,6 +336,7 @@ export function PipelinesList() {
                     </code>
                   </div>
                   <PipelineRuns name={p.name} dir={p.dir} />
+                  {!readOnly && (
                   <Button
                     variant="ghost"
                     size="icon"
@@ -343,6 +351,7 @@ export function PipelinesList() {
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
+                  )}
                 </CardContent>
               </Card>
             ))}
@@ -352,7 +361,7 @@ export function PipelinesList() {
           )}
         </QueryShell>
 
-      {showNew && <NewPipelineDialog onClose={() => setShowNew(false)} />}
+      {showNew && !readOnly && <NewPipelineDialog onClose={() => setShowNew(false)} />}
     </div>
   );
 }

@@ -58,7 +58,7 @@ func TestGetDatabricksRun(t *testing.T) {
 	t.Cleanup(func() { readDatabricksRunObject = prev })
 
 	var gotBucket, gotKey string
-	readDatabricksRunObject = func(_ context.Context, bucket, key string) ([]byte, error) {
+	readDatabricksRunObject = func(_ context.Context, _, bucket, key string) ([]byte, error) {
 		gotBucket, gotKey = bucket, key
 		return []byte(`{"tables":[{"full_name":"a.b.c","action":"registered","url":"u"}],"jobs":[{"job_id":459311252754064,"run_id":162074173789529,"run_page_url":"r"}],"status":"ok"}`), nil
 	}
@@ -77,7 +77,7 @@ func TestGetDatabricksRun(t *testing.T) {
 	// turned into the execution ARN the runner keyed the record by.
 	prevARN := executionARN
 	t.Cleanup(func() { executionARN = prevARN })
-	executionARN = func(_ context.Context, awsName, id string) (string, error) {
+	executionARN = func(_ context.Context, _, awsName, id string) (string, error) {
 		return "arn:aws:states:us-east-2:1:execution:" + awsName + ":" + id, nil
 	}
 	if _, err := svc.GetDatabricksRun(context.Background(), "uc_orders", "02cfc32a"); err != nil {
@@ -87,7 +87,7 @@ func TestGetDatabricksRun(t *testing.T) {
 		t.Errorf("short ID read %s", gotKey)
 	}
 
-	readDatabricksRunObject = func(context.Context, string, string) ([]byte, error) { return nil, nil }
+	readDatabricksRunObject = func(context.Context, string, string, string) ([]byte, error) { return nil, nil }
 	run, err = svc.GetDatabricksRun(context.Background(), "", "arn:other")
 	if err != nil || run.Found {
 		t.Errorf("absent record: %+v, %v", run, err)

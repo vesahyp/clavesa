@@ -86,7 +86,7 @@ module "managed" {
 			"cat.sales.daily_old": {TableType: "EXTERNAL"},
 		}
 	}
-	bucketKMSKey = func(_ context.Context, bucket string) (string, error) {
+	bucketKMSKey = func(_ context.Context, _, bucket string) (string, error) {
 		if bucket == "team-bucket" {
 			return "arn:aws:kms:us-east-2:1:key/abc", nil
 		}

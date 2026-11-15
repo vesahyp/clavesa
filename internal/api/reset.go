@@ -52,7 +52,7 @@ func NewResetHandler(svc Resetter) *ResetHandler {
 // RegisterRoutes mounts plan / execute under the api mux. Plan is a POST
 // (not GET) because it shares the request body with execute — the UI's
 // confirm modal sends the same JSON to both.
-func (h *ResetHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *ResetHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("POST /pipeline/reset/plan", h.plan)
 	mux.HandleFunc("POST /pipeline/reset", h.reset)
 }

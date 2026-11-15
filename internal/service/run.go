@@ -1328,7 +1328,7 @@ func (s *Service) runTransform(ctx context.Context, image, pipelineDir, workdir 
 		// same args every host-spawned AWS-reaching container gets,
 		// see runner.AWSEnvDockerArgs. Also forwarded for S3-writing
 		// outputs (e.g. json_object to s3://) whose boto3 put needs creds.
-		awsArgs = runner.AWSEnvDockerArgs(ctx)
+		awsArgs = runner.AWSEnvDockerArgs(ctx, workspace.AWSConfigOptions(ctx, s.workspace)...)
 	}
 
 	// Mount the workdir so logic + outputs are accessible, and the
@@ -1573,7 +1573,7 @@ func (s *Service) runPipelineBundle(ctx context.Context, image, pipelineDir, wor
 	var awsArgs []string
 	for _, bt := range bundle {
 		if hasS3Input(bt.Inputs) || hasS3Output(bt.Outputs) {
-			awsArgs = runner.AWSEnvDockerArgs(ctx)
+			awsArgs = runner.AWSEnvDockerArgs(ctx, workspace.AWSConfigOptions(ctx, s.workspace)...)
 			break
 		}
 	}

@@ -1,6 +1,6 @@
 # ADR 005: Self-Hosted Deployment Model
 
-**Status**: Withdrawn (never reached a decision; hosted deployment is out of scope).
+**Status**: Withdrawn (never reached a decision). Amended 2026-11-15 by ADR 032: a self-deployed, read-only hosted UI is now in scope.
 
 ## Context
 
@@ -19,3 +19,12 @@ If a hosted deployment ever becomes in-scope, it should be filed as a new ADR ra
 - Single binary with embedded UI; no service infrastructure to operate (consistent with ADR 009).
 - All cloud resources live in the user's AWS account; the local CLI is the only trust boundary.
 - "Local-cloud parity" (ADR 014) means parity between `compute = "local"` and the user's own AWS deployment, not between local and a hosted service.
+
+## Amendment, 2026-11-15 (ADR 032)
+
+ADR 032 adds a hosted, read-only UI. It does not add a clavesa-operated
+service. Any clavesa user can deploy their own hosted UI into their own AWS
+account from `hosted/infra/`; `ui.clavesa.dev` is Vesa's copy. There is
+still no multi-tenant control plane and no clavesa-operated AWS account.
+The trust boundary per AWS account stays: each workspace account trusts the
+hosted UI only through a read-only role it creates and can remove itself.

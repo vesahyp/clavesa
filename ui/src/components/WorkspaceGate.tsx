@@ -27,8 +27,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { getWorkspace, initWorkspace } from "@/api/workspace";
+import { useReadOnly } from "@/hooks/useReadOnly";
 
 export function WorkspaceGate({ children }: { children: React.ReactNode }) {
+  const readOnly = useReadOnly();
   const { data, isLoading, error } = useQuery({
     queryKey: ["workspace"],
     queryFn: getWorkspace,
@@ -46,7 +48,8 @@ export function WorkspaceGate({ children }: { children: React.ReactNode }) {
   // A failed /api/workspace probe shouldn't strand the user on a blank
   // screen — fall through to the app, where the per-page error states
   // give a more specific diagnosis.
-  if (error || data?.exists) {
+  // Read-only (ADR-032): never offer to create a workspace.
+  if (error || data?.exists || readOnly) {
     return <>{children}</>;
   }
 
@@ -57,6 +60,7 @@ function CreateWorkspaceScreen({ root }: { root: string }) {
   const qc = useQueryClient();
   const [name, setName] = useState("");
   const [catalog, setCatalog] = useState("");
+  const [region, setRegion] = useState("");
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -66,7 +70,7 @@ function CreateWorkspaceScreen({ root }: { root: string }) {
     if (!trimmed || busy) return;
     setBusy(true);
     try {
-      await initWorkspace(trimmed, catalog.trim());
+      await initWorkspace(trimmed, catalog.trim(), region.trim());
       toast.success(`Workspace "${trimmed}" created`);
       // Root path is unchanged — re-fetching /api/workspace flips
       // `exists` to true and the gate renders the app.
@@ -122,7 +126,7 @@ function CreateWorkspaceScreen({ root }: { root: string }) {
               disabled={busy}
               className="self-start text-xs text-muted-foreground hover:text-foreground"
             >
-              {advanced ? "▾ Advanced" : "▸ Advanced (catalog identifier)"}
+              {advanced ? "▾ Advanced" : "▸ Advanced (catalog identifier, AWS region)"}
             </button>
             {advanced && (
               <label className="flex flex-col gap-1.5 text-sm">
@@ -142,6 +146,30 @@ function CreateWorkspaceScreen({ root }: { root: string }) {
                 <span className="text-xs text-muted-foreground">
                   Top level of the <code>catalog.schema.table</code>{" "}
                   namespace (ADR-016). One catalog per workspace.
+                </span>
+              </label>
+            )}
+            {advanced && (
+              <label className="flex flex-col gap-1.5 text-sm">
+                <span className="font-medium">
+                  AWS region{" "}
+                  <span className="font-normal text-muted-foreground">
+                    (optional)
+                  </span>
+                </span>
+                <Input
+                  value={region}
+                  onChange={(e) => setRegion(e.target.value)}
+                  placeholder="(default: recorded at the first deploy)"
+                  pattern="[a-z]{2}(-[a-z]+)+-[0-9]+"
+                  title="An AWS region name, such as us-east-2."
+                  disabled={busy}
+                  data-testid="workspace-region"
+                  className="font-mono"
+                />
+                <span className="text-xs text-muted-foreground">
+                  Every AWS call and deploy of the workspace uses this
+                  region. Same as <code>workspace init --region</code>.
                 </span>
               </label>
             )}

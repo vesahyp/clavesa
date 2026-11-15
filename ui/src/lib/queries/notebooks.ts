@@ -7,7 +7,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { z } from "zod";
 
-import { BASE_URL, request } from "@/api/client";
+import { apiFetch, request } from "@/api/client";
 import { ServedInfo, requestParsed, requestVoid } from "./core";
 
 const NotebookSummary = z.object({
@@ -186,8 +186,8 @@ export async function cancelNotebookCell(
   name: string,
   cellRunId: string,
 ): Promise<void> {
-  await fetch(
-    `${BASE_URL}/notebooks/${encodeURIComponent(name)}/cells/${encodeURIComponent(cellRunId)}/cancel`,
+  await apiFetch(
+    `/notebooks/${encodeURIComponent(name)}/cells/${encodeURIComponent(cellRunId)}/cancel`,
     { method: "POST" },
   );
 }
@@ -195,8 +195,8 @@ export async function cancelNotebookCell(
 /** DELETE /api/notebooks/{name}/session — kill the REPL subprocess.
  * Fire-and-forget, like cancelNotebookCell. */
 export async function stopNotebookSession(name: string): Promise<void> {
-  await fetch(
-    `${BASE_URL}/notebooks/${encodeURIComponent(name)}/session`,
+  await apiFetch(
+    `/notebooks/${encodeURIComponent(name)}/session`,
     { method: "DELETE" },
   );
 }

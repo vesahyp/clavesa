@@ -111,7 +111,7 @@ func (h *CatalogHandler) WithWorkspace(root string) *CatalogHandler {
 }
 
 // RegisterRoutes wires the handler's endpoints into mux.
-func (h *CatalogHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *CatalogHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /workspace/tables", h.ListTables)
 }
 

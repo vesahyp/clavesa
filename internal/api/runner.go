@@ -27,7 +27,7 @@ func NewRunnerHandler(svc RunnerRequirementsService) *RunnerHandler {
 }
 
 // RegisterRoutes mounts the runner-requirements routes under the api mux.
-func (h *RunnerHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *RunnerHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /runner/requirements", h.get)
 	mux.HandleFunc("PUT /runner/requirements", h.set)
 }

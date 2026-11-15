@@ -63,6 +63,10 @@ func (s *Service) UpgradeWorkspace(target string, includePipelines bool) (Worksp
 	if err := s.syncUnityCatalogTF(target); err != nil {
 		return WorkspaceUpgradeResult{}, fmt.Errorf("workspace upgrade: %w", err)
 	}
+	// ADR-032: hosted.tf pins the same module version too.
+	if err := s.SyncHostedTF(target); err != nil {
+		return WorkspaceUpgradeResult{}, fmt.Errorf("workspace upgrade: %w", err)
+	}
 
 	result := WorkspaceUpgradeResult{
 		PrevVersion:        prev,

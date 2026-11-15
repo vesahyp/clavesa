@@ -9,6 +9,7 @@
  * next deploy does that.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -45,6 +46,7 @@ import {
 } from "@/lib/queries";
 
 export function UnityCatalog() {
+  const readOnly = useReadOnly();
   const status = useDatabricks();
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
@@ -171,6 +173,7 @@ export function UnityCatalog() {
                 </code>
               </div>
             )}
+            {!readOnly && (
             <div className="flex flex-wrap gap-2">
               <Button
                 size="sm"
@@ -207,6 +210,7 @@ export function UnityCatalog() {
                 </>
               )}
             </div>
+            )}
           </CardContent>
         </Card>
       )}

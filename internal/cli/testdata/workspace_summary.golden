@@ -1,0 +1,394 @@
+{
+  "name": "summary-ws",
+  "kind": "local",
+  "generated_at": "<now>",
+  "status": "warn",
+  "status_reasons": [
+    "orders: 1 table(s) past their freshness target",
+    "orders: no run inside the expected interval"
+  ],
+  "pipelines": [
+    {
+      "name": "orders",
+      "dir": "orders",
+      "schedule": "rate(1 day)",
+      "expected_interval_seconds": 86400,
+      "status": "warn",
+      "status_reasons": [
+        "1 table(s) past their freshness target",
+        "no run inside the expected interval"
+      ],
+      "last_run_nodes": [],
+      "runs": [],
+      "freshness": [
+        {
+          "table": "transform1",
+          "node": "transform1",
+          "age_seconds": 0,
+          "sla_seconds": 14400,
+          "stale": true
+        }
+      ],
+      "freshness_state": "stale",
+      "cost_usd_30d": 0,
+      "records_30d": 0,
+      "cost_per_billion": 0,
+      "records_per_sec": 0
+    }
+  ],
+  "runs_per_day_14d": [
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    }
+  ],
+  "runs_per_day_30d": [
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    },
+    {
+      "date": "<day>",
+      "succeeded": 0,
+      "failed": 0
+    }
+  ],
+  "cost_per_day_30d": [
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    },
+    {
+      "date": "<day>",
+      "cost_usd": 0
+    }
+  ],
+  "cost_usd_30d": 0,
+  "records_30d": 0,
+  "cost_per_billion": 0,
+  "records_per_sec": 0,
+  "stale_tables": 1,
+  "oldest_table_age_seconds": 0,
+  "freshness_state": "stale",
+  "sla_tables": 1,
+  "problems": []
+}

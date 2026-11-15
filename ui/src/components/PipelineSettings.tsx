@@ -9,7 +9,7 @@
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 
-import { BASE_URL } from "../api/client";
+import { apiFetch } from "../api/client";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -36,7 +36,7 @@ export function PipelineSettings({ dir, onClose }: PipelineSettingsProps) {
   useEffect(() => {
     setLoading(true);
     setError(null);
-    fetch(`${BASE_URL}/pipeline/vars?dir=${encodeURIComponent(dir)}`)
+    apiFetch(`/pipeline/vars?dir=${encodeURIComponent(dir)}`)
       .then((r) => {
         if (!r.ok) throw new Error(`${r.status}`);
         return r.json() as Promise<Record<string, string>>;
@@ -55,7 +55,7 @@ export function PipelineSettings({ dir, onClose }: PipelineSettingsProps) {
     setSaving(true);
     setError(null);
     try {
-      const res = await fetch(`${BASE_URL}/pipeline/vars`, {
+      const res = await apiFetch(`/pipeline/vars`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ dir, vars }),

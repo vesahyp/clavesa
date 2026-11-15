@@ -25,6 +25,7 @@
  *     removal ships via the per-row detach button / handleDetach).
  */
 
+import { Link } from "react-router-dom";
 import { useMemo, useState } from "react";
 import { Loader2, Plus, Database, Workflow, X } from "lucide-react";
 
@@ -269,9 +270,9 @@ function defaultAliasForTable(ref: string): string {
             {!canOpen ? (
               <>
                 Register a source on the{" "}
-                <a href="/sources" className="underline hover:text-foreground">
+                <Link to="/sources" className="underline hover:text-foreground">
                   Sources
-                </a>{" "}
+                </Link>{" "}
                 page, or have another pipeline produce a table first.
               </>
             ) : (

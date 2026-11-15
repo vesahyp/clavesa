@@ -43,7 +43,7 @@ func NewOptimizeHandler(svc Optimizer) *OptimizeHandler {
 }
 
 // RegisterRoutes mounts the optimize endpoint under the api mux.
-func (h *OptimizeHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *OptimizeHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("POST /pipelines/optimize", h.optimize)
 }
 

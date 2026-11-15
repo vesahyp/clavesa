@@ -91,11 +91,11 @@ export function PipelineHealthHeader({
   const h = HEALTH[state];
   return (
     <div
-      className="sticky top-0 z-30 -mx-6 -mt-8 mb-6 border-b border-border bg-background px-6 py-4"
+      className="sticky top-0 z-30 -mx-4 -mt-4 mb-4 border-b border-border bg-background px-4 py-3 md:-mx-6 md:-mt-8 md:mb-6 md:px-6 md:py-4"
       data-testid="deployment-status"
     >
       <div className="flex flex-wrap items-center justify-between gap-x-8 gap-y-3">
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 items-center gap-3">
           <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", h.dot)} />
           <div className="min-w-0">
             <div className="flex flex-wrap items-baseline gap-x-2.5">
@@ -114,7 +114,7 @@ export function PipelineHealthHeader({
           </div>
         </div>
 
-        <div className="flex items-center gap-6">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
           {lastRun && (
             <Stat
               label="Last run"

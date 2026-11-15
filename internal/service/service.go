@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/vesahyp/clavesa/internal/dataquery"
@@ -295,6 +295,26 @@ type Service struct {
 	// MigrateState is exercised without a terraform binary on PATH or
 	// any real Terraform state. See backend.go.
 	runTerraform func(ctx context.Context, dir string, stdout, stderr io.Writer, args ...string) (exitCode int, err error)
+
+	// awsRegion is the region of the AWS clients the cloud provider reads
+	// with ("" when unknown). WorkspaceSummary compares it with the region
+	// in the Terraform state to name a region mismatch. Set by
+	// WithAWSRegion; see workspace_summary.go.
+	awsRegion string
+}
+
+// WithAWSRegion records the region of the AWS clients the cloud
+// observability provider reads with.
+func (s *Service) WithAWSRegion(region string) *Service {
+	s.awsRegion = region
+	return s
+}
+
+// loadAWSConfig is the AWS config of every AWS call the service makes for
+// its workspace: the workspace's profile and recorded region on top of the
+// default chain (workspace.LoadAWSConfig, GH #107).
+func (s *Service) loadAWSConfig(ctx context.Context) (aws.Config, error) {
+	return wspkg.LoadAWSConfig(ctx, s.workspace)
 }
 
 // Ref wraps a bare HCL expression (e.g. file("path"), var.x) as a reference
@@ -418,7 +438,7 @@ func (s *Service) resolveDir(dir string) string {
 
 func (s *Service) ensureS3Client() error {
 	s.s3Once.Do(func() {
-		cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+		cfg, err := s.loadAWSConfig(context.Background())
 		if err != nil {
 			s.s3Err = NoAWSCredsError{Err: err}
 			return

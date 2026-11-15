@@ -83,6 +83,18 @@ type Manifest struct {
 	// workspace deployed before this field existed sees no diff.
 	// `workspace init` writes "workspace" for every new workspace.
 	AWSNames string `json:"aws_names,omitempty"`
+	// Hosted is the hosted read-only UI this workspace joins (ADR-032).
+	// Nil means not hosted: no reader role, no tree copy on deploy.
+	// Written by `clavesa workspace hosted enable` and its UI twin.
+	Hosted *Hosted `json:"hosted,omitempty"`
+	// Region is the AWS region the workspace stack is applied in (GH
+	// #107). Every AWS call and Terraform run of the workspace uses it,
+	// ahead of AWS_REGION and the profile's region (see region.go).
+	// Written by `workspace deploy` from the applied state, by `workspace
+	// init` from an explicit AWS_REGION, and derived once from the state
+	// for a workspace deployed before the field existed. Not the state
+	// bucket's region: that is Backend.Region.
+	Region string `json:"region,omitempty"`
 }
 
 // AWSNamesWorkspace is the Manifest.AWSNames value for workspace-scoped names.
@@ -768,6 +780,11 @@ func Load(root string) (*Manifest, error) {
 	}
 	if m.Databricks != nil {
 		if err := m.Databricks.Validate(); err != nil {
+			return nil, fmt.Errorf("clavesa.json: %w", err)
+		}
+	}
+	if m.Hosted != nil {
+		if err := m.Hosted.Validate(); err != nil {
 			return nil, fmt.Errorf("clavesa.json: %w", err)
 		}
 	}

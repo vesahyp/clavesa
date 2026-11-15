@@ -6,7 +6,7 @@
  */
 
 import type { PipelineGraph, ValidationResult } from "../types/pipeline";
-import { BASE_URL, request } from "./client";
+import { apiFetch, request } from "./client";
 
 // ---------------------------------------------------------------------------
 // Exported API functions
@@ -148,8 +148,8 @@ export function validatePipeline(dir: string): Promise<ValidationResult> {
 
 /** GET /pipeline/script?dir=&path= — returns raw script text */
 export async function getScript(dir: string, path: string): Promise<string> {
-  const res = await fetch(
-    `${BASE_URL}/pipeline/script?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(path)}`
+  const res = await apiFetch(
+    `/pipeline/script?dir=${encodeURIComponent(dir)}&path=${encodeURIComponent(path)}`
   );
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
@@ -160,7 +160,7 @@ export async function getScript(dir: string, path: string): Promise<string> {
 
 /** PUT /pipeline/script — writes raw script text */
 export async function putScript(dir: string, path: string, content: string): Promise<void> {
-  const res = await fetch(`${BASE_URL}/pipeline/script`, {
+  const res = await apiFetch(`/pipeline/script`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ dir, path, content }),
@@ -218,7 +218,7 @@ export async function runPipeline(
     body.force_nodes = opts.forceNodes;
   }
   if (opts?.compute === "local") body.compute = "local";
-  const res = await fetch(`${BASE_URL}/pipeline/run`, {
+  const res = await apiFetch(`/pipeline/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

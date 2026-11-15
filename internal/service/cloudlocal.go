@@ -183,7 +183,7 @@ func (s *Service) runCloudLocalEvent(ctx context.Context, env, perNodeEnv map[st
 
 	// No co-resident metastore on this path — the container reads the cloud
 	// catalog directly — so reserve only OS/daemon slack.
-	args := cloudLocalDockerArgs(image, env, perNodeEnv, localHeapArgs(reserveStandaloneMB), runner.AWSEnvDockerArgs(ctx))
+	args := cloudLocalDockerArgs(image, env, perNodeEnv, localHeapArgs(reserveStandaloneMB), runner.AWSEnvDockerArgs(ctx, workspace.AWSConfigOptions(ctx, s.workspace)...))
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdin = bytes.NewReader(body)
 	stdoutPipe, err := cmd.StdoutPipe()

@@ -7,6 +7,7 @@
  * dashboard" opens the editor on a blank spec.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useMemo, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { LayoutDashboard, ChevronRight, Plus } from "lucide-react";
@@ -32,6 +33,7 @@ const DASHBOARDS_CHROME: PageChrome = {
 };
 
 export function Dashboards() {
+  const readOnly = useReadOnly();
   const list = useDashboards();
   useChrome(DASHBOARDS_CHROME);
 
@@ -62,7 +64,9 @@ export function Dashboards() {
             system table.
           </p>
         </div>
-        <NewDashboardButton existing={list.data?.dashboards.map((d) => d.slug) ?? []} />
+        {!readOnly && (
+          <NewDashboardButton existing={list.data?.dashboards.map((d) => d.slug) ?? []} />
+        )}
       </div>
 
       <RegistryList

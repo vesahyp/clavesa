@@ -38,11 +38,18 @@ func localImageForDir(dir string) string {
 // dirs; the CLI sends absolute. Without this, hclparser.Parse and the
 // source-registry lookup both fail on the UI path.
 func NewHandler(s3Client dataquery.S3Client, hclParserFunc func(dir string) (*graph.PipelineGraph, error), resolveDir func(string) string) http.Handler {
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, s3Client, hclParserFunc, resolveDir)
+	return mux
+}
+
+// RegisterRoutes registers the /preview/* routes on mux. NewHandler uses
+// it for its own mux; ui.BuildWorkspaceMux registers them straight on the
+// workspace route table so the read-only test sees every route.
+func RegisterRoutes(mux httputil.Router, s3Client dataquery.S3Client, hclParserFunc func(dir string) (*graph.PipelineGraph, error), resolveDir func(string) string) {
 	if resolveDir == nil {
 		resolveDir = func(dir string) string { return dir }
 	}
-	mux := http.NewServeMux()
-
 	mux.HandleFunc("GET /preview/source", func(w http.ResponseWriter, r *http.Request) {
 		handleSourcePreview(w, r, s3Client, hclParserFunc, resolveDir)
 	})
@@ -54,8 +61,6 @@ func NewHandler(s3Client dataquery.S3Client, hclParserFunc func(dir string) (*gr
 	mux.HandleFunc("GET /preview/destination", func(w http.ResponseWriter, r *http.Request) {
 		handleDestinationPreview(w, r, s3Client, hclParserFunc, resolveDir)
 	})
-
-	return mux
 }
 
 // handleSourcePreview serves GET /preview/source?dir=<dir>&node_id=<id>&offset=<n>&limit=<n>

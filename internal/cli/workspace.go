@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
@@ -44,6 +43,7 @@ Examples:
 		newWorkspaceUpgradeCmd(),
 		newWorkspaceUseCmd(),
 		newWorkspaceTablesCmd(),
+		newWorkspaceSummaryCmd(),
 		newWorkspacePlanCmd(),
 		newWorkspaceDeployCmd(),
 		newWorkspaceDestroyCmd(),
@@ -53,6 +53,7 @@ Examples:
 		newWorkspaceConnectCmd(),
 		newWorkspaceDisconnectCmd(),
 		newWorkspaceDatabricksCmd(),
+		newWorkspaceHostedCmd(),
 	)
 
 	return cmd
@@ -166,6 +167,7 @@ func newWorkspaceInitCmd() *cobra.Command {
 	var cloud string
 	var catalog string
 	var backendType, stateBucket, stateRegion, stateKeyPrefix string
+	var region string
 
 	cmd := &cobra.Command{
 		Use:   "init <name>",
@@ -182,13 +184,21 @@ local state, no backend.tf.
 The bucket must already exist, with versioning and default encryption
 enabled — see docs/remote-state.md. For an existing local-state
 workspace, use ` + "`clavesa workspace set-backend`" + ` followed by
-` + "`clavesa workspace migrate-state`" + ` instead.`,
+` + "`clavesa workspace migrate-state`" + ` instead.
+
+Pass --region <r> to record the AWS region the workspace deploys to.
+Without it, the first ` + "`clavesa workspace deploy`" + ` records the region it
+applied in (AWS_REGION or the profile's region). Every later AWS call
+and Terraform run of the workspace uses the recorded region.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			backend, err := parseBackendFlags(backendType, stateBucket, stateRegion, stateKeyPrefix)
 			if err != nil {
 				return err
+			}
+			if region != "" && !workspace.ValidRegion(region) {
+				return fmt.Errorf("--region %q is not an AWS region name (such as us-east-2)", region)
 			}
 			// workspace init uses the simpler --workspace-or-cwd resolution
 			// rather than the env-var/state-file chain — a remembered
@@ -206,6 +216,11 @@ workspace, use ` + "`clavesa workspace set-backend`" + ` followed by
 			if err := workspace.Init(root, name, cloud, catalog, tuiservice.ModuleVersion, backend); err != nil {
 				return fmt.Errorf("workspace init: %w", err)
 			}
+			if region != "" {
+				if err := workspace.RecordRegion(root, region); err != nil {
+					return fmt.Errorf("workspace init: record region: %w", err)
+				}
+			}
 			// Remember the new workspace so subsequent commands don't need
 			// --workspace. Best-effort: a state-file write failure does
 			// not abort the init.
@@ -219,6 +234,9 @@ workspace, use ` + "`clavesa workspace set-backend`" + ` followed by
 			}
 			if backend != nil {
 				fmt.Printf("Remote backend: s3://%s/%s (region %s)\n", backend.Bucket, backend.KeyPrefixOrDefault(), backend.Region)
+			}
+			if region != "" {
+				fmt.Printf("AWS region: %s\n", region)
 			}
 			fmt.Println()
 			fmt.Println("Next steps:")
@@ -239,6 +257,7 @@ workspace, use ` + "`clavesa workspace set-backend`" + ` followed by
 	cmd.Flags().StringVar(&stateBucket, "state-bucket", "", "S3 bucket the backend stores state in (required with --backend)")
 	cmd.Flags().StringVar(&stateRegion, "state-region", "", "AWS region of the state bucket (required with --backend)")
 	cmd.Flags().StringVar(&stateKeyPrefix, "state-key-prefix", "", `key prefix inside the bucket (default "clavesa/")`)
+	cmd.Flags().StringVar(&region, "region", "", "AWS region the workspace deploys to (default: recorded at the first deploy)")
 
 	return cmd
 }
@@ -656,7 +675,7 @@ CLI twin of the Catalog page's ?catalog=&schema= view:
 			// Glue only carries a stub `col array<string>` for Delta tables.
 			var glueClient api.GlueClient
 			var s3Client api.S3API
-			if cfg, cfgErr := config.LoadDefaultConfig(ctx); cfgErr == nil {
+			if cfg, cfgErr := workspace.LoadAWSConfig(ctx, root); cfgErr == nil {
 				glueClient = glue.NewFromConfig(cfg)
 				s3Client = s3.NewFromConfig(cfg)
 			}
@@ -741,6 +760,134 @@ CLI twin of the Catalog page's ?catalog=&schema= view:
 	cmd.Flags().StringVar(&schemaFilter, "schema", "", "show only tables in this schema")
 
 	return cmd
+}
+
+// newWorkspaceSummaryCmd is the CLI twin of GET /workspace/summary and the
+// health card on the Catalog page (ADR-032, ADR-015): one call to
+// Service.WorkspaceSummary.
+func newWorkspaceSummaryCmd() *cobra.Command {
+	var jsonOut, publish bool
+	cmd := &cobra.Command{
+		Use:   "summary",
+		Short: "Show the workspace health summary",
+		Long: `Show the health of the workspace: its status, the last run, runs per
+day, tables past their freshness_sla and the compute cost of the last 30
+days.
+
+The status is the worst of: the last run of a pipeline failed (fail), a
+table is past its freshness_sla (warn), a pipeline with a trigger_schedule
+did not run inside its expected interval (warn).
+
+With --publish, the summary is also written to the hosted UI's data
+bucket (summaries/<workspace>.json, ADR-032) through the hosted UI's
+publisher role, which the workspace's own AWS identity assumes. The
+bucket and the role come from <hosted url>/.well-known/clavesa.json, so
+the workspace needs a hosted block (clavesa workspace hosted enable). The
+role writes only the names registered as local-warehouse workspaces in
+the hosted UI's hosted/infra/workspaces.tf.
+
+  clavesa workspace summary
+  clavesa workspace summary --json
+  clavesa workspace summary --publish`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			svc, _, err := newService(cmd)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), 2*time.Minute)
+			defer cancel()
+			// A one-shot command shows the state now: no Athena result
+			// reuse (the UI's polling keeps it).
+			ctx = observability.WithFreshReads(ctx)
+			sum, err := svc.WorkspaceSummary(ctx, tuiservice.WorkspaceSummaryQuery{})
+			if err != nil {
+				return err
+			}
+			var pub *tuiservice.PublishResult
+			if publish {
+				if pub, err = svc.PublishSummary(ctx, sum); err != nil {
+					return err
+				}
+			}
+			if jsonOut {
+				if pub != nil {
+					return printJSON(os.Stdout, struct {
+						*tuiservice.WorkspaceSummary
+						Published *tuiservice.PublishResult `json:"published"`
+					}{sum, pub})
+				}
+				return printJSON(os.Stdout, sum)
+			}
+			printWorkspaceSummary(os.Stdout, sum)
+			if pub != nil {
+				fmt.Printf("Published: %s\n", pub.URI)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	cmd.Flags().BoolVar(&publish, "publish", false, "also write the summary to the hosted UI's data bucket (ADR-032)")
+	return cmd
+}
+
+// printWorkspaceSummary renders the human block of `workspace summary`.
+func printWorkspaceSummary(w io.Writer, s *tuiservice.WorkspaceSummary) {
+	where := s.Kind + " warehouse"
+	if s.Region != "" {
+		where += ", " + s.Region
+	}
+	fmt.Fprintf(w, "%s (%s): %s\n", s.Name, where, strings.ToUpper(s.Status))
+	for _, r := range s.StatusReasons {
+		fmt.Fprintf(w, "  - %s\n", r)
+	}
+	if s.LastRun != nil {
+		d := s.LastRun.DurationMs
+		fmt.Fprintf(w, "Last run:   %s %s at %s (%s)\n", s.LastRun.Pipeline, s.LastRun.Result,
+			formatLocalTimestamp(s.LastRun.StartedAt), humanDurationMs(&d))
+	} else {
+		fmt.Fprintln(w, "Last run:   none")
+	}
+	var ok, failed int
+	for _, d := range s.RunsPerDay14d {
+		ok += d.Succeeded
+		failed += d.Failed
+	}
+	fmt.Fprintf(w, "Runs, 14 d: %d succeeded, %d failed\n", ok, failed)
+	switch s.FreshnessState {
+	case tuiservice.FreshnessStale:
+		fmt.Fprintf(w, "Freshness:  %d table(s) past freshness_sla, oldest %s\n", s.StaleTables,
+			(time.Duration(s.OldestTableAgeSeconds) * time.Second).String())
+	case tuiservice.FreshnessFresh:
+		fmt.Fprintf(w, "Freshness:  all %d table(s) with a freshness_sla fresh\n", s.SLATables)
+	case tuiservice.FreshnessUnknown:
+		fmt.Fprintf(w, "Freshness:  unknown (%s)\n", s.FreshnessReason)
+	default:
+		fmt.Fprintln(w, "Freshness:  no freshness_sla declared")
+	}
+	if s.Kind == "local" {
+		fmt.Fprintf(w, "Cost, 30 d: $0 (local), %.0f records/s\n", s.RecordsPerSec)
+	} else {
+		fmt.Fprintf(w, "Cost, 30 d: $%.4f, $%.2f per billion records\n", s.CostUSD30d, s.CostPerBillion)
+	}
+	if len(s.Pipelines) == 0 {
+		fmt.Fprintln(w, "\nNo pipelines yet.")
+		return
+	}
+	rows := make([][]string, len(s.Pipelines))
+	for i, p := range s.Pipelines {
+		last := "—"
+		if p.LastRun != nil {
+			last = p.LastRun.Result + " " + formatLocalTimestamp(p.LastRun.StartedAt)
+		}
+		sched := p.Schedule
+		if sched == "" {
+			sched = "—"
+		}
+		rows[i] = []string{p.Name, strings.ToUpper(p.Status), last, strconv.Itoa(len(p.Runs)), sched}
+	}
+	fmt.Fprintln(w)
+	printTable(w, []string{"PIPELINE", "STATUS", "LAST RUN", "RUNS 30D", "SCHEDULE"}, rows)
 }
 
 // tablesStateLimit caps how many per-table rows the observability layer
@@ -940,7 +1087,14 @@ Use --plan-only to stop after plan without applying.`,
 				}
 				return nil
 			}
-			return flow.Run()
+			if err := flow.Run(); err != nil {
+				return err
+			}
+			if planOnly {
+				return nil
+			}
+			// ADR-032: a hosted workspace's tree copy follows each deploy.
+			return uploadHostedTree(cmd, root, os.Stdout)
 		},
 	}
 	cmd.Flags().BoolVarP(&autoApprove, "yes", "y", false, "skip the interactive 'Apply this plan?' confirmation")
@@ -1007,10 +1161,10 @@ echoed to stderr before any AWS calls.`,
 			}
 			bucketName := m.Name + "-clavesa"
 			workgroupName := "clavesa-" + m.Name
-			if err := emptyVersionedBucket(cmd.Context(), bucketName, os.Stderr); err != nil {
+			if err := emptyVersionedBucket(cmd.Context(), root, bucketName, os.Stderr); err != nil {
 				return err
 			}
-			if err := drainAthenaWorkgroup(cmd.Context(), workgroupName, os.Stderr); err != nil {
+			if err := drainAthenaWorkgroup(cmd.Context(), root, workgroupName, os.Stderr); err != nil {
 				return err
 			}
 

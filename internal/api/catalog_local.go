@@ -10,6 +10,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/delta"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
+	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -272,7 +273,7 @@ func scanWorkspacePipelines(root string) []discoveredPipeline {
 			if raw == "" {
 				continue
 			}
-			if sec, ok := parseFreshnessSLA(raw); ok {
+			if sec, ok := observability.ParseFreshnessSLA(raw); ok {
 				slaByNode[identutil.Sanitize(n.ID)] = sec
 			}
 		}
@@ -323,39 +324,6 @@ func readPipelineSchemaDefault(dir string) string {
 		}
 	}
 	return ""
-}
-
-// parseFreshnessSLA converts an HCL "4h" / "30m" / "7d" / "120s" budget into
-// seconds. Mirrors the validation regex on the Terraform variable. Returns
-// (0, false) for malformed strings — callers treat that as "no SLA"
-// (graceful, the UI hides the chip rather than blocking the catalog).
-func parseFreshnessSLA(s string) (int64, bool) {
-	if len(s) < 2 {
-		return 0, false
-	}
-	suffix := s[len(s)-1]
-	numStr := s[:len(s)-1]
-	if numStr == "" {
-		return 0, false
-	}
-	var n int64
-	for _, c := range numStr {
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		n = n*10 + int64(c-'0')
-	}
-	switch suffix {
-	case 's':
-		return n, true
-	case 'm':
-		return n * 60, true
-	case 'h':
-		return n * 3600, true
-	case 'd':
-		return n * 86400, true
-	}
-	return 0, false
 }
 
 // candidateDirs lists the workspace root + immediate subdirs + one level

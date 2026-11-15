@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -180,7 +180,12 @@ sync-public: ## Publish docs/source updates to the public repo on main, NO versi
 test-stream: $(if $(SKIP_BUILD),,build) ## Stream mode (ADR-028 slice 1) on this machine: LocalStack Kinesis + Kafka containers, exact row counts after kill -9 cycles, a shard split, producer duplicates and a checkpoint reset. Docker-gated, ~25 min, no AWS
 	@./scripts/test-stream.sh
 
-smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS / SMOKE_PIPELINE env-overridable)
+# The persistent cloud smoke workspace (the old ~/clavesa-workspaces/smoke
+# is gone; smoke2 replaced it).
+SMOKE_WS ?= $(HOME)/clavesa-workspaces/smoke2
+export SMOKE_WS
+
+smoke-cloud: $(if $(SKIP_BUILD),,build) ## Per-release cloud gate: drive bin/clavesa against the deployed smoke workspace (SMOKE_WS, default ~/clavesa-workspaces/smoke2; SMOKE_PIPELINE env-overridable)
 	@./scripts/cloud-smoke.sh run
 
 smoke-databricks: $(if $(SKIP_BUILD),,build) ## Unity Catalog gate (ADR-027): run a published pipeline on a connected, deployed workspace and assert the table, lineage and downstream Databricks run in Databricks (UC_SMOKE_WS / UC_SMOKE_PIPELINE)
@@ -208,6 +213,49 @@ shadow-compare: ## Shadow mode: compare the Databricks step's table with clavesa
 	  $(if $(SUMS),--sum "$(SUMS)") \
 	  $(if $(WHERE),--where "$(WHERE)",$(if $(DAYS),--where "$(PARTITION) >= date_sub(current_date(), $(DAYS))")) \
 	  $(if $(JSON),--json)
+
+ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; AWS_PROFILE passes through)
+	cd ui && npx playwright install chromium
+	node ui/scripts/phone-shots.mjs
+
+# Hosted read-only UI (ADR-032): hosted/infra/ and its SPA deploy. A copy
+# in another account passes its backend with HOSTED_BACKEND_FLAGS and its
+# names with -var flags in HOSTED_TF_VARS; see hosted/README.md.
+HOSTED_TF            = terraform -chdir=hosted/infra
+HOSTED_BACKEND_FLAGS ?=
+HOSTED_TF_VARS       ?=
+
+hosted-init: ## Hosted UI: terraform init for hosted/infra (HOSTED_BACKEND_FLAGS for your own state bucket)
+	$(HOSTED_TF) init -input=false $(HOSTED_BACKEND_FLAGS)
+
+hosted-plan: hosted-build-lambda hosted/infra/.terraform ## Hosted UI: build the Lambda, plan into hosted/infra/tfplan (review it, then make hosted-apply)
+	$(HOSTED_TF) plan -input=false -out=tfplan $(HOSTED_TF_VARS)
+
+hosted-apply: ## Hosted UI: apply the saved plan hosted/infra/tfplan
+	$(HOSTED_TF) apply -input=false tfplan
+
+hosted-outputs: hosted/infra/.terraform ## Hosted UI: print the stack outputs
+	@$(HOSTED_TF) output
+
+# The hosted Lambda (cmd/clavesa-hosted): linux/arm64 for provided.al2023,
+# -tags nodist so the SPA is not embedded (CloudFront serves it from S3).
+# hosted-plan zips hosted/infra/.build/lambda/ (archive_file in api.tf), so
+# plan after a build.
+HOSTED_LAMBDA_DIR = hosted/infra/.build/lambda
+
+hosted-build-lambda: ## Hosted UI: build the Lambda's bootstrap binary into hosted/infra/.build/lambda/ (zipped by make hosted-plan)
+	mkdir -p $(HOSTED_LAMBDA_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags nodist,lambda.norpc -trimpath -ldflags="-s -w" -o $(HOSTED_LAMBDA_DIR)/bootstrap ./cmd/clavesa-hosted
+
+hosted-deploy-spa: build-ui hosted/infra/.terraform ## Hosted UI: the ui/ build with the hosted config → the SPA bucket, invalidate /index.html
+	bash hosted/scripts/deploy-spa.sh
+
+hosted-add-user: hosted/infra/.terraform ## Hosted UI: create a confirmed user that signs in with emailed codes, no mail sent now (EMAIL=<address>)
+	@test -n "$(EMAIL)" || { echo "usage: make hosted-add-user EMAIL=<address>"; exit 2; }
+	bash hosted/scripts/add-user.sh "$(EMAIL)"
+
+hosted/infra/.terraform:
+	$(HOSTED_TF) init -input=false $(HOSTED_BACKEND_FLAGS)
 
 screenshots-unity-catalog: ## Screenshot + assert the Unity Catalog page and a run's Databricks card (needs a running `clavesa ui` on a connected workspace; UC_RUN=<run id>, see the script)
 	bash scripts/uc-screenshots.sh

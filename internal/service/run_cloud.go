@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 
@@ -42,7 +41,7 @@ func (s *Service) RunPipelineCloud(ctx context.Context, dir string, opts RunOpts
 	pipelineName := filepath.Base(abs)
 	stateMachineName := s.awsName(pipelineName)
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return "", fmt.Errorf("load AWS config: %w", err)
 	}

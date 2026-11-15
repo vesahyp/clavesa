@@ -57,7 +57,7 @@ func NewNotebooksHandler(svc NotebookRegistry) *NotebooksHandler {
 }
 
 // RegisterRoutes mounts CRUD + cell-execution routes under the api mux.
-func (h *NotebooksHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *NotebooksHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /notebooks", h.list)
 	mux.HandleFunc("POST /notebooks", h.create)
 	mux.HandleFunc("GET /notebooks/{name}", h.get)

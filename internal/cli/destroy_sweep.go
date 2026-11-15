@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/glue/types"
 
@@ -28,10 +27,10 @@ import (
 // `aws_glue_catalog_database` with "database is not empty" and the user
 // has to drop into the AWS console or run `aws glue delete-table` by
 // hand.
-func sweepGlueDB(ctx context.Context, glueDB, label string, out io.Writer, in io.Reader) error {
+func sweepGlueDB(ctx context.Context, workspaceRoot, glueDB, label string, out io.Writer, in io.Reader) error {
 	awsCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cfg, err := config.LoadDefaultConfig(awsCtx)
+	cfg, err := workspace.LoadAWSConfig(awsCtx, workspaceRoot)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
 	}
@@ -116,7 +115,7 @@ func sweepPipelineGlueTables(ctx context.Context, workspaceRoot, pipelineName, g
 		schema := identutil.Sanitize(pipelineName)
 		glueDB = identutil.EncodeGlueDatabase(m.CatalogIdentifier(), schema)
 	}
-	return sweepGlueDB(ctx, glueDB, "pipeline", out, in)
+	return sweepGlueDB(ctx, workspaceRoot, glueDB, "pipeline", out, in)
 }
 
 // sweepWorkspaceSystemGlueTables resolves the workspace's system-catalog
@@ -133,5 +132,5 @@ func sweepWorkspaceSystemGlueTables(ctx context.Context, workspaceRoot string, o
 		return fmt.Errorf("not a clavesa workspace at %s (no clavesa.json)", workspaceRoot)
 	}
 	systemDB := identutil.EncodeGlueDatabase(m.SystemCatalogIdentifier(), "pipelines")
-	return sweepGlueDB(ctx, systemDB, "workspace", out, in)
+	return sweepGlueDB(ctx, workspaceRoot, systemDB, "workspace", out, in)
 }

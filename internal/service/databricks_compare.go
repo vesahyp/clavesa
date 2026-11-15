@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 )
 
@@ -84,7 +83,7 @@ func (s *Service) CompareDatabricksTables(ctx context.Context, pipeline string, 
 	if _, err := s.pipelineDir(pipeline); err != nil {
 		return out, err
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return out, fmt.Errorf("load AWS config: %w", err)
 	}

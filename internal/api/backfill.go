@@ -107,7 +107,7 @@ func NewBackfillHandler(svc Backfiller) *BackfillHandler {
 // RegisterRoutes mounts list / stage / diff / promote / discard under the
 // api mux. Run IDs travel as path params on the per-run routes so the UI
 // can render bookmarkable URLs at /backfills?dir=…&run=<id>.
-func (h *BackfillHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *BackfillHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /backfills", h.list)
 	mux.HandleFunc("POST /backfills/stage", h.stage)
 	mux.HandleFunc("GET /backfills/{run_id}/diff", h.diff)

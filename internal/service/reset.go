@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
@@ -154,7 +153,7 @@ func (s *Service) resolveResetPlan(ctx context.Context, req PipelineResetRequest
 		if plan.bucket == "" {
 			return nil, fmt.Errorf("reset: pipeline bucket not found — is the workspace deployed?")
 		}
-		cfg, err := awsconfig.LoadDefaultConfig(ctx)
+		cfg, err := s.loadAWSConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load AWS config: %w", err)
 		}
@@ -319,7 +318,7 @@ func (s *Service) executeResetLocal(plan *resetPlan) (*PipelineResetResult, erro
 // catalog entry pointing at an empty location (recoverable; the next run
 // recreates the data) rather than orphaned data with no catalog entry.
 func (s *Service) executeResetCloud(ctx context.Context, plan *resetPlan) (*PipelineResetResult, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}

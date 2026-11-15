@@ -33,6 +33,7 @@ var validFormats = map[string]bool{
 // so existing tests continue to compile against the original signature.
 type Handler struct {
 	mux      *http.ServeMux
+	s3       S3Client
 	cloud    observability.Provider
 	resolver *observability.Resolver
 	queryFn  QueryFunc
@@ -72,12 +73,21 @@ type RunTimingsFunc func(ctx context.Context, dir string, limit int, since time.
 // based on the `dir` query param.
 func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athenaOutputBucket string) http.Handler {
 	h := &Handler{
+		s3:    s3Client,
 		cloud: observability.NewCloudProvider(athenaClient, athenaOutputBucket, nil, nil),
 	}
 	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	h.mux = mux
+	return h
+}
 
+// RegisterRoutes registers the /data/* routes on mux. NewHandler uses it
+// for its own mux; ui.BuildWorkspaceMux registers them straight on the
+// workspace route table so the read-only test sees every route.
+func (h *Handler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /data/source", func(w http.ResponseWriter, r *http.Request) {
-		handleSource(w, r, s3Client)
+		handleSource(w, r, h.s3)
 	})
 
 	mux.HandleFunc("GET /data/table", func(w http.ResponseWriter, r *http.Request) {
@@ -167,9 +177,6 @@ func NewHandler(s3Client S3Client, athenaClient observability.AthenaClient, athe
 		}
 		handleAdhocQuery(w, r, p)
 	})
-
-	h.mux = mux
-	return h
 }
 
 // ServeHTTP makes Handler an http.Handler. Routing is delegated to the

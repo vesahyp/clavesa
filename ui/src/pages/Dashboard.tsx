@@ -8,6 +8,7 @@
  * DashboardEditor. `?new=1` opens the editor on a blank dashboard.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Pencil } from "lucide-react";
@@ -45,6 +46,7 @@ function pipelineScopeLabel(datasets: DashboardDataset[]): string {
 }
 
 export function Dashboard() {
+  const readOnly = useReadOnly();
   const params = useParams<{ slug: string }>();
   const slug = decodeURIComponent(params.slug ?? "");
   const [searchParams, setSearchParams] = useSearchParams();
@@ -147,7 +149,7 @@ export function Dashboard() {
         }}
         onPick={onTemplatePick}
       />
-      {editing && editorInitial ? (
+      {editing && editorInitial && !readOnly ? (
         <DashboardEditor
           isNew={isNew}
           initial={editorInitial}
@@ -205,16 +207,18 @@ export function Dashboard() {
                     </p>
                   )}
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    setEditorInitial(spec);
-                    setEditing(true);
-                  }}
-                >
-                  <Pencil className="mr-1 h-3.5 w-3.5" /> Edit
-                </Button>
+                {!readOnly && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setEditorInitial(spec);
+                      setEditing(true);
+                    }}
+                  >
+                    <Pencil className="mr-1 h-3.5 w-3.5" /> Edit
+                  </Button>
+                )}
               </div>
 
               {spec.controls.length > 0 && (

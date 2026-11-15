@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
@@ -187,7 +186,7 @@ func (s *Service) BackfillStage(ctx context.Context, req BackfillStageRequest) (
 		return s.backfillStageLocal(ctx, req, &g, node, abs, pipelineName, runID)
 	}
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
@@ -374,7 +373,7 @@ func (s *Service) BackfillList(ctx context.Context, dir string) ([]BackfillRun, 
 		return nil, fmt.Errorf("parse pipeline: %w", err)
 	}
 	pipelineName := strings.TrimSuffix(filepathBase(abs), "/")
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +434,7 @@ func (s *Service) BackfillDiff(ctx context.Context, dir, runID string) (*Backfil
 	}
 	mode, mergeKeys := outputModeAndKeys(&g, run.Node, run.OutputKey)
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -590,7 +589,7 @@ func (s *Service) BackfillPromote(ctx context.Context, dir, runID string, opts B
 	// Spark-side MERGE. Same engine + IAM scope that wrote the staging
 	// table — SparkSQL's MERGE INTO accepts `UPDATE SET *` and `INSERT *`,
 	// no column enumeration needed.
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -679,7 +678,7 @@ func (s *Service) BackfillDedupCheck(ctx context.Context, dir, runID, col string
 	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
 		return s.backfillDedupCheckLocal(ctx, dir, run, col)
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -773,7 +772,7 @@ func (s *Service) BackfillDiscard(ctx context.Context, dir, runID, compute strin
 		return nil
 	}
 
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	cfg, err := s.loadAWSConfig(ctx)
 	if err != nil {
 		return err
 	}

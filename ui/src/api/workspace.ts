@@ -2,7 +2,7 @@
  * workspace.ts — API client for workspace-level endpoints.
  */
 
-import { BASE_URL, request } from "./client";
+import { apiFetch, request } from "./client";
 
 // PipelineInfo + listPipelines were removed in C24 (2026-05-24 review) —
 // the live versions live in lib/queries.ts and carry the full ADR-016
@@ -27,8 +27,8 @@ export function createPipeline(name: string, schema = ""): Promise<{ dir: string
  * Raw fetch rather than request<T> because the server replies 204 No
  * Content on success — request<T> would crash trying to parse JSON. */
 export async function deletePipeline(dir: string): Promise<void> {
-  const res = await fetch(
-    `${BASE_URL}/pipelines?dir=${encodeURIComponent(dir)}`,
+  const res = await apiFetch(
+    `/pipelines?dir=${encodeURIComponent(dir)}`,
     { method: "DELETE" },
   );
   if (res.status === 204) return;
@@ -55,10 +55,15 @@ export function getWorkspace(): Promise<WorkspaceInfo> {
 export function initWorkspace(
   name: string,
   catalog = "",
+  region = "",
 ): Promise<WorkspaceInfo> {
   return request<WorkspaceInfo>("/workspace/init", {
     method: "POST",
-    body: JSON.stringify({ name, ...(catalog ? { catalog } : {}) }),
+    body: JSON.stringify({
+      name,
+      ...(catalog ? { catalog } : {}),
+      ...(region ? { region } : {}),
+    }),
   });
 }
 

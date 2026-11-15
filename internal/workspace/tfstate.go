@@ -56,6 +56,11 @@ func SetStateGetterForTest(fn func(ctx context.Context, bucket, region, key stri
 	}
 }
 
+// ForgetCachedState drops every cached remote state, so the next read
+// fetches it again. Deploy calls it after an apply, before it reads the
+// new outputs (ADR-032 deployed.json).
+func ForgetCachedState() { clearStateCache() }
+
 func clearStateCache() {
 	stateCacheMu.Lock()
 	defer stateCacheMu.Unlock()
@@ -85,6 +90,13 @@ func clearStateCache() {
 // Remote fetches are cached for remoteStateCacheTTL, keyed on
 // bucket+key — local reads are not cached.
 func ReadStackState(ctx context.Context, workspaceRoot, stackDir string) ([]byte, error) {
+	// A hosted tree copy (ADR-032) carries deployed.json in place of
+	// state: answer from it, and never reach for the state bucket.
+	if d, err := LoadDeployed(workspaceRoot); err != nil {
+		return nil, err
+	} else if d != nil {
+		return d.stackState(workspaceRoot, stackDir)
+	}
 	m, err := Load(workspaceRoot)
 	if err != nil {
 		return nil, err
@@ -204,6 +216,15 @@ func PipelineBucket(workspaceRoot string) string {
 		return ""
 	}
 	return tfstateOutput(data, "pipeline_bucket")
+}
+
+// StateOutput returns the named string output of state JSON as read by
+// ReadStackState, or "" when the state is nil or lacks it.
+func StateOutput(data []byte, name string) string {
+	if data == nil {
+		return ""
+	}
+	return tfstateOutput(data, name)
 }
 
 // tfstateOutput pulls a named string output from state JSON. Returns ""

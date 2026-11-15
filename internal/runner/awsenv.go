@@ -32,7 +32,12 @@ import (
 // Caveat: injected credentials are a point-in-time snapshot — a session
 // credential (SSO) expires and is NOT refreshed inside a long-lived warm
 // worker; the next worker respawn re-resolves. Static keys don't expire.
-func AWSEnvDockerArgs(ctx context.Context) []string {
+//
+// opts are the workspace's config load options (workspace.AWSConfigOptions:
+// its profile and recorded region, GH #107). The resolved region is
+// appended after the passthrough, so the workspace's region is the one the
+// container sees.
+func AWSEnvDockerArgs(ctx context.Context, opts ...func(*awsconfig.LoadOptions) error) []string {
 	var args []string
 	for _, name := range []string{
 		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
@@ -56,7 +61,7 @@ func AWSEnvDockerArgs(ctx context.Context) []string {
 	// Host-side resolution. Best-effort: when the host has no AWS context
 	// at all this resolves nothing and the container simply gets the
 	// passthrough above (matching the old behavior).
-	if cfg, err := awsconfig.LoadDefaultConfig(ctx); err == nil {
+	if cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...); err == nil {
 		if creds, err := cfg.Credentials.Retrieve(ctx); err == nil && creds.AccessKeyID != "" {
 			args = append(args,
 				"-e", "AWS_ACCESS_KEY_ID="+creds.AccessKeyID,

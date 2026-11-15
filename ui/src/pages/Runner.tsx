@@ -7,6 +7,7 @@
  * preview shows which lines are recognized as packages vs comments/blanks.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Package } from "lucide-react";
@@ -25,6 +26,7 @@ import {
 } from "@/lib/queries";
 
 export function Runner() {
+  const readOnly = useReadOnly();
   const reqs = useRunnerRequirements();
   const qc = useQueryClient();
 
@@ -152,9 +154,11 @@ export function Runner() {
                 </code>{" "}
                 for cloud.
               </p>
-              <Button onClick={save} disabled={saving || !dirty}>
-                {saving ? "Saving…" : "Save"}
-              </Button>
+              {!readOnly && (
+                <Button onClick={save} disabled={saving || !dirty}>
+                  {saving ? "Saving…" : "Save"}
+                </Button>
+              )}
             </div>
           </CardContent>
         </Card>

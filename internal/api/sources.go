@@ -65,7 +65,7 @@ func NewSourcesHandler(svc SourceRegistry) *SourcesHandler {
 }
 
 // RegisterRoutes mounts CRUD + attach routes under the api mux.
-func (h *SourcesHandler) RegisterRoutes(mux *http.ServeMux) {
+func (h *SourcesHandler) RegisterRoutes(mux httputil.Router) {
 	mux.HandleFunc("GET /sources", h.list)
 	mux.HandleFunc("POST /sources", h.register)
 	mux.HandleFunc("GET /sources/{name}", h.get)

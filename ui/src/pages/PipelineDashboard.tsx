@@ -14,6 +14,7 @@
  * this page is data the user already has — no new backend.
  */
 
+import { useReadOnly } from "@/hooks/useReadOnly";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import { ArrowUp, ChevronRight, FileWarning, History, Laptop, Loader2, Play, Settings, Zap } from "lucide-react";
@@ -43,6 +44,8 @@ import {
   deriveNodeOutputs,
 } from "@/components/PipelineGraph";
 const RunTimingsCard = lazy(() => import("@/components/RunTimingsCard"));
+import { PipelinePhoneView } from "@/components/PipelinePhoneView";
+import { useIsPhone } from "@/hooks/useIsPhone";
 import { PipelineHealthHeader } from "@/components/PipelineHealthHeader";
 import { NodesGrid, type NodeInfo } from "@/components/NodesGrid";
 import type { NodeSpec } from "@/components/NodeDetailDrawer";
@@ -146,6 +149,10 @@ function formatRate(n: number): string {
 export function PipelineDashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  // Read-only (ADR-032): hide Run, settings, upgrade, backfill, reset,
+  // optimize and the canvas editor.
+  const readOnly = useReadOnly();
+  const isPhone = useIsPhone();
   const qc = useQueryClient();
   const dir = searchParams.get("dir") ?? "";
   const selectedRunId = searchParams.get("run") ?? null;
@@ -571,6 +578,7 @@ export function PipelineDashboard() {
           warnings={graph.validation.warnings}
         />
       )}
+      {!readOnly && (
       <RunPipelineButton
         dir={dir}
         disabled={!hasNodes}
@@ -597,16 +605,20 @@ export function PipelineDashboard() {
           void qc.invalidateQueries({ queryKey: ["execution-states"] });
         }}
       />
-      <Button
-        onClick={() => setSettingsOpen(true)}
-        variant="outline"
-        size="icon"
-        className="h-8 w-8"
-        title="Pipeline settings"
-        aria-label="Pipeline settings"
-      >
-        <Settings className="h-4 w-4" />
-      </Button>
+      )}
+      {!readOnly && (
+        <Button
+          onClick={() => setSettingsOpen(true)}
+          variant="outline"
+          size="icon"
+          className="h-8 w-8"
+          title="Pipeline settings"
+          aria-label="Pipeline settings"
+          data-testid="pipeline-settings-button"
+        >
+          <Settings className="h-4 w-4" />
+        </Button>
+      )}
     </>
   );
 
@@ -658,7 +670,7 @@ export function PipelineDashboard() {
 
   if (!dir) {
     return (
-      <div className="mx-auto w-full max-w-6xl px-6 py-8">
+      <div className="mx-auto w-full max-w-6xl px-4 py-4 md:px-6 md:py-8">
           <Card className="border-destructive/40 bg-destructive/5">
             <CardHeader className="flex-row items-start gap-3">
               <FileWarning className="mt-0.5 h-5 w-5 text-destructive" />
@@ -676,7 +688,7 @@ export function PipelineDashboard() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-6 py-8">
+    <div className="mx-auto w-full max-w-6xl px-4 py-4 md:px-6 md:py-8">
       <PipelineHealthHeader
         pipelineName={pipelineName}
         dir={dir}
@@ -696,10 +708,12 @@ export function PipelineDashboard() {
             <p className="text-sm text-muted-foreground">
               This pipeline has no nodes yet.
             </p>
-            <p className="mt-2 text-xs text-muted-foreground">
-              Use the + button on the canvas below to add a source,
-              transform, or destination.
-            </p>
+            {!readOnly && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Use the + button on the canvas below to add a source,
+                transform, or destination.
+              </p>
+            )}
             <div className="relative mt-6 h-[420px] w-full overflow-hidden rounded-md border">
               <ReactFlowProvider>
                 <PipelineGraphView
@@ -713,7 +727,9 @@ export function PipelineDashboard() {
                   showSources
                 />
               </ReactFlowProvider>
-              <NodePalette dir={dir} onGraphUpdate={fetchPipeline} />
+              {!readOnly && (
+                <NodePalette dir={dir} onGraphUpdate={fetchPipeline} />
+              )}
             </div>
           </CardContent>
         </Card>
@@ -725,7 +741,19 @@ export function PipelineDashboard() {
         </div>
       )}
 
-      {hasNodes && (
+      {/* Phone (below md, ADR-032): one column of charts and the run
+          list instead of the Graph / Runs tabs. */}
+      {hasNodes && isPhone && (
+        <PipelinePhoneView
+          dir={queryDir}
+          runs={runs.data?.rows ?? []}
+          loading={runs.isLoading}
+          isLocal={isLocalWarehouse}
+          onOpenRun={openRunDetail}
+        />
+      )}
+
+      {hasNodes && !isPhone && (
         <Tabs
           value={activeTab}
           onValueChange={(v) => setActiveTab(v as "graph" | "runs")}
@@ -972,6 +1000,7 @@ export function PipelineDashboard() {
                   <History className="h-4 w-4 text-muted-foreground" />
                   Backfills
                 </CardTitle>
+                {!readOnly && (
                 <div className="flex items-center gap-2">
                   <Button
                     size="sm"
@@ -991,6 +1020,7 @@ export function PipelineDashboard() {
                     Stage backfill
                   </Button>
                 </div>
+                )}
               </CardHeader>
               <CardContent className="p-0">
                 <QueryShell
@@ -1030,7 +1060,9 @@ export function PipelineDashboard() {
               </CardContent>
             </Card>
 
-            {/* Optimize (Delta maintenance) — local + cloud (ADR-014). */}
+            {/* Optimize (Delta maintenance) — local + cloud (ADR-014).
+                An action card only, so read-only hides all of it. */}
+            {!readOnly && (
             <Card>
               <CardHeader className="flex-row items-center justify-between pb-3">
                 <CardTitle className="flex items-center gap-2">
@@ -1135,6 +1167,7 @@ export function PipelineDashboard() {
                 )}
               </CardContent>
             </Card>
+            )}
           </TabsContent>
 
           {/* Graph — editable canvas with right-edge ConfigPanel drawer
@@ -1172,6 +1205,9 @@ export function PipelineDashboard() {
                             setPreviewedNodeId(null);
                             return;
                           }
+                          // Read-only: the ConfigPanel is the node editor,
+                          // so a transform click opens nothing.
+                          if (readOnly) return;
                           setSelectedNodeId((prev) => (prev === id ? null : id));
                           setInspectedSyntheticId(null);
                           setPreviewNodeId(null);
@@ -1188,7 +1224,9 @@ export function PipelineDashboard() {
                       />
                     </ReactFlowProvider>
                   )}
-                  <NodePalette dir={dir} onGraphUpdate={fetchPipeline} />
+                  {!readOnly && (
+                    <NodePalette dir={dir} onGraphUpdate={fetchPipeline} />
+                  )}
                 </div>
               </CardContent>
             </Card>
@@ -1296,7 +1334,7 @@ export function PipelineDashboard() {
         />
       )}
 
-      {settingsOpen && (
+      {settingsOpen && !readOnly && (
         <PipelineSettings dir={dir} onClose={() => setSettingsOpen(false)} />
       )}
 
@@ -1622,6 +1660,7 @@ interface ModuleVersionChipProps {
  */
 function ModuleVersionChip({ dir }: ModuleVersionChipProps) {
   const qc = useQueryClient();
+  const readOnly = useReadOnly();
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["module-version", dir],
     queryFn: () => getPipelineModuleVersion(dir),
@@ -1674,7 +1713,7 @@ function ModuleVersionChip({ dir }: ModuleVersionChipProps) {
           </span>
         )}
       </Badge>
-      {!upToDate && (
+      {!upToDate && !readOnly && (
         <Button
           size="sm"
           variant="outline"

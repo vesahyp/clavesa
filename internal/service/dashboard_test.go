@@ -32,8 +32,9 @@ type fakeProvider struct {
 	// tables is returned by Tables when set (tests that exercise the
 	// tables-state path). tablesQ records the last query so the test can
 	// assert the wiring.
-	tables  []observability.TableInfo
-	tablesQ observability.TablesQuery
+	tables    []observability.TableInfo
+	tablesErr error
+	tablesQ   observability.TablesQuery
 
 	// runs is returned by Runs when set (tests that exercise the runs
 	// service wrapper). runsQ records the last query.
@@ -82,6 +83,9 @@ func (f *fakeProvider) Runs(_ context.Context, q observability.RunsQuery) (*obse
 }
 func (f *fakeProvider) Tables(_ context.Context, q observability.TablesQuery) (*observability.TablesResult, error) {
 	f.tablesQ = q
+	if f.tablesErr != nil {
+		return nil, f.tablesErr
+	}
 	return &observability.TablesResult{Rows: f.tables}, nil
 }
 func (f *fakeProvider) Snapshots(context.Context, observability.SnapshotsQuery) (*observability.SnapshotsResult, error) {
