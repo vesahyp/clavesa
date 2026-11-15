@@ -27,6 +27,16 @@ resources:
               run_date: "{{job.parameters.run_date}}"
               catalog: ${var.catalog}
 
+        - task_key: compact
+          depends_on:
+            - task_key: clean
+          sql_task:
+            file:
+              path: ../sql/compact.sql
+            warehouse_id: 0123456789abcdef
+            parameters:
+              catalog: ${var.catalog}
+
       environments:
         - environment_key: default
           spec:

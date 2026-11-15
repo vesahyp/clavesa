@@ -1,5 +1,6 @@
 # A small bundle for the runner's script mode (ADR-031 slice 3): a
-# spark_python_task loads raw orders, a sql_task with a file cleans them.
+# spark_python_task loads raw orders, a sql_task with a file cleans them,
+# and a second sql_task compacts the table (OPTIMIZE ZORDER BY, VACUUM).
 bundle:
   name: orders_sql
 

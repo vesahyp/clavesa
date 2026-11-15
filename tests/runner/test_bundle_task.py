@@ -183,6 +183,28 @@ class UnityTest(unittest.TestCase):
                        "main.s.clean_clavesa", ["id"]), calls)
         self.assertEqual(recs[0]["lineage"], "pushed")
 
+    def test_bundle_job_owns_the_tables(self):
+        """The owner the guard checks is the bundle job, not the target's
+        pipeline, so aws and aws-mixed (and v2.25.0's pipeline) agree."""
+        specs = []
+
+        class FakeUC:
+            bundle_job_owner = staticmethod(lambda b, j: f"{b}_{j}")
+
+            def prepare(self, client, cfg, spark, table_id, spec):
+                specs.append(spec)
+                return {"full_name": spec["uc_table"], "state": "new"}
+
+        class FakeSpark:
+            def sql(self, q):
+                pass
+
+        names = bt.Names(mode="unity", known={"main.s.t"}, writes={"main.s.t"}, shadow={"main.s.t"},
+                         job_writes={"main.s.t"})
+        bt.UnityTask(FakeSpark(), names, {"bundle": "default_sql", "job": "default_sql_sql_job"}, "t",
+                     uc_module=FakeUC(), client=object(), cfg={}).before()
+        self.assertEqual(specs[0]["owner"], "default_sql_default_sql_sql_job")
+
     def test_unity_needs_a_connection(self):
         class NoConfig:
             def config(self):

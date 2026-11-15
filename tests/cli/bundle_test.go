@@ -45,13 +45,26 @@ func TestBundleRunScriptMode(t *testing.T) {
 	bundleDir := filepath.Join(repoRoot(), "testdata", "bundles", "orders_sql")
 
 	out := run(t, "bundle", "run", "--bundle", bundleDir, "--workspace", ws, "--compute", "local")
-	for _, want := range []string{"Pipeline: orders_sql_local_orders", "load", "clean"} {
+	for _, want := range []string{"Pipeline: orders_sql_local_orders", "load", "clean", "compact"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("bundle run output lacks %q:\n%s", want, out)
 		}
 	}
-	if strings.Count(out, " ok") < 2 {
-		t.Fatalf("both tasks should be ok:\n%s", out)
+	if strings.Count(out, " ok") < 3 {
+		t.Fatalf("all three tasks should be ok:\n%s", out)
+	}
+	// The compact task's OPTIMIZE ... ZORDER BY and VACUUM ran on the
+	// table (Delta records VACUUM as VACUUM START / VACUUM END).
+	ops := map[string]bool{}
+	for _, r := range queryRows(t, ws, "DESCRIBE HISTORY main__sales.orders_clean") {
+		for _, cell := range r { // the operation column, among the others
+			ops[cell] = true
+		}
+	}
+	for _, want := range []string{"OPTIMIZE", "VACUUM START", "VACUUM END"} {
+		if !ops[want] {
+			t.Fatalf("orders_clean history lacks %s: %v", want, ops)
+		}
 	}
 
 	rows := queryRows(t, ws, "SELECT order_id, country, CAST(amount AS STRING) AS amount FROM main__sales.orders_clean ORDER BY order_id")
@@ -68,6 +81,28 @@ func TestBundleRunScriptMode(t *testing.T) {
 	run(t, "bundle", "run", "--bundle", bundleDir, "--workspace", ws, "--param", "run_date=2026-11-12")
 	if n := len(queryRows(t, ws, "SELECT * FROM main__sales.orders_clean")); n != 7 {
 		t.Fatalf("after run_date=2026-11-12: want 7 rows, got %d", n)
+	}
+
+	// pipeline optimize finds the tables the job's tasks write (a task node
+	// declares no outputs; the job file lists them) and compacts and
+	// vacuums each one.
+	optOut := run(t, "pipeline", "optimize", filepath.Join(ws, "orders_sql_local_orders"), "--vacuum", "--json", "--workspace", ws)
+	var opt []struct {
+		Table  string `json:"table"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(optOut), &opt); err != nil {
+		t.Fatalf("pipeline optimize --json: %v\n%s", err, optOut)
+	}
+	got = nil
+	for _, r := range opt {
+		if r.Status != "ok" {
+			t.Fatalf("pipeline optimize: %s is %s\n%s", r.Table, r.Status, optOut)
+		}
+		got = append(got, r.Table)
+	}
+	if strings.Join(got, ",") != "main__sales.orders_clean,main__sales.orders_raw" {
+		t.Fatalf("pipeline optimize on a bundle pipeline: tables %v\n%s", got, optOut)
 	}
 
 	// The generated pipeline is read-only.

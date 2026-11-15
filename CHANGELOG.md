@@ -12,6 +12,13 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.25.2] — 2026-11-15
+
+### Fixed
+- **A bundle job's tables belong to the job, not to one target's pipeline** (ADR-031). With `catalog: unity`, the one-writer guard and the `clavesa.pipeline` mark on a table use `<bundle>_<job>` for a pipeline generated from a bundle. A job deployed by v2.25.0 (pipeline `<bundle>_<job>`) runs again after the v2.25.1 rename, where it failed with "already written by clavesa pipeline '<bundle>_<job>'", and two clavesa targets of one job (shadow and mixed) can both write its shadow tables.
+- **`clavesa pipeline optimize` on a pipeline generated from a bundle** compacts (and with `--vacuum` vacuums) the tables the job's clavesa tasks write, from the job file, under their Spark names (`<catalog>__<schema>.<table>`, `_clavesa` in shadow mode). It found no tables and exited 0. Tables a Databricks task writes are left to Databricks; `--node` takes a task key.
+- **`clavesa pipeline optimize --vacuum` on a local warehouse** failed on every table with "no parseable output": Delta's VACUUM prints on stdout before the runner's answer. The answer is now read from the last line.
+
 ## [v2.25.1] — 2026-11-14
 
 ### Fixed

@@ -1515,6 +1515,9 @@ class UnityTask:
 
     def before(self):
         spec = {}
+        if self.job.get("bundle") and self.job.get("job"):
+            # The bundle job owns its tables, not the target's pipeline.
+            spec["owner"] = self.uc.bundle_job_owner(self.job["bundle"], self.job["job"])
         if self.job.get("replaces_job"):
             spec["replaces_job"] = int(self.job["replaces_job"])
         for w in sorted(self.names.writes):

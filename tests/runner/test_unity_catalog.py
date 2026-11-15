@@ -151,6 +151,45 @@ class PrepareTest(unittest.TestCase):
             uc.prepare(client, CFG, FakeSpark(), "db.daily")
         self.assertIn("two pipelines may not write one table", str(cm.exception))
 
+    def test_bundle_job_owner_spans_targets_and_the_v2_25_0_name(self):
+        """A table a bundle job wrote under v2.25.0 (pipeline <bundle>_<job>)
+        or under another target of the same job is the job's own table."""
+        client = FakeClient({("GET", TABLES + "cat.orders.daily"): {
+            "table_type": "EXTERNAL", "data_source_format": "DELTA", "storage_location": "s3://b/x",
+            "properties": {"clavesa.pipeline": "default_sql_default_sql_sql_job"}}})
+        owner = uc.bundle_job_owner("default_sql", "default_sql_sql_job")
+        env = {"CLAVESA_PIPELINE": "default_sql_aws_default_sql_sql_job"}
+        with mock.patch.dict(os.environ, env), redirect_stderr(io.StringIO()):
+            ctx = uc.prepare(client, CFG, FakeSpark(), "db.daily", {"owner": owner})
+        self.assertEqual(ctx["owner"], "default_sql_default_sql_sql_job")
+        # Another job's table is still refused.
+        with mock.patch.dict(os.environ, env), self.assertRaises(uc.UCError):
+            uc.prepare(client, CFG, FakeSpark(), "db.daily", {"owner": uc.bundle_job_owner("default_sql", "other")})
+
+    def test_new_table_is_registered_and_marked_with_the_owner(self):
+        client = FakeClient()
+        class _Spark(MarkDeltaTest._Spark):
+            def sql(self, stmt):
+                self.stmts.append(stmt)
+
+                class _R:
+                    def collect(_):  # noqa: N805
+                        return [{"properties": {}, "location": "s3a://b/t"}]
+
+                return _R()
+
+            def table(self, _t):
+                return type("T", (), {"schema": None})()
+
+        spark = _Spark({})
+        with mock.patch.dict(os.environ, {"CLAVESA_PIPELINE": "b_aws_j", "CLAVESA_NODE": "n"}), \
+                mock.patch.object(uc, "columns_from_schema", return_value=[]), \
+                mock.patch.object(uc, "grant_readers"), redirect_stderr(io.StringIO()):
+            uc.publish(client, CFG, spark, "db.t", {"full_name": "cat.orders.t", "state": "new", "owner": "b_j"})
+        self.assertIn("'clavesa.pipeline' = 'b_j'", spark.stmts[1])
+        reg = [c for c in client.calls if c[0] == "POST" and c[1] == "/api/2.1/unity-catalog/tables"][0]
+        self.assertEqual(reg[2]["properties"]["clavesa.pipeline"], "b_j")
+
 
 
 class OutputNameTest(unittest.TestCase):

@@ -250,15 +250,22 @@ def prepare(client: Client, cfg: dict[str, Any], spark, table_id: str, spec: dic
       docs/cookbook/replace-a-databricks-step.md.
 
     With `replaces_job` set, the job must be paused first.
+
+    `spec["owner"]` is who owns the table for the one-writer guard
+    (ADR-016); the default is the pipeline. A pipeline generated from a
+    Databricks bundle passes its bundle job (table_owner), so the clavesa
+    targets of one job, and the v2.25.0 name of that job's pipeline, are
+    one owner.
     """
     spec = spec or {}
+    owner = table_owner(spec)
     name = full_name(cfg, table_id, spec.get("uc_table", ""))
     if spec.get("replaces_job"):
         check_step_paused(client, spec["replaces_job"], name)
     existing = client.call("GET", "/api/2.1/unity-catalog/tables/" + urllib.parse.quote(name), ok404=True)
     if existing is None:
         want = s3_uri(spec.get("uc_location", "")).rstrip("/")
-        ctx: dict[str, Any] = {"full_name": name, "state": "new"}
+        ctx: dict[str, Any] = {"full_name": name, "state": "new", **_owner_key(spec)}
         if want:
             if spark.catalog.tableExists(table_id):
                 current = s3_uri(spark.sql(f"DESCRIBE DETAIL {table_id}").collect()[0]["location"]).rstrip("/")
@@ -291,7 +298,7 @@ def prepare(client: Client, cfg: dict[str, Any], spark, table_id: str, spec: dic
             owner_pipeline = props.get("clavesa.pipeline")
         except Exception:  # noqa: BLE001  (no Delta log yet, or unreadable: treat as not clavesa's)
             owner_pipeline = None
-    if owner_pipeline not in (None, os.environ.get("CLAVESA_PIPELINE", "")):
+    if owner_pipeline not in (None, owner):
         raise UCError(
             f"{name} is already written by clavesa pipeline {owner_pipeline!r}; "
             "two pipelines may not write one table (ADR-016)"
@@ -315,10 +322,29 @@ def prepare(client: Client, cfg: dict[str, Any], spark, table_id: str, spec: dic
                 f"{name} is at {location}, but this pipeline's table {table_id} is already at {current}. "
                 f"Reset the clavesa table (clavesa pipeline reset) so the next run writes the Unity Catalog table."
             )
-    return {"full_name": name, "state": "external", "location": location, "columns": existing.get("columns") or []}
+    return {"full_name": name, "state": "external", "location": location, "columns": existing.get("columns") or [],
+            **_owner_key(spec)}
 
 
-def mark_delta(spark, table_id: str) -> None:
+def _owner_key(spec: dict[str, Any]) -> dict[str, str]:
+    return {"owner": spec["owner"]} if spec.get("owner") else {}
+
+
+def table_owner(spec: dict[str, Any] | None = None) -> str:
+    """The owner recorded on a table clavesa writes (clavesa.pipeline):
+    spec["owner"] when the caller sets one, else the pipeline."""
+    return (spec or {}).get("owner") or os.environ.get("CLAVESA_PIPELINE", "")
+
+
+def bundle_job_owner(bundle: str, job: str) -> str:
+    """The owner of the tables a Databricks bundle job writes: the job,
+    as <bundle>_<job>, whatever the target. That is also the pipeline name
+    v2.25.0 gave the job, so tables written then keep their owner after
+    v2.25.1 put the target in the pipeline name."""
+    return f"{bundle}_{job}"
+
+
+def mark_delta(spark, table_id: str, owner: str | None = None) -> None:
     """Record which clavesa pipeline and node write the table in the Delta
     log itself (TBLPROPERTIES), not only in the Unity Catalog registration.
 
@@ -327,7 +353,7 @@ def mark_delta(spark, table_id: str) -> None:
     and the ones clavesa set through REST are gone, and with them the
     one-pipeline-per-table guard. A metadata-only commit, made only when a
     value is missing or differs."""
-    want = {"clavesa.pipeline": os.environ.get("CLAVESA_PIPELINE", ""), "clavesa.node": os.environ.get("CLAVESA_NODE", "")}
+    want = {"clavesa.pipeline": owner or table_owner(), "clavesa.node": os.environ.get("CLAVESA_NODE", "")}
     have = spark.sql(f"DESCRIBE DETAIL {table_id}").collect()[0]["properties"] or {}
     if all(have.get(k) == v for k, v in want.items()):
         return
@@ -341,7 +367,7 @@ def publish(client: Client, cfg: dict[str, Any], spark, table_id: str, ctx: dict
     Returns {"full_name", "action", "url"} for the run record.
     """
     name = ctx["full_name"]
-    mark_delta(spark, table_id)
+    mark_delta(spark, table_id, ctx.get("owner"))
     schema = spark.table(table_id).schema
     cols = columns_from_schema(schema)
     catalog, uc_schema, table = name.split(".")
@@ -356,7 +382,7 @@ def publish(client: Client, cfg: dict[str, Any], spark, table_id: str, ctx: dict
             "storage_location": location,
             "columns": cols,
             "properties": {
-                "clavesa.pipeline": os.environ.get("CLAVESA_PIPELINE", ""),
+                "clavesa.pipeline": ctx.get("owner") or table_owner(),
                 "clavesa.node": os.environ.get("CLAVESA_NODE", ""),
                 "clavesa.glue-table": table_id,
             },

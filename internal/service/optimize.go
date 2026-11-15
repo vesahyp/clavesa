@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 
+	"github.com/vesahyp/clavesa/internal/bundle"
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/workspace"
@@ -126,6 +128,15 @@ func (s *Service) OptimizeTable(ctx context.Context, req OptimizeRequest) ([]Opt
 				operation: op, clusterBy: clusterBy,
 			})
 		}
+	}
+	// A pipeline generated from a Databricks bundle has task nodes, which
+	// declare no outputs: the job file lists the tables each task writes.
+	bt, err := bundleOptimizeTargets(abs, req.Node)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bt {
+		targets = append(targets, target{node: b.node, outputKey: "default", tableID: b.tableID, operation: "optimize"})
 	}
 	if req.Node != "" && len(targets) == 0 {
 		return nil, fmt.Errorf("optimize: node %q not found or not a transform in %s", req.Node, req.Dir)
@@ -243,4 +254,57 @@ func (s *Service) OptimizeTable(ctx context.Context, req OptimizeRequest) ([]Opt
 		results = append(results, res)
 	}
 	return results, nil
+}
+
+type bundleOptimizeTarget struct {
+	node    *graph.Node
+	tableID string
+}
+
+// bundleOptimizeTargets lists the tables the clavesa tasks of a pipeline
+// generated from a bundle write (none for any other pipeline), under the
+// Spark names the runner gives them: <catalog>__<schema>.<table>, with the
+// _clavesa suffix in shadow mode. Tables a Databricks task writes are
+// Databricks' to maintain. A table two tasks write (a later task that
+// compacts it, say) is listed once, under the first task.
+func bundleOptimizeTargets(pipelineDir, onlyTask string) ([]bundleOptimizeTarget, error) {
+	raw, err := os.ReadFile(bundleJobPath(pipelineDir))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var jf bundle.JobFile
+	if err := json.Unmarshal(raw, &jf); err != nil {
+		return nil, fmt.Errorf("%s: %w", bundle.JobFileName, err)
+	}
+	seen := map[string]bool{}
+	var out []bundleOptimizeTarget
+	for _, key := range jf.Order {
+		t := jf.Tasks[key]
+		if t == nil || t.Place == "databricks" || t.Disabled || (onlyTask != "" && key != onlyTask) {
+			continue
+		}
+		for _, w := range t.Writes {
+			parts := strings.Split(w, ".")
+			if len(parts) != 3 {
+				continue
+			}
+			cat, sch, tbl := parts[0], parts[1], parts[2]
+			if c, ok := jf.Catalogs[cat]; ok {
+				cat = c
+			}
+			if jf.Shadow {
+				tbl += "_clavesa"
+			}
+			id := cat + "__" + sch + "." + tbl
+			if seen[strings.ToLower(id)] {
+				continue
+			}
+			seen[strings.ToLower(id)] = true
+			out = append(out, bundleOptimizeTarget{node: &graph.Node{ID: key, Type: "task"}, tableID: id})
+		}
+	}
+	return out, nil
 }

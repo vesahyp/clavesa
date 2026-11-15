@@ -2431,15 +2431,11 @@ func (s *Service) runOperation(ctx context.Context, op map[string]any) (map[stri
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
 
-	out := bytes.TrimSpace(stdout.Bytes())
-	if len(out) > 0 {
-		var resp map[string]any
-		if err := json.Unmarshal(out, &resp); err == nil {
-			if msg, _ := resp["error"].(string); msg != "" {
-				return nil, fmt.Errorf("runner operation %v: %s", op["_operation"], msg)
-			}
-			return resp, nil
+	if resp, ok := operationResponse(stdout.Bytes()); ok {
+		if msg, _ := resp["error"].(string); msg != "" {
+			return nil, fmt.Errorf("runner operation %v: %s", op["_operation"], msg)
 		}
+		return resp, nil
 	}
 	if runErr != nil {
 		return nil, fmt.Errorf("docker run operation: %w\nstdout: %s\nstderr: %s", runErr, stdout.String(), stderr.String())
@@ -2487,4 +2483,21 @@ func newRunID() string {
 		}
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// operationResponse reads the runner's JSON answer from an operation's
+// stdout. The answer is the last line: Spark itself may print first
+// (Delta's VACUUM prints "Deleted N files and directories ..." on stdout).
+func operationResponse(stdout []byte) (map[string]any, bool) {
+	out := bytes.TrimSpace(stdout)
+	var resp map[string]any
+	if len(out) > 0 && json.Unmarshal(out, &resp) == nil {
+		return resp, true
+	}
+	if i := bytes.LastIndexByte(out, '\n'); i >= 0 {
+		if json.Unmarshal(bytes.TrimSpace(out[i+1:]), &resp) == nil {
+			return resp, true
+		}
+	}
+	return nil, false
 }
