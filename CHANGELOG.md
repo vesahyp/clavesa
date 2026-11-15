@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+### Added
+- **[docs/databricks/bundles.md](docs/databricks/bundles.md)**, the user guide for `clavesa bundle`: plan, deploy, run, compare, switch, destroy, mixed jobs, Unity Catalog shadow tables, lineage in Catalog Explorer (Databricks external lineage, Public Preview; the grants it needs) and table maintenance (`clavesa pipeline optimize --vacuum`, or OPTIMIZE and VACUUM in a `sql_task`), with the results of the end-to-end test.
+
+### Fixed
+- `clavesa bundle run --help` gave the generated pipeline's folder as `bundles/<bundle>_<job>/`. It is `<bundle>_<target>_<job>/`.
+
 ## [v2.25.2] — 2026-11-15
 
 ### Fixed

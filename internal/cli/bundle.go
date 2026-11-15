@@ -121,7 +121,7 @@ func newBundleRunCmd() *cobra.Command {
 		Use:   "run",
 		Short: "Run one job of a bundle target on clavesa",
 		Long: `Plan the bundle target, generate the job's clavesa pipeline into the
-workspace (bundles/<bundle>_<job>/, read-only: the bundle is the source) and
+workspace (<bundle>_<target>_<job>/, read-only: the bundle is the source) and
 run it. The plan must be ready (clavesa bundle plan says Ready: yes).
 
 Job parameters take their defaults from the bundle; --param overrides one.

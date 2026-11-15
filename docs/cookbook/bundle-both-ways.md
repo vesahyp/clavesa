@@ -44,7 +44,9 @@ Job default_sql_sql_job (pipeline default_sql_default_sql_sql_job): PASS
 
 and for the mixed run, the Databricks run of the `aws-mixed` job shows `orders_raw` DISABLED (not in `only`) and `orders_daily` SUCCESS, started by clavesa's state machine (segments `Seg0`, `Seg1Start`, `Seg1Wait`, `Seg1Poll`).
 
-In Catalog Explorer, `team_ucpub.sales` has the four tables; the Lineage tab of `orders_daily_clavesa` shows `orders_raw_clavesa`, then the clavesa task `orders_daily`.
+In Catalog Explorer, `team_ucpub.sales` has the four tables. The Lineage tab of `orders_daily_clavesa` shows `orders_raw_clavesa`, then the clavesa task as an external object of type `clavesa transform` (`clavesa_default_sql_aws_default_sql_sql_job_orders_daily`), then the table. This is Databricks external lineage, which is Public Preview; the table lineage API returns nothing for these tables. [bundles](../databricks/bundles.md#8-lineage-in-catalog-explorer), section 8, has the details and the grants.
+
+On 2026-11-15 the clavesa side ran again on v2.25.2 with the same PASS, and `clavesa pipeline optimize default_sql_aws_default_sql_sql_job --vacuum` compacted and vacuumed both shadow tables ([bundles](../databricks/bundles.md#9-table-maintenance), section 9). v2.25.2 is needed to run this job again after a v2.25.0 deploy: before it, the run refused with "already written by clavesa pipeline 'default_sql_default_sql_sql_job'".
 
 ## Cost
 

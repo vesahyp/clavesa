@@ -243,7 +243,15 @@ lists each pipeline's tables with a Catalog Explorer link:
 daily_events  →  main.daily_events
     main.sales.daily_events_clavesa      EXTERNAL written by clavesa
       https://<host>/explore/data/main/sales/daily_events_clavesa
-``` In **Catalog Explorer**, the shadow table is an External table in the team's bucket; its **Lineage** tab shows the input, the clavesa step (`clavesa_<pipeline>_<node>`) and the table, with the column mapping. The step is a box of its own in the graph because it runs outside Databricks.
+```
+
+In **Catalog Explorer**, the shadow table is an External table in the team's bucket. Its **Lineage** tab shows the input, the clavesa step and the table. Three things to know about this lineage:
+
+1. **It uses Databricks external lineage, which is Public Preview.** The Databricks API reference marks the external lineage endpoints "Public Preview" ([API reference](https://docs.databricks.com/api/workspace/externallineage), [user guide](https://docs.databricks.com/aws/data-governance/unity-catalog/external-lineage)). `--push-lineage=false` on `clavesa workspace connect databricks` turns it off.
+2. **The clavesa step is an external object of type `clavesa transform` between the tables, with the column mapping.** Its name is `clavesa_<pipeline>_<node>`. It is not shown as a Databricks job, because it does not run in Databricks. The table lineage API (`/api/2.0/lineage-tracking/table-lineage`) returns nothing for a clavesa table; only the external lineage API (`/api/2.0/lineage-tracking/external-lineage`) returns its edges.
+3. **It needs `CREATE EXTERNAL METADATA` on the metastore and `MODIFY` on each table clavesa writes**, for clavesa's service principal. The preflight (step 4) checks the first.
+
+[bundles](bundles.md#8-lineage-in-catalog-explorer), section 8, has the API calls, the limits and how to remove the objects.
 
 The clavesa UI shows the same, and the run history:
 

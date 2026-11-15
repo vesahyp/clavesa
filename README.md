@@ -198,6 +198,7 @@ AWS_PROFILE=my-account clavesa deploy --workspace $WS
 - **[docs/reference/](docs/reference/)** is the look-up material: the full **[CLI reference](docs/reference/cli/README.md)** (every command and flag, generated from the binary), plus per-module input/output docs.
 - **[docs/cookbook/](docs/cookbook/README.md)** holds task-oriented recipes — how to solve a specific problem end to end.
 - **[docs/databricks/getting-started.md](docs/databricks/getting-started.md)** is for a team on Databricks with Unity Catalog: run one step of a Databricks pipeline on clavesa, with its table and lineage still in Unity Catalog, a shadow run, a daily comparison, the switch and the roll-back ([ADR-027](docs/decisions/027-unity-catalog-publish.md)).
+- **[docs/databricks/bundles.md](docs/databricks/bundles.md)** is the user guide for `clavesa bundle`: a job defined in a Databricks Asset Bundle deployed to clavesa in your AWS account, with plan, deploy, run, compare, switch, destroy, mixed jobs, shadow tables, lineage in Unity Catalog and table maintenance ([ADR-031](docs/decisions/031-dab-bundles-on-clavesa.md)).
 - **[docs/remote-state.md](docs/remote-state.md)** covers moving a workspace's Terraform state to a shared S3 backend so more than one developer can deploy against it ([ADR-025](docs/decisions/025-remote-terraform-backend.md)).
 - **[CHANGELOG.md](CHANGELOG.md)** lists what shipped in each release, in user-facing terms.
 - **[docs/architecture.md](docs/architecture.md)** covers system layers and the data model.
