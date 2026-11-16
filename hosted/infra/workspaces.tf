@@ -47,6 +47,16 @@ locals {
       reader_role_arn = "arn:aws:iam::699166197771:role/clavesa-ui-reader-ucguide"
       bucket          = "ucguide-clavesa"
     },
+    # The webbaa account's web traffic analytics (aabbew/monorepo
+    # analytics/web-traffic). Its reader role came with monorepo PR 341.
+    {
+      name            = "web-traffic"
+      kind            = "cloud"
+      account         = "471112936790"
+      region          = "eu-north-1"
+      reader_role_arn = "arn:aws:iam::471112936790:role/clavesa-ui-reader-web-traffic"
+      bucket          = "web-traffic-clavesa"
+    },
     # The nightly site-traffic pipelines on the main Mac (local warehouse).
     # Each run publishes summaries/<name>.json through the publisher role
     # (hosted/README.md, "Adding a local workspace").

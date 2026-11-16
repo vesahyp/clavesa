@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -211,8 +212,18 @@ func (d deployFlow) Run() error {
 	// content-addressed layers dedup, so an unchanged image re-pushes only
 	// metadata. This replaces the version-gated null_resource.push_runner,
 	// which skipped the push whenever runner_version was unchanged.
+	//
+	// A workspace made before that change still has null_resource.push_runner
+	// in its Terraform: it pins its own runner (var.runner_version) and the
+	// apply above already pushed that image as :latest. clavesa does not
+	// push over it. Pushing the binary's runner there moved :latest of a
+	// shared account's workspace to a runner nobody chose (monorepo
+	// web-traffic, 2026-11-16); upgrading such a workspace's runner is the
+	// owner's change in its Terraform.
 	if d.BuildRunnerImage {
-		if err := d.pushRunnerImage(); err != nil {
+		if file, ok := terraformPushesRunner(d.TfDir); ok {
+			fmt.Fprintf(d.stdout(), "\n→ Runner image: not pushed. %s has null_resource.push_runner, so this workspace's Terraform pins and pushes its own runner (runner_version).\n", file)
+		} else if err := d.pushRunnerImage(); err != nil {
 			return err
 		}
 	}
@@ -332,6 +343,25 @@ func (d deployFlow) verifyAWSCredentials() error {
 	fmt.Fprintf(d.stdout(), "→ AWS account %s as %s\n", aws.ToString(out.Account), aws.ToString(out.Arn))
 	return nil
 }
+
+// terraformPushesRunner reports whether a .tf file in dir declares
+// null_resource.push_runner, the runner push of workspaces made before
+// clavesa moved it into the deploy flow. It returns the file's base name.
+func terraformPushesRunner(dir string) (string, bool) {
+	files, _ := filepath.Glob(filepath.Join(dir, "*.tf"))
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if pushRunnerDecl.Match(b) {
+			return filepath.Base(f), true
+		}
+	}
+	return "", false
+}
+
+var pushRunnerDecl = regexp.MustCompile(`(?m)^\s*resource\s+"null_resource"\s+"push_runner"\s*\{`)
 
 // pushRunnerImage tags the freshly-built local runner image into the
 // workspace ECR repository and pushes it — unconditionally. The local image

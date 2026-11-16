@@ -94,7 +94,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
       data-runs-14d={runs14}
       data-runs-30d={s.runs_per_day_30d.reduce((a, d) => a + d.succeeded + d.failed, 0)}
       aria-label={`${entry.name}, ${STATUS_LABEL[status]}`}
-      className={cn(shell, "p-3 transition-colors hover:border-primary/50 active:bg-muted/40")}
+      className={cn(shell, "px-3 py-2.5 transition-colors hover:border-primary/50 active:bg-muted/40")}
     >
       <div className="flex min-w-0 items-center gap-2">
         <StatusDot status={status} />
@@ -115,7 +115,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
           ))}
         </ul>
       )}
-      <div className="mt-1.5 flex min-w-0 items-baseline justify-between gap-3 text-xs text-muted-foreground">
+      <div className="mt-1 flex min-w-0 items-baseline justify-between gap-3 text-xs text-muted-foreground">
         <span data-testid="workspace-card-last-run" className="min-w-0 truncate">
           {last ? (
             <>
@@ -158,7 +158,7 @@ function RunStrip({ days }: { days: WorkspaceSummary["runs_per_day_14d"] }) {
       data-testid="workspace-card-runs-strip"
       role="img"
       aria-label={`Runs per day, last 14 days: ${days.map((d) => `${shortDay(d.date)} ${d.succeeded} ok ${d.failed} failed`).join(", ")}`}
-      className="mt-1.5 flex h-4 items-end gap-[2px]"
+      className="mt-1 flex h-4 items-end gap-[2px]"
     >
       {days.map((d) => {
         const n = d.succeeded + d.failed;

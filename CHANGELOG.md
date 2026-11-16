@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.3] — 2026-11-16
+
+### Fixed
+
+- **`clavesa workspace deploy` no longer pushes its runner over a workspace that pins its own.** An older workspace still has `null_resource.push_runner` in its Terraform, which pushes the runner of its `runner_version` as `:latest`. The deploy then pushed the binary's own runner as `:latest` too, so the next pipeline deploy would have run a runner nobody chose. Now the deploy prints "Runner image: not pushed" for such a workspace. Workspaces of the current layout push as before.
+
 ## [v2.27.2] — 2026-11-16
 
 ### Fixed
