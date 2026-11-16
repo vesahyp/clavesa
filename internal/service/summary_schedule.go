@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -42,20 +43,51 @@ func (s *Service) awsScheduleState(ctx context.Context, rule string) (bool, stri
 	if err != nil || out.State != ebtypes.RuleStateDisabled {
 		return false, ""
 	}
-	ev, err := cloudtrail.NewFromConfig(cfg).LookupEvents(ctx, &cloudtrail.LookupEventsInput{
+	// CloudTrail does not index an EventBridge rule by its name as a
+	// resource, so look up DisableRule events and match the rule name in
+	// each event's request (newest first).
+	ct := cloudtrail.NewFromConfig(cfg)
+	in := &cloudtrail.LookupEventsInput{
 		LookupAttributes: []cttypes.LookupAttribute{{
-			AttributeKey:   cttypes.LookupAttributeKeyResourceName,
-			AttributeValue: aws.String(rule),
+			AttributeKey:   cttypes.LookupAttributeKeyEventName,
+			AttributeValue: aws.String("DisableRule"),
 		}},
 		MaxResults: aws.Int32(50),
-	})
-	if err != nil {
-		return true, ""
 	}
-	for _, e := range ev.Events { // newest first
-		if aws.ToString(e.EventName) == "DisableRule" && e.EventTime != nil {
-			return true, e.EventTime.UTC().Format(time.RFC3339)
+	for page := 0; page < 5; page++ {
+		out, err := ct.LookupEvents(ctx, in)
+		if err != nil {
+			return true, ""
 		}
+		if since := disabledSince(out.Events, rule); since != "" {
+			return true, since
+		}
+		if out.NextToken == nil {
+			break
+		}
+		in.NextToken = out.NextToken
 	}
 	return true, ""
+}
+
+// disabledSince returns the time (RFC 3339, UTC) of the newest DisableRule
+// event in events whose request names rule, or "".
+func disabledSince(events []cttypes.Event, rule string) string {
+	for _, e := range events { // newest first
+		if aws.ToString(e.EventName) != "DisableRule" || e.EventTime == nil {
+			continue
+		}
+		var body struct {
+			RequestParameters struct {
+				Name string `json:"name"`
+			} `json:"requestParameters"`
+		}
+		if json.Unmarshal([]byte(aws.ToString(e.CloudTrailEvent)), &body) != nil {
+			continue
+		}
+		if body.RequestParameters.Name == rule {
+			return e.EventTime.UTC().Format(time.RFC3339)
+		}
+	}
+	return ""
 }

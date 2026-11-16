@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.5] — 2026-11-16
+
+### Fixed
+
+- **A paused schedule says when it was paused.** The hosted card and `clavesa workspace summary` say "schedule paused since 9.11 09:21"; v2.27.4 found no time and said only "schedule paused". `clavesa workspace summary` also prints the notes (failed runs a later run fixed, paused schedules) under the status.
+
 ## [v2.27.4] — 2026-11-16
 
 ### Fixed

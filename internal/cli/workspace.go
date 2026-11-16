@@ -841,6 +841,9 @@ func printWorkspaceSummary(w io.Writer, s *tuiservice.WorkspaceSummary) {
 	for _, r := range s.StatusReasons {
 		fmt.Fprintf(w, "  - %s\n", r)
 	}
+	for _, n := range s.Notes {
+		fmt.Fprintf(w, "  note: %s\n", n)
+	}
 	if s.LastRun != nil {
 		d := s.LastRun.DurationMs
 		fmt.Fprintf(w, "Last run:   %s %s at %s (%s)\n", s.LastRun.Pipeline, s.LastRun.Result,

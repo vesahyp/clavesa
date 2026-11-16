@@ -113,8 +113,8 @@ type PipelineSummary struct {
 	// Schedule is the declared trigger_schedule; ExpectedIntervalSeconds
 	// is the interval it implies (0 when none is declared or the
 	// expression is not one clavesa can read).
-	Schedule                string   `json:"schedule,omitempty"`
-	ExpectedIntervalSeconds int64    `json:"expected_interval_seconds,omitempty"`
+	Schedule                string `json:"schedule,omitempty"`
+	ExpectedIntervalSeconds int64  `json:"expected_interval_seconds,omitempty"`
 	// SchedulePaused: the schedule's EventBridge rule is disabled (cloud
 	// only), so no run is expected; SchedulePausedSince is when, RFC 3339,
 	// "" when that is not known.
