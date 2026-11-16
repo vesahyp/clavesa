@@ -28,6 +28,11 @@ const HEALTH: Record<Health, { label: string; dot: string; text: string }> = {
     dot: "bg-muted-foreground",
     text: "text-muted-foreground",
   },
+  loading: {
+    label: "Loading runs…",
+    dot: "bg-muted-foreground/40 animate-pulse",
+    text: "text-muted-foreground",
+  },
   unknown: {
     label: "Status unknown",
     dot: "bg-muted-foreground",
@@ -102,9 +107,17 @@ export function PipelineHealthHeader({
               <h1 className="font-mono text-xl font-semibold tracking-tight">
                 {pipelineName || "(unknown pipeline)"}
               </h1>
-              <span className={cn("text-sm font-medium", h.text)}>
-                {h.label}
-              </span>
+              {state === "loading" ? (
+                <span
+                  data-testid="pipeline-health-loading"
+                  aria-label={h.label}
+                  className="inline-block h-4 w-20 animate-pulse rounded bg-muted"
+                />
+              ) : (
+                <span data-testid="pipeline-health" className={cn("text-sm font-medium", h.text)}>
+                  {h.label}
+                </span>
+              )}
             </div>
             <p className="truncate text-xs text-muted-foreground">
               <code className="font-mono">{dir}</code>

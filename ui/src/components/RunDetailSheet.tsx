@@ -15,6 +15,12 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { useIsPhone } from "@/hooks/useIsPhone";
+import { stamp } from "@/lib/clock";
+import { formatDuration } from "@/lib/format";
+import { useRuns } from "@/lib/queries";
+import { cn } from "@/lib/utils";
+import { runtimeConfig } from "@/lib/runtimeConfig";
+import { PhoneBackButton } from "./PhoneBack";
 import { RunDetailView } from "./RunDetailView";
 import { RunPhoneView } from "./RunPhoneView";
 
@@ -26,18 +32,46 @@ export interface RunDetailSheetProps {
 
 export function RunDetailSheet({ dir, runId, onClose }: RunDetailSheetProps) {
   const isPhone = useIsPhone();
+  // Hosted phone: the run is a page of its own. The sheet stops above the
+  // bottom bar, which stays usable (non-modal: no dim, no focus trap), and
+  // a back button to the pipeline replaces the X.
+  const phonePage = isPhone && runtimeConfig.mode === "hosted";
+  const pipelineName = dir.split("/").pop() || dir;
+  // The run's start and duration name it on a phone.
+  // Same query as RunPhoneView, so it shares the cache.
+  const runs = useRuns(pipelineName, { dir, limit: 200, enabled: phonePage && !!runId });
+  const run = runs.data?.rows.find((r) => r.run_id === runId);
   return (
     <Sheet
+      modal={!phonePage}
       open={!!runId}
       onOpenChange={(o) => {
         if (!o) onClose();
       }}
     >
-      <SheetContent data-testid="run-detail-sheet">
+      <SheetContent
+        data-testid="run-detail-sheet"
+        hideClose={phonePage}
+        // No focus ring on the back button when the run page opens.
+        onOpenAutoFocus={phonePage ? (e) => e.preventDefault() : undefined}
+        className={
+          phonePage
+            ? "top-0 bottom-[calc(3.75rem+env(safe-area-inset-bottom))] border-l-0 shadow-none"
+            : undefined
+        }
+      >
         <SheetHeader>
-          <SheetTitle className="font-mono text-sm">
-            Run{runId ? ` ${runId.slice(0, 12)}` : ""}
+          {phonePage && (
+            <PhoneBackButton label={pipelineName} onClick={onClose} />
+          )}
+          <SheetTitle data-testid="run-title" className={cn("text-sm", !phonePage && "font-mono")}>
+            {phonePage
+              ? run
+                ? `Run ${stamp(run.started_at)}${run.duration_ms != null ? `, ${formatDuration(run.duration_ms)}` : ""}`
+                : "Run"
+              : `Run${runId ? ` ${runId.slice(0, 12)}` : ""}`}
           </SheetTitle>
+          {/* The run ID stays small in RunPhoneView, under the result line. */}
           <SheetDescription>
             {isPhone
               ? "Node timeline, rows per node, errors."

@@ -12,6 +12,23 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.2] — 2026-11-16
+
+### Fixed
+- **Hosted UI times and counts.** Every time is Helsinki time and every date is day.month ("16.11"), the same as the CLI; chart times were UTC without a label and the Stats page wrote 11.16. Run counts and day charts are rebuilt against today, so a summary written yesterday no longer counts one day too many (kivikko showed 14 and 30 runs where `clavesa workspace summary` says 13 and 29) or labels yesterday "today". The pipeline page shows a loading bar instead of "Never run" while its runs load, and an unknown pipeline URL shows "No pipeline with this name" instead of the server's error text.
+- **`clavesa workspace summary`: a failed run in the last 14 days is never OK.** The pipeline and its workspace say "warn" with "7 failed runs in 14 days, last 15.11 11:08", even when the newest run succeeded. "No run inside the expected interval" is now "no run since 9.11 07:16, expected daily" (or "never run, expected daily"). Times in reasons are Helsinki time on every machine. The hosted UI shows these verdicts and reasons from the summary, in amber or red.
+- **Hosted UI workspace list.** A line at the top says "2 need attention · 8 healthy". Cards are compact (name, status, reasons, last run, runs in 14 days, cost for a cloud workspace, a 14-day strip), so ten fit in about two phone screens, and the whole card opens the workspace.
+- **Hosted UI labels in plain words.** "$773.89/billion" is "$0.77 per million records", "rate(1 day)" is "Daily", a cron schedule is "Daily at 06:30" (Helsinki), no schedule is "Not scheduled by clavesa", chart tops say "max 1 run a day", "Module: v2.27.1" is "Built with clavesa v2.27.1" in read-only mode, and the phone run page is titled "Run 16.11 02:40, 31.6s" with the run ID small below.
+- **Hosted UI tap targets.** Back links, breadcrumbs, sign-out, the 7d/30d/90d range, "All pipelines", the pipeline name and its arrow, and the Chart/Table toggle are at least 44 by 44 px on a phone.
+- **Read-only UI on desktop** (hosted, `clavesa ui --read-only`): the sidebar has no Query, Credentials or Runner entry, and links to those pages open the workspace home.
+- **Hosted UI: the Stats tab is "Site usage"**, so it is not taken for pipeline stats (it shows how the UI itself is used).
+
+### Added
+- **`make hosted-live-check`** (ADR-032 slice 9): an iPhone 16 run against the deployed hosted UI as the scripted check user (credentials from SSM at run time, tokens from the check client's admin password flow). It opens Workspaces, the Workspace, Pipeline and Run pages and `/stats`, fails on a console error, a failed API request or horizontal scroll, retries a 503 once, and saves shots to `.shots/live/`. It also asserts that the phone bottom bar is the same on all five pages (items, order, labels, links, place), that only the active item changes and shows its marker, and that pages below the top level show a back button at the top.
+
+### Changed
+- **Hosted UI on a phone: one bottom bar on every page.** Workspaces and Stats, in that order, also inside a workspace and on a run (the run page no longer covers the bar). The active item has a bar on its top edge. The Workspace, Pipeline and Run pages have a back button at the top instead of extra bottom buttons. The Pipelines page (filter, schema, compute, recent run bars) is reached through **All pipelines** beside the Pipelines heading on the workspace page.
+
 ## [v2.27.1] — 2026-11-16
 
 ### Fixed

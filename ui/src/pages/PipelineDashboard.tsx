@@ -16,7 +16,8 @@
 
 import { useReadOnly } from "@/hooks/useReadOnly";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams, useNavigate } from "react-router-dom";
+import { Link, useSearchParams, useNavigate } from "react-router-dom";
+import { homePath } from "@/lib/runtimeConfig";
 import { ArrowUp, ChevronRight, FileWarning, History, Laptop, Loader2, Play, Settings, Zap } from "lucide-react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -146,7 +147,65 @@ function formatRate(n: number): string {
   return n.toFixed(1);
 }
 
+/**
+ * Read-only (hosted, `--read-only`), the pipeline page waits for the
+ * workspace's pipeline list, so an unknown dir (a typo or an old link)
+ * gets a plain not-found page and fires none of the pipeline's own reads
+ * (graph, lineage, module version). Nobody creates a pipeline there, so
+ * the list is the truth. The editing UI opens the dir as before: README
+ * step 2 creates a pipeline and goes straight to it, before the list
+ * shows it.
+ */
 export function PipelineDashboard() {
+  const readOnly = useReadOnly();
+  return readOnly ? <ReadOnlyPipelineGate /> : <PipelineDashboardBody />;
+}
+
+function ReadOnlyPipelineGate() {
+  const [searchParams] = useSearchParams();
+  const dir = searchParams.get("dir") ?? "";
+  const pipelines = usePipelines();
+  // The list may be cached from before this pipeline existed (just
+  // created, README step 2): read it once more before saying "not found".
+  const mountedAt = useRef(Date.now());
+  const known = !!pipelines.data?.some((p) => p.dir === dir);
+  const stale =
+    !!dir && !!pipelines.data && !known &&
+    pipelines.dataUpdatedAt < mountedAt.current && pipelines.errorUpdatedAt < mountedAt.current;
+  const { refetch } = pipelines;
+  useEffect(() => {
+    if (stale) void refetch();
+  }, [stale, refetch]);
+  if (dir && ((!pipelines.data && !pipelines.error) || stale)) {
+    return (
+      <div className="mx-auto w-full max-w-6xl px-4 py-4 md:px-6 md:py-8" data-testid="pipeline-loading">
+        <div className="h-6 w-40 animate-pulse rounded bg-muted" />
+        <div className="mt-3 h-4 w-64 animate-pulse rounded bg-muted" />
+      </div>
+    );
+  }
+  if (dir && pipelines.data && !known) {
+    return (
+      <div className="mx-auto w-full max-w-6xl px-4 py-8 md:px-6" data-testid="pipeline-not-found">
+        <h1 className="text-xl font-semibold tracking-tight">No pipeline with this name</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          This workspace has no pipeline called{" "}
+          <span className="font-mono text-foreground">{dir.split("/").pop() || dir}</span>. The link
+          may be old, or the pipeline was renamed or removed.
+        </p>
+        <Link
+          to={homePath}
+          className="mt-4 inline-flex min-h-11 items-center rounded-md border border-border px-4 text-sm hover:bg-muted"
+        >
+          Back to the workspace
+        </Link>
+      </div>
+    );
+  }
+  return <PipelineDashboardBody />;
+}
+
+function PipelineDashboardBody() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   // Read-only (ADR-032): hide Run, settings, upgrade, backfill, reset,
@@ -508,6 +567,15 @@ export function PipelineDashboard() {
       b.started_at.localeCompare(a.started_at),
     );
     const anyRunningNode = [...nodeStatuses.values()].includes("running");
+    if (!runs.data && !runs.error) {
+      // Still loading: a skeleton, never "Never run" for a second.
+      return {
+        state: "loading" as Health,
+        successRate: null as number | null,
+        successWindow: 0,
+        lastRun: null as Run | null,
+      };
+    }
     if (runs.error) {
       return {
         state: "unknown" as Health,
@@ -737,7 +805,8 @@ export function PipelineDashboard() {
 
       {graphErr && !hasNodes && (
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
-          {graphErr}
+          {/* Read-only (hosted): no server internals on the page. */}
+          {readOnly ? "This pipeline could not be loaded. Try again in a minute." : graphErr}
         </div>
       )}
 
@@ -1706,7 +1775,7 @@ function ModuleVersionChip({ dir }: ModuleVersionChipProps) {
         className="font-mono text-[10px]"
         title={`Module ref in pipeline .tf · CLI targets ${data.cli_version}`}
       >
-        Module: {data.current_ref}
+        {readOnly ? `Built with clavesa ${data.current_ref}` : `Module: ${data.current_ref}`}
         {!upToDate && (
           <span className="ml-1 text-muted-foreground">
             → {data.cli_version}

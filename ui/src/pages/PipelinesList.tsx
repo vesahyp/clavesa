@@ -200,7 +200,9 @@ export function PipelinesList() {
         <div className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">Pipelines</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Authoring view. Open one to edit its DAG, transforms, and config.
+            {readOnly
+              ? "Every pipeline with its schema, compute and last runs. Open one for its runs and timings."
+              : "Authoring view. Open one to edit its DAG, transforms, and config."}
           </p>
         </div>
 

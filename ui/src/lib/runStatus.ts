@@ -11,7 +11,8 @@
 export type StatusVariant = "success" | "failed" | "running" | "outline";
 
 /** Pipeline health verdict shown in the dashboard header. */
-export type Health = "healthy" | "failed" | "running" | "never-run" | "unknown";
+// "loading": the run history has not arrived yet (never shown as "Never run").
+export type Health = "healthy" | "failed" | "running" | "never-run" | "unknown" | "loading";
 
 const RUN_TERMINAL = new Set(["SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"]);
 const RUN_FAILED = new Set(["FAILED", "TIMED_OUT", "ABORTED"]);

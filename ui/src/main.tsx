@@ -2,6 +2,7 @@ import "modern-normalize";
 import "./index.css";
 import { StrictMode, Suspense, lazy, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { homePath, runtimeConfig as rc } from "@/lib/runtimeConfig";
 import {
   BrowserRouter,
   Routes,
@@ -36,6 +37,12 @@ import { atWorkspacesRoot, runtimeConfig } from "@/lib/runtimeConfig";
 
 // Dashboard pages pull recharts (~110 KB gzipped). Lazy so /, /tables/*,
 // and /pipelines/* don't pay for charts they don't render.
+// Read-only: Query, Credentials and Runner are not pages here; an old link
+// lands on the workspace home (AppSidebar hides their entries).
+function readOnlyGone(el: ReactNode): ReactNode {
+  return rc.readOnly ? <Navigate to={homePath} replace /> : el;
+}
+
 const Dashboards = lazy(() =>
   import("@/pages/Dashboards").then((m) => ({ default: m.Dashboards })),
 );
@@ -143,12 +150,12 @@ const app = (
               element={<TableDetail />}
             />
             <Route path="/sources" element={<Sources />} />
-            <Route path="/credentials" element={<Credentials />} />
+            <Route path="/credentials" element={readOnlyGone(<Credentials />)} />
             <Route path="/unity-catalog" element={<UnityCatalog />} />
-            <Route path="/runner" element={<Runner />} />
+            <Route path="/runner" element={readOnlyGone(<Runner />)} />
             <Route path="/notebooks" element={<Notebooks />} />
             <Route path="/notebooks/:name" element={<Notebook />} />
-            <Route path="/query" element={<Query />} />
+            <Route path="/query" element={readOnlyGone(<Query />)} />
             <Route path="/pipelines" element={<PipelinesList />} />
             <Route path="/bundles" element={<Bundles />} />
             <Route

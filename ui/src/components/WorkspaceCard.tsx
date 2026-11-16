@@ -1,9 +1,10 @@
 /**
  * WorkspaceCard — one workspace on the Workspaces page (ADR-032 section
- * 1, page 1): status dot, name, account and region, last run, a 14-day
- * runs strip, freshness, a 30-day cost sparkline with the total, and
- * when the summary was made. Cost per billion records is on the Pipeline
- * page, where it is a chart per run.
+ * 1, page 1), compact so ten fit in about two phone screens (review of
+ * 2026-11-16): status dot, name and status, the reasons when it is not
+ * healthy, last run, runs and (cloud) cost, and a 14-day run strip. The
+ * whole card is the link. Charts, cost per day and freshness are on the
+ * Workspace page.
  *
  * The page owns the summary query (it sorts the cards by it); the card
  * draws a skeleton while that query loads and an error card when the
@@ -11,28 +12,22 @@
  * the page.
  */
 
-import type { ReactNode } from "react";
+import { ChevronRight } from "lucide-react";
 
-import { formatDuration, formatRelative } from "@/lib/format";
 import type { WorkspaceEntry, WorkspaceSummary } from "@/lib/queries";
 import {
   STATUS_DOT,
   STATUS_LABEL,
   cardStatus,
+  formatAge,
+  REASON_TONE,
   formatUsd,
   freshnessText,
   historyUnread,
   shortDay,
 } from "@/lib/summary";
 import { cn } from "@/lib/utils";
-import {
-  FAILED_COLOR,
-  Sparkline,
-  StackedBars,
-  SUCCEEDED_COLOR,
-} from "./MiniCharts";
-
-const COST_COLOR = "#3987e5";
+import { FAILED_COLOR, SUCCEEDED_COLOR } from "./MiniCharts";
 
 export interface WorkspaceCardProps {
   entry: WorkspaceEntry;
@@ -80,123 +75,121 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
   const { status, reasons, overdue } = cardStatus(s, Date.now(), entry);
   const last = s.last_run;
   const strip = s.runs_per_day_14d;
-  const cost = s.cost_per_day_30d;
   const fresh = freshnessText(s);
   const unread = historyUnread(s);
+  const runs14 = strip.reduce((a, d) => a + d.succeeded + d.failed, 0);
+  // Freshness only when it says something: stale tables or unknown.
+  const lines = [...reasons];
+  if (fresh.tone === "bad") lines.push(`Freshness: ${fresh.text}${fresh.detail ? `, ${fresh.detail}` : ""}`);
   return (
-    <section data-testid="workspace-card" data-slug={entry.slug} data-state="ready" className={shell}>
-      <CardTitle entry={entry} status={status} summary={s} />
-      {reasons.length > 0 && (
-        <ul data-testid="workspace-card-reasons" className="mt-1 space-y-0.5 text-xs text-muted-foreground">
-          {reasons.map((r) => (
-            <li key={r} className="break-words">
+    // The whole card opens the workspace (its own page load and basename).
+    <a
+      href={href(entry)}
+      data-testid="workspace-card"
+      data-slug={entry.slug}
+      data-state="ready"
+      data-overdue={overdue ? "true" : undefined}
+      // Finished runs in the 14 and 30 Helsinki days ending today, for the
+      // live check's comparison with `clavesa workspace summary`.
+      data-runs-14d={runs14}
+      data-runs-30d={s.runs_per_day_30d.reduce((a, d) => a + d.succeeded + d.failed, 0)}
+      aria-label={`${entry.name}, ${STATUS_LABEL[status]}`}
+      className={cn(shell, "p-3 transition-colors hover:border-primary/50 active:bg-muted/40")}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <StatusDot status={status} />
+        <span data-testid="workspace-card-link" className="min-w-0 flex-1 truncate text-base font-semibold">
+          {entry.name}
+        </span>
+        <span className={cn("shrink-0 text-xs", status === "ok" ? "text-muted-foreground" : REASON_TONE[status])}>
+          {STATUS_LABEL[status]}
+        </span>
+        <ChevronRight className="-mr-1 h-4 w-4 shrink-0 text-muted-foreground" />
+      </div>
+      {lines.length > 0 && (
+        <ul data-testid="workspace-card-reasons" className={cn("mt-1 space-y-0.5 text-xs", REASON_TONE[status === "ok" ? "warn" : status])}>
+          {lines.map((r) => (
+            <li key={r} className="line-clamp-2 break-words">
               {r}
             </li>
           ))}
         </ul>
       )}
-
-      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3">
-        <Field label="Last run" testId="workspace-card-last-run">
+      <div className="mt-1.5 flex min-w-0 items-baseline justify-between gap-3 text-xs text-muted-foreground">
+        <span data-testid="workspace-card-last-run" className="min-w-0 truncate">
           {last ? (
             <>
+              Last run{" "}
               <span
                 className={cn(
                   last.result === "failed" && "text-status-failed",
-                  last.result === "succeeded" && "text-status-success",
+                  last.result === "succeeded" && "text-foreground",
                 )}
               >
                 {last.result}
               </span>{" "}
-              {formatRelative(last.started_at)}
-              <div className="truncate text-[11px] text-muted-foreground">
-                {last.pipeline} · {formatDuration(last.duration_ms)}
-              </div>
+              {formatAge((Date.now() - Date.parse(last.started_at)) / 1000)} ago
             </>
+          ) : unread ? (
+            "Run history unreadable"
           ) : (
-            <span className="text-muted-foreground">{unread ? "Unknown" : "No runs yet"}</span>
+            "No runs yet"
           )}
-        </Field>
-        <Field label="Freshness" testId="workspace-card-freshness">
-          <span
-            data-state={s.freshness_state}
-            className={cn(
-              fresh.tone === "bad" && "text-status-failed",
-              fresh.tone === "muted" && "text-muted-foreground",
-            )}
-          >
-            {fresh.text}
-          </span>
-          {fresh.detail && (
-            <div className="line-clamp-2 break-words text-[11px] text-muted-foreground">
-              {fresh.detail}
-            </div>
-          )}
-        </Field>
+        </span>
+        <span className="shrink-0 tabular-nums">
+          {runs14} run{runs14 === 1 ? "" : "s"} in 14 days
+        </span>
       </div>
-
-      <div className="mt-3">
-        <FieldLabel>Runs per day, 14 days</FieldLabel>
-        <StackedBars
-          testId="workspace-card-runs-strip"
-          ariaLabel="Runs per day over the last 14 days, succeeded and failed"
-          height={32}
-          data={strip.map((d) => ({
-            key: d.date,
-            caption: `${shortDay(d.date)}: ${d.succeeded} succeeded, ${d.failed} failed`,
-            segments: [
-              { key: "succeeded", value: d.succeeded, color: SUCCEEDED_COLOR },
-              { key: "failed", value: d.failed, color: FAILED_COLOR },
-            ],
-          }))}
-          empty={unread ? "Run history unreadable" : "No runs in 14 days"}
-          axis={{
-            top: `max ${Math.max(0, ...strip.map((d) => d.succeeded + d.failed))} runs`,
-            start: strip[0] ? shortDay(strip[0].date) : "",
-            end: "today",
-          }}
-        />
-      </div>
-
-      <div className="mt-1" data-testid="workspace-card-cost">
-        <div className="flex items-baseline justify-between gap-2">
-          <FieldLabel>Cost per day, 30 days</FieldLabel>
-          {s.kind === "local" ? (
-            <span className="text-sm tabular-nums">
-              $0{" "}
-              <span className="text-[11px] text-muted-foreground">
-                {Math.round(s.records_per_sec).toLocaleString()} records/s
-              </span>
-            </span>
-          ) : (
-            <span className="text-sm tabular-nums">{unread ? "Unknown" : formatUsd(s.cost_usd_30d)}</span>
-          )}
+      {s.kind !== "local" && !unread && (
+        <div data-testid="workspace-card-cost" className="mt-0.5 text-xs text-muted-foreground">
+          Cost {formatUsd(s.cost_usd_30d)} in 30 days
         </div>
-        <Sparkline
-          testId="workspace-card-cost-sparkline"
-          ariaLabel="Compute cost per day over the last 30 days"
-          color={COST_COLOR}
-          height={32}
-          values={cost.map((d) => d.cost_usd)}
-          captions={cost.map((d) => `${shortDay(d.date)}: ${formatUsd(d.cost_usd)}`)}
-          empty={unread ? "Run history unreadable" : "No cost in 30 days"}
-          axis={{
-            top: `max ${formatUsd(Math.max(0, ...cost.map((d) => d.cost_usd)))}`,
-            start: cost[0] ? shortDay(cost[0].date) : "",
-            end: "today",
-          }}
-        />
-      </div>
+      )}
+      <RunStrip days={strip} />
+    </a>
+  );
+}
 
-      <div
-        data-testid="workspace-card-generated-at"
-        data-overdue={overdue ? "true" : undefined}
-        className={cn("mt-1 text-[11px]", overdue ? "text-status-running" : "text-muted-foreground")}
-        title={s.generated_at}
-      >
-        Summary from {formatRelative(s.generated_at)}
-      </div>
-    </section>
+/** 14 bars, one per day, height by runs, red part for failures. Not interactive: the card is the link. */
+function RunStrip({ days }: { days: WorkspaceSummary["runs_per_day_14d"] }) {
+  const max = Math.max(1, ...days.map((d) => d.succeeded + d.failed));
+  return (
+    <div
+      data-testid="workspace-card-runs-strip"
+      role="img"
+      aria-label={`Runs per day, last 14 days: ${days.map((d) => `${shortDay(d.date)} ${d.succeeded} ok ${d.failed} failed`).join(", ")}`}
+      className="mt-1.5 flex h-4 items-end gap-[2px]"
+    >
+      {days.map((d) => {
+        const n = d.succeeded + d.failed;
+        return (
+          <div key={d.date} className="flex h-full min-w-0 flex-1 flex-col justify-end rounded-[2px] bg-muted/40">
+            {n > 0 && (
+              <div className="flex flex-col overflow-hidden rounded-[2px]" style={{ height: `${Math.max(25, (n / max) * 100)}%` }}>
+                {d.failed > 0 && <div style={{ flex: d.failed, background: FAILED_COLOR }} />}
+                {d.succeeded > 0 && <div style={{ flex: d.succeeded, background: SUCCEEDED_COLOR }} />}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function StatusDot({ status }: { status?: "ok" | "warn" | "fail" }) {
+  return (
+    <span
+      data-testid="workspace-card-status"
+      data-status={status ?? "loading"}
+      role="img"
+      aria-label={status ? STATUS_LABEL[status] : "Loading"}
+      title={status ? STATUS_LABEL[status] : "Loading"}
+      className={cn(
+        "inline-block size-2.5 shrink-0 rounded-full",
+        status ? STATUS_DOT[status] : "animate-pulse bg-muted-foreground",
+      )}
+    />
   );
 }
 
@@ -241,31 +234,6 @@ function CardTitle({
           {status && ` · ${STATUS_LABEL[status]}`}
         </div>
       </div>
-    </div>
-  );
-}
-
-function FieldLabel({ children }: { children: ReactNode }) {
-  return (
-    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
-      {children}
-    </div>
-  );
-}
-
-function Field({
-  label,
-  testId,
-  children,
-}: {
-  label: string;
-  testId: string;
-  children: ReactNode;
-}) {
-  return (
-    <div data-testid={testId} className="min-w-0">
-      <FieldLabel>{label}</FieldLabel>
-      <div className="mt-0.5 text-sm">{children}</div>
     </div>
   );
 }

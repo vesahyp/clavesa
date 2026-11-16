@@ -6,6 +6,7 @@
  * Workspaces page, and cost per day split by pipeline.
  */
 
+import { dayMonth, helsinkiDay, lastDays, stamp } from "@/lib/clock";
 import type {
   FreshnessState,
   SummaryStatus,
@@ -62,13 +63,8 @@ export function summaryOverdue(
   return (now - generated) / 1000 > iv + iv / 4;
 }
 
-/** The time a card names: "14.11 08:02" in the viewer's own zone. */
-function stampTime(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getDate()}.${d.getMonth() + 1} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
+/** The time a card names: "14.11 08:02", Helsinki time. */
+const stampTime = stamp;
 
 /**
  * cardStatus is the status a workspace card shows: the summary's status,
@@ -82,6 +78,9 @@ export function cardStatus(
   now: number = Date.now(),
   entry?: { kind?: string; summary_stale?: boolean },
 ): { status: SummaryStatus; reasons: string[]; overdue: boolean } {
+  // The verdict and its plain reasons come from clavesa itself (the
+  // failed-run rule and the wording are in internal/service/
+  // summary_health.go), so the CLI and this page say the same.
   const reasons = [...s.status_reasons];
   let status = s.status;
   const overdue = summaryOverdue(s, now, entry);
@@ -95,6 +94,21 @@ export function cardStatus(
     if (status === "ok") status = "warn";
   }
   return { status, reasons, overdue };
+}
+
+/** The text colour of reasons under a status: amber for warn, red for fail. */
+export const REASON_TONE: Record<SummaryStatus, string> = {
+  ok: "text-muted-foreground",
+  warn: "text-status-running",
+  fail: "text-status-failed",
+};
+
+/** A pipeline's status and reasons, as the summary gives them. */
+export function pipelineStatus(p: WorkspaceSummary["pipelines"][number]): {
+  status: SummaryStatus;
+  reasons: string[];
+} {
+  return { status: p.status, reasons: p.status_reasons };
 }
 
 /**
@@ -155,22 +169,62 @@ export function formatUsd(n: number): string {
   return `$${Math.round(n).toLocaleString()}`;
 }
 
-/** utcDay is the UTC calendar day of an ISO time, the summary's day key. */
-export function utcDay(iso: string): string {
-  const t = Date.parse(iso);
-  return Number.isNaN(t) ? "" : new Date(t).toISOString().slice(0, 10);
-}
-
 /** shortDay renders a "2026-11-14" day key as "14.11". */
-export function shortDay(day: string): string {
-  const [, m, d] = day.split("-");
-  return d && m ? `${Number(d)}.${Number(m)}` : day;
+export const shortDay = dayMonth;
+
+const FINISHED = new Set(["succeeded", "failed"]);
+
+/**
+ * rebaseSummary rebuilds the day series and the window counts of a
+ * summary against now, in Helsinki days. A stored summary was computed
+ * when it was written (a local workspace's at its last run's end), so its
+ * windows end on that day: read the next morning, "14 runs in 14 days"
+ * would still count a day the CLI has already dropped, and the last bar
+ * would be yesterday labelled "today". The runs the summary carries
+ * (30 days of each pipeline's) are enough to redo it.
+ */
+export function rebaseSummary<S extends WorkspaceSummary>(s: S, now: number = Date.now()): S {
+  const d30 = lastDays(30, now);
+  const d14 = d30.slice(-14);
+  const first = d30[0];
+  const runs = new Map(d30.map((d) => [d, { succeeded: 0, failed: 0 }]));
+  const cost = new Map(d30.map((d) => [d, 0]));
+  let costTotal = 0;
+  let records = 0;
+  const pipelines = s.pipelines.map((p) => {
+    const inWindow = p.runs.filter((r) => helsinkiDay(r.started_at) >= first);
+    let pCost = 0;
+    let pRecords = 0;
+    for (const r of inWindow) {
+      const day = helsinkiDay(r.started_at);
+      const slot = runs.get(day);
+      if (slot && FINISHED.has(r.result)) slot[r.result as "succeeded" | "failed"]++;
+      if (cost.has(day)) cost.set(day, (cost.get(day) ?? 0) + (r.cost_usd || 0));
+      pCost += r.cost_usd || 0;
+      pRecords += r.records || 0;
+    }
+    costTotal += pCost;
+    records += pRecords;
+    return { ...p, runs: inWindow };
+  });
+  const perDay = (days: string[]) => days.map((date) => ({ date, ...runs.get(date)! }));
+  return {
+    ...s,
+    pipelines,
+    runs_per_day_14d: perDay(d14),
+    runs_per_day_30d: perDay(d30),
+    cost_per_day_30d: d30.map((date) => ({ date, cost_usd: cost.get(date) ?? 0 })),
+    cost_usd_30d: costTotal,
+    records_30d: records,
+    cost_per_billion: records > 0 ? (costTotal / records) * 1e9 : s.cost_per_billion,
+  };
 }
 
 /**
  * costPerDayByPipeline splits the summary's 30 cost days by pipeline,
  * from the runs each pipeline carries. Keys are the summary's own day
- * keys (UTC), so the stack totals match cost_per_day_30d.
+ * keys (Helsinki days, rebaseSummary), so the stack totals match
+ * cost_per_day_30d.
  */
 export function costPerDayByPipeline(
   s: WorkspaceSummary,
@@ -182,7 +236,7 @@ export function costPerDayByPipeline(
   const idx = new Map(days.map((d, i) => [d.date, i]));
   for (const p of s.pipelines) {
     for (const r of p.runs) {
-      const i = idx.get(utcDay(r.started_at));
+      const i = idx.get(helsinkiDay(r.started_at));
       if (i === undefined || r.cost_usd <= 0) continue;
       const bp = days[i].byPipeline;
       bp[p.name] = (bp[p.name] ?? 0) + r.cost_usd;

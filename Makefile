@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda hosted-tracking-check errors
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda hosted-tracking-check hosted-live-check errors
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -75,7 +75,7 @@ build: build-ui sync-modules sync-runner ## Build everything → bin/clavesa (UI
 # then launches the gates with SKIP_BUILD=1 so three concurrent sub-makes
 # don't race each other rewriting bin/clavesa. NEVER set it manually — the
 # build dep is what keeps every gate off a stale binary.
-test: test-go test-runner-py test-cli test-runner ## Run all tests (incl. docker-gated runner suite — GH #27)
+test: test-go test-runner-py test-cli test-runner ui-new-pipeline-check ## Run all tests (incl. docker-gated runner suite — GH #27)
 	@./scripts/green-stamp.sh write test
 
 test-go: ## Go unit tests (fast, no binary)
@@ -214,6 +214,10 @@ shadow-compare: ## Shadow mode: compare the Databricks step's table with clavesa
 	  $(if $(WHERE),--where "$(WHERE)",$(if $(DAYS),--where "$(PARTITION) >= date_sub(current_date(), $(DAYS))")) \
 	  $(if $(JSON),--json)
 
+ui-new-pipeline-check: $(if $(SKIP_BUILD),,build) ## Editing UI: create a pipeline from the Pipelines page with the list already cached, its page opens the editor at once and after a reload, never "No pipeline with this name" (part of make test)
+	cd ui && npx playwright install chromium
+	node ui/scripts/new-pipeline-check.mjs
+
 ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; BASE_URL=<a running server, e.g. make hosted-local> instead of starting clavesa ui; AWS_PROFILE passes through)
 	cd ui && npx playwright install chromium
 	node ui/scripts/phone-shots.mjs
@@ -268,6 +272,10 @@ hosted/infra/.terraform:
 hosted-tracking-check: build-ui ## Hosted UI: a ?__throw=1 build sends the e=error type=boundary beacon (sanitized), no beacon carries the session, the local UI loads no tracker (LIVE_URL=https://ui.clavesa.dev checks the deployed site)
 	cd ui && npx playwright install chromium
 	node ui/scripts/hosted-tracking-check.mjs
+
+hosted-live-check: ## Hosted UI: iPhone 16 run of the five pages against the deployed site as the check user from SSM (/clavesa-ui/check-user), no console error, no failed API call, no horizontal scroll → .shots/live/ (BASE_URL, WS=smoke2, PIPELINE, RUN, PROFILE=personal; needs make hosted-init once)
+	cd ui && npx playwright install chromium
+	node ui/scripts/live-phone-check.mjs
 
 # The hosted UI's errors of the last 7 days from the data bucket's
 # stats/ui.json (written by the site-traffic traffic pipeline, node

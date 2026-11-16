@@ -5,7 +5,7 @@
   "status": "warn",
   "status_reasons": [
     "orders: 1 table(s) past their freshness target",
-    "orders: no run inside the expected interval"
+    "orders: never run, expected daily"
   ],
   "pipelines": [
     {
@@ -16,7 +16,7 @@
       "status": "warn",
       "status_reasons": [
         "1 table(s) past their freshness target",
-        "no run inside the expected interval"
+        "never run, expected daily"
       ],
       "last_run_nodes": [],
       "runs": [],

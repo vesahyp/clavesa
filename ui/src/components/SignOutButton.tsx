@@ -26,7 +26,7 @@ export function SignOutButton({
       onClick={() => void import("@/hosted/auth").then((m) => m.signOut())}
       className={cn(
         "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground",
-        compact && "justify-center px-2",
+        compact && "min-h-11 min-w-11 justify-center px-2",
         className,
       )}
     >

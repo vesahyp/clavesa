@@ -11,6 +11,8 @@
  * keeps the Catalog at "/" (lib/runtimeConfig.ts homePath).
  */
 
+import { perMillionRecords, plural, scheduleText } from "@/lib/labels";
+import { stamp } from "@/lib/clock";
 import { useMemo, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { ChevronRight } from "lucide-react";
@@ -32,6 +34,8 @@ import {
   STATUS_DOT,
   STATUS_LABEL,
   cardStatus,
+  pipelineStatus,
+  REASON_TONE,
   costPerDayByPipeline,
   formatAge,
   formatUsd,
@@ -105,7 +109,7 @@ function Body({ s }: { s: WorkspaceSummary }) {
 
   const pipelines = [...s.pipelines].sort(
     (a, b) =>
-      rank(a.status) - rank(b.status) || a.name.localeCompare(b.name),
+      rank(pipelineStatus(a).status) - rank(pipelineStatus(b).status) || a.name.localeCompare(b.name),
   );
 
   return (
@@ -127,7 +131,7 @@ function Body({ s }: { s: WorkspaceSummary }) {
             {formatRelative(s.generated_at)}
           </div>
           {reasons.length > 0 && (
-            <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+            <ul data-testid="workspace-home-reasons" className={cn("mt-1 space-y-0.5 text-xs", REASON_TONE[status])}>
               {reasons.map((r) => (
                 <li key={r} className="break-words">
                   {r}
@@ -165,7 +169,7 @@ function Body({ s }: { s: WorkspaceSummary }) {
             }))}
             empty={unread ? "Run history unreadable" : "No runs in 30 days"}
             axis={{
-              top: `max ${Math.max(0, ...runs.map((d) => d.succeeded + d.failed))} runs`,
+              top: `max ${plural(Math.max(0, ...runs.map((d) => d.succeeded + d.failed)), "run")} a day`,
               start: runs[0] ? shortDay(runs[0].date) : "",
               end: "today",
             }}
@@ -192,7 +196,7 @@ function Body({ s }: { s: WorkspaceSummary }) {
               </span>
             ) : (
               <span className="tabular-nums">
-                {formatUsd(s.cost_usd_30d)} · {formatUsd(s.cost_per_billion)}/billion
+                {formatUsd(s.cost_usd_30d)} in 30 days · {perMillionRecords(s.cost_per_billion)}
               </span>
             )
           }
@@ -223,7 +227,7 @@ function Body({ s }: { s: WorkspaceSummary }) {
             })}
             empty={unread ? "Run history unreadable" : "No cost in 30 days"}
             axis={{
-              top: `max ${formatUsd(Math.max(0, ...s.cost_per_day_30d.map((d) => d.cost_usd)))}`,
+              top: `max ${formatUsd(Math.max(0, ...s.cost_per_day_30d.map((d) => d.cost_usd)))} a day`,
               start: costDays[0] ? shortDay(costDays[0].date) : "",
               end: "today",
             }}
@@ -234,9 +238,22 @@ function Body({ s }: { s: WorkspaceSummary }) {
         </Panel>
       </div>
 
-      <h2 className="mt-2 text-sm font-medium text-muted-foreground">
-        Pipelines · {pipelines.length}
-      </h2>
+      <div className="mt-2 flex items-baseline justify-between gap-3">
+        <h2 className="text-sm font-medium text-muted-foreground">
+          Pipelines · {pipelines.length}
+        </h2>
+        {/* The Pipelines page (filter, schema and compute per pipeline,
+            recent run bars). Its bottom button is gone (one bar on every
+            page), so this is the way there on a phone. */}
+        <Link
+          to="/pipelines"
+          data-testid="workspace-home-all-pipelines"
+          className="-mr-1 flex min-h-11 items-center gap-0.5 pl-2 text-sm text-muted-foreground hover:text-foreground"
+        >
+          All pipelines
+          <ChevronRight className="h-4 w-4" />
+        </Link>
+      </div>
       {pipelines.length === 0 && (
         <p className="text-sm text-muted-foreground">No pipelines in this workspace.</p>
       )}
@@ -261,6 +278,7 @@ function PipelineCard({ p }: { p: PipelineSummary }) {
   const problemLine = p.problem
     ? `${p.problem.cause}${p.problem.action ? `. ${p.problem.action}` : ""}`
     : "";
+  const ps = pipelineStatus(p);
   return (
     <section
       data-testid="pipeline-card"
@@ -270,28 +288,28 @@ function PipelineCard({ p }: { p: PipelineSummary }) {
       <div className="flex min-w-0 items-start gap-2.5">
         <span
           data-testid="pipeline-card-status"
-          data-status={p.status}
+          data-status={ps.status}
           role="img"
-          aria-label={STATUS_LABEL[p.status]}
-          className={cn("mt-1.5 inline-block size-2.5 shrink-0 rounded-full", STATUS_DOT[p.status])}
+          aria-label={STATUS_LABEL[ps.status]}
+          className={cn("mt-1.5 inline-block size-2.5 shrink-0 rounded-full", STATUS_DOT[ps.status])}
         />
         <div className="min-w-0 flex-1">
           <Link
             to={to}
             data-testid="pipeline-card-link"
-            className="block truncate font-mono text-base font-semibold hover:underline"
+            className="flex min-h-11 items-center truncate font-mono text-base font-semibold hover:underline"
           >
             {p.name}
           </Link>
           <div className="truncate text-xs text-muted-foreground">
-            {p.schedule ? p.schedule : "no schedule"}
+            <span data-testid="pipeline-card-schedule">{scheduleText(p.schedule)}</span>
             {!p.problem && ` · ${p.runs.length} run${p.runs.length === 1 ? "" : "s"} in 30 days`}
           </div>
         </div>
         <Link
           to={to}
           aria-label={`Open ${p.name}`}
-          className="-mr-1 shrink-0 rounded p-1 text-muted-foreground hover:text-foreground"
+          className="-mr-2 -mt-2 flex size-11 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-foreground"
         >
           <ChevronRight className="h-5 w-5" />
         </Link>
@@ -306,9 +324,9 @@ function PipelineCard({ p }: { p: PipelineSummary }) {
           {problemLine}
         </p>
       )}
-      {p.status_reasons.some((r) => r !== problemLine) && (
-        <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
-          {p.status_reasons.filter((r) => r !== problemLine).map((r) => (
+      {ps.reasons.some((r) => r !== problemLine) && (
+        <ul data-testid="pipeline-card-reasons" className={cn("mt-1 space-y-0.5 text-xs", REASON_TONE[ps.status])}>
+          {ps.reasons.filter((r) => r !== problemLine).map((r) => (
             <li key={r} className="break-words">
               {r}
             </li>
@@ -351,7 +369,7 @@ function PipelineCard({ p }: { p: PipelineSummary }) {
             values={runs.map((r) => r.duration_ms / 1000)}
             captions={runs.map(
               (r) =>
-                `${shortDay(r.started_at.slice(0, 10))} ${r.started_at.slice(11, 16)}: ${formatDuration(r.duration_ms)}, ${r.result}`,
+                `${stamp(r.started_at)}: ${formatDuration(r.duration_ms)}, ${r.result}`,
             )}
             axis={{
               top: `duration per run · max ${formatDuration(Math.max(...runs.map((r) => r.duration_ms)))}`,

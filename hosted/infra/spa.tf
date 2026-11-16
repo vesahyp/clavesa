@@ -163,6 +163,30 @@ resource "aws_cloudfront_function" "spa_routes" {
   EOT
 }
 
+# tracker.js sends its beacons with navigator.sendBeacon, which is a POST
+# to /t.gif. The S3 behaviour allows only GET and HEAD, so CloudFront
+# answered every beacon 403 (a console error on every page). This
+# function answers any non-GET beacon with 204 at the edge: the request
+# and its query string still land in the access log, which is all the
+# traffic pipeline reads, and nothing reaches the bucket. The Image
+# fallback (GET) still gets the no-store pixel from S3.
+resource "aws_cloudfront_function" "beacon" {
+  name    = "${var.pool_name}-beacon"
+  runtime = "cloudfront-js-2.0"
+  comment = "tracker beacons: non-GET /t.gif -> 204 at the edge"
+  publish = true
+  code    = <<-EOT
+    function handler(event) {
+      var m = event.request.method;
+      if (m !== "GET" && m !== "HEAD") {
+        return { statusCode: 204, statusDescription: "No Content",
+                 headers: { "cache-control": { value: "no-store" } } };
+      }
+      return event.request;
+    }
+  EOT
+}
+
 # No caching (every TTL 0 but the 1 s maximum that lets the
 # Authorization header be part of the key, which is what forwards it).
 resource "aws_cloudfront_cache_policy" "api" {
@@ -240,6 +264,24 @@ resource "aws_cloudfront_distribution" "ui" {
       cache_policy_id            = aws_cloudfront_cache_policy.api.id
       origin_request_policy_id   = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # Managed-AllViewerExceptHostHeader
       response_headers_policy_id = aws_cloudfront_response_headers_policy.ui.id
+    }
+  }
+
+  # Tracker beacons: every method allowed so sendBeacon's POST reaches the
+  # beacon function (above) instead of a CloudFront 403. Never cached.
+  ordered_cache_behavior {
+    path_pattern               = "/t.gif"
+    target_origin_id           = local.spa_origin_id
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods             = ["GET", "HEAD"]
+    compress                   = false
+    cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # Managed-CachingDisabled
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.ui.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.beacon.arn
     }
   }
 

@@ -80,6 +80,12 @@ const NAV: NavItem[] = [
   { to: "/runner", label: "Runner", icon: Boxes, match: (p) => p.startsWith("/runner") },
 ];
 
+// Read-only (the hosted UI, `clavesa ui --read-only`): no entry for pages
+// whose point is to run or change something. The server refuses every
+// method but GET and HEAD anyway (ReadOnlyGuard); the pages are not shown.
+const READ_ONLY_HIDDEN = new Set(["/query", "/credentials", "/runner"]);
+const navItems = runtimeConfig.readOnly ? NAV.filter((i) => !READ_ONLY_HIDDEN.has(i.to)) : NAV;
+
 export function AppSidebar() {
   const { collapsed, toggle } = useSidebar();
   const { pathname } = useLocation();
@@ -136,7 +142,7 @@ export function AppSidebar() {
             )}
           </a>
         )}
-        {NAV.map((item) => {
+        {navItems.map((item) => {
           const active = item.match(pathname);
           const Icon = item.icon;
           const link = (

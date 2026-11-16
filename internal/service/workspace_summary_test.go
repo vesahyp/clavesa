@@ -221,7 +221,7 @@ func TestWorkspaceSummaryCloud(t *testing.T) {
 		t.Errorf("kind/status = %q/%q, reasons %v", sum.Kind, sum.Status, sum.StatusReasons)
 	}
 	p := sum.Pipelines[0]
-	if got := strings.Join(p.StatusReasons, "|"); got != "1 table(s) past their freshness target|no run inside the expected interval" {
+	if got := strings.Join(p.StatusReasons, "|"); got != "1 table(s) past their freshness target|no run since 15.11 12:00, expected hourly" {
 		t.Errorf("reasons = %q", got)
 	}
 	if len(p.Freshness) != 1 || p.Freshness[0].AgeSeconds != 36000 || !p.Freshness[0].Stale {

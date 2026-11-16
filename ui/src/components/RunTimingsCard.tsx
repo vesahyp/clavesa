@@ -4,6 +4,7 @@
  * recharts stays out of the eager bundle.
  */
 
+import { stamp } from "@/lib/clock";
 import { useMemo, useState } from "react";
 import {
   Bar,
@@ -25,12 +26,6 @@ import { runSeries, SERIES, type SeriesKey } from "@/lib/runTiming";
 const MIN = 60_000;
 const CARD_BG = "var(--card)";
 
-function stamp(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getDate())}.${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
 
 interface Row {
   label: string;
@@ -140,6 +135,11 @@ export default function RunTimingsCard({ dir }: { dir: string }) {
     [q.data],
   );
 
+  const newest = useMemo(
+    () => [...(q.data?.runs ?? [])].sort((a, b) => b.started_at.localeCompare(a.started_at))[0],
+    [q.data],
+  );
+
   // Hide the "no phase data" series from the legend when no run uses it.
   const series = SERIES.filter(
     (s) => s.key !== "nodes (no phase data yet)" || rows.some((r) => Number(r[dk(s.key)]) > 0),
@@ -155,6 +155,7 @@ export default function RunTimingsCard({ dir }: { dir: string }) {
           variant="outline"
           size="sm"
           data-testid="run-timings-toggle"
+          className="min-h-11 min-w-11 md:min-h-0"
           onClick={() => setAsTable((v) => !v)}
         >
           {asTable ? "Chart" : "Table"}
@@ -201,7 +202,12 @@ export default function RunTimingsCard({ dir }: { dir: string }) {
             </table>
           </div>
         ) : (
-          <div className="h-72 w-full text-muted-foreground" data-testid="run-timings-chart" data-point-count={rows.length}>
+          <div className="h-72 w-full text-muted-foreground" data-testid="run-timings-chart"
+            data-point-count={rows.length}
+            // For make hosted-live-check: the newest run's label, which must
+            // be its start in Helsinki time.
+            data-newest-run={newest?.run_id}
+            data-newest-label={newest ? stamp(newest.started_at) : undefined}>
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={rows} margin={{ top: 14, right: 8, bottom: 0, left: 0 }} barCategoryGap="30%">
                 <CartesianGrid vertical={false} stroke="currentColor" strokeOpacity={0.12} strokeWidth={0.5} />

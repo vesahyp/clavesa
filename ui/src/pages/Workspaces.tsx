@@ -69,13 +69,32 @@ export function Workspaces() {
       .sort((a, b) => a.r - b.r || a.ws.name.localeCompare(b.ws.name));
   }, [list, stored, summaries]);
 
+  // "1 needs attention · 9 healthy": the answer before the first card.
+  const counts = useMemo(() => {
+    const c = { fail: 0, warn: 0, ok: 0, loading: 0 };
+    list.forEach((ws, i) => {
+      const d = summaryOf(i);
+      if (loadingOf(i)) c.loading++;
+      else if (errorOf(i) || !d) c.fail++;
+      else c[cardStatus(d, Date.now(), ws).status]++;
+    });
+    return c;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list, stored, summaries]);
+  const summaryLine = [
+    counts.fail && `${counts.fail} failing`,
+    counts.warn && `${counts.warn} need${counts.warn === 1 ? "s" : ""} attention`,
+    counts.ok && `${counts.ok} healthy`,
+    counts.loading && `${counts.loading} loading`,
+  ].filter(Boolean);
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       <RootHeader title="Workspaces" />
       <main
         data-testid="workspaces-page"
         className={
-          "mx-auto grid max-w-5xl grid-cols-1 gap-4 px-4 py-4 md:grid-cols-2 md:px-6 md:py-6 " +
+          "mx-auto grid max-w-5xl grid-cols-1 gap-2 px-4 py-3 md:grid-cols-2 md:gap-3 md:px-6 md:py-6 " +
           // Room for RootNav below md (hosted), else for the home indicator.
           (hasStats
             ? "pb-[calc(4.75rem+env(safe-area-inset-bottom))] md:pb-6"
@@ -94,6 +113,32 @@ export function Workspaces() {
           <div data-testid="workspaces-empty" className="text-sm text-muted-foreground">
             No workspaces yet.
           </div>
+        )}
+        {list.length > 0 && (
+          <p
+            data-testid="workspaces-summary"
+            data-fail={counts.fail}
+            data-warn={counts.warn}
+            data-ok={counts.ok}
+            className="text-sm md:col-span-2"
+          >
+            {summaryLine.map((t, k) => (
+              <span key={String(t)}>
+                {k > 0 && <span className="text-muted-foreground"> · </span>}
+                <span
+                  className={
+                    String(t).includes("failing")
+                      ? "font-medium text-status-failed"
+                      : String(t).includes("attention")
+                        ? "font-medium text-status-running"
+                        : "text-muted-foreground"
+                  }
+                >
+                  {t}
+                </span>
+              </span>
+            ))}
+          </p>
         )}
         {ordered.map(({ ws, i }) => (
           <WorkspaceCard

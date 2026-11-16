@@ -21,6 +21,7 @@ import { HostedSettings } from "./HostedSettings";
 import { TerraformBackendControl } from "./TerraformBackendControl";
 import { WarehouseToggle } from "./WarehouseToggle";
 import { PageChromeProvider, usePageChrome } from "./PageChrome";
+import { PhoneBack } from "./PhoneBack";
 import { PhoneNav } from "./PhoneNav";
 import { RuntimeStatus } from "./RuntimeStatus";
 
@@ -34,6 +35,7 @@ function ShellFrame() {
       <AppSidebar />
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border bg-background px-4 md:px-6">
+          <PhoneBack />
           <Breadcrumbs items={breadcrumbs} />
           <div className="ml-auto flex shrink-0 items-center gap-3">
             {/* Phone (below md): the workspace chips do not fit; the

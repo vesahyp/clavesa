@@ -66,8 +66,10 @@ type WorkspaceSummary struct {
 	Account     string `json:"account,omitempty"`
 	Region      string `json:"region,omitempty"`
 	GeneratedAt string `json:"generated_at"`
-	// Status is the worst of: last run failed (fail), a table past its
-	// freshness_sla (warn), no run inside the expected interval (warn).
+	// Status is the worst of: last run failed (fail), a failed run in the
+	// last 14 days (warn), a table past its freshness_sla (warn), no run
+	// inside the expected interval (warn). Reasons are plain words with
+	// Helsinki times (summary_health.go).
 	Status        string   `json:"status"`
 	StatusReasons []string `json:"status_reasons"`
 	// LastRun is the newest run across every pipeline.
@@ -406,6 +408,12 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		status = SummaryFail
 		ps.StatusReasons = append(ps.StatusReasons, "last run failed")
 	}
+	// A failed run in the strip window is never "ok" (review of the hosted
+	// UI, 2026-11-16), even when the newest run succeeded.
+	if r := recentFailures(ps.Runs, now, lastFinished != nil && lastFinished.Result == "failed"); r != "" {
+		status = worseStatus(status, SummaryWarn)
+		ps.StatusReasons = append(ps.StatusReasons, r)
+	}
 	stale := 0
 	for _, f := range ps.Freshness {
 		if f.Stale {
@@ -423,7 +431,7 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		deadline := interval + interval/4
 		if ps.LastRun == nil || now.Sub(time.UnixMilli(isoMillis(ps.LastRun.StartedAt))) > deadline {
 			status = worseStatus(status, SummaryWarn)
-			ps.StatusReasons = append(ps.StatusReasons, "no run inside the expected interval")
+			ps.StatusReasons = append(ps.StatusReasons, overdueReason(ps.LastRun, ps.ExpectedIntervalSeconds))
 		}
 	}
 	if ps.Problem != nil {

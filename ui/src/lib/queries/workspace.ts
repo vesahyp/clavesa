@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { apiFetch, request } from "@/api/client";
 import { requestParsed } from "./core";
+import { rebaseSummary } from "@/lib/summary";
 
 // ---------------------------------------------------------------------------
 // Workspace warehouse (local | cloud)
@@ -768,7 +769,7 @@ const SummaryDayCost = z.object({
   cost_usd: z.number(),
 });
 
-export const WorkspaceSummary = z.object({
+const WorkspaceSummaryShape = z.object({
   name: z.string(),
   kind: z.enum(["cloud", "local"]),
   account: z.string().optional(),
@@ -792,7 +793,11 @@ export const WorkspaceSummary = z.object({
   sla_tables: z.number(),
   problems: z.array(SummaryProblem.extend({ pipelines: z.array(z.string()) })),
 });
-export type WorkspaceSummary = z.infer<typeof WorkspaceSummary>;
+// Parsed summaries are rebased on now in Helsinki days (summary.ts,
+// rebaseSummary): counts and day series then match the CLI, also for a
+// stored summary written the day before.
+export const WorkspaceSummary = WorkspaceSummaryShape.transform((s) => rebaseSummary(s));
+export type WorkspaceSummary = z.infer<typeof WorkspaceSummaryShape>;
 
 /**
  * GET /api/workspace/summary — the workspace health summary. The CLI twin

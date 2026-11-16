@@ -11,6 +11,7 @@
  * numbers as the Workspace page).
  */
 
+import { stamp } from "@/lib/clock";
 import { Suspense, lazy, useMemo } from "react";
 import { ChevronRight } from "lucide-react";
 
@@ -19,7 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { formatDuration, formatRelative } from "@/lib/format";
 import { useWorkspaceSummary, type Run } from "@/lib/queries";
 import { runIsFailed } from "@/lib/runStatus";
-import { SERIES_COLORS, formatUsd, shortDay } from "@/lib/summary";
+import { SERIES_COLORS, formatUsd } from "@/lib/summary";
 import { cn } from "@/lib/utils";
 import {
   FAILED_COLOR,
@@ -41,12 +42,6 @@ function resultColor(status: string): string {
   return RUNNING_COLOR;
 }
 
-function stamp(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getDate()}.${d.getMonth() + 1} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
 
 export function PipelinePhoneView({
   dir,
@@ -85,10 +80,10 @@ export function PipelinePhoneView({
       ? r.duration_ms > 0
         ? r.records / (r.duration_ms / 1000)
         : 0
-      : (r.cost_usd / r.records) * 1e9,
+      : (r.cost_usd / r.records) * 1e6,
   );
   const fmtCost = (v: number) =>
-    showRate ? `${Math.round(v).toLocaleString()} records/s` : `${formatUsd(v)}/billion`;
+    showRate ? `${Math.round(v).toLocaleString()} records/s` : `${formatUsd(v)} per million records`;
   const hasFailed = chartRuns.some((r) => runIsFailed(r.status));
   const hasRunning = chartRuns.some(
     (r) => !runIsFailed(r.status) && r.status !== "SUCCEEDED",
@@ -145,7 +140,7 @@ export function PipelinePhoneView({
       <Card data-testid="pipeline-phone-cost-chart">
         <CardHeader className="pb-2">
           <CardTitle className="text-sm">
-            {showRate ? "Records per second per run" : "Cost per billion records per run"}
+            {showRate ? "Records per second, per run" : "Cost per million records, per run"}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1 p-4 pt-0">
@@ -161,14 +156,14 @@ export function PipelinePhoneView({
               ariaLabel={
                 showRate
                   ? "Records per second of each run"
-                  : "Cost per billion records of each run"
+                  : "Cost per million records of each run"
               }
               color={SERIES_COLORS[0]}
               height={48}
               values={costValues}
               captions={costRuns.map(
                 (r, i) =>
-                  `${shortDay(r.started_at.slice(0, 10))} ${r.started_at.slice(11, 16)}: ${fmtCost(costValues[i])}`,
+                  `${stamp(r.started_at)}: ${fmtCost(costValues[i])}`,
               )}
               axis={{
                 top: `max ${fmtCost(Math.max(0, ...costValues))}`,

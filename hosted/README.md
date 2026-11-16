@@ -191,6 +191,22 @@ The local `clavesa ui` serves its own `index.html` and sends nothing.
   sees the local build load no tracker. `LIVE_URL=https://ui.clavesa.dev`
   runs the error check against the deployed site.
 
+## Live check
+
+`make hosted-live-check` opens the deployed site on an emulated iPhone 16
+as the scripted check user and walks five pages: Workspaces, the Workspace
+page of `WS` (default smoke2), its first pipeline, its newest run, and
+`/stats`. It reads `/clavesa-ui/check-user` from SSM at run time with the
+AWS CLI (`PROFILE`, default `personal`), takes the pool and the check
+client from `terraform output` (run `make hosted-init` once), signs in with
+`admin-initiate-auth` and puts the session in the page as `auth.ts` stores
+it. It never prints the password or a token. Per page: no console error,
+no failed `/api` or `/w/*/api` request, no horizontal scroll. A 503 from
+Lambda throttling gets one reload, said in the output. Shots go to
+`.shots/live/`. `BASE_URL`, `WS`, `PIPELINE` and `RUN` override the
+defaults; the exit status is 1 on any failure. The run sends its beacons
+with a headless user agent, so the traffic pipeline files it as a bot.
+
 ## Alarms
 
 Two CloudWatch alarms push to the phone through `jeeves-push`

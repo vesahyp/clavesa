@@ -12,6 +12,7 @@
  * Bot traffic (the scripted checks among it) is left out by the pipeline.
  */
 
+import { dayMonth } from "@/lib/clock";
 import { useMemo, useState, type ReactElement } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
@@ -137,7 +138,7 @@ export function Stats() {
   const label = `${days} days`;
   return (
     <div className="min-h-screen bg-background text-foreground">
-      <RootHeader title="Stats" />
+      <RootHeader title="Site usage" />
       <main
         data-testid="stats-page"
         className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-4 pb-[calc(4.75rem+env(safe-area-inset-bottom))] md:px-6 md:py-6 md:pb-6"
@@ -155,7 +156,7 @@ export function Stats() {
                 data-testid={`stats-window-${w}`}
                 onClick={() => setDays(w)}
                 className={cn(
-                  "rounded px-2 py-1 text-xs tabular-nums",
+                  "min-h-11 min-w-11 rounded px-2 text-xs tabular-nums",
                   w === days ? "bg-muted text-foreground" : "text-muted-foreground",
                 )}
               >
@@ -262,7 +263,8 @@ const tooltipBase = {
   itemStyle: { color: "rgb(255 255 255 / 0.9)" },
 };
 
-const shortDate = (d: string) => d.slice(5).replace("-", ".");
+// Day keys as day.month ("16.11"), the same as every other page.
+const shortDate = dayMonth;
 
 function ChartCard({
   testid,

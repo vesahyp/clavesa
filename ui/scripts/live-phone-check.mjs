@@ -1,0 +1,729 @@
+// The live phone check (ADR-032 slice 9): the deployed hosted UI, opened as
+// the scripted check user on an emulated iPhone 16.
+//
+// Run via `make hosted-live-check`. What it does:
+//   1. Reads the check user, /clavesa-ui/check-user (SecureString JSON
+//      {username, password}), from SSM with the AWS CLI at run time. The
+//      pool id and the check client id come from `terraform output` of
+//      hosted/infra. Nothing is read from the environment or the repo, and
+//      the password and the tokens are never printed.
+//   2. Gets tokens with `aws cognito-idp admin-initiate-auth`
+//      (ADMIN_USER_PASSWORD_AUTH, the check client only) and plants them
+//      the way ui/src/hosted/auth.ts keeps a session: sessionStorage
+//      `clavesa.hosted.session`, localStorage `clavesa.hosted.refresh`,
+//      before the app loads (addInitScript).
+//   3. Opens five pages: Workspaces, the Workspace page, a pipeline, one run
+//      of it (the four pages of ADR-032 section 1), and /stats. The
+//      pipeline and the run come from the API (the workspace summary), or
+//      from PIPELINE and RUN.
+//   Per page: no console error, no uncaught exception, no failed request to
+//   /api or /w/<name>/api, no horizontal scroll (scrollWidth <= innerWidth).
+//   The only failed request the pages are designed to tolerate:
+//   net::ERR_ABORTED, the browser cancelling a request when a page or a
+//   query is replaced. It is not a server answer and is not counted.
+//   The bottom bar (Vesa, 2026-11-16: "The ui bottom buttons change, which
+//   is not good ux"): every page shows the same items, in the same order,
+//   with the same labels, hrefs and boxes; only the active item differs,
+//   and it carries the visible marker (Workspaces on pages 1 to 4, Stats
+//   on page 5). Each item must be on top at its centre (not covered, so
+//   tappable). Pages 2 to 4 and 6 (the Pipelines page) show a visible back button at
+//   the top; pages 1 and 5 show none.
+//   Review fixes (2026-11-16):
+//   - times are Helsinki time: the pipeline page's newest run label in the
+//     "Where the time goes" chart equals the run's start in Helsinki;
+//   - dates are day.month: every x tick on /stats is "16.11", never "11.16";
+//   - run counts match the CLI: each workspace in CLI_COMPARE (default
+//     kivikko-traffic, ~/Repositories/kivikko/analytics/clavesa) shows the
+//     14 and 30 day run counts that `clavesa workspace summary --json` gives;
+//   - no "Never run" flash: the pipeline page never shows that text while
+//     it loads (a MutationObserver from the first byte);
+//   - an unknown pipeline URL (07-not-found) shows the plain not-found page
+//     and no server text (no "hclparser", "/tmp/", "API GET").
+//   - health: a workspace with a failed run in the last 14 Helsinki days
+//     (counted here from GET /api/workspaces, not by the app) is not
+//     "Healthy" and its card names the failed runs; every card that is not
+//     Healthy says why, in plain words (never the bare "no run inside the
+//     expected interval").
+//   - workspaces list: a summary line first whose counts equal the cards'
+//     statuses, the cards problems first, every ready card one link to
+//     /w/<name>/ (the whole card tappable), and the page no taller than
+//     2.1 phone screens.
+//   - plain labels: no page shows "/billion", "per billion", "rate(",
+//     "cron(", "no schedule", "Module:" or "1 runs"; the run page's title is
+//     "Run 16.11 02:40, 1m 22s" (start in Helsinki), not the run ID.
+//   - tap targets: every visible link and button is at least 44 x 44 px,
+//     except the bars inside a chart (a tap there only shows a value) and
+//     a link inside running text.
+//   - hosted desktop (1440 x 900): the workspace sidebar has no Query,
+//     Credentials or Runner entry, and /query, /credentials and /runner
+//     land on the workspace home with no Run button.
+//   - the second tab is "Site usage" (not "Stats"), on every page.
+//   A 503 (Lambda throttling on a cold load) on a page makes the script load
+//   that page once more and say so; a failure that persists fails the run.
+//
+// Beacons: the page sends its /t.gif beacons with the iPhone 16 user agent
+// plus a "HeadlessChrome" token, so the traffic pipeline (events_typed.py,
+// AUTOMATION_INDICATORS) files the run as a bot and the human numbers on
+// /stats stay clean. The iPhone descriptor's own agent has no such token.
+//
+// Shots: .shots/live/<page>.png (gitignored; emptied first), taken full
+// length. Exit status 1, with one line per failure, when a check fails.
+//
+// Env (all optional):
+//   BASE_URL   default https://ui.clavesa.dev
+//   WS         the workspace for pages 2 to 4 (default smoke2)
+//   PIPELINE   its pipeline dir (default: the first pipeline in the summary)
+//   RUN        the run id (default: the newest run in the summary)
+//   PROFILE    AWS profile (default personal); region is eu-north-1
+//   PARAMETER  the SSM parameter (default /clavesa-ui/check-user)
+//   WAIT_MS    per page wait for its content (default 90000)
+
+import { chromium, devices } from "playwright";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+
+const REPO = new URL("../../", import.meta.url).pathname;
+const env = (k, d) => process.env[k] || d;
+const BASE = env("BASE_URL", "https://ui.clavesa.dev").replace(/\/$/, "");
+const WS = env("WS", "smoke2");
+const PROFILE = env("PROFILE", "personal");
+const REGION = "eu-north-1";
+const PARAMETER = env("PARAMETER", "/clavesa-ui/check-user");
+const WAIT_MS = Number(env("WAIT_MS", "90000"));
+const OUT = `${REPO}.shots/live/`;
+
+const iphone = devices["iPhone 16"];
+if (!iphone) throw new Error('playwright has no "iPhone 16" device descriptor');
+
+const HEL = "Europe/Helsinki";
+const helDay = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: HEL }).format(d);
+const helHM = (d) =>
+  new Intl.DateTimeFormat("en-GB", { timeZone: HEL, hour: "2-digit", minute: "2-digit", hour12: false }).format(d);
+/** "16.11 08:00", Helsinki time: the UI's stamp(). */
+function helStamp(iso) {
+  const d = new Date(iso);
+  const [, m, day] = helDay(d).split("-");
+  return `${Number(day)}.${Number(m)} ${helHM(d)}`;
+}
+
+// CLI_COMPARE: "name=dir,name=dir". The default is kivikko when its repo
+// is on this Mac; a dir that is missing is skipped with a note.
+const CLI_COMPARE = (process.env.CLI_COMPARE ??
+  `kivikko-traffic=${homedir()}/Repositories/kivikko/analytics/clavesa`)
+  .split(",")
+  .filter(Boolean)
+  .map((kv) => kv.split("="));
+
+/** Finished runs in the CLI's 14 and 30 day windows for one workspace. */
+function cliCounts(dir) {
+  const raw = execFileSync("clavesa", ["workspace", "summary", "--json"], {
+    cwd: dir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const j = JSON.parse(raw);
+  const sum = (a) => (a ?? []).reduce((n, d) => n + d.succeeded + d.failed, 0);
+  return { d14: sum(j.runs_per_day_14d), d30: sum(j.runs_per_day_30d) };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const awsEnv = { ...process.env, AWS_PROFILE: PROFILE, AWS_REGION: REGION, AWS_DEFAULT_REGION: REGION };
+
+function run(cmd, args, opts = {}) {
+  return execFileSync(cmd, args, { encoding: "utf8", env: awsEnv, stdio: ["ignore", "pipe", "pipe"], ...opts });
+}
+
+// ---- credentials and tokens (secrets stay in this process) ----
+
+function readCheckUser() {
+  let raw;
+  try {
+    raw = run("aws", [
+      "ssm", "get-parameter", "--name", PARAMETER, "--with-decryption",
+      "--query", "Parameter.Value", "--output", "text",
+      "--profile", PROFILE, "--region", REGION,
+    ]);
+  } catch (e) {
+    throw new Error(`could not read ${PARAMETER} from SSM (profile ${PROFILE}): ${String(e.stderr ?? e.message).split("\n")[0]}`);
+  }
+  const u = JSON.parse(raw);
+  if (!u.username || !u.password) throw new Error(`${PARAMETER} has no username and password`);
+  return u;
+}
+
+function terraformOutputs() {
+  let raw;
+  try {
+    raw = run("terraform", [`-chdir=${REPO}hosted/infra`, "output", "-json"]);
+  } catch (e) {
+    throw new Error(`terraform output of hosted/infra failed (make hosted-init first?): ${String(e.stderr ?? e.message).split("\n")[0]}`);
+  }
+  const o = JSON.parse(raw);
+  const need = (k) => {
+    const v = o[k]?.value;
+    if (!v) throw new Error(`terraform output ${k} is missing`);
+    return v;
+  };
+  return { pool: need("user_pool_id"), client: need("check_client_id"), region: need("region") };
+}
+
+function signIn(user, tf) {
+  // The password goes through a 0600 file, never on a command line (ps).
+  const dir = mkdtempSync(join(tmpdir(), "clavesa-live-"));
+  const file = join(dir, "auth.json");
+  try {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        UserPoolId: tf.pool,
+        ClientId: tf.client,
+        AuthFlow: "ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters: { USERNAME: user.username, PASSWORD: user.password },
+      }),
+      { mode: 0o600 },
+    );
+    const raw = run("aws", [
+      "cognito-idp", "admin-initiate-auth", "--cli-input-json", `file://${file}`,
+      "--region", tf.region, "--profile", PROFILE,
+    ]);
+    const a = JSON.parse(raw).AuthenticationResult;
+    if (!a?.IdToken) throw new Error("Cognito returned no tokens");
+    return {
+      idToken: a.IdToken,
+      accessToken: a.AccessToken,
+      refreshToken: a.RefreshToken,
+      expiresAt: Date.now() + a.ExpiresIn * 1000,
+    };
+  } catch (e) {
+    // Never echo e.cmd or the input: the first stderr line is enough.
+    throw new Error(`admin-initiate-auth failed: ${String(e.stderr ?? e.message).split("\n")[0]}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function api(tok, path) {
+  const r = await fetch(`${BASE}${path}`, {
+    headers: { Authorization: `Bearer ${tok.idToken}` },
+    signal: AbortSignal.timeout(WAIT_MS),
+  });
+  if (!r.ok) throw new Error(`GET ${path}: HTTP ${r.status}`);
+  return r.json();
+}
+
+// ---- pages ----
+
+const ws = encodeURIComponent(WS);
+let newestRuns = [];
+let workspaceList = [];
+async function buildPages(tok) {
+  let pipeline = process.env.PIPELINE;
+  let runId = process.env.RUN;
+  if (!pipeline || !runId) {
+    const s = await api(tok, `/w/${ws}/api/workspace/summary`);
+    const pls = s.pipelines ?? [];
+    const p = pipeline ? pls.find((x) => x.dir === pipeline || x.name === pipeline) : pls[0];
+    if (!p) throw new Error(`workspace ${WS} has no pipeline${pipeline ? ` ${pipeline}` : ""}`);
+    pipeline = p.dir ?? p.name;
+    if (!runId) {
+      const runs = await api(tok, `/w/${ws}/api/data/runs?pipeline=${encodeURIComponent(pipeline)}`).catch(() => null);
+      const newest = Array.isArray(runs) ? runs[0]?.run_id : undefined;
+      runId = newest ?? p.last_run?.run_id;
+      if (!runId) throw new Error(`${WS}/${pipeline} has no run; set RUN=<id>`);
+    }
+  }
+  const wl = await api(tok, "/api/workspaces").catch(() => null);
+  workspaceList = Array.isArray(wl) ? wl : (wl?.workspaces ?? []);
+  if (!workspaceList.length) throw new Error("GET /api/workspaces gave no workspaces");
+  // The runs the "Where the time goes" chart draws, with their UTC starts.
+  const timings = await api(tok, `/w/${ws}/api/data/run-timings?dir=${encodeURIComponent(pipeline)}&limit=20`).catch(() => null);
+  newestRuns = timings?.runs ?? [];
+  const dash = `/w/${ws}/pipelines/dashboard?dir=${encodeURIComponent(pipeline)}`;
+  return [
+    {
+      name: "01-workspaces",
+      path: "/",
+      testids: ["workspaces-page", "workspace-card", "phone-nav"],
+      active: "workspaces",
+      back: false,
+      ready: () =>
+        document.querySelectorAll('[data-testid="workspace-card"]').length > 0 &&
+        document.querySelectorAll('[data-testid="workspace-card"][data-state="loading"]').length === 0,
+      describe: async (page) => {
+        const cards = await page.locator('[data-testid="workspace-card"]').evaluateAll((els) =>
+          els.map((el) => ({
+            slug: el.dataset.slug,
+            state: el.dataset.state,
+            status: el.querySelector('[data-testid="workspace-card-status"]')?.getAttribute("aria-label") ?? "",
+            line: (el.querySelector('[data-testid="workspace-card-reasons"]')?.textContent ?? "").trim().replace(/\s+/g, " "),
+          })),
+        );
+        const layout = await page.evaluate(() => {
+          const line = document.querySelector('[data-testid="workspaces-summary"]');
+          const cards = [...document.querySelectorAll('[data-testid="workspace-card"]')];
+          return {
+            line: line ? { text: line.textContent.trim(), fail: +line.dataset.fail, warn: +line.dataset.warn, ok: +line.dataset.ok, top: line.getBoundingClientRect().top } : null,
+            firstCardTop: cards[0]?.getBoundingClientRect().top ?? 0,
+            cards: cards.map((el) => ({
+              slug: el.dataset.slug,
+              tag: el.tagName,
+              href: el.getAttribute("href"),
+              h: el.getBoundingClientRect().height,
+            })),
+            height: document.scrollingElement.scrollHeight,
+            screen: innerHeight,
+          };
+        });
+        const counts = await page.locator('[data-testid="workspace-card"]').evaluateAll((els) =>
+          Object.fromEntries(
+            els.map((el) => [el.dataset.slug, { d14: el.getAttribute("data-runs-14d"), d30: el.getAttribute("data-runs-30d") }]),
+          ),
+        );
+        return { cards, counts, layout };
+      },
+      extra: async (page, info) => {
+        const out = [];
+        const L = info.layout;
+        if (!L?.line) out.push("no summary line above the cards");
+        else {
+          const st = { Failing: 0, "Needs attention": 0, Healthy: 0 };
+          for (const c of info.cards ?? []) if (c.status in st) st[c.status]++;
+          if (L.line.fail !== st.Failing || L.line.warn !== st["Needs attention"] || L.line.ok !== st.Healthy)
+            out.push(`summary line "${L.line.text}" does not match the cards (${JSON.stringify(st)})`);
+          if (L.line.top > L.firstCardTop) out.push("summary line is not above the cards");
+          console.log(`       summary line: ${L.line.text}`);
+        }
+        const rankOf = { Failing: 0, "Needs attention": 1, Healthy: 2 };
+        const ranks = (info.cards ?? []).map((c) => rankOf[c.status] ?? 3);
+        if (ranks.some((r, i) => i > 0 && r < ranks[i - 1])) out.push(`cards not problems first: ${(info.cards ?? []).map((c) => c.status).join(", ")}`);
+        for (const c of L?.cards ?? []) {
+          if (c.tag !== "A" || c.href !== `/w/${encodeURIComponent(c.slug)}/`)
+            out.push(`${c.slug}: the card is not one link to /w/${c.slug}/ (${c.tag} ${c.href})`);
+        }
+        if (L && L.height > 2.1 * L.screen)
+          out.push(`workspaces page is ${(L.height / L.screen).toFixed(2)} screens tall, want at most 2.1`);
+        else if (L) console.log(`       page height ${(L.height / L.screen).toFixed(2)} screens`);
+        const firstDay = (() => {
+          const [y, m, d] = helDay(new Date()).split("-").map(Number);
+          return new Date(Date.UTC(y, m - 1, d - 13)).toISOString().slice(0, 10);
+        })();
+        for (const ws of workspaceList) {
+          const s = ws.summary;
+          if (!s) continue;
+          const failed = (s.pipelines ?? []).flatMap((p) => p.runs ?? [])
+            .filter((r) => r.result === "failed" && helDay(new Date(r.started_at)) >= firstDay).length;
+          const card = (info.cards ?? []).find((c) => c.slug === ws.slug);
+          if (!card) continue;
+          if (failed && card.status === "Healthy")
+            out.push(`${ws.slug}: ${failed} failed run(s) in 14 days but the card says Healthy`);
+          if (failed && !/failed run/.test(card.line))
+            out.push(`${ws.slug}: the card does not name its ${failed} failed run(s)`);
+          if (card.status !== "Healthy" && !card.line)
+            out.push(`${ws.slug}: "${card.status}" with no reason on the card`);
+          if (/no run inside the expected interval/.test(card.line))
+            out.push(`${ws.slug}: reason is not in plain words: ${card.line}`);
+        }
+        for (const [name, dir] of CLI_COMPARE) {
+          if (!existsSync(dir)) {
+            console.log(`       note: ${dir} is not on this Mac, ${name} not compared with the CLI`);
+            continue;
+          }
+          const ui = info.counts?.[name];
+          if (!ui) {
+            out.push(`no card for ${name} to compare with the CLI`);
+            continue;
+          }
+          const cli = cliCounts(dir);
+          console.log(`       ${name}: UI ${ui.d14} runs in 14 d, ${ui.d30} in 30 d; CLI ${cli.d14} and ${cli.d30}`);
+          if (Number(ui.d14) !== cli.d14 || Number(ui.d30) !== cli.d30)
+            out.push(`${name} run counts differ from the CLI: UI ${ui.d14}/${ui.d30}, CLI ${cli.d14}/${cli.d30}`);
+        }
+        return out;
+      },
+    },
+    {
+      name: "02-workspace",
+      path: `/w/${ws}/`,
+      testids: ["workspace-home", "workspace-home-runs-chart", "pipeline-card", "workspace-home-all-pipelines", "phone-nav"],
+      active: "workspaces",
+      back: true,
+    },
+    {
+      name: "03-pipeline",
+      path: dash,
+      testids: ["deployment-status", "pipeline-phone-duration-bars", "run-timings-chart", "pipeline-phone-run-row", "phone-nav"],
+      neverShow: ["Never run"],
+      active: "workspaces",
+      back: true,
+      ready: () =>
+        Number(document.querySelector('[data-testid="run-timings-chart"]')?.dataset.pointCount ?? 0) > 0,
+      extra: async (page) => {
+        const out = [];
+        const el = page.locator('[data-testid="run-timings-chart"]');
+        const id = await el.getAttribute("data-newest-run");
+        const label = await el.getAttribute("data-newest-label");
+        const run = newestRuns.find((r) => r.run_id === id);
+        if (!run) out.push(`newest chart run ${id} is not in the run-timings answer`);
+        else if (label !== helStamp(run.started_at))
+          out.push(`chart time ${label} is not Helsinki time ${helStamp(run.started_at)} (started_at ${run.started_at})`);
+        else console.log(`       newest run ${label} Helsinki (started_at ${run.started_at})`);
+        return out;
+      },
+    },
+    {
+      name: "04-run",
+      path: `${dash}&run=${encodeURIComponent(runId)}`,
+      testids: ["run-detail-sheet", "run-phone-timeline-chart", "run-phone-node-row", "phone-nav"],
+      active: "workspaces",
+      back: true,
+      fit: '[data-testid="run-phone-view"]',
+      extra: async (page) => {
+        const t = (await page.locator('[data-testid="run-title"]').first().textContent())?.trim() ?? "";
+        const run = newestRuns.find((r) => r.run_id === runId);
+        const out = [];
+        if (!/^Run \d{1,2}\.\d{1,2} \d\d:\d\d/.test(t)) out.push(`run title "${t}" is not "Run <day.month> <time>"`);
+        if (t.includes(runId.slice(0, 8))) out.push(`run title shows the run ID: ${t}`);
+        if (run && !t.startsWith(`Run ${helStamp(run.started_at)}`)) out.push(`run title "${t}" is not the run's Helsinki start ${helStamp(run.started_at)}`);
+        if (!out.length) console.log(`       run title: ${t}`);
+        return out;
+      },
+    },
+    {
+      // The Pipelines page, reached by "All pipelines" on the workspace page.
+      name: "06-pipelines",
+      path: `/w/${ws}/pipelines`,
+      testids: ["pipeline-card", "phone-nav"],
+      active: "workspaces",
+      back: true,
+    },
+    {
+      name: "05-stats",
+      path: "/stats",
+      testids: ["stats-page", "phone-nav"],
+      active: "stats",
+      back: false,
+      // The page shows data, the empty note or an error; an error is a failure.
+      ready: () =>
+        !!document.querySelector('[data-testid="stats-sessions"], [data-testid="stats-empty"], [data-testid="stats-error"]'),
+      extra: async (page) => {
+        const out = (await page.locator('[data-testid="stats-error"]').count()) ? ["stats page shows its error card"] : [];
+        const ticks = await page
+          .locator(".recharts-cartesian-axis-tick-value")
+          // The x ticks are the dates; the y ticks are whole counts.
+          .evaluateAll((els) => els.map((e) => e.textContent.trim()).filter((t) => t.includes(".")));
+        const bad = ticks.filter((t) => {
+          const m = /^(\d{1,2})\.(\d{1,2})$/.exec(t);
+          return !m || Number(m[1]) > 31 || Number(m[2]) > 12;
+        });
+        if (!ticks.length) out.push("stats: no date ticks to check");
+        if (bad.length) out.push(`stats: dates not day.month: ${bad.slice(0, 5).join(", ")}`);
+        else console.log(`       stats dates day.month: ${ticks.slice(0, 3).join(", ")} …`);
+        return out;
+      },
+    },
+    {
+      name: "07-not-found",
+      path: `/w/${ws}/pipelines/dashboard?dir=no-such-pipeline`,
+      testids: ["pipeline-not-found", "phone-nav"],
+      active: "workspaces",
+      back: true,
+      // The graph read of a pipeline that does not exist answers 404.
+      allowHttp: [404],
+      extra: async (page) => {
+        const text = await page.evaluate(() => document.body.innerText);
+        return ["hclparser", "/tmp/", "API GET", "read dir"]
+          .filter((t) => text.includes(t))
+          .map((t) => `not-found page shows server text "${t}"`);
+      },
+    },
+  ];
+}
+
+async function fitHeight(page, only) {
+  for (let i = 0; i < 3; i++) {
+    const extra = await page.evaluate((only) => {
+      if (only) {
+        const el = document.querySelector(only);
+        return el ? Math.max(0, Math.ceil(el.scrollHeight - el.clientHeight)) : 0;
+      }
+      let max = document.scrollingElement.scrollHeight - innerHeight;
+      for (const el of document.querySelectorAll("*")) {
+        const oy = getComputedStyle(el).overflowY;
+        if ((oy === "auto" || oy === "scroll") && el.clientHeight > 0)
+          max = Math.max(max, el.scrollHeight - el.clientHeight);
+      }
+      return Math.max(0, Math.ceil(max));
+    }, only);
+    if (extra <= 1) return;
+    const vp = page.viewportSize();
+    await page.setViewportSize({ width: vp.width, height: Math.min(vp.height + extra, 8000) });
+    await sleep(300);
+  }
+}
+
+/** The bottom bar and the back button as the page shows them. */
+async function readNav(page) {
+  return page.evaluate(() => {
+    const navs = [...document.querySelectorAll('[data-testid="phone-nav"]')];
+    const nav = navs[0];
+    const items = nav
+      ? [...nav.querySelectorAll(":scope > a")].map((a) => {
+          const r = a.getBoundingClientRect();
+          const marker = a.querySelector("span[aria-hidden]");
+          const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+          return {
+            testid: a.dataset.testid,
+            label: a.textContent.trim(),
+            href: a.getAttribute("href"),
+            box: [r.x, r.y, r.width, r.height].map(Math.round).join(","),
+            active: a.getAttribute("aria-current") === "page",
+            marker: marker ? getComputedStyle(marker).backgroundColor : "",
+            onTop: !!hit && a.contains(hit),
+          };
+        })
+      : [];
+    const back = [...document.querySelectorAll('[data-testid="phone-back"]')].some((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && r.top < innerHeight / 3;
+    });
+    return { count: navs.length, items, back };
+  });
+}
+
+/** Problems with one page's bar, against the first page's bar. */
+function navProblems(pg, nav, ref) {
+  const out = [];
+  if (nav.count !== 1) out.push(`bottom bar: ${nav.count} bars on the page, want 1`);
+  if (!nav.items.length) return [...out, "bottom bar: no items"];
+  const labels = nav.items.map((i) => i.label);
+  if (labels.join("|") !== "Workspaces|Site usage") out.push(`bottom bar labels ${labels.join(" | ")}, want Workspaces | Site usage`);
+  const actives = nav.items.filter((i) => i.active).map((i) => i.testid);
+  if (actives.length !== 1 || actives[0] !== `phone-nav-${pg.active}`)
+    out.push(`bottom bar: active ${actives.join("+") || "none"}, want phone-nav-${pg.active}`);
+  for (const i of nav.items) {
+    const shown = i.marker && i.marker !== "rgba(0, 0, 0, 0)" && i.marker !== "transparent";
+    if (i.active && !shown) out.push(`bottom bar: active ${i.testid} has no visible marker`);
+    if (!i.active && shown) out.push(`bottom bar: inactive ${i.testid} shows the marker`);
+    if (!i.onTop) out.push(`bottom bar: ${i.testid} is covered at its centre`);
+  }
+  if (ref) {
+    const shape = (n) => n.items.map((i) => `${i.testid}|${i.label}|${i.href}|${i.box}`).join(" ; ");
+    if (shape(nav) !== shape(ref)) out.push(`bottom bar differs from 01-workspaces: [${shape(nav)}] vs [${shape(ref)}]`);
+  }
+  if (nav.back !== pg.back) out.push(pg.back ? "no back button at the top" : "a back button on a top level page");
+  return out;
+}
+
+const isApi = (u) => /^\/(w\/[^/]+\/)?api\//.test(new URL(u).pathname);
+
+/** One attempt at one page. Returns {problems, beacons, throttled, info}. */
+async function visit(ctx, pg) {
+  const page = await ctx.newPage();
+  const problems = [];
+  let throttled = false;
+  let beacons = 0;
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    const url = m.location()?.url ?? "";
+    problems.push(`console error: ${m.text()} ${url}`.trim());
+  });
+  page.on("pageerror", (e) => problems.push(`uncaught exception: ${e.message}`));
+  page.on("response", (r) => {
+    const u = r.url();
+    if (new URL(u).pathname === "/t.gif") beacons++;
+    if (!isApi(u) || r.status() < 400) return;
+    if (pg.allowHttp?.includes(r.status())) return;
+    if (r.status() === 503) throttled = true;
+    problems.push(`HTTP ${r.status()} ${new URL(u).pathname}`);
+  });
+  page.on("requestfailed", (r) => {
+    const err = r.failure()?.errorText ?? "";
+    if (isApi(r.url()) && !/ERR_ABORTED/.test(err)) problems.push(`request failed (${err}) ${new URL(r.url()).pathname}`);
+  });
+
+  let info = {};
+  try {
+    await page.goto(BASE + pg.path, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+    for (const id of pg.testids) {
+      await page.locator(`[data-testid="${id}"]`).first().waitFor({ state: "visible", timeout: WAIT_MS });
+    }
+    if (pg.ready) await page.waitForFunction(pg.ready, null, { timeout: WAIT_MS });
+    await sleep(1500);
+    if (pg.describe) info = await pg.describe(page);
+    if (pg.extra) problems.push(...(await pg.extra(page, info)));
+    {
+      const text = await page.evaluate(() => document.body.innerText);
+      for (const [label, re] of [
+        ["/billion", /\/billion/],
+        ["per billion", /per billion/i],
+        ["rate(", /\brate\(/],
+        ["cron(", /\bcron\(/],
+        ["no schedule", /\bno schedule\b/i],
+        ["Module:", /Module:/],
+        ["1 runs", /(^|[^\d.])1 runs\b/],
+      ])
+        if (re.test(text)) problems.push(`shows the label "${label}"`);
+    }
+    {
+      const small = await page.evaluate(() => {
+        const chart = '[role="img"], [data-testid*="chart"], [data-testid*="strip"], [data-testid*="sparkline"], [data-testid*="bars"], .recharts-wrapper';
+        return [...document.querySelectorAll("a[href], button")]
+          .filter((el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            if (getComputedStyle(el).visibility === "hidden") return false;
+            if (el.closest(chart)) return false;
+            if (el.closest("p, li") && el.closest("p, li").textContent.trim() !== el.textContent.trim()) return false;
+            return r.width < 44 || r.height < 44;
+          })
+          .map((el) => {
+            const r = el.getBoundingClientRect();
+            const name = el.dataset.testid || el.getAttribute("aria-label") || el.textContent.trim().slice(0, 24) || el.tagName;
+            return `${name} ${Math.round(r.width)}x${Math.round(r.height)}`;
+          });
+      });
+      if (small.length) problems.push(`tap targets under 44 px: ${[...new Set(small)].join("; ")}`);
+    }
+    if (pg.neverShow) {
+      const seen = await page.evaluate(() => [...(window.__clavesaSeen ?? [])]);
+      for (const t of pg.neverShow) if (seen.includes(t)) problems.push(`showed "${t}" while loading`);
+    }
+    info.nav = await readNav(page);
+  } catch (e) {
+    problems.push(`page did not finish: ${e.message.split("\n")[0]}`);
+  }
+
+  const scroll = await page
+    .evaluate(() => {
+      const wide = [...document.querySelectorAll("main, [data-testid='run-phone-view']")]
+        .filter((el) => el.scrollWidth > el.clientWidth + 1)
+        .map((el) => `${el.tagName.toLowerCase()}${el.dataset.testid ? `[${el.dataset.testid}]` : ""} ${el.scrollWidth}>${el.clientWidth}`);
+      return { doc: document.scrollingElement.scrollWidth, inner: innerWidth, wide };
+    })
+    .catch(() => ({ doc: 0, inner: 0, wide: [] }));
+  if (scroll.doc > scroll.inner || scroll.wide.length) {
+    problems.push(`horizontal scroll (document ${scroll.doc} > ${scroll.inner}; ${scroll.wide.join(", ")})`);
+  }
+  return { page, problems, beacons, throttled, info, scroll };
+}
+
+// ---- main ----
+
+const failures = [];
+const user = readCheckUser();
+const tf = terraformOutputs();
+const tok = signIn(user, tf);
+user.password = "";
+console.log(`signed in as the check user on ${BASE} (tokens not printed)`);
+
+const pages = await buildPages(tok);
+const browser = await chromium.launch();
+rmSync(OUT, { recursive: true, force: true });
+mkdirSync(OUT, { recursive: true });
+try {
+  const ctx = await browser.newContext({
+    ...iphone,
+    userAgent: `${iphone.userAgent} HeadlessChrome`,
+    colorScheme: "dark",
+  });
+  // Texts a page must never show, even for a frame while it loads.
+  await ctx.addInitScript(() => {
+    const watch = ["Never run"];
+    window.__clavesaSeen = new Set();
+    const look = () => {
+      const t = document.body?.textContent ?? "";
+      for (const w of watch) if (t.includes(w)) window.__clavesaSeen.add(w);
+    };
+    new MutationObserver(look).observe(document, { childList: true, subtree: true, characterData: true });
+  });
+  // Exactly what auth.ts stores, before the app loads.
+  await ctx.addInitScript((t) => {
+    try {
+      sessionStorage.setItem(
+        "clavesa.hosted.session",
+        JSON.stringify({ idToken: t.idToken, accessToken: t.accessToken, expiresAt: t.expiresAt }),
+      );
+      if (t.refreshToken) localStorage.setItem("clavesa.hosted.refresh", t.refreshToken);
+    } catch {}
+  }, tok);
+
+  let refNav = null;
+  for (const pg of pages) {
+    let r = await visit(ctx, pg);
+    let retried = false;
+    if (r.problems.length && r.throttled) {
+      retried = true;
+      console.log(`retry ${pg.name}: HTTP 503 (Lambda throttling) on the first load, loading it once more`);
+      await r.page.close();
+      await sleep(3000);
+      r = await visit(ctx, pg);
+    }
+    await fitHeight(r.page, pg.fit);
+    const file = `${OUT}${pg.name}.png`;
+    await r.page.screenshot({ path: file });
+    await r.page.close();
+
+    if (r.info.nav) {
+      r.problems.push(...navProblems(pg, r.info.nav, refNav));
+      refNav ??= r.info.nav;
+    } else r.problems.push("bottom bar: not read");
+    const uniq = [...new Set(r.problems)];
+    console.log(
+      `${uniq.length ? "FAIL" : "ok  "} ${pg.name}: ${uniq.length} problem(s), scrollWidth ${r.scroll.doc}/${r.scroll.inner}, ` +
+        `${r.beacons} beacon(s)${retried ? ", after a retry" : ""} -> ${file}`,
+    );
+    if (r.info.nav)
+      console.log(
+        `       bar ${r.info.nav.items.map((i) => `${i.label}${i.active ? "*" : ""}`).join(" | ")}` +
+          `${r.info.nav.back ? ", back button at the top" : ""}`,
+      );
+    for (const c of r.info.cards ?? []) console.log(`       card ${c.slug} [${c.state}] ${c.status}${c.line ? `: ${c.line}` : ""}`);
+    if (pg.name === "01-workspaces" && !(r.info.cards ?? []).length) uniq.push("no workspace card");
+    for (const p of uniq) failures.push(`${pg.name}: ${p}`);
+  }
+  await ctx.close();
+
+  // Desktop: read-only shows no page whose point is to run or change.
+  const desk = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: "dark" });
+  await desk.addInitScript((t) => {
+    try {
+      sessionStorage.setItem(
+        "clavesa.hosted.session",
+        JSON.stringify({ idToken: t.idToken, accessToken: t.accessToken, expiresAt: t.expiresAt }),
+      );
+      if (t.refreshToken) localStorage.setItem("clavesa.hosted.refresh", t.refreshToken);
+    } catch {}
+  }, tok);
+  {
+    const page = await desk.newPage();
+    const out = [];
+    await page.goto(`${BASE}/w/${ws}/`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+    await page.locator('[data-testid="workspace-home"]').first().waitFor({ state: "visible", timeout: WAIT_MS });
+    const entries = await page.locator("aside a[href]").evaluateAll((els) => els.map((a) => a.getAttribute("href")));
+    for (const bad of ["query", "credentials", "runner"])
+      if (entries.some((h) => h.replace(/\/$/, "").endsWith(`/${bad}`))) out.push(`desktop sidebar has ${bad}`);
+    for (const bad of ["query", "credentials", "runner"]) {
+      await page.goto(`${BASE}/w/${ws}/${bad}`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+      await page.locator('[data-testid="workspace-home"]').first().waitFor({ state: "visible", timeout: WAIT_MS }).catch(() => {});
+      const path = new URL(page.url()).pathname;
+      if (path.replace(/\/$/, "") !== `/w/${ws}`) out.push(`desktop /${bad} stays at ${path}, want the workspace home`);
+      if (await page.getByRole("button", { name: /^Run\b/ }).count()) out.push(`desktop /${bad} shows a Run button`);
+    }
+    await page.screenshot({ path: `${OUT}08-desktop-workspace.png` });
+    console.log(`${out.length ? "FAIL" : "ok  "} 08-desktop: sidebar ${entries.length} entries, no Query/Credentials/Runner${out.length ? "?" : ""}`);
+    for (const p of out) failures.push(`08-desktop: ${p}`);
+    await page.close();
+  }
+  await desk.close();
+} finally {
+  await browser.close();
+}
+
+if (failures.length) {
+  console.error(`\n${failures.length} failure(s):`);
+  for (const f of failures) console.error(`  ${f}`);
+  process.exit(1);
+}
+console.log(`\nAll pages pass. Shots in ${OUT}`);

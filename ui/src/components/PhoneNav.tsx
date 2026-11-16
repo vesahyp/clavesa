@@ -1,15 +1,16 @@
 /**
  * PhoneNav — the bottom navigation below the md breakpoint (ADR-032
- * section 3), where the sidebar is hidden: all workspaces, this
- * workspace's home and its pipelines, and in the hosted UI the Stats page
- * of the UI itself. The local UI has no Workspaces page, so its first item
+ * section 3), where the sidebar is hidden. Hosted, it is the same bar as
+ * on the root pages (SiteNav in RootNav.tsx). Local: all workspaces, this
+ * workspace's home and its pipelines. The local UI has no Workspaces page, so its first item
  * is the Catalog. Padded for the home indicator (safe-area-inset-bottom).
  */
 
 import { NavLink, useLocation } from "react-router-dom";
-import { Activity, ChartColumn, Database, LayoutGrid, Workflow } from "lucide-react";
+import { Activity, Database, LayoutGrid, Workflow } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
+import { SiteNav } from "@/components/RootNav";
 import { homePath, runtimeConfig } from "@/lib/runtimeConfig";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +28,9 @@ function Inner({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
 
 export function PhoneNav() {
   const { pathname } = useLocation();
+  // Hosted: the one bar of every page (RootNav.tsx); inside a workspace
+  // its active item is Workspaces. Deeper pages get PhoneBack at the top.
+  if (runtimeConfig.mode === "hosted") return <SiteNav active="workspaces" inWorkspace />;
   const multi = runtimeConfig.mode !== "local";
   const homeActive = pathname === homePath || pathname === "/overview";
   const pipelinesActive =
@@ -67,12 +71,6 @@ export function PhoneNav() {
       >
         <Inner icon={Workflow} label="Pipelines" />
       </NavLink>
-      {runtimeConfig.mode === "hosted" && (
-        // "/stats" is outside this workspace's basename: a full page load.
-        <a href="/stats" data-testid="phone-nav-stats" className={cn(item, tone(false))}>
-          <Inner icon={ChartColumn} label="Stats" />
-        </a>
-      )}
     </nav>
   );
 }
