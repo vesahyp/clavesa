@@ -53,6 +53,7 @@ func TestWorkspaceHosted(t *testing.T) {
 	fail("required flag(s) \"url\" not set", "workspace", "hosted", "enable")
 	fail("HTTP 404", "workspace", "hosted", "enable", "--url", missing.URL)
 	fail("is not an IAM principal ARN", "workspace", "hosted", "enable", "--url", srv.URL, "--reader-principal", "vesa")
+	fail("kind must be", "workspace", "hosted", "enable", "--url", srv.URL, "--kind", "hybrid")
 	fail("must be an https URL", "workspace", "hosted", "enable", "--url", "http://ui.clavesa.dev", "--reader-principal", "arn:aws:iam::111122223333:role/x")
 	if _, err := os.Stat(tfPath); !os.IsNotExist(err) {
 		t.Fatalf("a refused enable wrote hosted.tf: %v", err)
@@ -150,6 +151,21 @@ func TestWorkspaceHostedLocal(t *testing.T) {
 	cmd := exec.Command(binPath, "workspace", "hosted", "enable", "--url", srv.URL, "--reader-principal", "arn:aws:iam::111122223333:role/a", "--workspace", ws)
 	if b, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(b), "local-warehouse workspace") {
 		t.Errorf("--reader-principal on a local workspace: %v\n%s", err, b)
+	}
+	// --kind overrides the warehouse setting, and is recorded.
+	out = run(t, "workspace", "hosted", "enable", "--url", srv.URL, "--kind", "cloud", "--workspace", ws)
+	if !strings.Contains(out, "Reader role:") {
+		t.Errorf("--kind cloud on a local-warehouse workspace:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "hosted.tf")); err != nil {
+		t.Errorf("--kind cloud wrote no hosted.tf: %v", err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(ws, "clavesa.json")); !strings.Contains(string(data), `"kind": "cloud"`) {
+		t.Errorf("clavesa.json does not record the kind:\n%s", data)
+	}
+	run(t, "workspace", "hosted", "enable", "--url", srv.URL, "--kind", "local", "--workspace", ws)
+	if _, err := os.Stat(filepath.Join(ws, "hosted.tf")); !os.IsNotExist(err) {
+		t.Errorf("--kind local left hosted.tf: %v", err)
 	}
 
 	// A run with no AWS credentials at all: the publish fails at once.

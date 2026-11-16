@@ -63,6 +63,10 @@ func hostedWorkspace(t *testing.T) string {
 	write("taxi/.terraform/modules/modules.json", "{}")
 	write("taxi/_clavesa_sidecar/poller.py", "print()")
 	write("taxi/notes.md", "notes")
+	// No stack is deployed: every state read answers "not found" and
+	// none reaches S3.
+	restore := workspace.SetStateGetterForTest(func(context.Context, string, string, string) ([]byte, error) { return nil, nil })
+	t.Cleanup(restore)
 	return ws
 }
 
@@ -315,6 +319,13 @@ func TestEnableHostedOlderPinnedWorkspace(t *testing.T) {
 // hosted.tf, and no tree copy on deploy.
 func TestEnableHostedLocal(t *testing.T) {
 	ws := hostedWorkspace(t)
+	// No remote backend and no deployed stack: the warehouse setting
+	// picks the kind.
+	m0, _ := workspace.Load(ws)
+	m0.Backend = nil
+	if err := workspace.SaveManifest(ws, m0); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(ws, ".clavesa", "environment.json"), []byte(`{"warehouse":"local","mode":"local"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -342,10 +353,162 @@ func TestEnableHostedLocal(t *testing.T) {
 		t.Errorf("a local workspace must get no hosted.tf: %v", err)
 	}
 	m, err := workspace.Load(ws)
-	if err != nil || !m.Hosted.IsLocal() {
+	if err != nil || !m.Hosted.IsLocal() || m.Hosted.Kind != workspace.HostedKindLocal {
 		t.Fatalf("manifest = %+v, %v", m, err)
 	}
 	if res, err := svc.UploadHostedTree(context.Background()); err != nil || res != nil {
 		t.Errorf("tree copy of a local workspace = %+v, %v; want nothing", res, err)
+	}
+}
+
+const hostedTestPublisher = "arn:aws:iam::111122223333:role/clavesa-ui-publisher"
+
+// stubFullWellKnown answers with a document that serves both kinds.
+func stubFullWellKnown(t *testing.T) {
+	stubWellKnown(t, HostedWellKnown{ReaderPrincipal: hostedTestPrincipal, EventBusARN: hostedTestBus,
+		PublisherRoleARN: hostedTestPublisher, DataBucket: "clavesa-ui-data-111122223333", Region: "eu-north-1"}, nil)
+}
+
+// TestHostedKindDefault: without --kind, a workspace shared as a cloud
+// workspace (remote backend, or a deployed stack) is hosted as cloud
+// even when this developer's warehouse setting is local (a fresh clone:
+// .clavesa/environment.json is gitignored and defaults to local). Only a
+// workspace with neither follows the warehouse setting. The kind is
+// recorded in the block.
+func TestHostedKindDefault(t *testing.T) {
+	localEnv := func(t *testing.T, ws string) {
+		t.Helper()
+		if err := os.Remove(filepath.Join(ws, ".clavesa", "environment.json")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	noBackend := func(t *testing.T, ws string) {
+		t.Helper()
+		m, _ := workspace.Load(ws)
+		m.Backend = nil
+		if err := workspace.SaveManifest(ws, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]struct {
+		setup func(t *testing.T, ws string)
+		kind  string // explicit kind passed in
+		want  string
+	}{
+		"remote backend, local warehouse": {func(t *testing.T, ws string) { localEnv(t, ws) }, "", "cloud"},
+		"deployed stack in local state, local warehouse": {func(t *testing.T, ws string) {
+			localEnv(t, ws)
+			noBackend(t, ws)
+			if err := os.WriteFile(filepath.Join(ws, "terraform.tfstate"), []byte(`{"outputs":{"pipeline_bucket":{"value":"smoke2-clavesa"}}}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, "", "cloud"},
+		"deployed.json, local warehouse": {func(t *testing.T, ws string) {
+			localEnv(t, ws)
+			noBackend(t, ws)
+			if err := os.WriteFile(filepath.Join(ws, workspace.DeployedFile), []byte(`{"version":1,"workspace":{"outputs":{"pipeline_bucket":"smoke2-clavesa"}},"pipelines":{}}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, "", "cloud"},
+		"not deployed, local warehouse": {func(t *testing.T, ws string) { localEnv(t, ws); noBackend(t, ws) }, "", "local"},
+		"not deployed, cloud warehouse": {func(t *testing.T, ws string) { noBackend(t, ws) }, "", "cloud"},
+		"--kind local on a backend workspace": {func(t *testing.T, ws string) {}, "local", "local"},
+		"--kind cloud, not deployed, local warehouse": {func(t *testing.T, ws string) { localEnv(t, ws); noBackend(t, ws) }, "cloud", "cloud"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ws := hostedWorkspace(t)
+			c.setup(t, ws)
+			stubFullWellKnown(t)
+			st, err := New(ws).EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev", Kind: c.kind})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, _ := workspace.Load(ws)
+			if st.Kind != c.want || m.Hosted.Kind != c.want {
+				t.Errorf("kind = %q, recorded %q; want %q", st.Kind, m.Hosted.Kind, c.want)
+			}
+			_, err = os.Stat(filepath.Join(ws, workspace.HostedTFFile))
+			if hasTF := err == nil; hasTF != (c.want == "cloud") {
+				t.Errorf("hosted.tf present = %v for kind %s", hasTF, c.want)
+			}
+		})
+	}
+	ws := hostedWorkspace(t)
+	stubFullWellKnown(t)
+	if _, err := New(ws).EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev", Kind: "hybrid"}); err == nil || !strings.Contains(err.Error(), "kind") {
+		t.Errorf("unknown kind: err = %v", err)
+	}
+}
+
+// TestHostedRecordedKindSticks: once recorded, the kind does not follow a
+// later change of the developer's warehouse setting.
+func TestHostedRecordedKindSticks(t *testing.T) {
+	ws := hostedWorkspace(t)
+	stubFullWellKnown(t)
+	if _, err := New(ws).EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev", Kind: "cloud"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.WriteWarehouse(ws, workspace.WarehouseLocal); err != nil {
+		t.Fatal(err)
+	}
+	st, err := New(ws).GetHosted()
+	if err != nil || st.Kind != "cloud" {
+		t.Errorf("kind after the warehouse change = %q, %v", st.Kind, err)
+	}
+}
+
+// TestHostedTFLakeFormationDatabases: hosted.tf grants the reader on the
+// system database and on the database of every deployed pipeline, read
+// from the pipeline state; a pipeline with no state is left out until it
+// is deployed, and ResyncHostedTF reports the change.
+func TestHostedTFLakeFormationDatabases(t *testing.T) {
+	ws := hostedWorkspace(t)
+	for _, p := range []string{"orders", "events"} {
+		if err := os.MkdirAll(filepath.Join(ws, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(ws, p, "main.tf"), []byte(summaryPipelineTF), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deployed := map[string]bool{"taxi": true, "events": true}
+	restore := workspace.SetStateGetterForTest(func(_ context.Context, _, _, key string) ([]byte, error) {
+		for p := range deployed {
+			if strings.HasSuffix(key, "/pipelines/"+p+".tfstate") {
+				return []byte(`{"resources":[{"mode":"managed","type":"aws_glue_catalog_database","name":"pipeline","instances":[{"attributes":{"name":"clavesa_smoke2__` + p + `"}}]}]}`), nil
+			}
+		}
+		return nil, nil
+	})
+	defer restore()
+	svc := New(ws)
+	stubFullWellKnown(t)
+	if _, err := svc.EnableHosted(context.Background(), HostedInput{URL: "https://ui.clavesa.dev", Kind: "cloud"}); err != nil {
+		t.Fatal(err)
+	}
+	tf, _ := os.ReadFile(filepath.Join(ws, workspace.HostedTFFile))
+	want := `lf_databases           = concat([module.workspace.system_pipelines_db], ["clavesa_smoke2__events", "clavesa_smoke2__taxi"])`
+	if !strings.Contains(string(tf), want) {
+		t.Errorf("hosted.tf: want %s in\n%s", want, tf)
+	}
+	if changed, err := svc.ResyncHostedTF(); err != nil || changed {
+		t.Errorf("resync with nothing new = %v, %v", changed, err)
+	}
+	deployed["orders"] = true
+	if changed, err := svc.ResyncHostedTF(); err != nil || !changed {
+		t.Errorf("resync after orders deployed = %v, %v", changed, err)
+	}
+	tf, _ = os.ReadFile(filepath.Join(ws, workspace.HostedTFFile))
+	if !strings.Contains(string(tf), `"clavesa_smoke2__events", "clavesa_smoke2__orders", "clavesa_smoke2__taxi"]`) {
+		t.Errorf("hosted.tf after orders deployed:\n%s", tf)
+	}
+	// A state read that fails stops the sync: no grant is dropped silently.
+	restoreErr := workspace.SetStateGetterForTest(func(context.Context, string, string, string) ([]byte, error) {
+		return nil, errors.New("access denied")
+	})
+	defer restoreErr()
+	if _, err := svc.ResyncHostedTF(); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("failing state read: err = %v", err)
 	}
 }

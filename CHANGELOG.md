@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.1] — 2026-11-16
+
+### Fixed
+- **`clavesa workspace hosted enable` recorded a local block for a deployed cloud workspace** when the developer's own warehouse setting was local, as it is in a fresh clone (`.clavesa/environment.json` is gitignored and defaults to local). The block now records `"kind": "cloud"` or `"kind": "local"`, and the kind no longer follows a developer's settings. `--kind cloud|local` (also `kind` in `PUT /api/workspace/hosted` and the Kind field of the Hosted UI dialog) sets it. Without it: cloud when `clavesa.json` names a remote Terraform backend or the workspace stack is deployed (`pipeline_bucket` readable from its state or `deployed.json`), else the warehouse setting. A block written before this keeps the old rule.
+- **The hosted reader could not query on a Lake Formation account** ("Insufficient Lake Formation permission(s)"). The `hosted-reader` module now gives the reader role `lakeformation:GetDataAccess` and, for each database in its new `lf_databases` list, LF `DESCRIBE` on the database and `SELECT` + `DESCRIBE` on its tables. `hosted.tf` fills the list with the system database `<system_catalog>__pipelines` and the database of every deployed pipeline (read from its state), so only `hosted.tf` changes, never a pipeline's `orchestration.tf`. `clavesa deploy` applies the workspace stack once more after the pipelines when a pipeline deployed for the first time added a database. The deploying principal must be a Lake Formation data lake admin, as for a pipeline deploy; on an account that leaves the catalog to IAM the grants pass through.
+
 ## [v2.27.0] — 2026-11-16
 
 ### Added

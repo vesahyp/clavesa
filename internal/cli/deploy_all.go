@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -173,6 +174,14 @@ func deployAll(cmd *cobra.Command, autoApprove, planOnly bool) error {
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Workspace %s. %d/%d pipeline(s) %s OK.\n", verb, ok, len(pipelines), verb)
 	if !planOnly {
+		// ADR-032: a pipeline deployed for the first time just created its
+		// Glue database, which the hosted reader's Lake Formation grants in
+		// the workspace stack can name only now. Apply the workspace again
+		// when hosted.tf changed.
+		if err := reapplyHostedGrants(cmd, svc, root, autoApprove); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Hosted reader grants failed: %v\n", err)
+			failures = append(failures, fmt.Sprintf("hosted reader grants: %v", err))
+		}
 		// ADR-032: the hosted tree copy matches what is deployed.
 		if err := uploadHostedTree(cmd, root, cmd.OutOrStdout()); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "Hosted tree copy failed: %v\n", err)
@@ -187,4 +196,21 @@ func deployAll(cmd *cobra.Command, autoApprove, planOnly bool) error {
 		return fmt.Errorf("%d pipeline(s) failed", len(failures))
 	}
 	return nil
+}
+
+// reapplyHostedGrants re-renders hosted.tf from the pipeline states after
+// the pipeline applies and, when it changed (a pipeline database that
+// did not exist at the workspace apply), applies the workspace stack
+// again. A no-op for a workspace that is not hosted as cloud.
+func reapplyHostedGrants(cmd *cobra.Command, svc *service.Service, root string, autoApprove bool) error {
+	changed, err := svc.ResyncHostedTF()
+	if err != nil || !changed {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "\n=== Workspace (hosted reader grants for newly deployed pipelines) ===\n")
+	return (deployFlow{
+		WorkspaceRoot: root,
+		TfDir:         root,
+		AutoApprove:   autoApprove,
+	}).Run()
 }

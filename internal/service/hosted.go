@@ -24,7 +24,9 @@ import (
 // HostedInput is what `clavesa workspace hosted enable` and PUT
 // /workspace/hosted both decode into (ADR-015, ADR-032).
 type HostedInput struct {
-	URL              string   `json:"url"`
+	URL string `json:"url"`
+	// Kind is "cloud" or "local"; empty picks the default (HostedKind).
+	Kind             string   `json:"kind,omitempty"`
 	ReaderPrincipals []string `json:"reader_principals,omitempty"`
 	EventBusARN      string   `json:"event_bus_arn,omitempty"`
 }
@@ -140,6 +142,10 @@ func (s *Service) EnableHosted(ctx context.Context, in HostedInput) (HostedStatu
 	if err != nil {
 		return HostedStatus{}, err
 	}
+	in.Kind = strings.TrimSpace(in.Kind)
+	if in.Kind != "" && in.Kind != workspace.HostedKindCloud && in.Kind != workspace.HostedKindLocal {
+		return HostedStatus{}, fmt.Errorf("kind must be %q or %q, got %q", workspace.HostedKindCloud, workspace.HostedKindLocal, in.Kind)
+	}
 	u, err := workspace.NormalizeHostedURL(in.URL)
 	if err != nil {
 		return HostedStatus{}, err
@@ -151,14 +157,14 @@ func (s *Service) EnableHosted(ctx context.Context, in HostedInput) (HostedStatu
 	if err != nil {
 		return HostedStatus{}, err
 	}
-	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
+	if s.hostedKind(m, in.Kind) == workspace.HostedKindLocal {
 		return s.enableHostedLocal(m, u, in, wk)
 	}
 	in.ReaderPrincipals = cleanPrincipals(append([]string{wk.ReaderPrincipal}, in.ReaderPrincipals...))
 	if strings.TrimSpace(in.EventBusARN) == "" {
 		in.EventBusARN = wk.EventBusARN
 	}
-	h := &workspace.Hosted{URL: u, ReaderPrincipals: in.ReaderPrincipals, EventBusARN: strings.TrimSpace(in.EventBusARN)}
+	h := &workspace.Hosted{URL: u, Kind: workspace.HostedKindCloud, ReaderPrincipals: in.ReaderPrincipals, EventBusARN: strings.TrimSpace(in.EventBusARN)}
 	if err := h.Validate(); err != nil {
 		return HostedStatus{}, err
 	}
@@ -170,6 +176,26 @@ func (s *Service) EnableHosted(ctx context.Context, in HostedInput) (HostedStatu
 		return HostedStatus{}, fmt.Errorf("write %s: %w", workspace.HostedTFFile, err)
 	}
 	return s.GetHosted()
+}
+
+// hostedKind is the kind `hosted enable` records: the explicit one when
+// given; else cloud when the workspace is shared as a cloud workspace (a
+// remote backend in clavesa.json, or a deployed workspace stack whose
+// pipeline_bucket output is readable from state or deployed.json); else
+// this developer's warehouse setting. The warehouse setting is
+// gitignored and defaults to local, so it alone would record a local
+// block in a fresh clone of a deployed cloud workspace.
+func (s *Service) hostedKind(m *workspace.Manifest, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if m.Backend != nil || workspace.PipelineBucket(s.workspace) != "" {
+		return workspace.HostedKindCloud
+	}
+	if workspace.LoadWarehouse(s.workspace) == workspace.WarehouseLocal {
+		return workspace.HostedKindLocal
+	}
+	return workspace.HostedKindCloud
 }
 
 // enableHostedLocal records the block of a local-warehouse workspace
@@ -186,7 +212,7 @@ func (s *Service) enableHostedLocal(m *workspace.Manifest, u string, in HostedIn
 	if wk.PublisherRoleARN == "" || wk.DataBucket == "" {
 		return HostedStatus{}, fmt.Errorf("%s%s names no publisher role or data bucket, which a local-warehouse workspace needs", u, HostedWellKnownPath)
 	}
-	h := &workspace.Hosted{URL: u, PublisherRoleARN: wk.PublisherRoleARN, DataBucket: wk.DataBucket, Region: wk.Region}
+	h := &workspace.Hosted{URL: u, Kind: workspace.HostedKindLocal, PublisherRoleARN: wk.PublisherRoleARN, DataBucket: wk.DataBucket, Region: wk.Region}
 	if err := h.Validate(); err != nil {
 		return HostedStatus{}, err
 	}
@@ -236,7 +262,7 @@ func (s *Service) SyncHostedTF(version string) error {
 	}
 	if m.Hosted == nil || m.Hosted.IsLocal() {
 		// A local-warehouse workspace has no stack: nothing to deploy.
-		return workspace.SyncHostedTF(s.workspace, m, "", nil)
+		return workspace.SyncHostedTF(s.workspace, m, "", nil, nil)
 	}
 	if version == "" {
 		version = ModuleVersion
@@ -252,7 +278,49 @@ func (s *Service) SyncHostedTF(version string) error {
 	for _, p := range pipes {
 		names = append(names, p.Name)
 	}
-	return workspace.SyncHostedTF(s.workspace, m, version, names)
+	dbs, err := s.deployedPipelineDatabases(pipes)
+	if err != nil {
+		return err
+	}
+	return workspace.SyncHostedTF(s.workspace, m, version, names, dbs)
+}
+
+// deployedPipelineDatabases returns the Glue database of every deployed
+// pipeline, read from its state (aws_glue_catalog_database.pipeline).
+// These get the reader's Lake Formation grants. A pipeline with no state
+// yet has no database to grant on: it is left out until it is deployed,
+// and `clavesa deploy` applies the workspace stack again after the
+// pipelines when the list grew (ResyncHostedTF).
+func (s *Service) deployedPipelineDatabases(pipes []PipelineInfo) ([]string, error) {
+	var dbs []string
+	for _, p := range pipes {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		data, err := workspace.ReadStackState(ctx, s.workspace, filepath.Join(s.workspace, p.Dir))
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("read state of pipeline %s (for the hosted reader's Lake Formation grants): %w", p.Name, err)
+		}
+		if db := workspace.GlueDatabaseFromState(data); db != "" {
+			dbs = append(dbs, db)
+		}
+	}
+	return dbs, nil
+}
+
+// ResyncHostedTF re-reads the pipeline states and rewrites hosted.tf.
+// changed is true when the file is different afterwards, which after a
+// pipeline deploy means a newly deployed pipeline database needs its
+// reader grant: the caller applies the workspace stack again.
+func (s *Service) ResyncHostedTF() (changed bool, err error) {
+	path := filepath.Join(s.workspace, workspace.HostedTFFile)
+	before, _ := os.ReadFile(path)
+	// The pipeline applies just changed their states; read them fresh.
+	workspace.ForgetCachedState()
+	if err := s.SyncHostedTF(""); err != nil {
+		return false, err
+	}
+	after, _ := os.ReadFile(path)
+	return !bytes.Equal(before, after), nil
 }
 
 // ---------------------------------------------------------------------------

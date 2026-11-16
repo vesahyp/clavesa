@@ -9,7 +9,9 @@
 #     per-query scan limit, so a bad query has a capped cost;
 #   - with var.event_bus_arn: EventBridge rules that forward the
 #     workspace's Step Functions status changes and its _progress run
-#     markers to the hosted bus, so the hosted summary refreshes on a run.
+#     markers to the hosted bus, so the hosted summary refreshes on a run;
+#   - for each database in var.lf_databases: Lake Formation grants, for
+#     accounts where Lake Formation governs the Glue catalog.
 #
 # No access key is created. Terraform state is never readable: the
 # policy has an explicit Deny on the state object patterns.
@@ -119,8 +121,48 @@ resource "aws_iam_role_policy" "reader" {
         Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
         Resource = local.log_group_arns
       },
+      {
+        # Lake Formation vends the S3 credentials of an LF-registered
+        # location to Athena through this call. It has no resource ARN;
+        # what the role may read is set by the grants below.
+        Sid      = "LakeFormationDataAccess"
+        Effect   = "Allow"
+        Action   = ["lakeformation:GetDataAccess"]
+        Resource = "*"
+      },
     ]
   })
+}
+
+# ---------------------------------------------------------------------------
+# Lake Formation grants (one pair per database in var.lf_databases)
+# ---------------------------------------------------------------------------
+
+# On an account where Lake Formation governs the Glue catalog, the IAM
+# policy above is not enough: the reader also needs LF DESCRIBE on each
+# database and SELECT + DESCRIBE on its tables, or Athena fails with
+# "Insufficient Lake Formation permission(s)". The same pair the
+# pipelines emit for their own roles (orchestration.tf). On an account
+# that leaves the catalog to IAM (IAMAllowedPrincipals on each database)
+# the grants pass through and change nothing. The deploying principal
+# must be a Lake Formation data lake admin, as for a pipeline deploy.
+resource "aws_lakeformation_permissions" "reader_db" {
+  for_each    = toset(var.lf_databases)
+  principal   = aws_iam_role.reader.arn
+  permissions = ["DESCRIBE"]
+  database {
+    name = each.value
+  }
+}
+
+resource "aws_lakeformation_permissions" "reader_tables" {
+  for_each    = toset(var.lf_databases)
+  principal   = aws_iam_role.reader.arn
+  permissions = ["SELECT", "DESCRIBE"]
+  table {
+    database_name = each.value
+    wildcard      = true
+  }
 }
 
 resource "aws_athena_workgroup" "reader" {

@@ -10,6 +10,7 @@ module "hosted_reader" {
   workgroup_name         = "clavesa-ui-smoke2"
   pipeline_bucket        = module.workspace.pipeline_bucket
   glue_database_patterns = ["clavesa_smoke2__*", "clavesa_smoke2_system__*"]
+  lf_databases           = concat([module.workspace.system_pipelines_db], ["clavesa_smoke2__events"])
   state_machine_patterns = ["clavesa-smoke2-*"]
   log_group_patterns     = ["/aws/lambda/clavesa-smoke2-*", "/clavesa/clavesa-smoke2-*"]
   state_object_patterns  = ["*.tfstate", "*.tfstate.*"]

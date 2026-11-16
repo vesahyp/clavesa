@@ -136,6 +136,33 @@ func StateMachineARNFromState(data []byte) string {
 	return ""
 }
 
+// GlueDatabaseFromState returns the name of aws_glue_catalog_database.pipeline
+// (the pipeline's <catalog>__<schema> database) in a pipeline stack's
+// state JSON, or "" when it is not there: the pipeline is not deployed.
+func GlueDatabaseFromState(data []byte) string {
+	var state struct {
+		Resources []struct {
+			Mode      string `json:"mode"`
+			Type      string `json:"type"`
+			Name      string `json:"name"`
+			Instances []struct {
+				Attributes struct {
+					Name string `json:"name"`
+				} `json:"attributes"`
+			} `json:"instances"`
+		} `json:"resources"`
+	}
+	if json.Unmarshal(data, &state) != nil {
+		return ""
+	}
+	for _, r := range state.Resources {
+		if r.Mode != "data" && r.Type == "aws_glue_catalog_database" && r.Name == "pipeline" && len(r.Instances) > 0 {
+			return r.Instances[0].Attributes.Name
+		}
+	}
+	return ""
+}
+
 // StackOutput returns one string output of a stack's state JSON, "" when
 // absent. Exported for the deploy-time deployed.json builder.
 func StackOutput(data []byte, name string) string { return tfstateOutput(data, name) }

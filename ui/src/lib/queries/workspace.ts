@@ -284,6 +284,9 @@ const HostedStatus = z.object({
   hosted: z
     .object({
       url: z.string(),
+      // "cloud" or "local", recorded at enable time; "" in blocks
+      // written before the field.
+      kind: z.string().optional().default(""),
       reader_principals: z.array(z.string()).nullish().transform((v) => v ?? []),
       event_bus_arn: z.string().optional().default(""),
       // A local-warehouse workspace's block: the role its runs publish
@@ -310,6 +313,9 @@ export function useHosted() {
 
 export interface EnableHostedInput {
   url: string;
+  /** "cloud" or "local"; undefined lets the server pick (remote backend
+   * or deployed stack: cloud; else the warehouse setting). */
+  kind?: "cloud" | "local";
   readerPrincipals: string[];
   eventBusArn?: string;
 }
@@ -322,6 +328,7 @@ export async function enableHosted(
     method: "PUT",
     body: JSON.stringify({
       url: input.url,
+      kind: input.kind || undefined,
       reader_principals: input.readerPrincipals,
       event_bus_arn: input.eventBusArn || undefined,
     }),

@@ -35,6 +35,9 @@ export function HostedSettings() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
   const [url, setUrl] = useState("");
+  // "" lets the server pick the kind (ADR-032): cloud for a workspace
+  // with a remote backend or a deployed stack, else the warehouse setting.
+  const [kind, setKind] = useState<"" | "cloud" | "local">("");
   const [principals, setPrincipals] = useState("");
   const [busArn, setBusArn] = useState("");
   const [changed, setChanged] = useState<"" | "enabled" | "disabled">("");
@@ -74,6 +77,7 @@ export function HostedSettings() {
 
   function startEdit() {
     setUrl(block?.url ?? "");
+    setKind(block?.kind === "cloud" || block?.kind === "local" ? block.kind : "");
     // The first principal is the hosted UI's own (from its well-known
     // document); the field holds only the extras.
     setPrincipals((block?.reader_principals ?? []).slice(1).join("\n"));
@@ -218,6 +222,22 @@ export function HostedSettings() {
               />
             </div>
             <div className="space-y-1.5">
+              <Label htmlFor="hosted-kind">Kind</Label>
+              <select
+                id="hosted-kind"
+                data-testid="hosted-kind-input"
+                value={kind}
+                onChange={(e) => setKind(e.target.value as "" | "cloud" | "local")}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-xs"
+              >
+                <option value="">
+                  Automatic (cloud when the workspace has a remote backend or is deployed)
+                </option>
+                <option value="cloud">Cloud: the hosted UI reads through a reader role</option>
+                <option value="local">Local: each local run publishes the summary</option>
+              </select>
+            </div>
+            <div className="space-y-1.5">
               <Label htmlFor="hosted-principal">
                 Extra reader principal ARNs (optional, one per line)
               </Label>
@@ -270,6 +290,7 @@ export function HostedSettings() {
                 onClick={() =>
                   enableMutation.mutate({
                     url,
+                    kind: kind || undefined,
                     readerPrincipals: principalList,
                     eventBusArn: busArn.trim() || undefined,
                   })

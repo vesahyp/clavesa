@@ -21,6 +21,12 @@ import (
 type Hosted struct {
 	// URL is the hosted UI, https and no path: https://ui.clavesa.dev
 	URL string `json:"url"`
+	// Kind is HostedKindCloud (read through the reader role) or
+	// HostedKindLocal (summary published from the Mac). It is recorded
+	// at enable time so it never follows a developer's own warehouse
+	// setting. Empty in blocks written before the field existed; IsLocal
+	// then infers it from the other fields.
+	Kind string `json:"kind,omitempty"`
 	// ReaderPrincipals are the IAM principal ARNs the reader role trusts,
 	// normally the hosted Lambda's role. The ExternalId is the workspace
 	// name.
@@ -37,11 +43,24 @@ type Hosted struct {
 	Region           string `json:"region,omitempty"`
 }
 
-// IsLocal reports whether the block is a local-warehouse workspace's:
-// a publisher role and no reader principals. Such a workspace has no
-// stack, so no hosted.tf and nothing to deploy.
+// The values of Hosted.Kind.
+const (
+	HostedKindCloud = "cloud"
+	HostedKindLocal = "local"
+)
+
+// IsLocal reports whether the block is a local-warehouse workspace's.
+// Such a workspace has no stack, so no hosted.tf and nothing to deploy.
+// The recorded Kind decides; a block without one (written before the
+// field) is local when it has a publisher role and no reader principals.
 func (h *Hosted) IsLocal() bool {
-	return h != nil && len(h.ReaderPrincipals) == 0 && h.PublisherRoleARN != ""
+	if h == nil {
+		return false
+	}
+	if h.Kind != "" {
+		return h.Kind == HostedKindLocal
+	}
+	return len(h.ReaderPrincipals) == 0 && h.PublisherRoleARN != ""
 }
 
 var (
@@ -77,10 +96,19 @@ func (h *Hosted) Validate() error {
 	if _, err := NormalizeHostedURL(h.URL); err != nil {
 		return err
 	}
+	if h.Kind != "" && h.Kind != HostedKindCloud && h.Kind != HostedKindLocal {
+		return fmt.Errorf("hosted.kind must be %q or %q, got %q", HostedKindCloud, HostedKindLocal, h.Kind)
+	}
+	if h.IsLocal() && h.PublisherRoleARN == "" {
+		return fmt.Errorf("hosted.publisher_role_arn is required for a local-warehouse workspace")
+	}
 	if h.PublisherRoleARN != "" && !principalARNRE.MatchString(h.PublisherRoleARN) {
 		return fmt.Errorf("hosted.publisher_role_arn: %q is not an IAM role ARN", h.PublisherRoleARN)
 	}
 	if h.IsLocal() {
+		if len(h.ReaderPrincipals) > 0 || h.EventBusARN != "" {
+			return fmt.Errorf("a local-warehouse workspace has no reader role or event rule: hosted.reader_principals and hosted.event_bus_arn must be empty")
+		}
 		if h.DataBucket == "" {
 			return fmt.Errorf("hosted.data_bucket is required with hosted.publisher_role_arn")
 		}
@@ -189,9 +217,29 @@ func hostedStateObjectPatterns(m *Manifest) []string {
 	return pats
 }
 
+// hostedLFDatabases is the module's lf_databases expression: the system
+// database through the workspace module's output (same stack, so the
+// grant waits for the database), then the deployed pipelines' databases
+// sorted, without duplicates.
+func hostedLFDatabases(m *Manifest, pipelineDBs []string) string {
+	sys := strings.ReplaceAll(m.SystemCatalogIdentifier(), "-", "_") + "__pipelines"
+	seen := map[string]bool{sys: true, "": true}
+	var dbs []string
+	for _, d := range pipelineDBs {
+		if !seen[d] {
+			seen[d] = true
+			dbs = append(dbs, d)
+		}
+	}
+	sort.Strings(dbs)
+	return fmt.Sprintf("concat([module.workspace.system_pipelines_db], [%s])", quotedHCLList(dbs))
+}
+
 // RenderHostedTF renders hosted.tf. pipelines are the workspace's pipeline
 // names, used only for legacy (non workspace-scoped) AWS names.
-func RenderHostedTF(m *Manifest, moduleVersion string, pipelines []string) string {
+// pipelineDBs are the Glue databases of the deployed pipelines, which get
+// Lake Formation grants for the reader (with the system database).
+func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []string) string {
 	h := m.Hosted
 	sms, logs := HostedResourcePatterns(m, pipelines)
 	return hostedTFHeader + fmt.Sprintf(`module "hosted_reader" {
@@ -201,6 +249,7 @@ func RenderHostedTF(m *Manifest, moduleVersion string, pipelines []string) strin
   workgroup_name         = %q
   pipeline_bucket        = module.workspace.pipeline_bucket
   glue_database_patterns = [%s]
+  lf_databases           = %s
   state_machine_patterns = [%s]
   log_group_patterns     = [%s]
   state_object_patterns  = [%s]
@@ -218,14 +267,14 @@ output "hosted_workgroup" {
   value       = module.hosted_reader.workgroup_name
 }
 `, moduleVersion, HostedReaderRoleName(m.Name), HostedWorkGroupName(m.Name),
-		quotedHCLList(HostedGlueDatabasePatterns(m)), quotedHCLList(sms), quotedHCLList(logs),
+		quotedHCLList(HostedGlueDatabasePatterns(m)), hostedLFDatabases(m, pipelineDBs), quotedHCLList(sms), quotedHCLList(logs),
 		quotedHCLList(hostedStateObjectPatterns(m)), quotedHCLList(h.ReaderPrincipals), h.EventBusARN)
 }
 
 // SyncHostedTF makes hosted.tf match the manifest: written when m.Hosted
 // is set, removed when it is not or when it is a local-warehouse
 // workspace's block (no stack, no reader role).
-func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines []string) error {
+func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pipelineDBs []string) error {
 	path := filepath.Join(root, HostedTFFile)
 	if m.Hosted == nil || m.Hosted.IsLocal() {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -236,5 +285,5 @@ func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines []st
 	if moduleVersion == "" {
 		return fmt.Errorf("no module version: main.tf has no recognised workspace module source")
 	}
-	return os.WriteFile(path, []byte(RenderHostedTF(m, moduleVersion, pipelines)), 0o644)
+	return os.WriteFile(path, []byte(RenderHostedTF(m, moduleVersion, pipelines, pipelineDBs)), 0o644)
 }

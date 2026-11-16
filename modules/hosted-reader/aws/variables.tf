@@ -23,6 +23,12 @@ variable "glue_database_patterns" {
   type        = list(string)
 }
 
+variable "lf_databases" {
+  description = "Glue databases that get Lake Formation grants for the reader role: DESCRIBE on the database, SELECT and DESCRIBE on all its tables. Each must exist when the grant is applied. clavesa fills it with the system database <system_catalog>__pipelines and the <catalog>__<schema> database of every deployed pipeline. Empty: no grants."
+  type        = list(string)
+  default     = []
+}
+
 variable "state_machine_patterns" {
   description = "Step Functions state machine name patterns of the workspace's pipelines (a prefix with * in workspace-scoped naming, exact names otherwise)."
   type        = list(string)

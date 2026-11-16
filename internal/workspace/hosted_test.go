@@ -111,7 +111,8 @@ func TestRenderHostedTFGolden(t *testing.T) {
 		},
 	}
 	for name, m := range cases {
-		got := RenderHostedTF(m, "v9.9.9", []string{"orders", "events"})
+		// events is deployed, orders not yet; the system DB is never listed twice.
+		got := RenderHostedTF(m, "v9.9.9", []string{"orders", "events"}, []string{m.Catalog + "__events", m.SystemCatalog + "__pipelines", m.Catalog + "__events"})
 		path := filepath.Join("testdata", name+".golden")
 		if os.Getenv("UPDATE_GOLDEN") == "1" {
 			_ = os.MkdirAll("testdata", 0o755)
@@ -128,20 +129,20 @@ func TestSyncHostedTF(t *testing.T) {
 	root := t.TempDir()
 	m := &Manifest{Name: "ws", Catalog: "clavesa_ws", SystemCatalog: "clavesa_ws_system",
 		Hosted: &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}}}
-	if err := SyncHostedTF(root, m, "v1.0.0", nil); err != nil {
+	if err := SyncHostedTF(root, m, "v1.0.0", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(root, HostedTFFile))
 	if err != nil || !strings.Contains(string(data), `./.clavesa/modules/v1.0.0/hosted-reader/aws`) {
 		t.Fatalf("hosted.tf = %q, %v", data, err)
 	}
-	if err := SyncHostedTF(root, m, "", nil); err == nil {
+	if err := SyncHostedTF(root, m, "", nil, nil); err == nil {
 		t.Error("no module version must be refused")
 	}
 	// Hosted off: the file goes, twice is fine.
 	m.Hosted = nil
 	for i := 0; i < 2; i++ {
-		if err := SyncHostedTF(root, m, "", nil); err != nil {
+		if err := SyncHostedTF(root, m, "", nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -191,5 +192,52 @@ func TestReadStackStateFromDeployed(t *testing.T) {
 	// A workspace on disk (no deployed.json) has no hosted workgroup.
 	if got := HostedAthenaWorkGroup(t.TempDir()); got != "" {
 		t.Errorf("plain workspace workgroup = %q", got)
+	}
+}
+
+// TestHostedKind: the recorded kind decides IsLocal; a block written
+// before the field falls back to the publisher-role rule.
+func TestHostedKind(t *testing.T) {
+	const pub = "arn:aws:iam::111122223333:role/clavesa-ui-publisher"
+	for name, c := range map[string]struct {
+		h     Hosted
+		local bool
+	}{
+		"legacy cloud":           {Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}}, false},
+		"legacy local":           {Hosted{URL: "https://ui.clavesa.dev", PublisherRoleARN: pub, DataBucket: "b"}, true},
+		"recorded cloud":         {Hosted{URL: "https://ui.clavesa.dev", Kind: HostedKindCloud, ReaderPrincipals: []string{testPrincipal}}, false},
+		"recorded local":         {Hosted{URL: "https://ui.clavesa.dev", Kind: HostedKindLocal, PublisherRoleARN: pub, DataBucket: "b"}, true},
+		"cloud with a publisher": {Hosted{URL: "https://ui.clavesa.dev", Kind: HostedKindCloud, ReaderPrincipals: []string{testPrincipal}, PublisherRoleARN: pub}, false},
+	} {
+		if got := c.h.IsLocal(); got != c.local {
+			t.Errorf("%s: IsLocal = %v, want %v", name, got, c.local)
+		}
+		if err := c.h.Validate(); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for name, h := range map[string]Hosted{
+		"unknown kind":             {URL: "https://ui.clavesa.dev", Kind: "hybrid", ReaderPrincipals: []string{testPrincipal}},
+		"cloud without principals": {URL: "https://ui.clavesa.dev", Kind: HostedKindCloud, PublisherRoleARN: pub, DataBucket: "b"},
+		"local without publisher":  {URL: "https://ui.clavesa.dev", Kind: HostedKindLocal, ReaderPrincipals: []string{testPrincipal}},
+		"local with principals":    {URL: "https://ui.clavesa.dev", Kind: HostedKindLocal, PublisherRoleARN: pub, DataBucket: "b", ReaderPrincipals: []string{testPrincipal}},
+	} {
+		if err := h.Validate(); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+}
+
+func TestGlueDatabaseFromState(t *testing.T) {
+	state := `{"resources":[
+{"mode":"data","type":"aws_glue_catalog_database","name":"pipeline","instances":[{"attributes":{"name":"wrong"}}]},
+{"mode":"managed","type":"aws_glue_catalog_database","name":"pipeline","instances":[{"attributes":{"name":"clavesa_acme__orders"}}]}]}`
+	if got := GlueDatabaseFromState([]byte(state)); got != "clavesa_acme__orders" {
+		t.Errorf("database = %q", got)
+	}
+	for _, s := range []string{"", "{}", `{"resources":[{"mode":"managed","type":"aws_sfn_state_machine","name":"pipeline","instances":[{"attributes":{"name":"x"}}]}]}`} {
+		if got := GlueDatabaseFromState([]byte(s)); got != "" {
+			t.Errorf("%q: database = %q, want none", s, got)
+		}
 	}
 }
