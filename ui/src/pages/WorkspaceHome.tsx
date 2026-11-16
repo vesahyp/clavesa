@@ -139,6 +139,15 @@ function Body({ s }: { s: WorkspaceSummary }) {
               ))}
             </ul>
           )}
+          {(s.notes ?? []).length > 0 && (
+            <ul data-testid="workspace-home-notes" className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+              {(s.notes ?? []).map((r) => (
+                <li key={r} className="break-words">
+                  {r}
+                </li>
+              ))}
+            </ul>
+          )}
           <div
             data-testid="workspace-home-freshness"
             data-state={s.freshness_state}
@@ -327,6 +336,15 @@ function PipelineCard({ p }: { p: PipelineSummary }) {
       {ps.reasons.some((r) => r !== problemLine) && (
         <ul data-testid="pipeline-card-reasons" className={cn("mt-1 space-y-0.5 text-xs", REASON_TONE[ps.status])}>
           {ps.reasons.filter((r) => r !== problemLine).map((r) => (
+            <li key={r} className="break-words">
+              {r}
+            </li>
+          ))}
+        </ul>
+      )}
+      {(p.notes ?? []).length > 0 && (
+        <ul data-testid="pipeline-card-notes" className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+          {(p.notes ?? []).map((r) => (
             <li key={r} className="break-words">
               {r}
             </li>

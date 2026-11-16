@@ -24,6 +24,7 @@ import {
   formatUsd,
   freshnessText,
   historyUnread,
+  pausedLines,
   shortDay,
 } from "@/lib/summary";
 import { cn } from "@/lib/utils";
@@ -81,6 +82,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
   // Freshness only when it says something: stale tables or unknown.
   const lines = [...reasons];
   if (fresh.tone === "bad") lines.push(`Freshness: ${fresh.text}${fresh.detail ? `, ${fresh.detail}` : ""}`);
+  const paused = pausedLines(s);
   return (
     // The whole card opens the workspace (its own page load and basename).
     <a
@@ -109,6 +111,15 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
       {lines.length > 0 && (
         <ul data-testid="workspace-card-reasons" className={cn("mt-1 space-y-0.5 text-xs", REASON_TONE[status === "ok" ? "warn" : status])}>
           {lines.map((r) => (
+            <li key={r} className="line-clamp-2 break-words">
+              {r}
+            </li>
+          ))}
+        </ul>
+      )}
+      {paused.length > 0 && (
+        <ul data-testid="workspace-card-notes" className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+          {paused.map((r) => (
             <li key={r} className="line-clamp-2 break-words">
               {r}
             </li>

@@ -4,7 +4,8 @@
 # practices/auth.md; copied from keitos/infra/app.tf and auth.tf).
 #
 #   SPA client   ALLOW_USER_AUTH (EMAIL_OTP) + refresh, code flow + PKCE
-#                for Google. No password flow.
+#                for Google only (no COGNITO login page). No password
+#                flow; account recovery is admin_only.
 #   check client ALLOW_ADMIN_USER_PASSWORD_AUTH + refresh only. The admin
 #                flow needs IAM credentials, so only a principal of this
 #                account can use the check user's password (slice 9).
@@ -53,9 +54,12 @@ resource "aws_cognito_user_pool" "ui" {
     temporary_password_validity_days = 7
   }
 
+  # No self-service password reset: a person never gets a password they
+  # know (the emailed code is the sign-in), so "Forgot your password"
+  # must not hand one out.
   account_recovery_setting {
     recovery_mechanism {
-      name     = "verified_email"
+      name     = "admin_only"
       priority = 1
     }
   }
@@ -73,16 +77,17 @@ resource "aws_cognito_user_pool_client" "spa" {
     "ALLOW_REFRESH_TOKEN_AUTH",
   ]
 
-  # Public SPA client; the code flow with PKCE is the Google path.
-  allowed_oauth_flows                  = ["code"]
-  allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_scopes                 = ["openid", "email", "profile"]
-  supported_identity_providers = concat(
-    local.google_enabled ? ["Google"] : [],
-    ["COGNITO"],
-  )
-  callback_urls = ["https://${var.ui_domain}/"]
-  logout_urls   = ["https://${var.ui_domain}/"]
+  # Public SPA client; the code flow with PKCE is the Google path, and
+  # its only one. COGNITO is not a login provider: Cognito's own login
+  # page would offer a password and "Forgot your password". The emailed
+  # code is the USER_AUTH API, which needs no provider. With Google off,
+  # the client has no OAuth flow at all.
+  allowed_oauth_flows                  = local.google_enabled ? ["code"] : []
+  allowed_oauth_flows_user_pool_client = local.google_enabled
+  allowed_oauth_scopes                 = local.google_enabled ? ["openid", "email", "profile"] : []
+  supported_identity_providers         = local.google_enabled ? ["Google"] : []
+  callback_urls                        = local.google_enabled ? ["https://${var.ui_domain}/"] : []
+  logout_urls                          = local.google_enabled ? ["https://${var.ui_domain}/"] : []
 
   generate_secret               = false
   prevent_user_existence_errors = "ENABLED"

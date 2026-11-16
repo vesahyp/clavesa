@@ -48,6 +48,9 @@ type summaryEnv struct {
 	DeployedRegion string
 	// ReadRegion is the region of the AWS clients the summary reads with.
 	ReadRegion string
+	// Cloud: a cloud-warehouse workspace, whose schedules are EventBridge
+	// rules the summary can ask about.
+	Cloud bool
 }
 
 var (

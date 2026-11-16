@@ -66,12 +66,15 @@ type WorkspaceSummary struct {
 	Account     string `json:"account,omitempty"`
 	Region      string `json:"region,omitempty"`
 	GeneratedAt string `json:"generated_at"`
-	// Status is the worst of: last run failed (fail), a failed run in the
-	// last 14 days (warn), a table past its freshness_sla (warn), no run
-	// inside the expected interval (warn). Reasons are plain words with
-	// Helsinki times (summary_health.go).
+	// Status is the worst of: last run failed (fail), a table past its
+	// freshness_sla (warn), no run inside the expected interval of a
+	// schedule that is not paused (warn). Reasons are plain words with
+	// Helsinki times (summary_health.go). Notes are facts that do not
+	// change the status: failed runs that a later run of the same
+	// pipeline followed with a success, a paused schedule.
 	Status        string   `json:"status"`
 	StatusReasons []string `json:"status_reasons"`
+	Notes         []string `json:"notes,omitempty"`
 	// LastRun is the newest run across every pipeline.
 	LastRun   *SummaryRun       `json:"last_run,omitempty"`
 	Pipelines []PipelineSummary `json:"pipelines"`
@@ -112,8 +115,14 @@ type PipelineSummary struct {
 	// expression is not one clavesa can read).
 	Schedule                string   `json:"schedule,omitempty"`
 	ExpectedIntervalSeconds int64    `json:"expected_interval_seconds,omitempty"`
-	Status                  string   `json:"status"`
-	StatusReasons           []string `json:"status_reasons"`
+	// SchedulePaused: the schedule's EventBridge rule is disabled (cloud
+	// only), so no run is expected; SchedulePausedSince is when, RFC 3339,
+	// "" when that is not known.
+	SchedulePaused      bool     `json:"schedule_paused,omitempty"`
+	SchedulePausedSince string   `json:"schedule_paused_since,omitempty"`
+	Status              string   `json:"status"`
+	StatusReasons       []string `json:"status_reasons"`
+	Notes               []string `json:"notes,omitempty"`
 	// LastRun is the newest run; LastRunNodes its per-node timings.
 	LastRun      *SummaryRun   `json:"last_run,omitempty"`
 	LastRunNodes []SummaryNode `json:"last_run_nodes"`
@@ -223,7 +232,7 @@ func (s *Service) WorkspaceSummary(ctx context.Context, q WorkspaceSummaryQuery)
 	}
 	// The workspace's own region (GH #107), not the state bucket's.
 	sum.Region = workspace.ResolveRegion(ctx, s.workspace)
-	env := summaryEnv{ReadRegion: s.awsRegion}
+	env := summaryEnv{ReadRegion: s.awsRegion, Cloud: sum.Kind == "cloud"}
 	undeployed := false
 	if sum.Kind == "cloud" {
 		dep := s.summaryDeployment(ctx)
@@ -272,6 +281,9 @@ func (s *Service) WorkspaceSummary(ctx context.Context, q WorkspaceSummaryQuery)
 				continue // already in the grouped line above
 			}
 			sum.StatusReasons = append(sum.StatusReasons, p.Name+": "+r)
+		}
+		for _, n := range p.Notes {
+			sum.Notes = append(sum.Notes, p.Name+": "+n)
 		}
 		for _, f := range p.Freshness {
 			sum.SLATables++
@@ -408,11 +420,17 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		status = SummaryFail
 		ps.StatusReasons = append(ps.StatusReasons, "last run failed")
 	}
-	// A failed run in the strip window is never "ok" (review of the hosted
-	// UI, 2026-11-16), even when the newest run succeeded.
-	if r := recentFailures(ps.Runs, now, lastFinished != nil && lastFinished.Result == "failed"); r != "" {
-		status = worseStatus(status, SummaryWarn)
-		ps.StatusReasons = append(ps.StatusReasons, r)
+	// Failed runs in the strip window. When a later run succeeded the
+	// pipeline has recovered: the failures are a note and the status
+	// stays as it is (v2.27.4). When the last finished run failed, the
+	// status is already "fail" and the count goes with it as a reason.
+	lastFailed := lastFinished != nil && lastFinished.Result == "failed"
+	if r := recentFailures(ps.Runs, now, lastFailed); r != "" {
+		if lastFailed {
+			ps.StatusReasons = append(ps.StatusReasons, r)
+		} else {
+			ps.Notes = append(ps.Notes, r+", later runs succeeded")
+		}
 	}
 	stale := 0
 	for _, f := range ps.Freshness {
@@ -424,7 +442,13 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		status = worseStatus(status, SummaryWarn)
 		ps.StatusReasons = append(ps.StatusReasons, fmt.Sprintf("%d table(s) past their freshness target", stale))
 	}
-	if ps.ExpectedIntervalSeconds > 0 {
+	if ps.ExpectedIntervalSeconds > 0 && env.Cloud {
+		ps.SchedulePaused, ps.SchedulePausedSince = s.scheduleState(ctx, s.awsName(p.Name)+"-schedule")
+		if ps.SchedulePaused {
+			ps.Notes = append(ps.Notes, pausedNote(ps.SchedulePausedSince))
+		}
+	}
+	if ps.ExpectedIntervalSeconds > 0 && !ps.SchedulePaused {
 		interval := time.Duration(ps.ExpectedIntervalSeconds) * time.Second
 		// A quarter of the interval as grace, so a run that starts a few
 		// minutes late does not flip the dot.

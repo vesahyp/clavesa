@@ -96,6 +96,18 @@ export function cardStatus(
   return { status, reasons, overdue };
 }
 
+/**
+ * pausedLines are the card's lines for pipelines whose schedule is
+ * paused: current state, so the overview card shows them (grey). The
+ * other notes (failed runs a later run fixed) are history and show on
+ * the workspace page only.
+ */
+export function pausedLines(s: WorkspaceSummary): string[] {
+  return s.pipelines
+    .filter((p) => p.schedule_paused)
+    .map((p) => `${p.name}: ${(p.notes ?? []).find((n) => n.startsWith("schedule paused")) ?? "schedule paused"}`);
+}
+
 /** The text colour of reasons under a status: amber for warn, red for fail. */
 export const REASON_TONE: Record<SummaryStatus, string> = {
   ok: "text-muted-foreground",

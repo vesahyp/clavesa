@@ -741,8 +741,15 @@ const PipelineSummary = z.object({
   dir: z.string(),
   schedule: z.string().optional(),
   expected_interval_seconds: z.number().optional(),
+  // The schedule's EventBridge rule is disabled (v2.27.4): no run is
+  // expected, so there is no overdue warning.
+  schedule_paused: z.boolean().optional(),
+  schedule_paused_since: z.string().optional(),
   status: SummaryStatus,
   status_reasons: z.array(z.string()),
+  // Facts that do not change the status: failed runs a later run fixed,
+  // a paused schedule. Shown grey.
+  notes: z.array(z.string()).optional(),
   last_run: SummaryRun.optional(),
   last_run_nodes: z.array(SummaryNode),
   runs: z.array(SummaryRun),
@@ -777,6 +784,7 @@ const WorkspaceSummaryShape = z.object({
   generated_at: z.string(),
   status: SummaryStatus,
   status_reasons: z.array(z.string()),
+  notes: z.array(z.string()).optional(),
   last_run: SummaryRun.optional(),
   pipelines: z.array(PipelineSummary),
   runs_per_day_14d: z.array(SummaryDayRuns),

@@ -13,24 +13,19 @@ import (
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
-// TestSummaryFailedRunRule: a failed run in the last 14 days makes a
-// pipeline and its workspace "warn" with a plain reason, even when the
-// newest run succeeded. The CLI and the hosted UI read the same summary,
-// so they give the same verdict and the same words.
-func TestSummaryFailedRunRule(t *testing.T) {
+// summaryRunsWorkspace is a local workspace whose one pipeline, orders,
+// has the given runs (start, status), each with one node row.
+func summaryRunsWorkspace(t *testing.T, runs []struct {
+	id     string
+	start  time.Time
+	status string
+}) *WorkspaceSummary {
+	t.Helper()
 	ws := summaryWorkspace(t, "rate(1 day)")
+	dropSLA(t, ws)
 	store := observability.NewFileProgressStore(workspace.LocalWarehouseDir(ws))
 	ctx := context.Background()
-	for _, r := range []struct {
-		id     string
-		start  time.Time
-		status string
-	}{
-		{"old-fail", summaryNow.Add(-20 * 24 * time.Hour), "FAILED"}, // outside 14 days
-		{"fail-a", summaryNow.Add(-5 * 24 * time.Hour), "FAILED"},
-		{"fail-b", summaryNow.Add(-3*24*time.Hour - 50*time.Minute), "FAILED"}, // 12.11 11:10 UTC, 13:10 Helsinki
-		{"ok", summaryNow.Add(-2 * time.Hour), "SUCCEEDED"},
-	} {
+	for _, r := range runs {
 		end := r.start.Add(time.Minute)
 		if err := observability.WriteRunMarker(ctx, store, r.id, observability.RunMarker{
 			Status: r.status, Trigger: "manual", StartedMs: ms(r.start), EndedMs: ms(end), Pipeline: "orders",
@@ -47,13 +42,52 @@ func TestSummaryFailedRunRule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WorkspaceSummary: %v", err)
 	}
-	want := "2 failed runs in 14 days, last 12.11 13:10"
+	return sum
+}
+
+// TestSummaryRecoveredFailures: failed runs that a later run of the same
+// pipeline followed with a success leave the status "ok" and show as a
+// note (v2.27.4; before, they kept the card amber for 14 days). The CLI
+// and the hosted UI read the same summary, so they say the same.
+func TestSummaryRecoveredFailures(t *testing.T) {
+	sum := summaryRunsWorkspace(t, []struct {
+		id     string
+		start  time.Time
+		status string
+	}{
+		{"old-fail", summaryNow.Add(-20 * 24 * time.Hour), "FAILED"}, // outside 14 days
+		{"fail-a", summaryNow.Add(-5 * 24 * time.Hour), "FAILED"},
+		{"fail-b", summaryNow.Add(-3*24*time.Hour - 50*time.Minute), "FAILED"}, // 12.11 11:10 UTC, 13:10 Helsinki
+		{"ok", summaryNow.Add(-2 * time.Hour), "SUCCEEDED"},
+	})
+	want := "2 failed runs in 14 days, last 12.11 13:10, later runs succeeded"
 	p := sum.Pipelines[0]
-	if p.Status != SummaryWarn || !hasReason(p.StatusReasons, want) {
-		t.Errorf("pipeline = %q %v, want warn with %q", p.Status, p.StatusReasons, want)
+	if p.Status != SummaryOK || len(p.StatusReasons) != 0 || !hasReason(p.Notes, want) {
+		t.Errorf("pipeline = %q %v notes %v, want ok with note %q", p.Status, p.StatusReasons, p.Notes, want)
 	}
-	if sum.Status != SummaryWarn || !hasReason(sum.StatusReasons, "orders: "+want) {
-		t.Errorf("workspace = %q %v, want warn with %q", sum.Status, sum.StatusReasons, "orders: "+want)
+	if sum.Status != SummaryOK || len(sum.StatusReasons) != 0 || !hasReason(sum.Notes, "orders: "+want) {
+		t.Errorf("workspace = %q %v notes %v, want ok with note %q", sum.Status, sum.StatusReasons, sum.Notes, "orders: "+want)
+	}
+}
+
+// TestSummaryUnrecoveredFailures: when no success follows the failures,
+// the pipeline fails as before and the count is a reason, not a note.
+func TestSummaryUnrecoveredFailures(t *testing.T) {
+	sum := summaryRunsWorkspace(t, []struct {
+		id     string
+		start  time.Time
+		status string
+	}{
+		{"ok", summaryNow.Add(-5 * 24 * time.Hour), "SUCCEEDED"},
+		{"fail-a", summaryNow.Add(-4 * time.Hour), "FAILED"},
+		{"fail-b", summaryNow.Add(-2 * time.Hour), "FAILED"},
+	})
+	p := sum.Pipelines[0]
+	if p.Status != SummaryFail || !hasReason(p.StatusReasons, "last run failed") || !hasReason(p.StatusReasons, "2 failed runs in 14 days") {
+		t.Errorf("pipeline = %q %v, want fail with the failure count", p.Status, p.StatusReasons)
+	}
+	if len(p.Notes) != 0 || sum.Status != SummaryFail {
+		t.Errorf("notes %v, workspace %q, want no note and fail", p.Notes, sum.Status)
 	}
 }
 

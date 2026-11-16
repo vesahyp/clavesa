@@ -55,6 +55,16 @@ func summaryWorkspace(t *testing.T, schedule string) string {
 	return ws
 }
 
+// dropSLA removes the freshness_sla from the orders pipeline, for tests
+// of the run and schedule rules that a stale table would mask.
+func dropSLA(t *testing.T, ws string) {
+	t.Helper()
+	body := strings.Replace(summaryPipelineTF, "  freshness_sla = \"4h\"\n", "", 1)
+	if err := os.WriteFile(filepath.Join(ws, "orders", "main.tf"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func ms(t time.Time) *int64 { v := t.UnixMilli(); return &v }
 
 // deployedState writes the workspace stack state `workspace deploy`
@@ -255,6 +265,68 @@ func TestWorkspaceSummaryCloud(t *testing.T) {
 		if !strings.Contains(string(raw), k) {
 			t.Errorf("JSON lacks %s", k)
 		}
+	}
+}
+
+// TestWorkspaceSummaryPausedSchedule: a daily pipeline whose schedule
+// rule is disabled gets the note "schedule paused since <time>" and no
+// overdue warning (v2.27.4). With the rule enabled, or when its state
+// cannot be read, the same history is overdue as before.
+func TestWorkspaceSummaryPausedSchedule(t *testing.T) {
+	ws := cloudSummaryWorkspace(t, "cron(30 4 * * ? *)")
+	dropSLA(t, ws)
+	deployedState(t, ws, "eu-north-1")
+	start := summaryNow.Add(-6 * 24 * time.Hour) // 9.11 12:00 UTC
+	iso := func(t time.Time) string { return t.Format("2006-01-02T15:04:05.000Z") }
+	arn := "arn:aws:states:eu-north-1:123456789012:execution:clavesa-orders:exec1"
+	cloud := &fakeProvider{runs: &observability.RunsResult{Rows: []observability.Run{{
+		RunID: "r-1", Pipeline: "orders", SfExecutionARN: arn, Status: "SUCCEEDED",
+		StartedAt: iso(start), EndedAt: iso(start.Add(time.Minute)),
+	}}}}
+	for _, c := range []struct {
+		name       string
+		paused     bool
+		since      string
+		wantStatus string
+		wantNote   string
+	}{
+		{"paused", true, "2026-11-09T07:21:11Z", SummaryOK, "schedule paused since 9.11 09:21"},
+		{"paused, time unknown", true, "", SummaryOK, "schedule paused"},
+		{"enabled", false, "", SummaryWarn, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			svc := New(ws).WithResolver(observability.NewResolver(ws, cloud, &fakeProvider{}))
+			var asked string
+			svc.scheduleStateFn = func(_ context.Context, rule string) (bool, string) {
+				asked = rule
+				return c.paused, c.since
+			}
+			sum, err := svc.WorkspaceSummary(context.Background(), WorkspaceSummaryQuery{Now: summaryNow})
+			if err != nil {
+				t.Fatalf("WorkspaceSummary: %v", err)
+			}
+			p := sum.Pipelines[0]
+			if !strings.HasSuffix(asked, "orders-schedule") {
+				t.Errorf("asked about rule %q, want the pipeline's schedule rule", asked)
+			}
+			if p.Status != c.wantStatus || sum.Status != c.wantStatus {
+				t.Errorf("status = %q / workspace %q, want %q; reasons %v", p.Status, sum.Status, c.wantStatus, p.StatusReasons)
+			}
+			overdue := hasReason(p.StatusReasons, "no run since 9.11 14:00, expected daily")
+			if overdue == c.paused {
+				t.Errorf("overdue reason present = %v with paused = %v: %v", overdue, c.paused, p.StatusReasons)
+			}
+			if c.wantNote != "" {
+				if len(p.Notes) != 1 || p.Notes[0] != c.wantNote || !hasReason(sum.Notes, "orders: "+c.wantNote) {
+					t.Errorf("notes = %v / %v, want %q", p.Notes, sum.Notes, c.wantNote)
+				}
+				if !p.SchedulePaused || p.SchedulePausedSince != c.since {
+					t.Errorf("paused fields = %v %q", p.SchedulePaused, p.SchedulePausedSince)
+				}
+			} else if len(p.Notes) != 0 {
+				t.Errorf("notes = %v, want none", p.Notes)
+			}
+		})
 	}
 }
 

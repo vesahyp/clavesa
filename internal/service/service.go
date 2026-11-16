@@ -288,6 +288,11 @@ type Service struct {
 	// HeadObject; tests stub it. See backend.go.
 	stateObjectStatus func(ctx context.Context, bucket, region, key string) (exists bool, size int64, err error)
 
+	// scheduleStateFn reports whether a pipeline's schedule rule is
+	// disabled and since when (summary_schedule.go). Defaults to
+	// scheduleLookup (EventBridge DescribeRule plus CloudTrail); tests stub it.
+	scheduleStateFn func(ctx context.Context, rule string) (paused bool, since string)
+
 	// runTerraform execs `terraform` with args in dir. exitCode is
 	// terraform's own exit status (0 success; with -detailed-exitcode,
 	// 2 means "changes"); err is non-nil only when the binary itself

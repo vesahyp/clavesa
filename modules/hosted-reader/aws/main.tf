@@ -3,7 +3,9 @@
 # has a `hosted` block:
 #   - the reader role: trusted only by var.reader_principals, with
 #     sts:ExternalId = the workspace name, and a policy that reads this
-#     workspace's bucket, Glue databases, state machines and log groups;
+#     workspace's bucket, Glue databases, state machines, log groups and
+#     schedule rules (and CloudTrail event history, for when a schedule
+#     was paused);
 #     the one write is Athena results under athena-results/clavesa-ui/;
 #   - an Athena workgroup with an enforced output location and a
 #     per-query scan limit, so a bad query has a capped cost;
@@ -30,6 +32,7 @@ locals {
   athena_results_prefix = "athena-results/clavesa-ui/"
 
   state_machine_arns = [for p in var.state_machine_patterns : "arn:${local.partition}:states:${local.region}:${local.account}:stateMachine:${p}"]
+  schedule_rule_arns = [for p in var.state_machine_patterns : "arn:${local.partition}:events:${local.region}:${local.account}:rule/${p}"]
   execution_arns     = [for p in var.state_machine_patterns : "arn:${local.partition}:states:${local.region}:${local.account}:execution:${p}:*"]
   log_group_arns = flatten([for p in var.log_group_patterns : [
     "arn:${local.partition}:logs:${local.region}:${local.account}:log-group:${p}",
@@ -120,6 +123,24 @@ resource "aws_iam_role_policy" "reader" {
         Effect   = "Allow"
         Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
         Resource = local.log_group_arns
+      },
+      {
+        # Whether a pipeline's schedule rule is enabled, so the summary
+        # does not call a pipeline whose schedule is paused overdue
+        # (v2.27.4). Pipeline rules share the state machine names.
+        Sid      = "ReadScheduleRules"
+        Effect   = "Allow"
+        Action   = ["events:DescribeRule"]
+        Resource = local.schedule_rule_arns
+      },
+      {
+        # When a schedule was paused: the newest DisableRule event of the
+        # rule. LookupEvents has no resource ARN; it reads event history
+        # (who called what, when), never data.
+        Sid      = "ReadPauseTime"
+        Effect   = "Allow"
+        Action   = ["cloudtrail:LookupEvents"]
+        Resource = "*"
       },
       {
         # Lake Formation vends the S3 credentials of an LF-registered

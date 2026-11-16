@@ -151,6 +151,10 @@ read-only role.**
   - Step Functions `ListExecutions`, `DescribeExecution`,
     `GetExecutionHistory` on the workspace's state machines.
   - CloudWatch Logs `FilterLogEvents` on the workspace's runner log groups.
+  - EventBridge `DescribeRule` on the workspace's pipeline rules, and
+    CloudTrail `LookupEvents` (no resource scope; event history only), so
+    a schedule paused by hand shows as paused, with the time it was
+    paused, instead of as an overdue pipeline (v2.27.4).
   - `kms:Decrypt` only if the bucket uses a customer key. Lake Formation
     `GetDataAccess` only if slice 4 shows it is needed.
   - No `GetObject` on Terraform state: state can hold secrets.

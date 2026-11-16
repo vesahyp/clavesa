@@ -12,6 +12,13 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.4] — 2026-11-16
+
+### Fixed
+
+- **Workspace status shows each pipeline as it is now.** A failed run that a later run of the same pipeline fixed no longer makes the workspace "Needs attention": the workspace page shows it in grey ("2 failed runs in 14 days, last 12.11 13:10, later runs succeeded"). When the last finished run failed, the pipeline is "Failing" as before.
+- **A paused schedule is not an overdue pipeline.** When a cloud pipeline's schedule rule is disabled, `clavesa workspace summary` and the hosted UI say "schedule paused since 9.11 09:21" in grey and give no "no run since" warning. The hosted reader role needs `events:DescribeRule` and `cloudtrail:LookupEvents` for this (run `clavesa workspace deploy` once); without them the hosted UI says what it said before.
+
 ## [v2.27.3] — 2026-11-16
 
 ### Fixed

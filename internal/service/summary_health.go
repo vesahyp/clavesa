@@ -54,6 +54,17 @@ func overdueReason(lastRun *SummaryRun, intervalSeconds int64) string {
 	return fmt.Sprintf("no run since %s, expected %s", reasonTime(isoMillis(lastRun.StartedAt)), everyText(intervalSeconds))
 }
 
+// pausedNote is the note of a pipeline whose schedule is paused:
+// "schedule paused since 9.11 09:21", or "schedule paused" when the time
+// it was paused is not known (CloudTrail keeps 90 days, and the reader
+// may not be allowed to look).
+func pausedNote(since string) string {
+	if t, err := time.Parse(time.RFC3339, since); err == nil {
+		return "schedule paused since " + reasonTime(t.UnixMilli())
+	}
+	return "schedule paused"
+}
+
 // recentFailures applies the failed-run rule: a pipeline with a failed
 // run in the card's strip window (summaryStripDays) is never "ok". It
 // returns the reason, "7 failed runs in 14 days, last 15.11 11:08", or ""
