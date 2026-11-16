@@ -66,10 +66,13 @@ type WorkspaceSummary struct {
 	Account     string `json:"account,omitempty"`
 	Region      string `json:"region,omitempty"`
 	GeneratedAt string `json:"generated_at"`
+	// TimeZone is the IANA zone the day series are counted in and the
+	// times in reasons and notes are written in (workspace.TimeZone).
+	TimeZone string `json:"time_zone,omitempty"`
 	// Status is the worst of: last run failed (fail), a table past its
 	// freshness_sla (warn), no run inside the expected interval of a
 	// schedule that is not paused (warn). Reasons are plain words with
-	// Helsinki times (summary_health.go). Notes are facts that do not
+	// times in TimeZone (summary_health.go). Notes are facts that do not
 	// change the status: failed runs that a later run of the same
 	// pipeline followed with a success, a paused schedule.
 	Status        string   `json:"status"`
@@ -206,7 +209,10 @@ func (s *Service) WorkspaceSummary(ctx context.Context, q WorkspaceSummaryQuery)
 	if now.IsZero() {
 		now = time.Now()
 	}
-	now = now.UTC()
+	// Days are counted and times written in one zone (workspace.TimeZone),
+	// the zone the UI is configured with too.
+	zoneName, loc := workspace.TimeZone(s.workspace)
+	now = now.In(loc)
 	if s.dashResolver == nil {
 		return nil, fmt.Errorf("workspace summary: observability resolver not configured")
 	}
@@ -219,7 +225,8 @@ func (s *Service) WorkspaceSummary(ctx context.Context, q WorkspaceSummaryQuery)
 	sum := &WorkspaceSummary{
 		Name:          s.workspaceName(),
 		Kind:          "cloud",
-		GeneratedAt:   now.Format(time.RFC3339),
+		GeneratedAt:   now.UTC().Format(time.RFC3339),
+		TimeZone:      zoneName,
 		StatusReasons: []string{},
 		Pipelines:     []PipelineSummary{},
 		Problems:      []SummaryProblemGroup{},
@@ -445,7 +452,7 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 	if ps.ExpectedIntervalSeconds > 0 && env.Cloud {
 		ps.SchedulePaused, ps.SchedulePausedSince = s.scheduleState(ctx, s.awsName(p.Name)+"-schedule")
 		if ps.SchedulePaused {
-			ps.Notes = append(ps.Notes, pausedNote(ps.SchedulePausedSince))
+			ps.Notes = append(ps.Notes, pausedNote(ps.SchedulePausedSince, now.Location()))
 		}
 	}
 	if ps.ExpectedIntervalSeconds > 0 && !ps.SchedulePaused {
@@ -455,7 +462,7 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		deadline := interval + interval/4
 		if ps.LastRun == nil || now.Sub(time.UnixMilli(isoMillis(ps.LastRun.StartedAt))) > deadline {
 			status = worseStatus(status, SummaryWarn)
-			ps.StatusReasons = append(ps.StatusReasons, overdueReason(ps.LastRun, ps.ExpectedIntervalSeconds))
+			ps.StatusReasons = append(ps.StatusReasons, overdueReason(ps.LastRun, ps.ExpectedIntervalSeconds, now.Location()))
 		}
 	}
 	if ps.Problem != nil {
@@ -692,7 +699,8 @@ func worseStatus(a, b string) string {
 	return a
 }
 
-// summaryDays returns the `days` UTC dates ending today, oldest first.
+// summaryDays returns the `days` dates ending today in now's zone,
+// oldest first.
 func summaryDays(now time.Time, days int) []string {
 	out := make([]string, days)
 	for i := 0; i < days; i++ {
@@ -701,7 +709,7 @@ func summaryDays(now time.Time, days int) []string {
 	return out
 }
 
-// runsPerDay counts finished runs per UTC start day for the last `days`
+// runsPerDay counts finished runs per start day (in now's zone) for the last `days`
 // days, oldest first. Every day is present, with zeros on days with no run.
 func runsPerDay(runs []SummaryRun, now time.Time, days int) []SummaryDayRuns {
 	dates := summaryDays(now, days)
@@ -716,7 +724,7 @@ func runsPerDay(runs []SummaryRun, now time.Time, days int) []SummaryDayRuns {
 		if ms == 0 {
 			continue
 		}
-		i, ok := idx[time.UnixMilli(ms).UTC().Format("2006-01-02")]
+		i, ok := idx[time.UnixMilli(ms).In(now.Location()).Format("2006-01-02")]
 		if !ok {
 			continue
 		}
@@ -730,7 +738,7 @@ func runsPerDay(runs []SummaryRun, now time.Time, days int) []SummaryDayRuns {
 	return out
 }
 
-// costPerDay sums run compute cost per UTC start day for the last `days`
+// costPerDay sums run compute cost per start day (in now's zone) for the last `days`
 // days, oldest first.
 func costPerDay(runs []SummaryRun, now time.Time, days int) []SummaryDayCost {
 	dates := summaryDays(now, days)
@@ -745,7 +753,7 @@ func costPerDay(runs []SummaryRun, now time.Time, days int) []SummaryDayCost {
 		if ms == 0 {
 			continue
 		}
-		if i, ok := idx[time.UnixMilli(ms).UTC().Format("2006-01-02")]; ok {
+		if i, ok := idx[time.UnixMilli(ms).In(now.Location()).Format("2006-01-02")]; ok {
 			out[i].CostUSD += r.CostUSD
 		}
 	}

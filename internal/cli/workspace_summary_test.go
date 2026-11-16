@@ -16,6 +16,8 @@ import (
 //
 // Not t.Parallel(): captureStdout swaps the process-global os.Stdout.
 func TestWorkspaceSummaryJSONGolden(t *testing.T) {
+	// One zone on every machine, so the golden "time_zone" is stable.
+	t.Setenv("CLAVESA_TIME_ZONE", "Europe/Helsinki")
 	ws := t.TempDir()
 	steps := [][]string{
 		{"workspace", "init", "summary-ws", "--workspace", ws,

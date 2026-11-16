@@ -801,7 +801,7 @@ const WorkspaceSummaryShape = z.object({
   sla_tables: z.number(),
   problems: z.array(SummaryProblem.extend({ pipelines: z.array(z.string()) })),
 });
-// Parsed summaries are rebased on now in Helsinki days (summary.ts,
+// Parsed summaries are rebased on now in TIME_ZONE days (summary.ts,
 // rebaseSummary): counts and day series then match the CLI, also for a
 // stored summary written the day before.
 export const WorkspaceSummary = WorkspaceSummaryShape.transform((s) => rebaseSummary(s));

@@ -124,7 +124,10 @@ func NewMultiRouter(entries []WorkspaceEntry, factory MuxFactory, static fs.FS, 
 // /w/<slug>/ of a known workspace the basename and API base point at it;
 // anywhere else they are the root.
 func (m *MultiRouter) Config(r *http.Request) RuntimeConfig {
-	cfg := RuntimeConfig{Mode: "multi", Basename: "", APIBase: "/api", ReadOnly: m.readOnly}
+	// One page shows every workspace, so the zone is the machine's (or
+	// $CLAVESA_TIME_ZONE), not one workspace's.
+	zone, _ := wspkg.TimeZone("")
+	cfg := RuntimeConfig{Mode: "multi", Basename: "", APIBase: "/api", ReadOnly: m.readOnly, TimeZone: zone}
 	if slug, _, ok := splitWorkspacePath(r.URL.Path); ok {
 		if _, known := m.bySlug[slug]; known {
 			cfg.Basename = "/w/" + slug

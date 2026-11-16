@@ -91,7 +91,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
       data-slug={entry.slug}
       data-state="ready"
       data-overdue={overdue ? "true" : undefined}
-      // Finished runs in the 14 and 30 Helsinki days ending today, for the
+      // Finished runs in the 14 and 30 days (TIME_ZONE) ending today, for the
       // live check's comparison with `clavesa workspace summary`.
       data-runs-14d={runs14}
       data-runs-30d={s.runs_per_day_30d.reduce((a, d) => a + d.succeeded + d.failed, 0)}

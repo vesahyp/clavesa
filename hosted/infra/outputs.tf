@@ -75,3 +75,8 @@ output "event_bus_arn" {
 output "publisher_role_arn" {
   value = aws_iam_role.publisher.arn
 }
+
+output "time_zone" {
+  description = "The zone the SPA shows (render-index.mjs), the same the Lambda counts days in."
+  value       = var.time_zone
+}

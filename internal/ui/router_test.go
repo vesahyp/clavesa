@@ -151,13 +151,14 @@ func TestMultiRouter_UnknownWorkspace404(t *testing.T) {
 }
 
 func TestMultiRouter_SPAConfigInjection(t *testing.T) {
+	t.Setenv("CLAVESA_TIME_ZONE", "Europe/Helsinki")
 	r, _ := newTestRouter(t, true)
 	cases := []struct {
 		path string
 		want string
 	}{
-		{"/", `window.__CLAVESA__={"mode":"multi","basename":"","apiBase":"/api","readOnly":true};`},
-		{"/w/alpha/", `window.__CLAVESA__={"mode":"multi","basename":"/w/alpha","apiBase":"/w/alpha/api","readOnly":true,"workspace":"alpha"};`},
+		{"/", `window.__CLAVESA__={"mode":"multi","basename":"","apiBase":"/api","readOnly":true,"timeZone":"Europe/Helsinki"};`},
+		{"/w/alpha/", `window.__CLAVESA__={"mode":"multi","basename":"/w/alpha","apiBase":"/w/alpha/api","readOnly":true,"workspace":"alpha","timeZone":"Europe/Helsinki"};`},
 		{"/w/alpha/pipelines/dashboard", `"basename":"/w/alpha","apiBase":"/w/alpha/api"`},
 		{"/w/nope/pipelines", `"basename":"","apiBase":"/api"`},
 		{"/index.html", `"basename":"","apiBase":"/api"`},

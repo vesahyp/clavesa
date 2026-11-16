@@ -143,6 +143,7 @@ resource "aws_lambda_function" "api" {
       PUBLISHER_ROLE_ARN = aws_iam_role.publisher.arn
       WORK_ROOT          = "/tmp/ws"
       HOME               = "/tmp"
+      CLAVESA_TIME_ZONE  = var.time_zone
     }
   }
 

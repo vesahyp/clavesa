@@ -3,25 +3,13 @@ package service
 import (
 	"fmt"
 	"time"
-	// The summary's times are Helsinki time on every machine, also in the
-	// hosted Lambda (no zoneinfo there): the embedded zone database.
-	_ "time/tzdata"
 )
 
-// summaryZone is the zone every time in a status reason is written in:
-// Helsinki, the zone the hosted UI shows (ui/src/lib/clock.ts), so the
-// CLI, a summary written by the hosted Lambda and the UI say the same.
-var summaryZone = func() *time.Location {
-	loc, err := time.LoadLocation("Europe/Helsinki")
-	if err != nil {
-		return time.UTC
-	}
-	return loc
-}()
-
-// reasonTime is "9.11 07:16", Helsinki time.
-func reasonTime(ms int64) string {
-	return time.UnixMilli(ms).In(summaryZone).Format("2.1 15:04")
+// reasonTime is "9.11 07:16" in the summary's zone (workspace.TimeZone:
+// the hosted config, the workspace or the machine), the zone the UI
+// shows too, so the CLI, the hosted Lambda and the UI say the same.
+func reasonTime(ms int64, loc *time.Location) string {
+	return time.UnixMilli(ms).In(loc).Format("2.1 15:04")
 }
 
 // everyText is how often a pipeline should run, in words: "daily",
@@ -47,20 +35,20 @@ func everyText(seconds int64) string {
 // interval, with when it last ran: "no run since 9.11 07:16, expected
 // daily", or "never run, expected daily". The time is absolute, so a
 // stored summary that is read days later still says the truth.
-func overdueReason(lastRun *SummaryRun, intervalSeconds int64) string {
+func overdueReason(lastRun *SummaryRun, intervalSeconds int64, loc *time.Location) string {
 	if lastRun == nil || isoMillis(lastRun.StartedAt) == 0 {
 		return "never run, expected " + everyText(intervalSeconds)
 	}
-	return fmt.Sprintf("no run since %s, expected %s", reasonTime(isoMillis(lastRun.StartedAt)), everyText(intervalSeconds))
+	return fmt.Sprintf("no run since %s, expected %s", reasonTime(isoMillis(lastRun.StartedAt), loc), everyText(intervalSeconds))
 }
 
 // pausedNote is the note of a pipeline whose schedule is paused:
 // "schedule paused since 9.11 09:21", or "schedule paused" when the time
 // it was paused is not known (CloudTrail keeps 90 days, and the reader
 // may not be allowed to look).
-func pausedNote(since string) string {
+func pausedNote(since string, loc *time.Location) string {
 	if t, err := time.Parse(time.RFC3339, since); err == nil {
-		return "schedule paused since " + reasonTime(t.UnixMilli())
+		return "schedule paused since " + reasonTime(t.UnixMilli(), loc)
 	}
 	return "schedule paused"
 }
@@ -94,12 +82,12 @@ func recentFailures(runs []SummaryRun, now time.Time, lastFailed bool) string {
 	if n == 1 {
 		runsWord = "run"
 	}
-	return fmt.Sprintf("%d failed %s in %d days, last %s", n, runsWord, summaryStripDays, reasonTime(newest))
+	return fmt.Sprintf("%d failed %s in %d days, last %s", n, runsWord, summaryStripDays, reasonTime(newest, now.Location()))
 }
 
 // stripStart is the start of the first day of the strip window, the
-// same UTC days runsPerDay counts.
+// same days runsPerDay counts, in now's zone.
 func stripStart(now time.Time) time.Time {
-	d := now.UTC().AddDate(0, 0, -(summaryStripDays - 1))
-	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
+	d := now.AddDate(0, 0, -(summaryStripDays - 1))
+	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, now.Location())
 }

@@ -6,7 +6,7 @@
  * Workspaces page, and cost per day split by pipeline.
  */
 
-import { dayMonth, helsinkiDay, lastDays, stamp } from "@/lib/clock";
+import { dayMonth, zoneDay, lastDays, stamp } from "@/lib/clock";
 import type {
   FreshnessState,
   SummaryStatus,
@@ -63,7 +63,7 @@ export function summaryOverdue(
   return (now - generated) / 1000 > iv + iv / 4;
 }
 
-/** The time a card names: "14.11 08:02", Helsinki time. */
+/** The time a card names: "14.11 08:02", in TIME_ZONE. */
 const stampTime = stamp;
 
 /**
@@ -188,7 +188,7 @@ const FINISHED = new Set(["succeeded", "failed"]);
 
 /**
  * rebaseSummary rebuilds the day series and the window counts of a
- * summary against now, in Helsinki days. A stored summary was computed
+ * summary against now, in TIME_ZONE days. A stored summary was computed
  * when it was written (a local workspace's at its last run's end), so its
  * windows end on that day: read the next morning, "14 runs in 14 days"
  * would still count a day the CLI has already dropped, and the last bar
@@ -204,11 +204,11 @@ export function rebaseSummary<S extends WorkspaceSummary>(s: S, now: number = Da
   let costTotal = 0;
   let records = 0;
   const pipelines = s.pipelines.map((p) => {
-    const inWindow = p.runs.filter((r) => helsinkiDay(r.started_at) >= first);
+    const inWindow = p.runs.filter((r) => zoneDay(r.started_at) >= first);
     let pCost = 0;
     let pRecords = 0;
     for (const r of inWindow) {
-      const day = helsinkiDay(r.started_at);
+      const day = zoneDay(r.started_at);
       const slot = runs.get(day);
       if (slot && FINISHED.has(r.result)) slot[r.result as "succeeded" | "failed"]++;
       if (cost.has(day)) cost.set(day, (cost.get(day) ?? 0) + (r.cost_usd || 0));
@@ -235,7 +235,7 @@ export function rebaseSummary<S extends WorkspaceSummary>(s: S, now: number = Da
 /**
  * costPerDayByPipeline splits the summary's 30 cost days by pipeline,
  * from the runs each pipeline carries. Keys are the summary's own day
- * keys (Helsinki days, rebaseSummary), so the stack totals match
+ * keys (TIME_ZONE days, rebaseSummary), so the stack totals match
  * cost_per_day_30d.
  */
 export function costPerDayByPipeline(
@@ -248,7 +248,7 @@ export function costPerDayByPipeline(
   const idx = new Map(days.map((d, i) => [d.date, i]));
   for (const p of s.pipelines) {
     for (const r of p.runs) {
-      const i = idx.get(helsinkiDay(r.started_at));
+      const i = idx.get(zoneDay(r.started_at));
       if (i === undefined || r.cost_usd <= 0) continue;
       const bp = days[i].byPipeline;
       bp[p.name] = (bp[p.name] ?? 0) + r.cost_usd;

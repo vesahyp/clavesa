@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda hosted-tracking-check hosted-live-check errors
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda hosted-tracking-check hosted-live-check ui-day-windows-check errors
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -75,7 +75,7 @@ build: build-ui sync-modules sync-runner ## Build everything → bin/clavesa (UI
 # then launches the gates with SKIP_BUILD=1 so three concurrent sub-makes
 # don't race each other rewriting bin/clavesa. NEVER set it manually — the
 # build dep is what keeps every gate off a stale binary.
-test: test-go test-runner-py test-cli test-runner ui-new-pipeline-check ## Run all tests (incl. docker-gated runner suite — GH #27)
+test: test-go test-runner-py test-cli test-runner ui-new-pipeline-check ui-day-windows-check ## Run all tests (incl. docker-gated runner suite — GH #27)
 	@./scripts/green-stamp.sh write test
 
 test-go: ## Go unit tests (fast, no binary)
@@ -213,6 +213,9 @@ shadow-compare: ## Shadow mode: compare the Databricks step's table with clavesa
 	  $(if $(SUMS),--sum "$(SUMS)") \
 	  $(if $(WHERE),--where "$(WHERE)",$(if $(DAYS),--where "$(PARTITION) >= date_sub(current_date(), $(DAYS))")) \
 	  $(if $(JSON),--json)
+
+ui-day-windows-check: ## The UI counts the same 14 and 30 days as the CLI at 00:10 Helsinki time (internal/service/testdata/day_windows_0010.json; the Go half is TestDayWindowsAt0010; part of make test)
+	node ui/scripts/day-windows-check.mjs
 
 ui-new-pipeline-check: $(if $(SKIP_BUILD),,build) ## Editing UI: create a pipeline from the Pipelines page with the list already cached, its page opens the editor at once and after a reload, never "No pipeline with this name" (part of make test)
 	cd ui && npx playwright install chromium

@@ -96,6 +96,7 @@ function layOut() {
     "checkclient",
     "check.auth.eu-north-1.amazoncognito.com",
     "false",
+    "Europe/Helsinki",
   ]);
   cpSync(join(REPO, "web-tracker/tracker.js"), join(hosted, "tracker.js"));
   cpSync(join(REPO, "hosted/static/tracker-config.js"), join(hosted, "tracker-config.js"));

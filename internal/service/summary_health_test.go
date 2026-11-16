@@ -98,21 +98,21 @@ func TestRecentFailuresAndOverdueReason(t *testing.T) {
 		{Result: "succeeded", StartedAt: iso(-2 * time.Hour)},
 	}
 	// The only failure is the last run: "last run failed" says it already.
-	if got := recentFailures(runs, summaryNow, true); got != "" {
+	if got := recentFailures(runs, summaryNow.In(helsinki), true); got != "" {
 		t.Errorf("single last failure = %q, want none", got)
 	}
-	if got := recentFailures(runs, summaryNow, false); got != "1 failed run in 14 days, last 15.11 13:00" {
+	if got := recentFailures(runs, summaryNow.In(helsinki), false); got != "1 failed run in 14 days, last 15.11 13:00" {
 		t.Errorf("one failure = %q", got)
 	}
-	if got := recentFailures([]SummaryRun{{Result: "succeeded", StartedAt: iso(-time.Hour)}}, summaryNow, false); got != "" {
+	if got := recentFailures([]SummaryRun{{Result: "succeeded", StartedAt: iso(-time.Hour)}}, summaryNow.In(helsinki), false); got != "" {
 		t.Errorf("no failure = %q", got)
 	}
 
 	last := &SummaryRun{StartedAt: "2026-11-09T05:16:00Z"}
-	if got := overdueReason(last, 86400); got != "no run since 9.11 07:16, expected daily" {
+	if got := overdueReason(last, 86400, helsinki); got != "no run since 9.11 07:16, expected daily" {
 		t.Errorf("overdue = %q", got)
 	}
-	if got := overdueReason(nil, 3600); got != "never run, expected hourly" {
+	if got := overdueReason(nil, 3600, helsinki); got != "never run, expected hourly" {
 		t.Errorf("never run = %q", got)
 	}
 	for sec, want := range map[int64]string{900: "every 15 min", 21600: "every 6 h", 172800: "every 2 days"} {

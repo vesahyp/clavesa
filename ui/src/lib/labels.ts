@@ -25,7 +25,7 @@ const UNITS: Record<string, [string, string]> = {
   days: ["daily", "days"],
 };
 
-/** A UTC hour and minute of a cron line as Helsinki "06:30". */
+/** A UTC hour and minute of a cron line as "06:30" in TIME_ZONE. */
 function helsinkiClock(h: number, m: number): string {
   const now = new Date();
   return clockTime(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, m));
@@ -34,7 +34,7 @@ function helsinkiClock(h: number, m: number): string {
 /**
  * scheduleText turns an EventBridge schedule into words: "rate(1 day)" is
  * "Daily", "cron(30 4 * * ? *)" is "Daily at 06:30" (cron is UTC, the
- * time is shown in Helsinki), and no schedule is "Not scheduled by
+ * time is shown in TIME_ZONE), and no schedule is "Not scheduled by
  * clavesa" (the run is started from outside, such as the Mac's crontab).
  * Anything else keeps its expression after "Schedule:".
  */

@@ -2,6 +2,7 @@
   "name": "summary-ws",
   "kind": "local",
   "generated_at": "<now>",
+  "time_zone": "Europe/Helsinki",
   "status": "warn",
   "status_reasons": [
     "orders: 1 table(s) past their freshness target",

@@ -45,6 +45,9 @@ export interface RuntimeConfig {
   workspace: string;
   /** Hosted mode only: how to sign in. */
   cognito?: HostedCognitoConfig;
+  /** IANA zone every day and time is shown in (clock.ts). The server
+   * writes it; undefined means the browser's zone. */
+  timeZone?: string;
 }
 
 declare global {
@@ -63,6 +66,7 @@ export function resolveRuntimeConfig(
     raw?.mode === "multi" || raw?.mode === "hosted" ? raw.mode : "local";
   const readOnly = raw?.readOnly === true;
   const cognito = mode === "hosted" ? raw?.cognito : undefined;
+  const timeZone = typeof raw?.timeZone === "string" && raw.timeZone ? raw.timeZone : undefined;
   if (mode === "local") {
     return {
       mode,
@@ -70,6 +74,7 @@ export function resolveRuntimeConfig(
       apiBase: raw?.apiBase ?? "/api",
       readOnly,
       workspace: "",
+      timeZone,
     };
   }
   if (raw?.basename !== undefined && raw?.apiBase !== undefined) {
@@ -80,6 +85,7 @@ export function resolveRuntimeConfig(
       readOnly,
       workspace: raw.workspace ?? "",
       cognito,
+      timeZone,
     };
   }
   const m = WORKSPACE_PATH.exec(pathname);
@@ -92,9 +98,10 @@ export function resolveRuntimeConfig(
       readOnly,
       workspace: ws,
       cognito,
+      timeZone,
     };
   }
-  return { mode, basename: "", apiBase: "/api", readOnly, workspace: "", cognito };
+  return { mode, basename: "", apiBase: "/api", readOnly, workspace: "", cognito, timeZone };
 }
 
 export const runtimeConfig: RuntimeConfig = resolveRuntimeConfig(

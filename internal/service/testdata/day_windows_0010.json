@@ -1,0 +1,147 @@
+{
+ "_comment": "make test: the CLI (Go summary, TestDayWindowsAt0010) and the UI (ui/scripts/day-windows-check.mjs, rebaseSummary) count these runs at 00:10 Helsinki time and must both give want. Two runs fall on a different day in UTC (3.11 22:30 and 16.11 22:05): counted in UTC, d14 would be 16.",
+ "now": "2026-11-16T22:10:00Z",
+ "time_zone": "Europe/Helsinki",
+ "runs": [
+  {
+   "started_at": "2026-10-17T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-18T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-19T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-20T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-21T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-22T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-23T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-24T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-25T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-26T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-27T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-28T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-29T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-30T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-10-31T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-01T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-02T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-03T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-04T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-05T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-06T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-07T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-08T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-09T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-10T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-11T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-12T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-13T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-14T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-15T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-16T06:00:04.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-03T22:30:00.000Z",
+   "result": "succeeded"
+  },
+  {
+   "started_at": "2026-11-16T22:05:00.000Z",
+   "result": "failed"
+  }
+ ],
+ "want": {
+  "d14": 15,
+  "d30": 31,
+  "first_day_14": "2026-11-04",
+  "first_day_30": "2026-10-19",
+  "last_day": "2026-11-17",
+  "last_day_failed": 1
+ }
+}

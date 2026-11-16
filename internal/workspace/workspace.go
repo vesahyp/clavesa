@@ -95,6 +95,10 @@ type Manifest struct {
 	// for a workspace deployed before the field existed. Not the state
 	// bucket's region: that is Backend.Region.
 	Region string `json:"region,omitempty"`
+	// TimeZone is the IANA zone the workspace summary counts days in and
+	// writes times in ("Europe/Helsinki"). Empty means the machine's local
+	// zone; $CLAVESA_TIME_ZONE wins over both (see TimeZone).
+	TimeZone string `json:"time_zone,omitempty"`
 }
 
 // AWSNamesWorkspace is the Manifest.AWSNames value for workspace-scoped names.

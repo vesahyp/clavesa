@@ -10,6 +10,11 @@ The status is the worst of: the last run of a pipeline failed (fail), a
 table is past its freshness_sla (warn), a pipeline with a trigger_schedule
 did not run inside its expected interval (warn).
 
+Days are counted, and times written, in one time zone: $CLAVESA_TIME_ZONE
+when set, else "time_zone" in clavesa.json (an IANA name such as
+"Europe/Helsinki"), else the machine's local zone. The UI shows days in
+the same zone, so the 14 and 30 day counts agree.
+
 With --publish, the summary is also written to the hosted UI's data
 bucket (summaries/<workspace>.json, ADR-032) through the hosted UI's
 publisher role, which the workspace's own AWS identity assumes. The

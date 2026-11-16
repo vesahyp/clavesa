@@ -97,7 +97,9 @@ const OUT = `${REPO}.shots/live/`;
 const iphone = devices["iPhone 16"];
 if (!iphone) throw new Error('playwright has no "iPhone 16" device descriptor');
 
-const HEL = "Europe/Helsinki";
+// The zone the hosted UI shows: hosted/infra var.time_zone, from its
+// terraform output (set below, before any page is checked).
+let HEL = "Europe/Helsinki";
 const helDay = (d) => new Intl.DateTimeFormat("en-CA", { timeZone: HEL }).format(d);
 const helHM = (d) =>
   new Intl.DateTimeFormat("en-GB", { timeZone: HEL, hour: "2-digit", minute: "2-digit", hour12: false }).format(d);
@@ -166,7 +168,7 @@ function terraformOutputs() {
     if (!v) throw new Error(`terraform output ${k} is missing`);
     return v;
   };
-  return { pool: need("user_pool_id"), client: need("check_client_id"), region: need("region") };
+  return { pool: need("user_pool_id"), client: need("check_client_id"), region: need("region"), timeZone: o.time_zone?.value };
 }
 
 function signIn(user, tf) {
@@ -312,14 +314,19 @@ async function buildPages(tok) {
         for (const ws of workspaceList) {
           const s = ws.summary;
           if (!s) continue;
-          const failed = (s.pipelines ?? []).flatMap((p) => p.runs ?? [])
-            .filter((r) => r.result === "failed" && helDay(new Date(r.started_at)) >= firstDay).length;
+          // A failure counts only while it is the pipeline's newest finished
+          // run. A failure that a later run fixed is history: a grey note.
+          const failing = (s.pipelines ?? []).filter((p) => {
+            const done = (p.runs ?? []).filter((r) => r.result === "failed" || r.result === "succeeded")
+              .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)));
+            return done[0]?.result === "failed" && helDay(new Date(done[0].started_at)) >= firstDay;
+          }).map((p) => p.name);
           const card = (info.cards ?? []).find((c) => c.slug === ws.slug);
           if (!card) continue;
-          if (failed && card.status === "Healthy")
-            out.push(`${ws.slug}: ${failed} failed run(s) in 14 days but the card says Healthy`);
-          if (failed && !/failed run/.test(card.line))
-            out.push(`${ws.slug}: the card does not name its ${failed} failed run(s)`);
+          if (failing.length && card.status === "Healthy")
+            out.push(`${ws.slug}: newest run of ${failing.join(", ")} failed but the card says Healthy`);
+          if (failing.length && !/failed run/.test(card.line))
+            out.push(`${ws.slug}: the card does not name the failed run of ${failing.join(", ")}`);
           if (card.status !== "Healthy" && !card.line)
             out.push(`${ws.slug}: "${card.status}" with no reason on the card`);
           if (/no run inside the expected interval/.test(card.line))
@@ -614,6 +621,8 @@ async function visit(ctx, pg) {
 const failures = [];
 const user = readCheckUser();
 const tf = terraformOutputs();
+if (tf.timeZone) HEL = tf.timeZone;
+console.log(`hosted time zone: ${HEL}`);
 const tok = signIn(user, tf);
 user.password = "";
 console.log(`signed in as the check user on ${BASE} (tokens not printed)`);

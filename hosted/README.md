@@ -293,7 +293,10 @@ Google redirect URI.
 - `presignup/index.mjs` the pre-signup Lambda.
 - `scripts/deploy-spa.sh` and `scripts/render-index.mjs` write the
   hosted `index.html` (`window.__CLAVESA__ = {mode: "hosted", readOnly:
-  true, cognito: {...}}`) and upload the build.
+  true, cognito: {...}, timeZone}`) and upload the build. `timeZone` is
+  `var.time_zone` (default Europe/Helsinki), which the Lambda also gets
+  as `CLAVESA_TIME_ZONE`: the cards count days in the same zone as the
+  summaries.
 - `scripts/add-user.sh` the user that `make hosted-add-user` creates.
 - `static/tracker-config.js`, `static/t.gif` the tracker's settings
   and pixel; `scripts/errors.sh` is `make errors`;

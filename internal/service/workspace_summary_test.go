@@ -18,6 +18,15 @@ import (
 // summaryNow is the fixed clock every summary test computes against.
 var summaryNow = time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
 
+// helsinki is the zone TestMain sets through CLAVESA_TIME_ZONE.
+var helsinki = func() *time.Location {
+	loc, err := time.LoadLocation("Europe/Helsinki")
+	if err != nil {
+		panic(err)
+	}
+	return loc
+}()
+
 // summaryPipelineTF is one transform that declares a freshness_sla, the
 // shape `node add` + `node edit --set freshness_sla=4h` writes.
 const summaryPipelineTF = `variable "pipeline_name" { type = string default = "orders" }
@@ -524,10 +533,10 @@ func TestClassifySummaryError(t *testing.T) {
 func TestTFVarValue(t *testing.T) {
 	for in, want := range map[string]string{
 		`"cron(30 4 * * ? *)"   # 04:30 UTC every day`: "cron(30 4 * * ? *)",
-		`"rate(1 day)"`:            "rate(1 day)",
-		`"a # b"`:                  "a # b",
-		`null // none`:             "null",
-		`3`:                        "3",
+		`"rate(1 day)"`:          "rate(1 day)",
+		`"a # b"`:                "a # b",
+		`null // none`:           "null",
+		`3`:                      "3",
 		`"say \"hi\"" # comment`: `say \"hi\"`,
 	} {
 		if got := tfvarValue(in); got != want {

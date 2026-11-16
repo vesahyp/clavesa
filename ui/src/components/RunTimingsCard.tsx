@@ -205,7 +205,7 @@ export default function RunTimingsCard({ dir }: { dir: string }) {
           <div className="h-72 w-full text-muted-foreground" data-testid="run-timings-chart"
             data-point-count={rows.length}
             // For make hosted-live-check: the newest run's label, which must
-            // be its start in Helsinki time.
+            // be its start in TIME_ZONE.
             data-newest-run={newest?.run_id}
             data-newest-label={newest ? stamp(newest.started_at) : undefined}>
             <ResponsiveContainer width="100%" height="100%">

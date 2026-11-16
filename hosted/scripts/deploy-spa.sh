@@ -3,7 +3,7 @@
 # with the hosted runtime config, to the SPA bucket of hosted/infra.
 #
 #   index.html          window.__CLAVESA__ = {mode:"hosted", readOnly:true,
-#                       cognito:{...}} from the Terraform outputs, plus a
+#                       cognito:{...}, timeZone} from the Terraform outputs, plus a
 #                       noindex meta. no-cache.
 #   assets/*            Vite-hashed, immutable.
 #   robots.txt          Disallow everything.
@@ -41,7 +41,8 @@ cp -R "$DIST/." "$OUT/"
 rm -f "$OUT/.gitkeep"
 
 node "$ROOT/hosted/scripts/render-index.mjs" "$DIST/index.html" "$OUT/index.html" \
-  "$REGION" "$(out user_pool_id)" "$(out spa_client_id)" "$(out cognito_domain)" "$(out google_enabled)"
+  "$REGION" "$(out user_pool_id)" "$(out spa_client_id)" "$(out cognito_domain)" "$(out google_enabled)" \
+  "$(out time_zone)"
 cp "$ROOT/hosted/static/robots.txt" "$OUT/robots.txt"
 cp "$ROOT/web-tracker/tracker.js" "$OUT/tracker.js"
 cp "$ROOT/hosted/static/tracker-config.js" "$OUT/tracker-config.js"

@@ -207,7 +207,8 @@ func runLocalUI(cmd *cobra.Command, addr string, static fs.FS, readOnly, noBrows
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/api/", http.StripPrefix("/api", apiHandler))
-	cfg := ui.RuntimeConfig{Mode: "local", Basename: "", APIBase: "/api", ReadOnly: readOnly}
+	zone, _ := wspkg.TimeZone(workspace)
+	cfg := ui.RuntimeConfig{Mode: "local", Basename: "", APIBase: "/api", ReadOnly: readOnly, TimeZone: zone}
 	mux.Handle("/", ui.SPAHandler(static, func(*http.Request) ui.RuntimeConfig { return cfg }))
 	var handler http.Handler = mux
 	if readOnly {

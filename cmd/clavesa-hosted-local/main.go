@@ -31,6 +31,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/hosted"
 	"github.com/vesahyp/clavesa/internal/service"
 	"github.com/vesahyp/clavesa/internal/ui"
+	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
 // dirStore is a hosted.SummaryStore over <dir>/<name>.json.
@@ -84,7 +85,8 @@ func main() {
 		log.Fatal(err)
 	}
 	spa := ui.SPAHandler(static, func(r *http.Request) ui.RuntimeConfig {
-		c := ui.RuntimeConfig{Mode: "multi", APIBase: "/api", ReadOnly: true}
+		zone, _ := workspace.TimeZone("")
+		c := ui.RuntimeConfig{Mode: "multi", APIBase: "/api", ReadOnly: true, TimeZone: zone}
 		if rest, ok := strings.CutPrefix(r.URL.Path, "/w/"); ok {
 			if name, _, _ := strings.Cut(rest, "/"); name != "" {
 				c.Basename, c.APIBase, c.Workspace = "/w/"+name, "/w/"+name+"/api", name

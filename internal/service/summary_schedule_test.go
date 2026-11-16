@@ -27,7 +27,7 @@ func TestDisabledSince(t *testing.T) {
 	if got := disabledSince(events, "clavesa-none-schedule"); got != "" {
 		t.Errorf("no match = %q, want \"\"", got)
 	}
-	if got := pausedNote("2026-11-09T07:21:11Z"); got != "schedule paused since 9.11 09:21" {
+	if got := pausedNote("2026-11-09T07:21:11Z", helsinki); got != "schedule paused since 9.11 09:21" {
 		t.Errorf("note = %q", got)
 	}
 }

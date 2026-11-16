@@ -113,3 +113,9 @@ variable "daily_refresh_schedule" {
   type        = string
   default     = "cron(0 5 * * ? *)"
 }
+
+variable "time_zone" {
+  description = "IANA zone the hosted UI counts days in and shows times in. The Lambda gets it as CLAVESA_TIME_ZONE (the workspace summaries) and the SPA as timeZone in index.html, so both count the same days."
+  type        = string
+  default     = "Europe/Helsinki"
+}

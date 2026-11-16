@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.6] — 2026-11-17
+
+### Fixed
+
+- **The UI and the CLI count the same days.** `clavesa workspace summary` counted runs per UTC day, and the UI per Helsinki day, so between midnight and 02:00 the 14 and 30 day run counts differed by a day. Both now use one time zone: `$CLAVESA_TIME_ZONE`, else the new `"time_zone"` key in `clavesa.json`, else the machine's local zone. `clavesa ui` shows days and times in that zone. The hosted UI takes it from `var.time_zone` in `hosted/infra` (default `Europe/Helsinki`), for both its Lambda and its pages.
+
 ## [v2.27.5] — 2026-11-16
 
 ### Fixed

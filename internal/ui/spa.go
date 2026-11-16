@@ -26,6 +26,9 @@ type RuntimeConfig struct {
 	// Workspace is the path-safe workspace name inside a multi-workspace
 	// server; empty at the root and in local mode.
 	Workspace string `json:"workspace,omitempty"`
+	// TimeZone is the IANA zone the SPA shows days and times in, the zone
+	// the workspace summary counts its days in (workspace.TimeZone).
+	TimeZone string `json:"timeZone,omitempty"`
 }
 
 // spaHandler serves the embedded SPA. Paths that name a file serve it;

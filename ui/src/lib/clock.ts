@@ -1,11 +1,26 @@
 /**
- * clock.ts — every time and day the UI shows is Helsinki local time, the
- * zone the CLI prints on Vesa's Mac (`clavesa workspace summary`), and
- * every date is day.month ("16.11"). The summary from the server keys its
- * days in UTC; rebaseSummary (summary.ts) rebuilds them with helsinkiDay.
+ * clock.ts — every time and day the UI shows is in one zone, TIME_ZONE,
+ * and every date is day.month ("16.11"). The zone comes from the runtime
+ * config the server writes (`timeZone`: the hosted config's time_zone, or
+ * for `clavesa ui` the workspace's or the machine's zone), the same zone
+ * the Go summary counts its days in (workspace.TimeZone). With no config
+ * (Vite dev server) it is the browser's zone. rebaseSummary (summary.ts)
+ * rebuilds the day series with zoneDay.
  */
+import { runtimeConfig } from "@/lib/runtimeConfig";
 
-export const TIME_ZONE = "Europe/Helsinki";
+function usableZone(tz: string | undefined): string | undefined {
+  if (!tz) return undefined;
+  try {
+    new Intl.DateTimeFormat("en-CA", { timeZone: tz });
+    return tz;
+  } catch {
+    return undefined;
+  }
+}
+
+export const TIME_ZONE: string =
+  usableZone(runtimeConfig.timeZone) ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 const dayFmt = new Intl.DateTimeFormat("en-CA", {
   timeZone: TIME_ZONE,
@@ -25,15 +40,15 @@ function toDate(v: string | number | Date): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/** helsinkiDay is the Helsinki calendar day of a time, "2026-11-16". */
-export function helsinkiDay(v: string | number | Date): string {
+/** zoneDay is the calendar day of a time in TIME_ZONE, "2026-11-16". */
+export function zoneDay(v: string | number | Date): string {
   const d = toDate(v);
   return d ? dayFmt.format(d) : "";
 }
 
-/** The `n` Helsinki days ending today, oldest first, as "YYYY-MM-DD". */
+/** The `n` days (in TIME_ZONE) ending today, oldest first, as "YYYY-MM-DD". */
 export function lastDays(n: number, now: number = Date.now()): string[] {
-  const [y, m, d] = helsinkiDay(now).split("-").map(Number);
+  const [y, m, d] = zoneDay(now).split("-").map(Number);
   const out: string[] = [];
   for (let i = n - 1; i >= 0; i--) {
     out.push(new Date(Date.UTC(y, m - 1, d - i)).toISOString().slice(0, 10));
@@ -47,15 +62,15 @@ export function dayMonth(day: string): string {
   return d && m ? `${Number(d)}.${Number(m)}` : day;
 }
 
-/** clockTime is "08:00", Helsinki time. */
+/** clockTime is "08:00" in TIME_ZONE. */
 export function clockTime(v: string | number | Date): string {
   const d = toDate(v);
   return d ? hmFmt.format(d) : "";
 }
 
-/** stamp is "16.11 08:00", Helsinki time. */
+/** stamp is "16.11 08:00" in TIME_ZONE. */
 export function stamp(v: string | number | Date): string {
   const d = toDate(v);
   if (!d) return typeof v === "string" ? v : "";
-  return `${dayMonth(helsinkiDay(d))} ${clockTime(d)}`;
+  return `${dayMonth(zoneDay(d))} ${clockTime(d)}`;
 }

@@ -1,5 +1,5 @@
 // render-index.mjs <in index.html> <out index.html> <region> <userPoolId>
-//                  <clientId> <cognitoDomain> <googleEnabled>
+//                  <clientId> <cognitoDomain> <googleEnabled> <timeZone>
 //
 // Writes the hosted index.html: the same script tag the Go server injects
 // (internal/ui/spa.go InjectRuntimeConfig), plus the Cognito settings and
@@ -15,10 +15,10 @@
 // local `clavesa ui` never loads the tracker.
 import { readFileSync, writeFileSync } from "node:fs";
 
-const [input, output, region, userPoolId, clientId, domain, google] =
+const [input, output, region, userPoolId, clientId, domain, google, timeZone] =
   process.argv.slice(2);
-if (!output || !userPoolId || !clientId) {
-  console.error("usage: render-index.mjs <in> <out> <region> <poolId> <clientId> <domain> <googleEnabled>");
+if (!output || !userPoolId || !clientId || !timeZone) {
+  console.error("usage: render-index.mjs <in> <out> <region> <poolId> <clientId> <domain> <googleEnabled> <timeZone>");
   process.exit(2);
 }
 
@@ -32,6 +32,9 @@ const config = {
     domain,
     googleEnabled: google === "true",
   },
+  // hosted/infra var.time_zone: the Lambda counts the summary days in it
+  // too (CLAVESA_TIME_ZONE), so the cards and the CLI agree.
+  timeZone,
 };
 // Escape < so a value can never close the script tag (json.Marshal does
 // the same on the Go side).
