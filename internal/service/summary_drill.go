@@ -5,6 +5,8 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/runtiming"
@@ -48,6 +50,9 @@ type SummaryDrill struct {
 	Tree map[string]string `json:"tree"`
 	// Pipelines is keyed by the pipeline's workspace-relative dir.
 	Pipelines map[string]PipelineDrill `json:"pipelines"`
+	// Snapshot is the catalog and dashboard snapshot (ADR-036); nil from
+	// a clavesa older than it.
+	Snapshot *DrillSnapshot `json:"snapshot,omitempty"`
 }
 
 // PipelineDrill is one pipeline's part of a SummaryDrill.
@@ -85,6 +90,13 @@ func (s *Service) SummaryDrill(ctx context.Context, sum *WorkspaceSummary) *Summ
 			if f.Path == "" {
 				continue // the generated environment.json: the reader writes its own
 			}
+			// The workspace's shape, and its dashboard specs (ADR-036:
+			// their stored widget results are in Snapshot). Sources,
+			// notebooks and the runner requirements stay on the Mac.
+			isSpec := strings.HasPrefix(f.Key, ".clavesa/dashboards/") || strings.HasPrefix(f.Key, "dashboards/")
+			if !strings.HasSuffix(f.Key, ".tf") && !strings.HasSuffix(f.Key, ".tfvars") && f.Key != "clavesa.json" && !isSpec {
+				continue
+			}
 			if body, err := os.ReadFile(f.Path); err == nil {
 				d.Tree[f.Key] = string(body)
 			}
@@ -93,6 +105,7 @@ func (s *Service) SummaryDrill(ctx context.Context, sum *WorkspaceSummary) *Summ
 	for _, p := range sum.Pipelines {
 		d.Pipelines[p.Dir] = s.pipelineDrill(ctx, p)
 	}
+	d.Snapshot = s.drillSnapshot(ctx, time.Now())
 	return d
 }
 

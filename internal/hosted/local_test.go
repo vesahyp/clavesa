@@ -58,7 +58,9 @@ func localFixture(t *testing.T, now time.Time) string {
 			t.Fatal(err)
 		}
 	}
-	write("clavesa.json", `{"name":"local-ws","cloud":"aws","version":1,"catalog":"clavesa_local_ws","system_catalog":"clavesa_local_ws_system"}`+"\n")
+	// A local hosted block with the snapshot on (ADR-036 is opt-in).
+	write("clavesa.json", `{"name":"local-ws","cloud":"aws","version":1,"catalog":"clavesa_local_ws","system_catalog":"clavesa_local_ws_system",`+
+		`"hosted":{"url":"https://ui.clavesa.dev","kind":"local","publisher_role_arn":"arn:aws:iam::111122223333:role/clavesa-ui-publisher","data_bucket":"clavesa-ui-data-111122223333","region":"eu-north-1","snapshot":true}}`+"\n")
 	write("orders/main.tf", localPipelineTF)
 	write("orders/variables.tf", "variable \"trigger_schedule\" {\n  type    = string\n  default = \"rate(1 day)\"\n}\n")
 	write(".env", "SECRET=1\n")
@@ -247,8 +249,9 @@ func TestLocalSummaryBackedParity(t *testing.T) {
 		}
 		sort.Strings(diff)
 		allowed := func(d string) bool {
-			// The summary-backed /workspace says summary_only.
-			return strings.Contains(d, ".summary_only")
+			// The summary-backed /workspace says summary_only, and when
+			// its snapshot was taken (ADR-036).
+			return strings.Contains(d, ".summary_only") || strings.Contains(d, ".snapshot_at")
 		}
 		for _, d := range diff {
 			if !allowed(d) {
@@ -286,8 +289,14 @@ func TestLocalSummaryBackedParity(t *testing.T) {
 		t.Errorf("timing records = %d, want 12", n)
 	}
 	_, hw := getJSON(t, hosted, "/workspace")
-	if hw.(map[string]any)["summary_only"] != true {
-		t.Errorf("/workspace = %v, want summary_only", hw)
+	if hw.(map[string]any)["summary_only"] != true || hw.(map[string]any)["snapshot_at"] == nil {
+		t.Errorf("/workspace = %v, want summary_only and snapshot_at", hw)
+	}
+	// ADR-036: the catalog listing is the Mac's, from the snapshot.
+	lcode, lc := getJSON(t, live, "/workspace/tables")
+	hcode, hc := getJSON(t, hosted, "/workspace/tables")
+	if lcode != http.StatusOK || hcode != http.StatusOK || fmt.Sprint(lc) != fmt.Sprint(hc) {
+		t.Errorf("GET /workspace/tables: live %d %v, hosted %d %v", lcode, lc, hcode, hc)
 	}
 
 	// The published file names no path on the Mac and holds no secret.
@@ -304,7 +313,6 @@ func TestLocalSummaryBackedParity(t *testing.T) {
 	for _, rt := range []string{
 		"/data/tables-state?pipeline=orders&limit=50&dir=orders",
 		"/backfills?dir=orders",
-		"/workspace/tables",
 		"/pipeline/lineage?dir=orders",
 		"/data/table?dir=orders",
 		"/pipeline/execution?dir=orders&run=run00",

@@ -144,7 +144,7 @@ const app = (
               }
             />
             {runtimeConfig.mode !== "local" && (
-              <Route path="/catalog" element={<OnTheMac title="Catalog"><Catalog /></OnTheMac>} />
+              <Route path="/catalog" element={<OnTheMac title="Catalog" snapshot><Catalog /></OnTheMac>} />
             )}
             <Route path="/overview" element={<WorkspaceHome />} />
             <Route
@@ -154,7 +154,7 @@ const app = (
             <Route path="/sources" element={<OnTheMac title="Sources"><Sources /></OnTheMac>} />
             <Route path="/credentials" element={readOnlyAlt(<Credentials />, "Credentials", NOT_HOSTED.credentials)} />
             <Route path="/unity-catalog" element={<OnTheMac title="Unity Catalog"><UnityCatalog /></OnTheMac>} />
-            <Route path="/runner" element={readOnlyAlt(<Runner />, "Runner", NOT_HOSTED.runner)} />
+            <Route path="/runner" element={<OnTheMac title="Runner"><Runner /></OnTheMac>} />
             <Route path="/notebooks" element={<OnTheMac title="Notebooks"><Notebooks /></OnTheMac>} />
             <Route path="/notebooks/:name" element={<OnTheMac title="Notebook"><Notebook /></OnTheMac>} />
             <Route path="/query" element={readOnlyAlt(<Query />, "Query", NOT_HOSTED.query)} />
@@ -170,7 +170,7 @@ const app = (
             <Route
               path="/dashboards"
               element={
-                <OnTheMac title="Dashboards">
+                <OnTheMac title="Dashboards" snapshot>
                   <Suspense fallback={null}>
                     <Dashboards />
                   </Suspense>
@@ -180,7 +180,7 @@ const app = (
             <Route
               path="/dashboards/:slug"
               element={
-                <OnTheMac title="Dashboard">
+                <OnTheMac title="Dashboard" snapshot>
                   <Suspense fallback={null}>
                     <Dashboard />
                   </Suspense>

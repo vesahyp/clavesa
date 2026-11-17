@@ -92,3 +92,21 @@ func TestEmitEveryGrantHasLifecycle(t *testing.T) {
 		t.Errorf("%d grants, %d terraform_data", grants, n)
 	}
 }
+
+// TestRunsWriterCannotWriteTreeCopy: the runs_writer role may write its
+// bucket, except the hosted UI's tree copy under _clavesa/ (slice 3
+// review, finding 1: its specs and translations choose the SQL the
+// hosted reader runs).
+func TestRunsWriterCannotWriteTreeCopy(t *testing.T) {
+	got, err := Emit(basePipelineForLF("clavesa_demo", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `resource "aws_iam_role_policy" "runs_writer"`) {
+		t.Skip("this pipeline emits no runs_writer")
+	}
+	want := `{ Sid = "NoHostedTreeCopy", Effect = "Deny", Action = ["s3:PutObject", "s3:DeleteObject"], Resource = ["arn:aws:s3:::${`
+	if !strings.Contains(got, want) || !strings.Contains(got, `}/_clavesa/*"] },`) {
+		t.Errorf("runs_writer policy has no Deny on _clavesa/*:\n%s", got)
+	}
+}

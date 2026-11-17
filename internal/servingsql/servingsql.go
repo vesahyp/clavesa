@@ -123,6 +123,14 @@ func cacheKey(sql string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// CacheFileName is the name of sql's cache file in a CachedTranspiler's
+// cache directory. The hosted tree copy ships these files for the
+// dashboard datasets, so the hosted Lambda, which has no translator,
+// finds every widget's translation in its cache (ADR-034).
+func CacheFileName(sql string) string {
+	return cacheKey(sql) + ".trino"
+}
+
 // ToServing returns the cached transpile of sql when present, otherwise
 // calls inner and best-effort caches a successful result. Read errors
 // are treated as a miss (never a hard failure). Inner errors are

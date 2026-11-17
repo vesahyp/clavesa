@@ -66,6 +66,7 @@ var localRoutes = map[string]bool{
 	"/data/run-timings":          true,
 	"/data/pipeline-cost":        true,
 	"/data/rightsize":            true,
+	"/dashboards":                true,
 }
 
 // LocalRoutes returns the paths a local workspace answers, sorted.
@@ -78,11 +79,28 @@ func LocalRoutes() []string {
 	return out
 }
 
-// localOnly answers 404 for every path outside localRoutes. Mounted
+// localRoute reports whether a local workspace answers path: the exact
+// routes above, a dashboard spec (/dashboards/<slug>, ADR-036) and a
+// table's snapshots (/data/tables/<db>/<table>/snapshots, ADR-036).
+func localRoute(path string) bool {
+	if localRoutes[path] {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(path, "/dashboards/"); ok && rest != "" && !strings.Contains(rest, "/") {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(path, "/data/tables/"); ok {
+		parts := strings.Split(rest, "/")
+		return len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] == "snapshots"
+	}
+	return false
+}
+
+// localOnly answers 404 for every path outside localRoute. Mounted
 // behind StripPrefix, so paths are bare (/data/runs).
 func localOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !localRoutes[r.URL.Path] {
+		if !localRoute(r.URL.Path) {
 			httputil.WriteError(w, http.StatusNotFound,
 				"not kept for local workspaces: the hosted UI has only the summary the Mac publishes ("+r.URL.Path+")")
 			return
@@ -118,14 +136,19 @@ func OpenLocal(ctx context.Context, root string, e Entry, body []byte) (*Workspa
 	}
 	prov := newSummaryProvider(sum.Drill)
 	deps := wsdeps.New(ctx, root, wsdeps.Options{LocalProvider: prov})
+	snapshotAt := ""
+	if sum.Drill.Snapshot != nil {
+		snapshotAt = sum.Drill.Snapshot.At
+	}
 	ws := &Workspace{
 		Entry: e,
 		Root:  root,
-		Handler: localOnly(ui.BuildWorkspaceMux(ui.WorkspaceDeps{
+		Handler: snapshotRoutes(e, sum.Drill.Snapshot, localOnly(ui.BuildWorkspaceMux(ui.WorkspaceDeps{
 			Deps:        deps,
 			ReadOnly:    true,
 			SummaryOnly: true,
-		})),
+			SnapshotAt:  snapshotAt,
+		}))),
 		Summarize: func(context.Context) (*service.WorkspaceSummary, error) {
 			return sum, nil
 		},
@@ -328,7 +351,18 @@ func (p *summaryProvider) Tables(context.Context, observability.TablesQuery) (*o
 	return nil, errNotKept
 }
 
-func (p *summaryProvider) Snapshots(context.Context, observability.SnapshotsQuery) (*observability.SnapshotsResult, error) {
+// Snapshots answers from the drill's snapshot (ADR-036): the newest
+// snapshots of each table, as the Mac read them at publish time.
+func (p *summaryProvider) Snapshots(_ context.Context, q observability.SnapshotsQuery) (*observability.SnapshotsResult, error) {
+	if s := p.drill.Snapshot; s != nil {
+		if res, ok := s.Snapshots[q.Database+"."+q.Table]; ok && res != nil {
+			out := *res
+			if q.Limit > 0 && len(out.Snapshots) > q.Limit {
+				out.Snapshots = out.Snapshots[:q.Limit]
+			}
+			return &out, nil
+		}
+	}
 	return nil, errNotKept
 }
 

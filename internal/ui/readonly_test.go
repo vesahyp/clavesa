@@ -58,7 +58,7 @@ func TestReadOnly_EveryWriteRouteAnswers405(t *testing.T) {
 			continue
 		}
 		seen[p] = true
-		if isRead(method) {
+		if isRead(method) || p == PostReadRoute {
 			continue
 		}
 		writes++
@@ -119,6 +119,9 @@ func TestReadOnly_ReadRoutesPass(t *testing.T) {
 			}
 			continue
 		}
+		if p == PostReadRoute {
+			continue // ADR-034, TestReadOnly_OnePostRead
+		}
 		w := httptest.NewRecorder()
 		guarded.ServeHTTP(w, httptest.NewRequest(method, concretePath(path), nil))
 		if w.Code != http.StatusMethodNotAllowed {
@@ -150,5 +153,53 @@ func TestBuildWorkspaceMux_ReadOnlyFlag(t *testing.T) {
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/pipeline/run", strings.NewReader(`{"dir":"x"}`)))
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST /pipeline/run: status %d, want 405", w.Code)
+	}
+}
+
+// TestReadOnly_OnePostRead: exactly one route that is not GET or HEAD
+// passes the guard, POST /dashboards/query (ADR-034), at every mount
+// point; POST /data/query and every other POST still answer 405.
+func TestReadOnly_OnePostRead(t *testing.T) {
+	rec, _ := recordWorkspaceRoutes(t)
+	passed := 0
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	guarded := ReadOnlyGuard(ok)
+	for _, p := range rec.patterns {
+		method, path := splitPattern(p)
+		if isRead(method) {
+			continue
+		}
+		w := httptest.NewRecorder()
+		guarded.ServeHTTP(w, httptest.NewRequest(method, concretePath(path), nil))
+		if w.Code != http.StatusMethodNotAllowed {
+			passed++
+			if p != PostReadRoute {
+				t.Errorf("%s passes the read-only guard", p)
+			}
+		}
+	}
+	if passed != 1 {
+		t.Errorf("%d non-GET routes pass, want exactly 1 (%s)", passed, PostReadRoute)
+	}
+	for _, path := range []string{"/dashboards/query", "/api/dashboards/query", "/w/smoke2/api/dashboards/query"} {
+		w := httptest.NewRecorder()
+		guarded.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("POST %s: %d, want it passed", path, w.Code)
+		}
+	}
+	for _, path := range []string{"/data/query", "/w/smoke2/api/data/query", "/dashboards", "/w/a/b/api/dashboards/query", "/dashboards/query/x"} {
+		w := httptest.NewRecorder()
+		guarded.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s: %d, want 405", path, w.Code)
+		}
+	}
+	for _, m := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		w := httptest.NewRecorder()
+		guarded.ServeHTTP(w, httptest.NewRequest(m, "/dashboards/query", nil))
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /dashboards/query: %d, want 405", m, w.Code)
+		}
 	}
 }

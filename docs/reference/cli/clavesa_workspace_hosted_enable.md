@@ -34,7 +34,9 @@ clavesa workspace hosted enable [flags]
       --event-bus-arn string           the hosted clavesa-ui event bus; empty: the one the hosted UI names
       --json                           output as JSON
       --kind string                    cloud (read through the reader role) or local (summary published at run end); default: cloud when the workspace has a remote backend or is deployed, else its warehouse setting
+      --no-snapshot                    local workspace: stop publishing the snapshot
       --reader-principal stringArray   extra IAM principal ARN allowed to assume the reader role, beside the hosted UI's own (repeatable)
+      --snapshot                       local workspace: publish its catalog and dashboard snapshot at run end (ADR-036; off unless set). Values go only with "personal_data": false in clavesa.json
       --url string                     the hosted UI, such as https://ui.clavesa.dev (required)
 ```
 

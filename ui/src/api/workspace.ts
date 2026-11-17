@@ -45,6 +45,9 @@ export interface WorkspaceInfo {
   /** A hosted local-warehouse workspace, served from its published
    * summary (ADR-032): see useSummaryOnly. */
   summary_only?: boolean;
+  // ADR-036: when a summary-only workspace's catalog and dashboard
+  // snapshot was taken on the Mac.
+  snapshot_at?: string;
 }
 
 /** GET /workspace — root path + whether a workspace exists there. */

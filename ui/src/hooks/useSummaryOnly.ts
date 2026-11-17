@@ -24,3 +24,17 @@ export function useSummaryOnly(): boolean {
   });
   return data?.summary_only === true;
 }
+
+/**
+ * useSnapshotAt — when a summary-only workspace's catalog and dashboard
+ * snapshot was taken (ADR-036), or "" when it has none. Its Catalog and
+ * Dashboards pages show that snapshot.
+ */
+export function useSnapshotAt(): string {
+  const { data } = useQuery({
+    queryKey: ["workspace"],
+    queryFn: getWorkspace,
+    staleTime: 60_000,
+  });
+  return data?.summary_only ? (data.snapshot_at ?? "") : "";
+}

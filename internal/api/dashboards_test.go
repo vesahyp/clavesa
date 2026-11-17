@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/vesahyp/clavesa/internal/api"
@@ -340,5 +341,44 @@ func TestDashboardsQueryEmptyDir(t *testing.T) {
 	mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/dashboards/query", bytes.NewReader([]byte(`{"dir":"","sql":"SELECT 1"}`))))
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// TestDashboardQueryDeployedSQLOnly: in read-only mode (ADR-034) the
+// query route runs a request only when its dir and SQL are a dataset of
+// a stored spec; anything else is 403 and never reaches the query seam.
+func TestDashboardQueryDeployedSQLOnly(t *testing.T) {
+	store := newFakeStore()
+	d := sampleDashboard("runs")
+	d.Datasets = append(d.Datasets, api.DashboardDataset{Name: "by_day", Dir: "taxi", SQL: "SELECT day FROM t WHERE day >= '{{from}}'"})
+	store.dashboards[d.Slug] = d
+	seam := &fakeQuerySeam{result: &observability.QueryResult{}}
+	h := api.NewDashboardsHandler(store).WithQueryService(seam.fn).WithDeployedSQLOnly()
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	post := func(body string) int {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/dashboards/query", strings.NewReader(body)))
+		return w.Code
+	}
+	for _, c := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"a deployed dataset", `{"dir":"demo","sql":"SELECT 1 AS n"}`, http.StatusOK},
+		{"surrounding whitespace", `{"dir":"demo","sql":"  SELECT 1 AS n\n"}`, http.StatusOK},
+		{"with control values", `{"dir":"taxi","sql":"SELECT day FROM t WHERE day >= '{{from}}'","params":{"from":"2026-11-01"}}`, http.StatusOK},
+		{"other SQL", `{"dir":"demo","sql":"SELECT * FROM bronze.cloudfront_raw"}`, http.StatusForbidden},
+		{"deployed SQL, other dir", `{"dir":"taxi","sql":"SELECT 1 AS n"}`, http.StatusForbidden},
+		{"one more clause", `{"dir":"demo","sql":"SELECT 1 AS n UNION ALL SELECT 2"}`, http.StatusForbidden},
+	} {
+		seam.gotSQL = ""
+		if got := post(c.body); got != c.want {
+			t.Errorf("%s: status %d, want %d", c.name, got, c.want)
+		}
+		if c.want == http.StatusForbidden && seam.gotSQL != "" {
+			t.Errorf("%s: the query seam ran %q", c.name, seam.gotSQL)
+		}
 	}
 }

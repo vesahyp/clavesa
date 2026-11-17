@@ -49,6 +49,9 @@ func hostedWorkspace(t *testing.T) string {
 	write(".clavesa/credentials/api.secret", "s3cret\n")
 	write(".clavesa/sources/raw.json", `{"name":"raw"}`)
 	write(".clavesa/dashboards/d.json", `{}`)
+	write(".clavesa/dashboards/notes.txt", "x")
+	write(".clavesa/dashboards/old/e.json", `{}`)
+	write("dashboards/root.json", `{}`)
 	write(".terraform/terraform.tfstate", `{}`)
 	write("taxi/main.tf", summaryPipelineTF)
 	write("taxi/variables.tf", "variable \"trigger_schedule\" { default = \"rate(1 day)\" }\n")
@@ -81,12 +84,14 @@ func TestHostedTreeFilesExclusions(t *testing.T) {
 		keys = append(keys, f.Key)
 	}
 	sort.Strings(keys)
-	want := []string{".clavesa/environment.json", "clavesa.json", "taxi/extra.auto.tfvars", "taxi/main.tf", "taxi/terraform.tfvars", "taxi/variables.tf"}
+	// Dashboard specs go (ADR-034): *.json directly in .clavesa/dashboards/
+	// and dashboards/, nothing else from there.
+	want := []string{".clavesa/dashboards/d.json", ".clavesa/environment.json", ".clavesa/sources/raw.json", "clavesa.json", "dashboards/root.json", "taxi/extra.auto.tfvars", "taxi/main.tf", "taxi/terraform.tfvars", "taxi/variables.tf"}
 	if strings.Join(keys, ",") != strings.Join(want, ",") {
 		t.Errorf("tree keys = %v\nwant %v", keys, want)
 	}
 	for _, k := range keys {
-		for _, bad := range []string{"tfstate", ".env", "credentials", ".secret", ".terraform", "tfplan", "aws-profile", "backend.tf", "sources", "dashboards", "_clavesa_sidecar"} {
+		for _, bad := range []string{"tfstate", ".env", "credentials", ".secret", ".terraform", "tfplan", "aws-profile", "backend.tf", "_clavesa_sidecar", "notes.txt", "old/"} {
 			if strings.Contains(k, bad) {
 				t.Errorf("tree holds %s (matches %q)", k, bad)
 			}

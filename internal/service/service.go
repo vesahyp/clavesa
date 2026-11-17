@@ -293,6 +293,10 @@ type Service struct {
 	// (EventBridge DescribeRule); tests stub it.
 	scheduleStateFn func(ctx context.Context, rule string) (paused bool)
 
+	// catalogSnapshotFn reads the catalog listing for a local-warehouse
+	// workspace's published snapshot (ADR-036); wired by wsdeps.
+	catalogSnapshotFn CatalogSnapshotFunc
+
 	// runTerraform execs `terraform` with args in dir. exitCode is
 	// terraform's own exit status (0 success; with -detailed-exitcode,
 	// 2 means "changes"); err is non-nil only when the binary itself

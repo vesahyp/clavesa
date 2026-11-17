@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/vesahyp/clavesa/internal/dashboardsql"
 	"github.com/vesahyp/clavesa/internal/httputil"
@@ -133,6 +134,56 @@ type QueryFunc func(ctx context.Context, sql, dir string, maxRows int) (*observa
 type DashboardsHandler struct {
 	store   DashboardStore
 	queryFn QueryFunc
+	// deployedOnly (read-only mode, ADR-034): the query route runs a
+	// request only when its dir and SQL are a dataset of a stored spec.
+	deployedOnly bool
+	// deployedQueryFn, when set, runs a matched dataset: its SQL as
+	// stored and the control values, so the runner can use the template
+	// translated at deploy instead of translating (ADR-034).
+	deployedQueryFn DeployedQueryFunc
+}
+
+// DeployedQueryFunc runs one deployed dashboard dataset: its SQL as the
+// spec stores it (with {{control}} placeholders) and the control values.
+type DeployedQueryFunc func(ctx context.Context, dir, datasetSQL string, params map[string]string, maxRows int) (*observability.QueryResult, error)
+
+// WithDeployedQuery sets how a matched dataset runs in deployed-only mode.
+func (h *DashboardsHandler) WithDeployedQuery(fn DeployedQueryFunc) *DashboardsHandler {
+	h.deployedQueryFn = fn
+	return h
+}
+
+// WithDeployedSQLOnly makes POST /dashboards/query answer 403 unless the
+// request's dir and SQL are exactly a dataset of a dashboard spec in the
+// workspace (the hosted tree copy holds the deployed specs). The hosted
+// and read-only UIs can then run only SQL that was deployed from the Mac,
+// never SQL a request writes (ADR-034).
+func (h *DashboardsHandler) WithDeployedSQLOnly() *DashboardsHandler {
+	h.deployedOnly = true
+	return h
+}
+
+// deployedDataset reports whether dir and sql are a dataset of one of the
+// stored dashboard specs. SQL is compared with its surrounding whitespace
+// trimmed, and nothing else.
+func (h *DashboardsHandler) deployedDataset(ctx context.Context, dir, sql string) (bool, error) {
+	list, err := h.store.ListDashboards(ctx)
+	if err != nil {
+		return false, err
+	}
+	want := strings.TrimSpace(sql)
+	for _, s := range list {
+		d, err := h.store.GetDashboard(ctx, s.Slug)
+		if err != nil {
+			continue
+		}
+		for _, ds := range d.Datasets {
+			if ds.Dir == dir && strings.TrimSpace(ds.SQL) == want {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // NewDashboardsHandler wires the handler against a service-layer store.
@@ -257,6 +308,32 @@ func (h *DashboardsHandler) query(w http.ResponseWriter, r *http.Request) {
 	if h.queryFn == nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "no query service configured for this request")
 		return
+	}
+	if h.deployedOnly {
+		ok, err := h.deployedDataset(r.Context(), req.Dir, req.SQL)
+		if err != nil {
+			httputil.WriteError(w, http.StatusInternalServerError, "read the dashboard specs: "+err.Error())
+			return
+		}
+		if !ok {
+			httputil.WriteError(w, http.StatusForbidden,
+				"read-only: this server runs only the SQL of a deployed dashboard dataset (ADR-034)")
+			return
+		}
+		if h.deployedQueryFn != nil {
+			res, err := h.deployedQueryFn(r.Context(), req.Dir, strings.TrimSpace(req.SQL), req.Params, queryMaxRowsCap)
+			if err != nil {
+				var de *service.DialectError
+				if errors.As(err, &de) || strings.Contains(err.Error(), "{{") {
+					httputil.WriteError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				httputil.WriteError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			httputil.WriteJSON(w, http.StatusOK, res)
+			return
+		}
 	}
 
 	expanded, err := expandDashboardPlaceholders(req.SQL, req.Params)

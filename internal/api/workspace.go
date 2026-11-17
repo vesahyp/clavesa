@@ -35,12 +35,20 @@ type WorkspaceHandler struct {
 	// its published summary (ADR-032): GET /workspace says so, and the
 	// UI skips the reads the summary does not keep.
 	summaryOnly bool
+	snapshotAt  string
 }
 
 // WithSummaryOnly marks the workspace as served from its published
 // summary (the hosted UI's local-warehouse workspaces, ADR-032).
 func (wh *WorkspaceHandler) WithSummaryOnly(on bool) *WorkspaceHandler {
 	wh.summaryOnly = on
+	return wh
+}
+
+// WithSnapshotAt says when a summary-only workspace's catalog and
+// dashboard snapshot was taken (ADR-036); "" when it has none.
+func (wh *WorkspaceHandler) WithSnapshotAt(at string) *WorkspaceHandler {
+	wh.snapshotAt = at
 	return wh
 }
 
@@ -152,13 +160,16 @@ type workspaceInfo struct {
 	// the hosted UI serves from its published summary alone (ADR-032):
 	// only the routes the summary backs answer; the rest are 404.
 	SummaryOnly bool `json:"summary_only,omitempty"`
+	// SnapshotAt: the summary carries a catalog and dashboard snapshot
+	// taken then (ADR-036), so those pages show it.
+	SnapshotAt string `json:"snapshot_at,omitempty"`
 }
 
 // GetWorkspace returns the server's workspace root and whether an
 // clavesa.json manifest exists there. The UI uses `exists` to decide
 // between the first-launch create-workspace screen and the normal app.
 func (wh *WorkspaceHandler) GetWorkspace(w http.ResponseWriter, _ *http.Request) {
-	info := workspaceInfo{Root: wh.root, SummaryOnly: wh.summaryOnly}
+	info := workspaceInfo{Root: wh.root, SummaryOnly: wh.summaryOnly, SnapshotAt: wh.snapshotAt}
 	if m, _ := workspace.Load(wh.root); m != nil {
 		info.Exists = true
 		info.Name = m.Name

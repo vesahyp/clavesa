@@ -101,6 +101,7 @@ export function Runner() {
                 requirements.txt
               </label>
               <Textarea
+                readOnly={readOnly}
                 id="runner-requirements"
                 value={content}
                 onChange={(e) => setContent(e.target.value)}

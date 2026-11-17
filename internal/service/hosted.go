@@ -30,6 +30,23 @@ type HostedInput struct {
 	Kind             string   `json:"kind,omitempty"`
 	ReaderPrincipals []string `json:"reader_principals,omitempty"`
 	EventBusARN      string   `json:"event_bus_arn,omitempty"`
+	// Snapshot turns the local workspace's catalog and dashboard snapshot
+	// on (true) or off (false); nil keeps what clavesa.json says
+	// (ADR-036: off unless turned on).
+	Snapshot *bool `json:"snapshot,omitempty"`
+}
+
+// keepHostedChoices carries over what the user set by hand or by an
+// earlier enable: personal_data and, unless in says otherwise, snapshot.
+// Re-running enable must never drop personal_data (it drives a Deny).
+func keepHostedChoices(prev, h *workspace.Hosted, in HostedInput) {
+	if prev != nil {
+		h.PersonalData = prev.PersonalData
+		h.Snapshot = prev.Snapshot
+	}
+	if in.Snapshot != nil {
+		h.Snapshot = *in.Snapshot
+	}
 }
 
 // HostedStatus is the shape both surfaces render: the recorded block (nil
@@ -166,6 +183,7 @@ func (s *Service) EnableHosted(ctx context.Context, in HostedInput) (HostedStatu
 		in.EventBusARN = wk.EventBusARN
 	}
 	h := &workspace.Hosted{URL: u, Kind: workspace.HostedKindCloud, ReaderPrincipals: in.ReaderPrincipals, EventBusARN: strings.TrimSpace(in.EventBusARN)}
+	keepHostedChoices(m.Hosted, h, in)
 	if err := h.Validate(); err != nil {
 		return HostedStatus{}, err
 	}
@@ -214,6 +232,7 @@ func (s *Service) enableHostedLocal(m *workspace.Manifest, u string, in HostedIn
 		return HostedStatus{}, fmt.Errorf("%s%s names no publisher role or data bucket, which a local-warehouse workspace needs", u, HostedWellKnownPath)
 	}
 	h := &workspace.Hosted{URL: u, Kind: workspace.HostedKindLocal, PublisherRoleARN: wk.PublisherRoleARN, DataBucket: wk.DataBucket, Region: wk.Region}
+	keepHostedChoices(m.Hosted, h, in)
 	if err := h.Validate(); err != nil {
 		return HostedStatus{}, err
 	}
@@ -292,7 +311,7 @@ func (s *Service) SyncHostedTF(version string) error {
 // their Delta logs are) and its Glue database.
 func hostedRaw(m *workspace.Manifest, pipes []PipelineInfo) workspace.HostedRaw {
 	var raw workspace.HostedRaw
-	if m.Hosted == nil || !m.Hosted.PersonalData {
+	if !m.Hosted.MarksPersonalData() {
 		return raw
 	}
 	for _, p := range pipes {
@@ -366,12 +385,13 @@ func hostedTreeDenied(name string) bool {
 
 // HostedTreeFiles selects what the tree copy holds. Allow-list, not a
 // deny-list: clavesa.json; a generated .clavesa/environment.json saying
-// cloud (what was deployed); and per pipeline only its .tf files (except
-// backend.tf) and terraform.tfvars / *.auto.tfvars, which carry the
-// trigger_schedule. These are what the hosted pages read
+// cloud (what was deployed); the dashboard specs (*.json in
+// .clavesa/dashboards/ and dashboards/, ADR-034); and per pipeline only
+// its .tf files (except backend.tf) and terraform.tfvars / *.auto.tfvars,
+// which carry the trigger_schedule. These are what the hosted pages read
 // (ui.BuildWorkspaceMux's GET handlers for Workspaces, Workspace, Pipeline
 // and Run). Never: Terraform state or plans, .terraform/, .env files,
-// .clavesa/credentials, the AWS profile, sources, dashboards, sidecars.
+// .clavesa/credentials, the AWS profile, sources, sidecars.
 // pipelineDirs are workspace-relative.
 func HostedTreeFiles(root string, pipelineDirs []string) ([]HostedTreeFile, error) {
 	env, err := json.MarshalIndent(map[string]string{"warehouse": "cloud", "mode": "cloud"}, "", "  ")
@@ -382,6 +402,31 @@ func HostedTreeFiles(root string, pipelineDirs []string) ([]HostedTreeFile, erro
 		{Key: "clavesa.json", Path: filepath.Join(root, "clavesa.json")},
 		{Key: ".clavesa/environment.json", Body: append(env, '\n')},
 	}
+	// Dashboard specs (ADR-034): the canonical .clavesa/dashboards/ and the
+	// older workspace-root dashboards/ that the service migrates on read.
+	// Only *.json files directly in those directories; a spec holds widget
+	// SQL and layout, no data and no secret.
+	for _, dir := range []string{".clavesa/dashboards", "dashboards"} {
+		entries, err := os.ReadDir(filepath.Join(root, dir))
+		if err != nil {
+			continue // no dashboards there
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !e.Type().IsRegular() || !strings.HasSuffix(name, ".json") || hostedTreeDenied(name) {
+				continue
+			}
+			files = append(files, HostedTreeFile{Key: dir + "/" + name, Path: filepath.Join(root, dir, name)})
+		}
+	}
+	// Sources, notebooks and the runner requirements (parity slice 4),
+	// read-only views of what is deployed. hostedTreeExtras says what each
+	// one may carry.
+	extras, err := hostedTreeExtras(root)
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, extras...)
 	dirs := append([]string(nil), pipelineDirs...)
 	sort.Strings(dirs)
 	for _, rel := range dirs {
@@ -579,6 +624,13 @@ func (s *Service) UploadHostedTree(ctx context.Context) (*HostedTreeResult, erro
 		return nil, err
 	}
 	files = append(files, HostedTreeFile{Key: workspace.DeployedFile, Body: append(dj, '\n')})
+	// The dashboards' SQL in the serving dialect, translated here because
+	// the hosted Lambda has no translator (ADR-034).
+	cached, errs := s.DashboardServingCacheFiles(ctx)
+	for _, e := range errs {
+		fmt.Fprintf(os.Stderr, "hosted tree copy: dashboard SQL not translated: %v\n", e)
+	}
+	files = append(files, cached...)
 
 	res := &HostedTreeResult{URI: "s3://" + bucket + "/" + HostedTreePrefix}
 	keep := map[string]bool{}

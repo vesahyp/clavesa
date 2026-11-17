@@ -108,3 +108,55 @@ func TestLambdaScriptTraversal(t *testing.T) {
 		}
 	}
 }
+
+// TestTreeFileBodyStripsNotebookOutputs (slice 4 review, finding 1): for
+// a registry entry marked personal_data, the Lambda keeps a notebook
+// without its saved outputs, whatever the workspace's own clavesa.json
+// says; other files and other workspaces are kept as they are.
+func TestTreeFileBodyStripsNotebookOutputs(t *testing.T) {
+	nb := []byte(`{"cells":[{"cell_type":"code","source":["SELECT c_ip FROM bronze.cloudfront_raw"],"outputs":[{"output_type":"stream","text":["203.0.113.7\n"]}],"execution_count":2}],"nbformat":4}`)
+	personal := Entry{Name: "web-traffic", PersonalData: true}
+	got, err := treeFileBody(personal, "notebooks/heineli_exploration.ipynb", nb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "203.0.113.7") || !strings.Contains(string(got), "SELECT c_ip") {
+		t.Errorf("personal notebook kept = %s, want the source without the output", got)
+	}
+	if got, _ := treeFileBody(Entry{Name: "smoke2"}, "notebooks/x.ipynb", nb); string(got) != string(nb) {
+		t.Errorf("another workspace's notebook changed: %s", got)
+	}
+	if got, _ := treeFileBody(personal, "clavesa.json", []byte(`{"a":1}`)); string(got) != `{"a":1}` {
+		t.Errorf("a non-notebook file changed: %s", got)
+	}
+	if _, err := treeFileBody(personal, "notebooks/bad.ipynb", []byte("not json")); err == nil {
+		t.Error("a notebook that does not parse was kept")
+	}
+}
+
+// TestPreviewsRefusedEverywhere (slice 4 review, finding 2): previews are
+// 403 on every workspace, before it is opened.
+func TestPreviewsRefusedEverywhere(t *testing.T) {
+	reg, err := ParseRegistry([]byte(personalRegistry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := &fakeOpener{ws: &Workspace{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })}}
+	s := NewServer(reg, service.HostedWellKnown{}, newMemStore(), op)
+	for _, u := range []string{
+		"/w/smoke2/api/preview/source?dir=taxi&node_id=trips",
+		"/w/smoke2/api/preview/transform?dir=taxi&node_id=trips",
+		"/w/smoke2/api/preview/destination?dir=taxi&node_id=x",
+		"/w/smoke2/api/sources/trips_raw/preview",
+		"/w/smoke2/api//preview/./source",
+	} {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, u, nil))
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s: %d, want 403", u, w.Code)
+		}
+	}
+	if op.opens != 0 {
+		t.Errorf("a preview opened the workspace %d time(s)", op.opens)
+	}
+}

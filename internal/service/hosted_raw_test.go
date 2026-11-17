@@ -17,7 +17,7 @@ func TestHostedRaw(t *testing.T) {
 		{Name: "gold", Dir: "gold", Schema: "gold"},
 	}
 	m := &workspace.Manifest{Name: "web-traffic", Catalog: "clavesa_web_traffic",
-		Hosted: &workspace.Hosted{URL: "https://ui.clavesa.dev", PersonalData: true}}
+		Hosted: &workspace.Hosted{URL: "https://ui.clavesa.dev", PersonalData: boolPtr(true)}}
 	got := hostedRaw(m, pipes)
 	want := workspace.HostedRaw{
 		ObjectPatterns: []string{"bronze/*", "silver/*"},
@@ -26,8 +26,10 @@ func TestHostedRaw(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("hostedRaw = %+v, want %+v", got, want)
 	}
-	m.Hosted.PersonalData = false
+	m.Hosted.PersonalData = boolPtr(false)
 	if got := hostedRaw(m, pipes); len(got.ObjectPatterns)+len(got.GlueDatabases) != 0 {
 		t.Errorf("without personal_data: %+v, want nothing", got)
 	}
 }
+
+func boolPtr(v bool) *bool { return &v }

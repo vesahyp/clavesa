@@ -238,6 +238,12 @@ async function buildPages(tok) {
       if (!runId) throw new Error(`${WS}/${pipeline} has no run; set RUN=<id>`);
     }
   }
+  // The workspace's first dashboard, for the dashboard page (ADR-034).
+  const dl = await api(tok, `/w/${ws}/api/dashboards`).catch(() => null);
+  const dashSlug = (dl?.dashboards ?? [])[0]?.slug;
+  // The workspace's first notebook, for the read-only notebook view.
+  const nl = await api(tok, `/w/${ws}/api/notebooks`).catch(() => null);
+  const nbName = (Array.isArray(nl) ? nl : (nl?.notebooks ?? []))[0]?.name;
   const wl = await api(tok, "/api/workspaces").catch(() => null);
   workspaceList = Array.isArray(wl) ? wl : (wl?.workspaces ?? []);
   if (!workspaceList.length) throw new Error("GET /api/workspaces gave no workspaces");
@@ -432,6 +438,44 @@ async function buildPages(tok) {
         return out;
       },
     },
+    ...(dashSlug
+      ? [
+          {
+            name: "09-dashboard",
+            path: `/w/${ws}/dashboards/${encodeURIComponent(dashSlug)}`,
+            testids: ["dashboard-widget", "phone-nav"],
+            active: "workspaces",
+            back: true,
+            // Every widget has run its query: no skeleton left.
+            ready: () =>
+              document.querySelectorAll('[data-testid="dashboard-widget"]').length > 0 &&
+              !document.querySelector('[data-testid="dashboard-widget"] .animate-pulse'),
+            extra: async (page) => {
+              const widgets = await page.locator('[data-testid="dashboard-widget"]').count();
+              const failed = await page.locator('[data-testid="dashboard-widget"]', { hasText: "Query failed" }).count();
+              console.log(`       dashboard ${dashSlug}: ${widgets} widget(s), ${failed} failed`);
+              return failed ? [`dashboard ${dashSlug}: ${failed} of ${widgets} widget(s) show "Query failed"`] : [];
+            },
+          },
+        ]
+      : []),
+    ...(nbName
+      ? [
+          {
+            name: "10-notebook",
+            path: `/w/${ws}/notebooks/${encodeURIComponent(nbName)}`,
+            testids: ["notebook-view", "phone-nav"],
+            active: "workspaces",
+            back: true,
+            extra: async (page) => {
+              const cells = await page.locator('[data-testid="notebook-view-cell"]').count();
+              const runs = await page.getByRole("button", { name: /Run/ }).count();
+              console.log(`       notebook ${nbName}: ${cells} cell(s)`);
+              return [...(cells ? [] : ["notebook view shows no cell"]), ...(runs ? ["notebook view has a Run button"] : [])];
+            },
+          },
+        ]
+      : []),
     {
       name: "07-not-found",
       path: `/w/${ws}/pipelines/dashboard?dir=no-such-pipeline`,
@@ -745,7 +789,7 @@ try {
       await sleep(1500);
       const path = new URL(page.url()).pathname.replace(/\/$/, "");
       if (path !== href.replace(/\/$/, "")) out.push(`${current}: moved to ${path}`);
-      if (/\/(query|credentials|runner)$/.test(current)) {
+      if (/\/(query|credentials)$/.test(current)) {
         if (!(await page.locator('[data-testid="not-hosted-line"]').count())) out.push(`${current}: no not-hosted line`);
         if (await page.getByRole("button", { name: /^Run\b/ }).count()) out.push(`${current}: shows a Run button`);
       }

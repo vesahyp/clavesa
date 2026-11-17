@@ -2,9 +2,12 @@ package ui
 
 import (
 	"context"
+	"github.com/vesahyp/clavesa/internal/dashboardsql"
 	"github.com/vesahyp/clavesa/internal/pathutil"
+	wspkg "github.com/vesahyp/clavesa/internal/workspace"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -42,6 +45,9 @@ type WorkspaceDeps struct {
 	// SummaryOnly marks a hosted local-warehouse workspace served from
 	// its published summary (ADR-032); GET /workspace reports it.
 	SummaryOnly bool
+	// SnapshotAt: the summary-only workspace's snapshot time (ADR-036);
+	// GET /workspace reports it.
+	SnapshotAt string
 }
 
 // BuildWorkspaceMux returns the /api handler set for ONE workspace, with
@@ -121,7 +127,7 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 		WithNodeAdder(nodeAdderBridge{svc: svc}).
 		WithExternalTableAttacher(svc).
 		WithInputDetacher(svc)
-	workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithSummaryOnly(d.SummaryOnly)
+	workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithSummaryOnly(d.SummaryOnly).WithSnapshotAt(d.SnapshotAt)
 	if d.Restart != nil {
 		workspaceHandler = workspaceHandler.WithRestart(d.Restart)
 	}
@@ -162,6 +168,36 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 		WithQueryService(func(ctx context.Context, sql, dir string, maxRows int) (*observability.QueryResult, error) {
 			return svc.Query(ctx, sql, tuiservice.QueryOptions{Dir: dir, MaxRows: maxRows})
 		})
+	if d.ReadOnly {
+		// ADR-034: read-only runs only SQL that a deployed spec holds,
+		// from the template translated at deploy when the tree copy has
+		// one (the hosted Lambda has no translator); else as on the Mac.
+		dashboardsHandler = dashboardsHandler.WithDeployedSQLOnly().
+			WithDeployedQuery(func(ctx context.Context, dir, datasetSQL string, params map[string]string, maxRows int) (*observability.QueryResult, error) {
+				// Local warehouse: run the authored SparkSQL as on the Mac.
+				if wspkg.LoadWarehouse(workspace) != wspkg.WarehouseCloud {
+					expanded, err := dashboardsql.ExpandPlaceholders(datasetSQL, params)
+					if err != nil {
+						return nil, err
+					}
+					return svc.Query(ctx, expanded, tuiservice.QueryOptions{Dir: dir, MaxRows: maxRows})
+				}
+				// Cloud: the serving template, from the translation cache
+				// that the tree copy ships (the Lambda has no translator).
+				tmpl, err := svc.ServingTemplate(ctx, datasetSQL)
+				if err != nil {
+					return nil, err
+				}
+				if err := tuiservice.CheckServedSelect(tmpl); err != nil {
+					return nil, err
+				}
+				expanded, err := dashboardsql.ExpandPlaceholders(tmpl, params)
+				if err != nil {
+					return nil, err
+				}
+				return svc.Query(ctx, expanded, tuiservice.QueryOptions{Dir: dir, MaxRows: maxRows, Served: true})
+			})
+	}
 	sourcesHandler := api.NewSourcesHandler(sourceRegistryBridge{svc: svc})
 	credentialsHandler := api.NewCredentialsHandler(credentialRegistryBridge{svc: svc})
 	notebooksHandler := api.NewNotebooksHandler(notebookRegistryBridge{svc: svc})
@@ -210,14 +246,26 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 	preview.RegisterRoutes(r, s3Client, hclParserFunc, resolveDirFunc)
 }
 
+// postReadRE matches the one read that uses POST and is allowed in
+// read-only mode (ADR-034): a dashboard widget query, at the bare path of
+// a workspace mux, under the local /api/, or under a hosted or
+// multi-workspace /w/<name>/api/.
+var postReadRE = regexp.MustCompile(`^(/w/[^/]+)?(/api)?/dashboards/query$`)
+
+// PostReadRoute is that route's pattern in the workspace route table.
+const PostReadRoute = "POST /dashboards/query"
+
 // ReadOnlyGuard answers 405 to every method except GET and HEAD, with a
 // JSON error body and `Allow: GET, HEAD`. It is the server half of
-// read-only mode (ADR-032 section 1); the IAM role is the other. It also
-// refuses the two read POSTs (POST /data/query, POST /dashboards/query):
-// the hosted pages do not need them.
+// read-only mode (ADR-032 section 1); the IAM role is the other. One POST
+// passes (ADR-034): POST /dashboards/query, which the read-only dashboards
+// handler answers only for SQL that is a dataset of a deployed dashboard
+// spec (api.DashboardsHandler.WithDeployedSQLOnly). POST /data/query stays
+// refused.
 func ReadOnlyGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead ||
+			(r.Method == http.MethodPost && postReadRE.MatchString(r.URL.Path)) {
 			next.ServeHTTP(w, r)
 			return
 		}

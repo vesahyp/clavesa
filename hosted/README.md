@@ -45,9 +45,15 @@ What `hosted/infra/` creates (all names are variables in
 
 Every route needs a Cognito id token (`Authorization: Bearer <id
 token>`; the SPA sends it) except the well-known document. The Lambda
-answers only GET and HEAD: every other method gets 405, whatever the
-route (`ui.ReadOnlyGuard`), and each workspace's reader role can only
-read (ADR-032 section 2).
+answers only GET and HEAD, plus one read that uses POST: every other
+method gets 405, whatever the route (`ui.ReadOnlyGuard`), and each
+workspace's reader role can only read (ADR-032 section 2). The POST is
+`/w/<name>/api/dashboards/query` (ADR-034): it runs a widget's SQL only
+when the request's pipeline dir and SQL are exactly a dataset of a
+dashboard spec in the tree copy, else 403. The SQL runs from its
+Athena translation, which the deploy made on the Mac and shipped in the
+tree copy (`.clavesa/cache/transpile/`): the Lambda has no translator. `POST /data/query` (ad-hoc
+SQL) is refused.
 
 | Path | What |
 |------|------|

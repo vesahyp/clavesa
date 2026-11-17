@@ -63,15 +63,17 @@ locals {
       personal_data   = true # bronze and silver hold visitor IPs
     },
     # The nightly site-traffic pipelines on the main Mac (local warehouse).
+    # personal_data: their sources are CloudFront logs with visitor IPs and
+    # their events tables hold visitor ids (slice 5 review, finding 2).
     # Each run publishes summaries/<name>.json through the publisher role
     # (hosted/README.md, "Adding a local workspace").
-    { name = "site-traffic", kind = "local" },
-    { name = "omatienoo-traffic", kind = "local" },
-    { name = "podbay-traffic", kind = "local" },
-    { name = "kivikko-traffic", kind = "local" },
-    { name = "keitos-traffic", kind = "local" },
-    { name = "vinkki-traffic", kind = "local" },
-    { name = "rakka-traffic", kind = "local" },
+    { name = "site-traffic", kind = "local", personal_data = true },
+    { name = "omatienoo-traffic", kind = "local", personal_data = true },
+    { name = "podbay-traffic", kind = "local", personal_data = true },
+    { name = "kivikko-traffic", kind = "local", personal_data = true },
+    { name = "keitos-traffic", kind = "local", personal_data = true },
+    { name = "vinkki-traffic", kind = "local", personal_data = true },
+    { name = "rakka-traffic", kind = "local", personal_data = true },
   ]
 
   # Only cloud workspaces send events, so only their accounts may put

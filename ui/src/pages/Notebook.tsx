@@ -25,6 +25,9 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect } from "@/components/ui/native-select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Cell } from "@/components/notebook/Cell";
+import { CellOutput } from "@/components/notebook/CellOutput";
+import { CellMarkdown } from "@/components/notebook/CellMarkdown";
+import { useReadOnly } from "@/hooks/useReadOnly";
 import {
   cancelNotebookCell,
   clearNotebookOutputs,
@@ -41,7 +44,78 @@ import {
 
 const AUTOSAVE_DEBOUNCE_MS = 600;
 
+/**
+ * Notebook: the editor, or in read-only mode (the hosted UI, ADR-033) the
+ * notebook as deployed: its cells and their saved outputs, with no
+ * editing, autosave or cell runs (those need the Mac's Spark kernel).
+ */
 export function Notebook() {
+  const readOnly = useReadOnly();
+  return readOnly ? <NotebookView /> : <NotebookEditor />;
+}
+
+function NotebookView() {
+  const { name = "" } = useParams<{ name: string }>();
+  const query = useNotebook(name);
+  useChrome(
+    useMemo(
+      () => ({
+        breadcrumbs: [
+          { label: "Notebooks", to: "/notebooks" },
+          { label: name, to: `/notebooks/${encodeURIComponent(name)}` },
+        ],
+      }),
+      [name],
+    ),
+  );
+  if (query.isLoading) {
+    return (
+      <div className="mx-auto w-full max-w-5xl space-y-3 px-4 py-8 md:px-6">
+        <Skeleton className="h-10 w-64" />
+        <Skeleton className="h-48 w-full" />
+      </div>
+    );
+  }
+  if (query.error || !query.data) {
+    return (
+      <div className="mx-auto w-full max-w-5xl px-4 py-8 text-sm text-destructive md:px-6">
+        Couldn't load notebook: {query.error instanceof Error ? query.error.message : "unknown error"}
+      </div>
+    );
+  }
+  const cells = query.data.cells;
+  return (
+    <div className="mx-auto w-full max-w-5xl px-4 py-8 md:px-6" data-testid="notebook-view">
+      <h1 className="font-mono text-2xl font-semibold tracking-tight">{name}</h1>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {cells.length} cell{cells.length === 1 ? "" : "s"}, with the outputs saved on the Mac. Cells run in clavesa ui there.
+      </p>
+      <div className="mt-6 space-y-4">
+        {cells.map((c) => {
+          const source = c.source.join("");
+          return (
+            <Card key={c.id} data-testid="notebook-view-cell">
+              <CardContent className="space-y-3 p-4">
+                {c.cell_type === "markdown" ? (
+                  <CellMarkdown source={source} />
+                ) : (
+                  <>
+                    <pre className="overflow-x-auto whitespace-pre rounded bg-muted p-3 font-mono text-xs">{source}</pre>
+                    {(c.outputs ?? []).map((o, i) => (
+                      <CellOutput key={i} output={o} />
+                    ))}
+                  </>
+                )}
+              </CardContent>
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function NotebookEditor() {
   const { name = "" } = useParams<{ name: string }>();
   const query = useNotebook(name);
   const qc = useQueryClient();

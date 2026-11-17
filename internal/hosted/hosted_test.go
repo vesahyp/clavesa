@@ -281,8 +281,8 @@ func TestLambdaAlwaysReadOnly(t *testing.T) {
 			t.Errorf("route %q has no method", p)
 			continue
 		}
-		if method == http.MethodGet || method == http.MethodHead {
-			continue
+		if method == http.MethodGet || method == http.MethodHead || p == ui.PostReadRoute {
+			continue // the one POST read: ADR-034, ui.TestReadOnly_OnePostRead
 		}
 		writes++
 		res := invokeHTTP(t, s, method, "/w/smoke2/api"+wildcard(path))

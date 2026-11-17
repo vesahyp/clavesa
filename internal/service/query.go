@@ -27,6 +27,10 @@ type QueryOptions struct {
 	// (the `--warehouse local|cloud` flag, ADR-024). Empty follows the
 	// workspace's persisted warehouse.
 	Warehouse workspace.Warehouse
+	// Served: the SQL is already in the serving dialect (a dashboard
+	// template translated at deploy, ADR-034); the cloud path runs it as
+	// is instead of translating it.
+	Served bool
 }
 
 // Query runs one free-form ad-hoc SQL statement against the workspace
@@ -87,13 +91,18 @@ func (s *Service) Query(ctx context.Context, sql string, opts QueryOptions) (*ob
 		if workspace.PipelineBucket(s.workspace) == "" {
 			return nil, fmt.Errorf("query targets the cloud warehouse, %w — run `clavesa workspace deploy` to create it, or query the local warehouse with `--warehouse local` / `clavesa workspace use --warehouse local`", workspace.ErrWarehouseUndeployed)
 		}
-		sqlToRun, err = s.TranspileServing(ctx, sql)
-		if err != nil {
-			return nil, err
+		if opts.Served {
+			// Translated at deploy (ADR-034): run as is.
+			transpiled = true
+		} else {
+			sqlToRun, err = s.TranspileServing(ctx, sql)
+			if err != nil {
+				return nil, err
+			}
+			// TranspileServing is a pass-through when no transpiler is wired
+			// (docker-free tests) — only claim a transpile that actually ran.
+			transpiled = s.transpiler != nil
 		}
-		// TranspileServing is a pass-through when no transpiler is wired
-		// (docker-free tests) — only claim a transpile that actually ran.
-		transpiled = s.transpiler != nil
 	} else {
 		// Local portability gate: transpile only to surface a *DialectError
 		// for non-portable SparkSQL, then discard the Trino output and run

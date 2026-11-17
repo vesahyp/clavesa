@@ -184,7 +184,7 @@ func (w *Workspaces) Open(ctx context.Context, e Entry) (*Workspace, error) {
 		return ow.ws, nil
 	}
 	root := filepath.Join(w.Root, e.Name)
-	if err := syncTree(ctx, ow.s3, e.Bucket, root); err != nil {
+	if err := syncTree(ctx, ow.s3, e, root); err != nil {
 		return nil, err
 	}
 	cfg := ow.cfg.Copy()
@@ -251,8 +251,10 @@ func (w *Workspaces) openLocal(ctx context.Context, e Entry) (*Workspace, error)
 	return ws, nil
 }
 
-// syncTree replaces root with the tree copy under _clavesa/tree/.
-func syncTree(ctx context.Context, c *s3.Client, bucket, root string) error {
+// syncTree replaces root with the tree copy under _clavesa/tree/ of
+// e.Bucket, each file through treeFileBody.
+func syncTree(ctx context.Context, c *s3.Client, e Entry, root string) error {
+	bucket := e.Bucket
 	if err := os.RemoveAll(root); err != nil {
 		return err
 	}
@@ -287,6 +289,9 @@ func syncTree(ctx context.Context, c *s3.Client, bucket, root string) error {
 			if err != nil {
 				return err
 			}
+			if body, err = treeFileBody(e, rel, body); err != nil {
+				return fmt.Errorf("s3://%s/%s: %w", bucket, key, err)
+			}
 			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 				return err
 			}
@@ -300,4 +305,21 @@ func syncTree(ctx context.Context, c *s3.Client, bucket, root string) error {
 		return fmt.Errorf("s3://%s/%s is empty", bucket, service.HostedTreePrefix)
 	}
 	return nil
+}
+
+// treeFileBody is the body the Lambda keeps of one tree-copy file. For a
+// workspace the registry marks personal_data, a notebook loses its saved
+// outputs here, whatever the workspace's own clavesa.json says: outputs
+// can hold rows (web-traffic's held visitor IPs), and the registry is the
+// hosted side's own word (slice 4 review). A notebook that does not parse
+// is dropped rather than kept with its outputs.
+func treeFileBody(e Entry, rel string, body []byte) ([]byte, error) {
+	if !e.PersonalData || !strings.HasSuffix(rel, ".ipynb") {
+		return body, nil
+	}
+	out, err := service.NotebookWithoutOutputs(body)
+	if err != nil {
+		return nil, fmt.Errorf("notebook %s: %w (not kept: the workspace holds personal data)", rel, err)
+	}
+	return out, nil
 }

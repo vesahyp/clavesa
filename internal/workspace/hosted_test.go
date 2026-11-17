@@ -113,7 +113,7 @@ func TestRenderHostedTFGolden(t *testing.T) {
 		"hosted_personal_data": {
 			Name: "acme", Catalog: "clavesa_acme", SystemCatalog: "clavesa_acme_system",
 			Backend: &Backend{Type: "s3", Bucket: "acme-clavesa", Region: "eu-north-1"},
-			Hosted:  &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}, PersonalData: true},
+			Hosted:  &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}, PersonalData: ptrTrue()},
 		},
 	}
 	// The raw data is passed even where PersonalData is off: only the
@@ -250,3 +250,5 @@ func TestGlueDatabaseFromState(t *testing.T) {
 		}
 	}
 }
+
+func ptrTrue() *bool { v := true; return &v }

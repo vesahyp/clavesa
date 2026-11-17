@@ -41,12 +41,29 @@ type Hosted struct {
 	PublisherRoleARN string `json:"publisher_role_arn,omitempty"`
 	DataBucket       string `json:"data_bucket,omitempty"`
 	Region           string `json:"region,omitempty"`
-	// PersonalData: the workspace's raw data holds personal data (visitor
-	// IPs). The reader role then gets an explicit Deny on every pipeline
-	// whose schema is not gold: its objects in the pipeline bucket and its
-	// Glue tables (HostedRaw). Set by hand in clavesa.json; the hosted
+	// PersonalData says whether the workspace's data holds personal data
+	// (visitor IPs, visitor ids). It has three states, set by hand in
+	// clavesa.json: true, false, or absent. true: the reader role gets an
+	// explicit Deny on every pipeline whose schema is not gold (HostedRaw).
+	// Only an explicit false lets a published snapshot carry values
+	// (ADR-036): absent counts as personal data there. The hosted
 	// registry's personal_data is the API-side half.
-	PersonalData bool `json:"personal_data,omitempty"`
+	PersonalData *bool `json:"personal_data,omitempty"`
+	// Snapshot turns on the catalog and dashboard snapshot of a local
+	// workspace's run-end publish (ADR-036). Off unless set:
+	// `clavesa workspace hosted enable --snapshot`.
+	Snapshot bool `json:"snapshot,omitempty"`
+}
+
+// MarksPersonalData reports an explicit "personal_data": true.
+func (h *Hosted) MarksPersonalData() bool {
+	return h != nil && h.PersonalData != nil && *h.PersonalData
+}
+
+// FreeOfPersonalData reports an explicit "personal_data": false, the only
+// state in which a published snapshot may carry values (ADR-036).
+func (h *Hosted) FreeOfPersonalData() bool {
+	return h != nil && h.PersonalData != nil && !*h.PersonalData
 }
 
 // HostedRaw is what the reader of a PersonalData workspace may not read:
@@ -256,7 +273,7 @@ func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []
 	h := m.Hosted
 	sms, logs := HostedResourcePatterns(m, pipelines)
 	rawLines := ""
-	if h.PersonalData {
+	if h.MarksPersonalData() {
 		objs := append([]string(nil), raw.ObjectPatterns...)
 		dbs := append([]string(nil), raw.GlueDatabases...)
 		sort.Strings(objs)

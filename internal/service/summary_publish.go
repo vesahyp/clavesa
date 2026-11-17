@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/vesahyp/clavesa/internal/observability"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -102,16 +105,30 @@ func (s *Service) PublishSummary(ctx context.Context, sum *WorkspaceSummary) (*P
 		withDrill.Drill = s.SummaryDrill(ctx, sum)
 		sum = &withDrill
 	}
-	body, err := json.Marshal(sum)
+	body, err := marshalWithinCap(sum, PublishMaxBytes)
 	if err != nil {
 		return nil, err
 	}
-	put, err := newSummaryPutter(ctx, s.workspace, "clavesa-publish-"+sessionSafe(name), wk)
+	// No path on the Mac leaves it (ADR-032; slice 5 review, finding 4):
+	// a snapshot whose bytes still name the workspace root is dropped.
+	if abs, _ := filepath.Abs(s.workspace); abs != "" && sum.Drill != nil && sum.Drill.Snapshot != nil && bytes.Contains(body, []byte(abs)) {
+		cp, d := *sum, *sum.Drill
+		d.Snapshot, cp.Drill = nil, &d
+		if body, err = marshalWithinCap(&cp, PublishMaxBytes); err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(os.Stderr, "Hosted: snapshot not published: it named a path on this machine\n")
+	}
+	// The upload has its own time, so a slow summary or snapshot never
+	// loses the whole publish (slice 5 review, finding 3).
+	putCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), PutTimeout)
+	defer cancel()
+	put, err := newSummaryPutter(putCtx, s.workspace, "clavesa-publish-"+sessionSafe(name), wk)
 	if err != nil {
 		return nil, fmt.Errorf("publish summary: %w", err)
 	}
 	key := HostedSummaryKey(name)
-	if err := put.PutSummary(ctx, wk.DataBucket, key, body); err != nil {
+	if err := put.PutSummary(putCtx, wk.DataBucket, key, body); err != nil {
 		return nil, fmt.Errorf("publish summary to s3://%s/%s: %w", wk.DataBucket, key, err)
 	}
 	return &PublishResult{URI: "s3://" + wk.DataBucket + "/" + key, GeneratedAt: sum.GeneratedAt}, nil
@@ -155,3 +172,56 @@ func (s *Service) PublishAfterRun(ctx context.Context) (*PublishResult, error) {
 	}
 	return s.PublishSummary(ctx, sum)
 }
+
+// PublishMaxBytes caps a published summary (ADR-036). The runs part is
+// about 100 to 160 KB; the snapshot fills the rest.
+const PublishMaxBytes = 2 << 20
+
+// marshalWithinCap marshals sum, and when it is over max drops the
+// snapshot's widget results, then its table snapshots, one at a time, each
+// with a note, until it fits. The runs part is never dropped.
+func marshalWithinCap(sum *WorkspaceSummary, max int) ([]byte, error) {
+	body, err := json.Marshal(sum)
+	if err != nil || len(body) <= max || sum.Drill == nil || sum.Drill.Snapshot == nil {
+		return body, err
+	}
+	cp := *sum
+	d := *sum.Drill
+	snap := *sum.Drill.Snapshot
+	d.Snapshot, cp.Drill = &snap, &d
+	widgets := make(map[string]*observability.QueryResult, len(snap.Widgets))
+	for k, v := range snap.Widgets {
+		widgets[k] = v
+	}
+	snaps := make(map[string]*observability.SnapshotsResult, len(snap.Snapshots))
+	for k, v := range snap.Snapshots {
+		snaps[k] = v
+	}
+	snap.Widgets, snap.Snapshots = widgets, snaps
+	for len(body) > max {
+		switch {
+		case len(widgets) > 0:
+			for k := range widgets {
+				delete(widgets, k)
+				break
+			}
+			snap.Notes = append(snap.Notes, "a dashboard widget result was left out: the published summary is capped at 2 MB")
+		case len(snaps) > 0:
+			for k := range snaps {
+				delete(snaps, k)
+				break
+			}
+			snap.Notes = append(snap.Notes, "a table's snapshots were left out: the published summary is capped at 2 MB")
+		default:
+			return body, nil
+		}
+		if body, err = json.Marshal(&cp); err != nil {
+			return nil, err
+		}
+	}
+	return body, nil
+}
+
+// PutTimeout bounds the role assume and the upload of a publish, apart
+// from the time the summary and its snapshot took.
+const PutTimeout = 15 * time.Second

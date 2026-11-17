@@ -10,8 +10,10 @@ import { Laptop } from "lucide-react";
 
 import { useLocation } from "react-router-dom";
 
+import { stamp } from "@/lib/clock";
+
 import { useChrome } from "@/components/PageChrome";
-import { useSummaryOnly } from "@/hooks/useSummaryOnly";
+import { useSnapshotAt, useSummaryOnly } from "@/hooks/useSummaryOnly";
 
 export function NotHosted({ title, line }: { title: string; line: string }) {
   const { pathname } = useLocation();
@@ -31,7 +33,6 @@ export function NotHosted({ title, line }: { title: string; line: string }) {
 export const NOT_HOSTED = {
   credentials: "Credentials are managed on the Mac, in clavesa ui. They are never sent to the hosted UI.",
   query: "Ad-hoc queries run in clavesa ui on the Mac.",
-  runner: "The runner image is built and edited on the Mac, in clavesa ui.",
   localData: "The data of this workspace is on the Mac. Open it in clavesa ui there; this page shows its runs and pipelines only.",
 } as const;
 
@@ -41,7 +42,36 @@ export const NOT_HOSTED = {
  * summary (useSummaryOnly): its catalog, tables, dashboards, notebooks
  * and sources stay on the Mac until ADR-036 publishes snapshots.
  */
-export function OnTheMac({ title, children }: { title: string; children: ReactNode }) {
+export function OnTheMac({
+  title,
+  children,
+  snapshot = false,
+}: {
+  title: string;
+  children: ReactNode;
+  // snapshot: the page can show a local workspace's published snapshot
+  // (ADR-036: Catalog, Dashboards), with when it was taken.
+  snapshot?: boolean;
+}) {
   const summaryOnly = useSummaryOnly();
-  return summaryOnly ? <NotHosted title={title} line={NOT_HOSTED.localData} /> : <>{children}</>;
+  const snapshotAt = useSnapshotAt();
+  if (!summaryOnly) return <>{children}</>;
+  if (snapshot && snapshotAt) {
+    return (
+      <>
+        <p
+          className="mx-auto mt-4 w-full max-w-6xl px-4 text-xs text-muted-foreground md:px-6"
+          data-testid="snapshot-as-of"
+        >
+          As of {formatSnapshotAt(snapshotAt)}, from the Mac's last run. Dashboards show their default selection.
+        </p>
+        {children}
+      </>
+    );
+  }
+  return <NotHosted title={title} line={NOT_HOSTED.localData} />;
+}
+
+function formatSnapshotAt(at: string): string {
+  return Number.isNaN(Date.parse(at)) ? at : stamp(at);
 }

@@ -141,6 +141,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, "unknown workspace: "+name)
 		return
 	}
+	if refusesPreview(pathpkg.Clean(strings.TrimPrefix(rest, "/api"))) {
+		httputil.WriteError(w, http.StatusForbidden, previewRefusal)
+		return
+	}
 	if e.PersonalData && refusesPersonalData(pathpkg.Clean(strings.TrimPrefix(rest, "/api")), r) {
 		httputil.WriteError(w, http.StatusForbidden, personalDataRefusal)
 		return

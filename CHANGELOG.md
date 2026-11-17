@@ -12,6 +12,22 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.9] — 2026-11-17
+
+### Security
+
+- **Notebooks, sources and the runner requirements in the hosted UI, read-only (parity slice 4).** The tree copy carries the source registry (URL query strings, fragments and user info removed), notebooks with their saved outputs (outputs removed in a `personal_data` workspace) and `runner-requirements.txt`. The read-only Notebook page shows cells and saved outputs with no run or edit controls, the Runner page shows the requirements without Save, and Sources has no preview (it reads the raw source, on the Mac).
+- **The hosted Lambda strips notebook outputs for every workspace its registry marks `personal_data`**, when it copies the tree to its disk, whatever the workspace's own `clavesa.json` says. A notebook that does not parse is not kept.
+- **The hosted UI refuses previews (`/preview/*`, `/sources/<name>/preview`) for every workspace**: they read raw sources, on the Mac.
+- **Local-warehouse workspaces can show their Catalog and dashboards in the hosted UI (parity slice 5, ADR-036). Off until you turn it on per workspace:** `clavesa workspace hosted enable --url <url> --snapshot` (and `--no-snapshot`). Then the run-end publish carries the catalog listing (no paths on your machine), each table's newest snapshots and, only when `clavesa.json` says `"personal_data": false`, each dashboard dataset's result with its control defaults; capped at 2 MB, with its own 15-second budget so the run summary is always published. The Lambda answers those pages from it and runs no SQL; the pages say "As of <time>". Registry entries marked `personal_data` serve no widget result. Re-running `hosted enable` keeps `personal_data`.
+- **Only a deploy writes the hosted tree copy.** Each pipeline's runs-writer role could write the whole pipeline bucket, including `_clavesa/tree/`, whose dashboard specs and translations choose the SQL the hosted reader runs. It now has an explicit Deny on `_clavesa/*`. Run `clavesa deploy` once.
+- **The hosted Lambda runs a stored dashboard translation only if it is one SELECT or WITH statement** (no `;`, no UNLOAD, INSERT or DDL).
+- **The hosted reader's Athena workgroup publishes its metrics**, and the hosted UI stack alarms (to `jeeves-push`) when a workspace's reads scan more than 2 GiB in an hour (workgroups in the hosted stack's own account and region).
+
+### Added
+
+- **Dashboards in the hosted UI for cloud workspaces (ADR-034).** The tree copy that a deploy uploads now holds the dashboard specs (`*.json` in `.clavesa/dashboards/` and `dashboards/`). The read-only server answers `POST /dashboards/query` (the one POST it allows), and runs only SQL that is exactly a dataset of a deployed spec; any other SQL is 403. `POST /data/query` stays refused. The deploy translates each dataset's SQL to Athena SQL on your machine and ships those translations in the tree copy, because the hosted Lambda cannot run the translator. A local-warehouse workspace's published summary does not carry its dashboards.
+
 ## [v2.27.8] — 2026-11-17
 
 ### Changed

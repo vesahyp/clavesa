@@ -1325,6 +1325,11 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}\",\n", p.BucketExpr)
 	fmt.Fprintf(b, "          \"arn:aws:s3:::${%s}/*\",\n", p.BucketExpr)
 	fmt.Fprintf(b, "      ]},\n")
+	// The hosted UI's tree copy (_clavesa/tree/, ADR-032/034) is written
+	// only by a deploy. Its dashboard specs and their translations choose
+	// the SQL the hosted reader runs, so this role, which needs the rest
+	// of the bucket, must not write it (slice 3 review, finding 1).
+	fmt.Fprintf(b, "      { Sid = \"NoHostedTreeCopy\", Effect = \"Deny\", Action = [\"s3:PutObject\", \"s3:DeleteObject\"], Resource = [\"arn:aws:s3:::${%s}/_clavesa/*\"] },\n", p.BucketExpr)
 	fmt.Fprintf(b, "      { Sid = \"Logs\", Effect = \"Allow\", Action = [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"], Resource = [\"arn:aws:logs:*:*:*\"] },\n")
 	fmt.Fprintf(b, "    ]\n")
 	fmt.Fprintf(b, "  })\n")

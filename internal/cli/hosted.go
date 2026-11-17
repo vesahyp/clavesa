@@ -2,8 +2,11 @@ package cli
 
 import (
 	"fmt"
+	"github.com/vesahyp/clavesa/internal/observability"
+	"github.com/vesahyp/clavesa/internal/servingsql"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -95,6 +98,17 @@ smoke gate's reader leg). --event-bus-arn overrides the bus.`,
 	cmd.Flags().StringVar(&in.Kind, "kind", "", "cloud (read through the reader role) or local (summary published at run end); default: cloud when the workspace has a remote backend or is deployed, else its warehouse setting")
 	cmd.Flags().StringArrayVar(&in.ReaderPrincipals, "reader-principal", nil, "extra IAM principal ARN allowed to assume the reader role, beside the hosted UI's own (repeatable)")
 	cmd.Flags().StringVar(&in.EventBusARN, "event-bus-arn", "", "the hosted clavesa-ui event bus; empty: the one the hosted UI names")
+	var snapshotOn, snapshotOff bool
+	cmd.Flags().BoolVar(&snapshotOn, "snapshot", false, "local workspace: publish its catalog and dashboard snapshot at run end (ADR-036; off unless set). Values go only with \"personal_data\": false in clavesa.json")
+	cmd.Flags().BoolVar(&snapshotOff, "no-snapshot", false, "local workspace: stop publishing the snapshot")
+	cmd.MarkFlagsMutuallyExclusive("snapshot", "no-snapshot")
+	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+		if snapshotOn || snapshotOff {
+			v := snapshotOn
+			in.Snapshot = &v
+		}
+		return nil
+	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
 	_ = cmd.MarkFlagRequired("url")
 	return cmd
@@ -178,7 +192,15 @@ func printHostedStatus(w io.Writer, st tuiservice.HostedStatus) {
 // uploadHostedTree runs after a successful apply: for a hosted workspace
 // it uploads the tree copy and deployed.json (ADR-032). A no-op otherwise.
 func uploadHostedTree(cmd *cobra.Command, root string, out io.Writer) error {
-	res, err := tuiservice.New(root).UploadHostedTree(cmd.Context())
+	// The tree copy ships the dashboards' Athena translations (ADR-034):
+	// the same cached translator `clavesa ui` uses, so a widget already
+	// translated is not translated again. The sidecar container starts
+	// only when a translation is missing from the cache.
+	sidecar := observability.NewTranspileSidecar(root)
+	defer sidecar.Close()
+	svc := tuiservice.New(root).WithTranspiler(
+		servingsql.NewCachedTranspiler(filepath.Join(root, tuiservice.TranspileCacheDir), sidecar.ToServing))
+	res, err := svc.UploadHostedTree(cmd.Context())
 	if err != nil {
 		return err
 	}

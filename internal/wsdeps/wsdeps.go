@@ -12,7 +12,9 @@ package wsdeps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/vesahyp/clavesa/internal/api"
 	"os"
 	"path/filepath"
 
@@ -146,7 +148,27 @@ func New(ctx context.Context, root string, opts Options) *Deps {
 		// Parse; cloud + undeployed surfaces an actionable error there.
 		WithSQLParser(warm.SQLParserForWorkspace()).
 		WithTranspiler(transpiler).
-		WithMetastoreEnsurer(MetastoreEnsurer())
+		WithMetastoreEnsurer(MetastoreEnsurer()).
+		// The catalog listing of a local-warehouse workspace's published
+		// snapshot (ADR-036): the same listing GET /workspace/tables gives.
+		WithCatalogSnapshot(func(ctx context.Context) (json.RawMessage, []service.CatalogTableRef, error) {
+			// The same handler as GET /workspace/tables (ui mux), Glue
+			// client included, so the listing is byte-for-byte the Mac's.
+			var glue api.GlueClient
+			if clients.Glue != nil {
+				glue = clients.Glue
+			}
+			resp := api.NewCatalogHandler(glue).WithWorkspace(root).Tables(ctx)
+			body, err := json.Marshal(resp)
+			if err != nil {
+				return nil, nil, err
+			}
+			refs := make([]service.CatalogTableRef, 0, len(resp.Tables))
+			for _, t := range resp.Tables {
+				refs = append(refs, service.CatalogTableRef{Database: t.Database, Table: t.Name, Dir: t.Dir})
+			}
+			return body, refs, nil
+		})
 	if clients.Err == nil {
 		svc.WithAWSRegion(clients.Config.Region)
 	}

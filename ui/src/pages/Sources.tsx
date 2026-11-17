@@ -616,15 +616,19 @@ function SourceRow({
               />
             </code>
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={togglePreview}
-            disabled={busy}
-            aria-label={`Preview source ${spec.name}`}
-          >
-            <Eye className="h-4 w-4" />
-          </Button>
+          {/* Read-only (hosted, ADR-033): a preview reads the raw source,
+              which runs on the Mac. */}
+          {!readOnly && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={togglePreview}
+              disabled={busy}
+              aria-label={`Preview source ${spec.name}`}
+            >
+              <Eye className="h-4 w-4" />
+            </Button>
+          )}
           {!readOnly && (
             <>
               <Button
