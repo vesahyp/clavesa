@@ -11,7 +11,7 @@
  * keeps the Catalog at "/" (lib/runtimeConfig.ts homePath).
  */
 
-import { perMillionRecords, plural, scheduleText } from "@/lib/labels";
+import { perMillionRecords, plural, triggerText } from "@/lib/labels";
 import { stamp } from "@/lib/clock";
 import { useMemo, type ReactNode } from "react";
 import { Link } from "react-router-dom";
@@ -311,7 +311,7 @@ function PipelineCard({ p }: { p: PipelineSummary }) {
             {p.name}
           </Link>
           <div className="truncate text-xs text-muted-foreground">
-            <span data-testid="pipeline-card-schedule">{scheduleText(p.schedule)}</span>
+            <span data-testid="pipeline-card-schedule">{triggerText(p)}</span>
             {!p.problem && ` · ${p.runs.length} run${p.runs.length === 1 ? "" : "s"} in 30 days`}
           </div>
         </div>

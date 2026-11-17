@@ -2,9 +2,9 @@ package ui
 
 import (
 	"context"
+	"github.com/vesahyp/clavesa/internal/pathutil"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -53,10 +53,54 @@ type WorkspaceDeps struct {
 func BuildWorkspaceMux(d WorkspaceDeps) http.Handler {
 	mux := http.NewServeMux()
 	registerWorkspaceRoutes(d, mux)
+	h := ContainPathParams(d.Workspace, mux)
 	if d.ReadOnly {
-		return ReadOnlyGuard(mux)
+		return ReadOnlyGuard(h)
 	}
-	return mux
+	return h
+}
+
+// pathParams are the query parameters that name a file or directory of
+// the workspace.
+var pathParams = []string{"dir", "path"}
+
+// ContainPathParams answers 400 to a request whose dir or path query
+// parameter leaves the workspace root (pathutil.Contain: no absolute
+// path outside it, no "..", no symlink out). Each handler resolves dir
+// again, some through the service; this is the one check that sees every
+// route, so a handler that forgets cannot read outside the workspace.
+// The hosted Lambda's /proc/self/environ holds AWS keys (2026-11-17
+// review: GET /pipeline/script?dir=/proc/self&path=environ).
+func ContainPathParams(root string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		dir := root
+		if v := q.Get("dir"); v != "" {
+			abs, err := pathutil.Contain(root, v)
+			if err != nil {
+				httputil.WriteError(w, http.StatusBadRequest, "dir must be inside the workspace")
+				return
+			}
+			dir = abs
+		}
+		for _, k := range pathParams[1:] {
+			if v := q.Get(k); v != "" {
+				if _, err := pathutil.Contain(dir, v); err != nil {
+					httputil.WriteError(w, http.StatusBadRequest, k+" must be inside the workspace")
+					return
+				}
+			}
+		}
+		// A repeated parameter (dir=a&dir=/proc) must not slip past the
+		// check of the first value.
+		for _, k := range pathParams {
+			if len(q[k]) > 1 {
+				httputil.WriteError(w, http.StatusBadRequest, k+" given more than once")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // registerWorkspaceRoutes registers every route of one workspace on r.
@@ -135,11 +179,17 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 		}
 		return &g, nil
 	}
+	// Request dirs are checked by ContainPathParams; this resolves them
+	// the same way, and an escaping dir resolves to "" (no directory).
 	resolveDirFunc := func(dir string) string {
-		if dir == "" || filepath.IsAbs(dir) {
+		if dir == "" {
 			return dir
 		}
-		return filepath.Join(workspace, dir)
+		abs, err := pathutil.Contain(workspace, dir)
+		if err != nil {
+			return ""
+		}
+		return abs
 	}
 
 	pipelineHandler.RegisterRoutes(r)

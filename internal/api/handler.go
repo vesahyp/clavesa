@@ -236,7 +236,10 @@ func (h *Handler) GetPipeline(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	dir := h.resolve(dirParam)
+	dir, dirOK := h.resolveDir(w, dirParam)
+	if !dirOK {
+		return
+	}
 	g, err := hclparser.Parse(dir)
 	if err != nil {
 		httputil.WriteError(w, parseStatus(err), err.Error())
@@ -266,7 +269,11 @@ func (h *Handler) TypedAddNode(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "type": req.Type}) {
 		return
 	}
-	req.Dir = h.resolve(req.Dir)
+	resolved, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	req.Dir = resolved
 	if err := h.nodeAdder.AddNode(req.Dir, req.Type, req.Name); err != nil {
 		// service.AddNode emits user-facing redirect messages for misuse
 		// (e.g. type=source) — surface verbatim rather than wrapping.
@@ -288,7 +295,11 @@ func (h *Handler) AddNode(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "file": req.File, "block_name": req.BlockName}) {
 		return
 	}
-	req.Dir = h.resolve(req.Dir)
+	resolved, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	req.Dir = resolved
 	// Resolve req.File against the workspace root the same way req.Dir is
 	// resolved. Without this, any UI session whose cwd differs from the
 	// workspace gets a 404 because fileops opens File from cwd.
@@ -323,7 +334,11 @@ func (h *Handler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
-	req.Dir = h.resolve(req.Dir)
+	resolved, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	req.Dir = resolved
 	file := req.File
 	if file == "" {
 		var err error
@@ -383,7 +398,10 @@ func (h *Handler) RenameNode(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "new_id": req.NewID}) {
 		return
 	}
-	dir := h.resolve(req.Dir)
+	dir, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
 	if _, err := h.service().RenameNode(dir, id, req.NewID); err != nil {
 		msg := err.Error()
 		switch {
@@ -414,7 +432,11 @@ func (h *Handler) DeleteNode(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir}) {
 		return
 	}
-	req.Dir = h.resolve(req.Dir)
+	resolved, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	req.Dir = resolved
 	file := req.File
 	if file == "" {
 		var err error
@@ -453,7 +475,10 @@ func (h *Handler) AddEdge(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "from_node": req.FromNode, "to_node": req.ToNode}) {
 		return
 	}
-	dir := h.resolve(req.Dir)
+	dir, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
 	if req.FromOutput == "" {
 		req.FromOutput = "default"
 	}
@@ -510,7 +535,11 @@ func (h *Handler) AttachExternalTable(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "ref": req.Ref, "to": req.To}) {
 		return
 	}
-	req.Dir = h.resolve(req.Dir)
+	resolved, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	req.Dir = resolved
 	if err := h.externalAttacher.AttachExternalTable(req.Dir, req.Ref, req.To, req.Alias); err != nil {
 		httputil.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -548,7 +577,11 @@ func (h *Handler) DetachInput(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "to": req.To, "alias": req.Alias}) {
 		return
 	}
-	req.Dir = h.resolve(req.Dir)
+	resolved, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	req.Dir = resolved
 	if err := h.inputDetacher.DetachInput(req.Dir, req.To, req.Alias); err != nil {
 		httputil.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -583,7 +616,10 @@ func (h *Handler) DeleteEdge(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": body.Dir}) {
 		return
 	}
-	dir := h.resolve(body.Dir)
+	dir, dirOK := h.resolveDir(w, body.Dir)
+	if !dirOK {
+		return
+	}
 
 	if _, err := h.service().DeleteEdge(dir, edgeID); err != nil {
 		// FindNodeFile returns a wrapped not-found; surface as 404 to match
@@ -606,7 +642,10 @@ func (h *Handler) ValidatePipeline(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	dir := h.resolve(dirParam)
+	dir, dirOK := h.resolveDir(w, dirParam)
+	if !dirOK {
+		return
+	}
 	g, err := hclparser.Parse(dir)
 	if err != nil {
 		httputil.WriteError(w, parseStatus(err), err.Error())
@@ -637,9 +676,24 @@ func (h *Handler) resolve(dir string) string {
 // Use for endpoints that take untrusted dir input; the bare h.resolve
 // pre-dates the containment rule and remains for tests + internal callers.
 func (h *Handler) resolveDir(w http.ResponseWriter, dir string) (string, bool) {
-	abs := pathutil.ResolveDir(h.root, dir)
-	if h.root != "" && !pathutil.IsWithin(h.root, abs) {
+	if h.root == "" {
+		// No workspace root (some tests): the old resolution.
+		return pathutil.ResolveDir(h.root, dir), true
+	}
+	abs, err := pathutil.Contain(h.root, dir)
+	if err != nil {
 		httputil.WriteError(w, http.StatusBadRequest, "dir must be within the workspace root")
+		return "", false
+	}
+	return abs, true
+}
+
+// containFile resolves rel, a file path from a request, inside dir: the
+// same rules as resolveDir (no absolute path, no "..", no symlink out).
+func containFile(w http.ResponseWriter, dir, rel string) (string, bool) {
+	abs, err := pathutil.Contain(dir, rel)
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, "path must be within the pipeline directory")
 		return "", false
 	}
 	return abs, true
@@ -750,11 +804,12 @@ func (h *Handler) GetScript(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	dir := h.resolve(dirParam)
-	abs := filepath.Join(dir, rel)
-	// Prevent path traversal outside the pipeline directory.
-	if !pathutil.IsWithin(dir, abs) {
-		httputil.WriteError(w, http.StatusBadRequest, "path must be within the pipeline directory")
+	dir, dirOK := h.resolveDir(w, dirParam)
+	if !dirOK {
+		return
+	}
+	abs, fileOK := containFile(w, dir, rel)
+	if !fileOK {
 		return
 	}
 	data, err := os.ReadFile(abs)
@@ -782,10 +837,12 @@ func (h *Handler) PutScript(w http.ResponseWriter, r *http.Request) {
 	if !httputil.RequireFields(w, map[string]string{"dir": req.Dir, "path": req.Path}) {
 		return
 	}
-	dir := h.resolve(req.Dir)
-	abs := filepath.Join(dir, req.Path)
-	if !pathutil.IsWithin(dir, abs) {
-		httputil.WriteError(w, http.StatusBadRequest, "path must be within the pipeline directory")
+	dir, dirOK := h.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
+	abs, fileOK := containFile(w, dir, req.Path)
+	if !fileOK {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {

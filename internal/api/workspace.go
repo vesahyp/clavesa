@@ -68,8 +68,11 @@ func (wh *WorkspaceHandler) service() *service.Service {
 // endpoints. Writes 400 and returns ("", false) on escape attempts; the
 // caller should return early. Mirrors Handler.resolveDir (C9, A P1-2).
 func (wh *WorkspaceHandler) resolveDir(w http.ResponseWriter, dir string) (string, bool) {
-	abs := pathutil.ResolveDir(wh.root, dir)
-	if wh.root != "" && !pathutil.IsWithin(wh.root, abs) {
+	if wh.root == "" {
+		return pathutil.ResolveDir(wh.root, dir), true
+	}
+	abs, err := pathutil.Contain(wh.root, dir)
+	if err != nil {
 		httputil.WriteError(w, http.StatusBadRequest, "dir must be within the workspace root")
 		return "", false
 	}
@@ -923,7 +926,10 @@ func (wh *WorkspaceHandler) GetVars(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	abs := pathutil.ResolveDir(wh.root, dir)
+	abs, dirOK := wh.resolveDir(w, dir)
+	if !dirOK {
+		return
+	}
 	vars, err := readTFVars(abs)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "read tfvars: "+err.Error())
@@ -963,7 +969,10 @@ func (wh *WorkspaceHandler) PutVars(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	abs := pathutil.ResolveDir(wh.root, req.Dir)
+	abs, dirOK := wh.resolveDir(w, req.Dir)
+	if !dirOK {
+		return
+	}
 
 	// Read existing vars, merge, write.
 	existing, _ := readTFVars(abs) // ignore error — file may not exist yet

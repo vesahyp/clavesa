@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/vesahyp/clavesa/internal/identutil"
 	"io"
 	"net/http"
 	"os"
@@ -262,7 +263,7 @@ func (s *Service) SyncHostedTF(version string) error {
 	}
 	if m.Hosted == nil || m.Hosted.IsLocal() {
 		// A local-warehouse workspace has no stack: nothing to deploy.
-		return workspace.SyncHostedTF(s.workspace, m, "", nil, nil)
+		return workspace.SyncHostedTF(s.workspace, m, "", nil, nil, workspace.HostedRaw{})
 	}
 	if version == "" {
 		version = ModuleVersion
@@ -282,7 +283,26 @@ func (s *Service) SyncHostedTF(version string) error {
 	if err != nil {
 		return err
 	}
-	return workspace.SyncHostedTF(s.workspace, m, version, names, dbs)
+	return workspace.SyncHostedTF(s.workspace, m, version, names, dbs, hostedRaw(m, pipes))
+}
+
+// hostedRaw is the raw data of a PersonalData workspace: every pipeline
+// whose schema is not gold (the default serving layer, parity plan),
+// as its prefix in the pipeline bucket (<dir>/*, where its tables and
+// their Delta logs are) and its Glue database.
+func hostedRaw(m *workspace.Manifest, pipes []PipelineInfo) workspace.HostedRaw {
+	var raw workspace.HostedRaw
+	if m.Hosted == nil || !m.Hosted.PersonalData {
+		return raw
+	}
+	for _, p := range pipes {
+		if p.Schema == "gold" {
+			continue
+		}
+		raw.ObjectPatterns = append(raw.ObjectPatterns, filepath.ToSlash(p.Dir)+"/*")
+		raw.GlueDatabases = append(raw.GlueDatabases, identutil.EncodeGlueDatabase(m.CatalogIdentifier(), p.Schema))
+	}
+	return raw
 }
 
 // deployedPipelineDatabases returns the Glue database of every deployed

@@ -23,7 +23,10 @@ func (h *Handler) GetLineage(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusInternalServerError, "lineage not wired: Handler.WithLineage was not called")
 		return
 	}
-	dir := h.resolve(r.URL.Query().Get("dir"))
+	dir, dirOK := h.resolveDir(w, r.URL.Query().Get("dir"))
+	if !dirOK {
+		return
+	}
 	if dir == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "missing required query param: dir")
 		return

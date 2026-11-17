@@ -128,6 +128,10 @@ resource "aws_lambda_function" "api" {
   filename         = data.archive_file.api.output_path
   source_code_hash = data.archive_file.api.output_base64sha256
   memory_size      = 512
+  # A cap on how many run at once, so a loop or a leaked token cannot use
+  # the account's 1000. A page opens about a dozen calls at once and the
+  # live checks reached 54 (2026-11-17), so 30 (review finding 7).
+  reserved_concurrent_executions = 30
   # An event refresh waits for the runs_writer (up to about a minute);
   # HTTP requests are cut at 30 s by the HTTP API.
   timeout = 120
@@ -207,15 +211,45 @@ resource "aws_apigatewayv2_route" "signed" {
   authorizer_id      = aws_apigatewayv2_authorizer.cognito.id
 }
 
+# The stage's access log: one line per request, also for requests sent
+# straight to the execute-api endpoint, which bypass CloudFront and its
+# log. The endpoint stays on because CloudFront reaches the API through
+# it (spa.tf origin). An HTTP API access log has no query string
+# variable; the Lambda answers 400 to any dir or path outside the
+# workspace (ui.ContainPathParams) whatever the log says.
+resource "aws_cloudwatch_log_group" "api_access" {
+  name              = "/aws/apigateway/${local.api_name}"
+  retention_in_days = 14
+}
+
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.ui.id
   name        = "$default"
   auto_deploy = true
 
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_access.arn
+    format = jsonencode({
+      requestId = "$context.requestId"
+      time      = "$context.requestTime"
+      method    = "$context.httpMethod"
+      path      = "$context.path"
+      status    = "$context.status"
+      domain    = "$context.domainName"
+      sourceIp  = "$context.identity.sourceIp"
+      userAgent = "$context.identity.userAgent"
+      user      = "$context.authorizer.claims.email"
+      authError = "$context.authorizer.error"
+      latencyMs = "$context.responseLatency"
+    })
+  }
+
   # One viewer: a low ceiling caps what a leaked token or a loop costs.
+  # 10/20 throttled a person tapping through the menu (429s, 2026-11-17:
+  # each page opens with about a dozen calls), so 25 a second, burst 50.
   default_route_settings {
-    throttling_burst_limit = 20
-    throttling_rate_limit  = 10
+    throttling_burst_limit = 50
+    throttling_rate_limit  = 25
   }
 }
 

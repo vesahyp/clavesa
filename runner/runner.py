@@ -2282,6 +2282,23 @@ def _create_delta_table(df, table_id: str, cluster_by: list[str], partition_by: 
         df.write.format("delta").mode("overwrite").saveAsTable(table_id)
 
 
+def _written_schema(spark, table_id: str, fallback):
+    """The table's own schema after a ``mergeSchema`` append.
+
+    An append with ``mergeSchema`` keeps the columns a newer runner added
+    (node_runs ``timing``), so the table can have more columns than the
+    rows this runner wrote. Glue must get the table's schema: syncing
+    the written rows' schema puts an older column list back in Glue, and
+    Athena then refuses the table with INVALID_GLUE_SCHEMA. Falls back to
+    ``fallback`` when the table cannot be read.
+    """
+    try:
+        return spark.table(table_id).schema
+    except Exception as exc:  # noqa: BLE001 - best effort, as the sync is
+        print(f"warn: read schema of {table_id} for the Glue sync: {exc}", file=sys.stderr)
+        return fallback
+
+
 def _sync_glue_table_schema(table_id: str, schema, location: str | None = None) -> None:
     """Write the real Delta schema into a Glue table's ``StorageDescriptor.Columns``.
 
@@ -3639,7 +3656,7 @@ def _record_node_run(row: dict[str, Any]) -> None:
     writer.saveAsTable(table_id)
     if created:
         _set_system_table_properties(spark, table_id)
-    _sync_glue_table_schema(table_id, df.schema, location=location)
+    _sync_glue_table_schema(table_id, _written_schema(spark, table_id, df.schema), location=location)
 
 
 def _runs_table_id() -> str:
@@ -3703,7 +3720,7 @@ def _record_run(row: dict[str, Any]) -> None:
     df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
     if created:
         _set_system_table_properties(spark, table_id)
-    _sync_glue_table_schema(table_id, df.schema)
+    _sync_glue_table_schema(table_id, _written_schema(spark, table_id, df.schema))
 
 
 def _tables_table_id() -> str:
@@ -3851,7 +3868,7 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
     writer.saveAsTable(tables_id)
     if created:
         _set_system_table_properties(spark, tables_id)
-    _sync_glue_table_schema(tables_id, df.schema, location=location)
+    _sync_glue_table_schema(tables_id, _written_schema(spark, tables_id, df.schema), location=location)
 
     # Net rows this commit contributed.
     #
@@ -4135,7 +4152,7 @@ def _record_column_stats(rows):
     writer.saveAsTable(table_id)
     if created:
         _set_system_table_properties(spark, table_id)
-    _sync_glue_table_schema(table_id, df.schema, location=location)
+    _sync_glue_table_schema(table_id, _written_schema(spark, table_id, df.schema), location=location)
 
 
 def run_record_run() -> None:

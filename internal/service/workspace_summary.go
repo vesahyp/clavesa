@@ -116,16 +116,23 @@ type PipelineSummary struct {
 	// Schedule is the declared trigger_schedule; ExpectedIntervalSeconds
 	// is the interval it implies (0 when none is declared or the
 	// expression is not one clavesa can read).
-	Schedule                string `json:"schedule,omitempty"`
-	ExpectedIntervalSeconds int64  `json:"expected_interval_seconds,omitempty"`
-	// SchedulePaused: the schedule's EventBridge rule is disabled (cloud
-	// only), so no run is expected; SchedulePausedSince is when, RFC 3339,
-	// "" when that is not known.
-	SchedulePaused      bool     `json:"schedule_paused,omitempty"`
-	SchedulePausedSince string   `json:"schedule_paused_since,omitempty"`
-	Status              string   `json:"status"`
-	StatusReasons       []string `json:"status_reasons"`
-	Notes               []string `json:"notes,omitempty"`
+	//
+	// Trigger is what starts the pipeline: "schedule" (Schedule),
+	// "poller" (BatchWindow, the source-queue poller's window, counted
+	// only when it is an hour or longer) or "upstream" (After, the
+	// upstream pipelines whose success starts it; it inherits their
+	// shortest interval). "" when nothing clavesa knows starts it.
+	Schedule                string   `json:"schedule,omitempty"`
+	Trigger                 string   `json:"trigger,omitempty"`
+	BatchWindow             string   `json:"batch_window,omitempty"`
+	After                   []string `json:"after,omitempty"`
+	ExpectedIntervalSeconds int64    `json:"expected_interval_seconds,omitempty"`
+	// SchedulePaused: the schedule or poller EventBridge rule is disabled
+	// (cloud only), or every upstream is paused, so no run is expected.
+	SchedulePaused bool     `json:"schedule_paused,omitempty"`
+	Status         string   `json:"status"`
+	StatusReasons  []string `json:"status_reasons"`
+	Notes          []string `json:"notes,omitempty"`
 	// LastRun is the newest run; LastRunNodes its per-node timings.
 	LastRun      *SummaryRun   `json:"last_run,omitempty"`
 	LastRunNodes []SummaryNode `json:"last_run_nodes"`
@@ -263,8 +270,12 @@ func (s *Service) WorkspaceSummary(ctx context.Context, q WorkspaceSummaryQuery)
 
 	windowStart := now.AddDate(0, 0, -summaryWindowDays)
 	var allRows []observability.NodeRun
+	triggers := s.pipelineTriggers(pipes, env.Cloud)
+	if env.Cloud {
+		s.triggerPauses(ctx, triggers)
+	}
 	for _, p := range pipes {
-		ps, rows := s.pipelineSummary(ctx, p, now, windowStart, env, undeployed)
+		ps, rows := s.pipelineSummary(ctx, p, triggers[p.Name], now, windowStart, env, undeployed)
 		allRows = append(allRows, rows...)
 		sum.Pipelines = append(sum.Pipelines, ps)
 	}
@@ -319,7 +330,7 @@ func (s *Service) WorkspaceSummary(ctx context.Context, q WorkspaceSummaryQuery)
 
 // pipelineSummary builds one pipeline's summary. It also returns the
 // pipeline's node_runs rows inside the window, for the workspace roll-up.
-func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, windowStart time.Time, env summaryEnv, undeployed bool) (PipelineSummary, []observability.NodeRun) {
+func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, trig pipelineTrigger, now, windowStart time.Time, env summaryEnv, undeployed bool) (PipelineSummary, []observability.NodeRun) {
 	ps := PipelineSummary{
 		Name:          p.Name,
 		Dir:           p.Dir,
@@ -328,11 +339,14 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		Runs:          []SummaryRun{},
 		Freshness:     []TableFreshness{},
 	}
-	if vars, err := s.GetVars(p.Dir); err == nil {
-		if sched := strings.TrimSpace(vars["trigger_schedule"]); sched != "" && sched != "null" {
-			ps.Schedule = sched
-			ps.ExpectedIntervalSeconds = int64(scheduleInterval(sched).Seconds())
-		}
+	ps.Trigger = trig.kind
+	ps.After = trig.after
+	ps.ExpectedIntervalSeconds = int64(trig.interval.Seconds())
+	switch trig.kind {
+	case TriggerSchedule:
+		ps.Schedule = trig.expr
+	case TriggerPoller:
+		ps.BatchWindow = trig.expr
 	}
 
 	// fail marks the pipeline's history unreadable: the problem line is
@@ -449,10 +463,12 @@ func (s *Service) pipelineSummary(ctx context.Context, p PipelineInfo, now, wind
 		status = worseStatus(status, SummaryWarn)
 		ps.StatusReasons = append(ps.StatusReasons, fmt.Sprintf("%d table(s) past their freshness target", stale))
 	}
-	if ps.ExpectedIntervalSeconds > 0 && env.Cloud {
-		ps.SchedulePaused, ps.SchedulePausedSince = s.scheduleState(ctx, s.awsName(p.Name)+"-schedule")
-		if ps.SchedulePaused {
-			ps.Notes = append(ps.Notes, pausedNote(ps.SchedulePausedSince, now.Location()))
+	if ps.ExpectedIntervalSeconds > 0 && trig.paused {
+		ps.SchedulePaused = true
+		if ps.Trigger == TriggerUpstream {
+			ps.Notes = append(ps.Notes, "upstream paused ("+strings.Join(ps.After, ", ")+")")
+		} else {
+			ps.Notes = append(ps.Notes, pausedNote)
 		}
 	}
 	if ps.ExpectedIntervalSeconds > 0 && !ps.SchedulePaused {

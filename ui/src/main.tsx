@@ -2,7 +2,7 @@ import "modern-normalize";
 import "./index.css";
 import { StrictMode, Suspense, lazy, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { homePath, runtimeConfig as rc } from "@/lib/runtimeConfig";
+import { runtimeConfig as rc } from "@/lib/runtimeConfig";
 import {
   BrowserRouter,
   Routes,
@@ -32,15 +32,17 @@ import { Notebook } from "@/pages/Notebook";
 import { Query } from "@/pages/Query";
 import { Bundles } from "@/pages/Bundles";
 import { Workspaces } from "@/pages/Workspaces";
+import { NOT_HOSTED, NotHosted, OnTheMac } from "@/pages/NotHosted";
 import { WorkspaceHome } from "@/pages/WorkspaceHome";
 import { atWorkspacesRoot, runtimeConfig } from "@/lib/runtimeConfig";
 
 // Dashboard pages pull recharts (~110 KB gzipped). Lazy so /, /tables/*,
 // and /pipelines/* don't pay for charts they don't render.
-// Read-only: Query, Credentials and Runner are not pages here; an old link
-// lands on the workspace home (AppSidebar hides their entries).
-function readOnlyGone(el: ReactNode): ReactNode {
-  return rc.readOnly ? <Navigate to={homePath} replace /> : el;
+// Read-only (ADR-033): Query, Credentials and Runner cannot work here.
+// Their entries stay in the navigation and open a page that says what
+// to do instead.
+function readOnlyAlt(el: ReactNode, title: string, line: string): ReactNode {
+  return rc.readOnly ? <NotHosted title={title} line={line} /> : el;
 }
 
 const Dashboards = lazy(() =>
@@ -142,43 +144,47 @@ const app = (
               }
             />
             {runtimeConfig.mode !== "local" && (
-              <Route path="/catalog" element={<Catalog />} />
+              <Route path="/catalog" element={<OnTheMac title="Catalog"><Catalog /></OnTheMac>} />
             )}
             <Route path="/overview" element={<WorkspaceHome />} />
             <Route
               path="/tables/:catalog/:schema/:table"
-              element={<TableDetail />}
+              element={<OnTheMac title="Table"><TableDetail /></OnTheMac>}
             />
-            <Route path="/sources" element={<Sources />} />
-            <Route path="/credentials" element={readOnlyGone(<Credentials />)} />
-            <Route path="/unity-catalog" element={<UnityCatalog />} />
-            <Route path="/runner" element={readOnlyGone(<Runner />)} />
-            <Route path="/notebooks" element={<Notebooks />} />
-            <Route path="/notebooks/:name" element={<Notebook />} />
-            <Route path="/query" element={readOnlyGone(<Query />)} />
+            <Route path="/sources" element={<OnTheMac title="Sources"><Sources /></OnTheMac>} />
+            <Route path="/credentials" element={readOnlyAlt(<Credentials />, "Credentials", NOT_HOSTED.credentials)} />
+            <Route path="/unity-catalog" element={<OnTheMac title="Unity Catalog"><UnityCatalog /></OnTheMac>} />
+            <Route path="/runner" element={readOnlyAlt(<Runner />, "Runner", NOT_HOSTED.runner)} />
+            <Route path="/notebooks" element={<OnTheMac title="Notebooks"><Notebooks /></OnTheMac>} />
+            <Route path="/notebooks/:name" element={<OnTheMac title="Notebook"><Notebook /></OnTheMac>} />
+            <Route path="/query" element={readOnlyAlt(<Query />, "Query", NOT_HOSTED.query)} />
             <Route path="/pipelines" element={<PipelinesList />} />
-            <Route path="/bundles" element={<Bundles />} />
+            <Route path="/bundles" element={<OnTheMac title="Bundles"><Bundles /></OnTheMac>} />
             <Route
               path="/pipelines/dashboard"
               element={<PipelineDashboard />}
             />
             <Route path="/pipelines/run" element={<RunDetail />} />
-            <Route path="/backfills" element={<BackfillDetail />} />
+            <Route path="/backfills" element={<OnTheMac title="Backfill"><BackfillDetail /></OnTheMac>} />
             <Route path="/editor" element={<EditorRedirect />} />
             <Route
               path="/dashboards"
               element={
-                <Suspense fallback={null}>
-                  <Dashboards />
-                </Suspense>
+                <OnTheMac title="Dashboards">
+                  <Suspense fallback={null}>
+                    <Dashboards />
+                  </Suspense>
+                </OnTheMac>
               }
             />
             <Route
               path="/dashboards/:slug"
               element={
-                <Suspense fallback={null}>
-                  <Dashboard />
-                </Suspense>
+                <OnTheMac title="Dashboard">
+                  <Suspense fallback={null}>
+                    <Dashboard />
+                  </Suspense>
+                </OnTheMac>
               }
             />
           </Route>

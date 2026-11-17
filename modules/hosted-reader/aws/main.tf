@@ -4,8 +4,7 @@
 #   - the reader role: trusted only by var.reader_principals, with
 #     sts:ExternalId = the workspace name, and a policy that reads this
 #     workspace's bucket, Glue databases, state machines, log groups and
-#     schedule rules (and CloudTrail event history, for when a schedule
-#     was paused);
+#     schedule rules;
 #     the one write is Athena results under athena-results/clavesa-ui/;
 #   - an Athena workgroup with an enforced output location and a
 #     per-query scan limit, so a bad query has a capped cost;
@@ -32,8 +31,15 @@ locals {
   athena_results_prefix = "athena-results/clavesa-ui/"
 
   state_machine_arns = [for p in var.state_machine_patterns : "arn:${local.partition}:states:${local.region}:${local.account}:stateMachine:${p}"]
-  schedule_rule_arns = [for p in var.state_machine_patterns : "arn:${local.partition}:events:${local.region}:${local.account}:rule/${p}"]
-  execution_arns     = [for p in var.state_machine_patterns : "arn:${local.partition}:states:${local.region}:${local.account}:execution:${p}:*"]
+  # A pipeline's EventBridge rules are its state machine name plus
+  # "-schedule" (trigger_schedule) or "-poller" (trigger_batch_window).
+  # The bare name matched only a "<prefix>-*" pattern (smoke2), never the
+  # exact names of a workspace on legacy aws_names (web-traffic).
+  schedule_rule_arns = flatten([for p in var.state_machine_patterns : [
+    "arn:${local.partition}:events:${local.region}:${local.account}:rule/${p}-schedule",
+    "arn:${local.partition}:events:${local.region}:${local.account}:rule/${p}-poller",
+  ]])
+  execution_arns = [for p in var.state_machine_patterns : "arn:${local.partition}:states:${local.region}:${local.account}:execution:${p}:*"]
   log_group_arns = flatten([for p in var.log_group_patterns : [
     "arn:${local.partition}:logs:${local.region}:${local.account}:log-group:${p}",
     "arn:${local.partition}:logs:${local.region}:${local.account}:log-group:${p}:*",
@@ -69,7 +75,7 @@ resource "aws_iam_role_policy" "reader" {
   role = aws_iam_role.reader.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "ReadBucket"
         Effect   = "Allow"
@@ -94,64 +100,77 @@ resource "aws_iam_role_policy" "reader" {
         Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = [for p in var.state_object_patterns : "${local.bucket}/${p}"]
       },
-      {
-        Sid      = "ReadGlue"
-        Effect   = "Allow"
-        Action   = ["glue:GetDatabase", "glue:GetDatabases", "glue:GetTable", "glue:GetTables", "glue:GetPartitions"]
-        Resource = local.glue_arns
-      },
-      {
-        Sid      = "QueryAthena"
-        Effect   = "Allow"
-        Action   = ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults", "athena:GetWorkGroup"]
-        Resource = [aws_athena_workgroup.reader.arn]
-      },
-      {
-        Sid      = "ReadStateMachines"
-        Effect   = "Allow"
-        Action   = ["states:ListExecutions", "states:DescribeStateMachine"]
-        Resource = local.state_machine_arns
-      },
-      {
-        Sid      = "ReadExecutions"
-        Effect   = "Allow"
-        Action   = ["states:DescribeExecution", "states:GetExecutionHistory"]
-        Resource = local.execution_arns
-      },
-      {
-        Sid      = "ReadLogs"
-        Effect   = "Allow"
-        Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
-        Resource = local.log_group_arns
-      },
-      {
-        # Whether a pipeline's schedule rule is enabled, so the summary
-        # does not call a pipeline whose schedule is paused overdue
-        # (v2.27.4). Pipeline rules share the state machine names.
-        Sid      = "ReadScheduleRules"
-        Effect   = "Allow"
-        Action   = ["events:DescribeRule"]
-        Resource = local.schedule_rule_arns
-      },
-      {
-        # When a schedule was paused: the newest DisableRule event of the
-        # rule. LookupEvents has no resource ARN; it reads event history
-        # (who called what, when), never data.
-        Sid      = "ReadPauseTime"
-        Effect   = "Allow"
-        Action   = ["cloudtrail:LookupEvents"]
-        Resource = "*"
-      },
-      {
-        # Lake Formation vends the S3 credentials of an LF-registered
-        # location to Athena through this call. It has no resource ARN;
-        # what the role may read is set by the grants below.
-        Sid      = "LakeFormationDataAccess"
-        Effect   = "Allow"
-        Action   = ["lakeformation:GetDataAccess"]
-        Resource = "*"
-      },
-    ]
+      ],
+      # A workspace whose raw data holds personal data (hosted
+      # personal_data): no object of a non-gold pipeline (its tables and
+      # their Delta logs, whose column statistics hold values too) and no
+      # table of its database. Athena reads with this role, so a query of
+      # those tables fails as well.
+      length(var.raw_object_patterns) == 0 ? [] : [{
+        Sid      = "DenyRawObjects"
+        Effect   = "Deny"
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = [for p in var.raw_object_patterns : "${local.bucket}/${p}"]
+      }],
+      length(var.raw_glue_databases) == 0 ? [] : [{
+        Sid    = "DenyRawTables"
+        Effect = "Deny"
+        Action = ["glue:GetTable", "glue:GetTables", "glue:GetPartition", "glue:GetPartitions"]
+        Resource = flatten([for d in var.raw_glue_databases : [
+          "arn:${local.partition}:glue:${local.region}:${local.account}:database/${d}",
+          "arn:${local.partition}:glue:${local.region}:${local.account}:table/${d}/*",
+        ]])
+      }],
+      [
+        {
+          Sid      = "ReadGlue"
+          Effect   = "Allow"
+          Action   = ["glue:GetDatabase", "glue:GetDatabases", "glue:GetTable", "glue:GetTables", "glue:GetPartitions"]
+          Resource = local.glue_arns
+        },
+        {
+          Sid      = "QueryAthena"
+          Effect   = "Allow"
+          Action   = ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults", "athena:GetWorkGroup"]
+          Resource = [aws_athena_workgroup.reader.arn]
+        },
+        {
+          Sid      = "ReadStateMachines"
+          Effect   = "Allow"
+          Action   = ["states:ListExecutions", "states:DescribeStateMachine"]
+          Resource = local.state_machine_arns
+        },
+        {
+          Sid      = "ReadExecutions"
+          Effect   = "Allow"
+          Action   = ["states:DescribeExecution", "states:GetExecutionHistory"]
+          Resource = local.execution_arns
+        },
+        {
+          Sid      = "ReadLogs"
+          Effect   = "Allow"
+          Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+          Resource = local.log_group_arns
+        },
+        {
+          # Whether a pipeline's schedule rule is enabled, so the summary
+          # does not call a pipeline whose schedule is paused overdue
+          # (v2.27.4). Pipeline rules share the state machine names.
+          Sid      = "ReadScheduleRules"
+          Effect   = "Allow"
+          Action   = ["events:DescribeRule"]
+          Resource = local.schedule_rule_arns
+        },
+        {
+          # Lake Formation vends the S3 credentials of an LF-registered
+          # location to Athena through this call. It has no resource ARN;
+          # what the role may read is set by the grants below.
+          Sid      = "LakeFormationDataAccess"
+          Effect   = "Allow"
+          Action   = ["lakeformation:GetDataAccess"]
+          Resource = "*"
+        },
+    ])
   })
 }
 
@@ -167,22 +186,45 @@ resource "aws_iam_role_policy" "reader" {
 # that leaves the catalog to IAM (IAMAllowedPrincipals on each database)
 # the grants pass through and change nothing. The deploying principal
 # must be a Lake Formation data lake admin, as for a pipeline deploy.
+# The reader's grants ignore the provider's read-back of permissions,
+# which adds what the principal holds from elsewhere (the database's
+# IAM_ALLOWED_PRINCIPALS ALL) and made every plan replace them
+# (2026-11-17). They are replaced only when the declared permissions,
+# kept in the terraform_data beside each, change.
+resource "terraform_data" "reader_db_permissions" {
+  input = ["DESCRIBE"]
+}
+
 resource "aws_lakeformation_permissions" "reader_db" {
   for_each    = toset(var.lf_databases)
   principal   = aws_iam_role.reader.arn
-  permissions = ["DESCRIBE"]
+  permissions = terraform_data.reader_db_permissions.input
   database {
     name = each.value
   }
+
+  lifecycle {
+    ignore_changes       = [permissions, permissions_with_grant_option]
+    replace_triggered_by = [terraform_data.reader_db_permissions]
+  }
+}
+
+resource "terraform_data" "reader_tables_permissions" {
+  input = ["SELECT", "DESCRIBE"]
 }
 
 resource "aws_lakeformation_permissions" "reader_tables" {
   for_each    = toset(var.lf_databases)
   principal   = aws_iam_role.reader.arn
-  permissions = ["SELECT", "DESCRIBE"]
+  permissions = terraform_data.reader_tables_permissions.input
   table {
     database_name = each.value
     wildcard      = true
+  }
+
+  lifecycle {
+    ignore_changes       = [permissions, permissions_with_grant_option]
+    replace_triggered_by = [terraform_data.reader_tables_permissions]
   }
 }
 

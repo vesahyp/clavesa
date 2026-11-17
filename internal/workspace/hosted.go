@@ -41,6 +41,19 @@ type Hosted struct {
 	PublisherRoleARN string `json:"publisher_role_arn,omitempty"`
 	DataBucket       string `json:"data_bucket,omitempty"`
 	Region           string `json:"region,omitempty"`
+	// PersonalData: the workspace's raw data holds personal data (visitor
+	// IPs). The reader role then gets an explicit Deny on every pipeline
+	// whose schema is not gold: its objects in the pipeline bucket and its
+	// Glue tables (HostedRaw). Set by hand in clavesa.json; the hosted
+	// registry's personal_data is the API-side half.
+	PersonalData bool `json:"personal_data,omitempty"`
+}
+
+// HostedRaw is what the reader of a PersonalData workspace may not read:
+// object key patterns in the pipeline bucket and Glue databases.
+type HostedRaw struct {
+	ObjectPatterns []string
+	GlueDatabases  []string
 }
 
 // The values of Hosted.Kind.
@@ -239,9 +252,17 @@ func hostedLFDatabases(m *Manifest, pipelineDBs []string) string {
 // names, used only for legacy (non workspace-scoped) AWS names.
 // pipelineDBs are the Glue databases of the deployed pipelines, which get
 // Lake Formation grants for the reader (with the system database).
-func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []string) string {
+func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []string, raw HostedRaw) string {
 	h := m.Hosted
 	sms, logs := HostedResourcePatterns(m, pipelines)
+	rawLines := ""
+	if h.PersonalData {
+		objs := append([]string(nil), raw.ObjectPatterns...)
+		dbs := append([]string(nil), raw.GlueDatabases...)
+		sort.Strings(objs)
+		sort.Strings(dbs)
+		rawLines = fmt.Sprintf("  raw_object_patterns    = [%s]\n  raw_glue_databases     = [%s]\n", quotedHCLList(objs), quotedHCLList(dbs))
+	}
 	return hostedTFHeader + fmt.Sprintf(`module "hosted_reader" {
   source                 = "./.clavesa/modules/%s/hosted-reader/aws"
   workspace_name         = var.workspace_name
@@ -255,7 +276,7 @@ func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []
   state_object_patterns  = [%s]
   reader_principals      = [%s]
   event_bus_arn          = %q
-}
+%s}
 
 output "hosted_reader_role_arn" {
   description = "Role the hosted UI assumes to read this workspace (ADR-032); ExternalId = the workspace name."
@@ -268,13 +289,13 @@ output "hosted_workgroup" {
 }
 `, moduleVersion, HostedReaderRoleName(m.Name), HostedWorkGroupName(m.Name),
 		quotedHCLList(HostedGlueDatabasePatterns(m)), hostedLFDatabases(m, pipelineDBs), quotedHCLList(sms), quotedHCLList(logs),
-		quotedHCLList(hostedStateObjectPatterns(m)), quotedHCLList(h.ReaderPrincipals), h.EventBusARN)
+		quotedHCLList(hostedStateObjectPatterns(m)), quotedHCLList(h.ReaderPrincipals), h.EventBusARN, rawLines)
 }
 
 // SyncHostedTF makes hosted.tf match the manifest: written when m.Hosted
 // is set, removed when it is not or when it is a local-warehouse
 // workspace's block (no stack, no reader role).
-func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pipelineDBs []string) error {
+func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pipelineDBs []string, raw HostedRaw) error {
 	path := filepath.Join(root, HostedTFFile)
 	if m.Hosted == nil || m.Hosted.IsLocal() {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -285,5 +306,5 @@ func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pip
 	if moduleVersion == "" {
 		return fmt.Errorf("no module version: main.tf has no recognised workspace module source")
 	}
-	return os.WriteFile(path, []byte(RenderHostedTF(m, moduleVersion, pipelines, pipelineDBs)), 0o644)
+	return os.WriteFile(path, []byte(RenderHostedTF(m, moduleVersion, pipelines, pipelineDBs, raw)), 0o644)
 }

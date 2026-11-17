@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 	// Summary days and times in one known zone on every machine and in CI.
 	os.Setenv("CLAVESA_TIME_ZONE", "Europe/Helsinki")
 	// No unit test asks a real EventBridge whether a schedule is paused.
-	scheduleLookup = func(*Service, context.Context, string) (bool, string) { return false, "" }
+	scheduleLookup = func(*Service, context.Context, string) bool { return false }
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)

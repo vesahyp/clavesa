@@ -41,7 +41,7 @@ bin/clavesa node edit newsfeed stories --set "sql=
     hit.objectID                         AS objectID,
     hit.title                            AS title,
     hit.url                              AS url,
-    parse_url(hit.url, 'HOST')           AS domain,
+    try_parse_url(hit.url, 'HOST')       AS domain,
     hit.author                           AS author,
     CAST(hit.points       AS INT)        AS points,
     CAST(hit.num_comments AS INT)        AS num_comments,
@@ -118,7 +118,7 @@ bin/clavesa pipeline run newsfeed
 
 ## Going further — a domain rollup
 
-The story dimension carries a `domain` column (`parse_url` of the URL). Join the fact to it for a gold rollup — "which sites get traction on HN, by day":
+The story dimension carries a `domain` column (`try_parse_url` of the URL: NULL when a URL is not valid, such as one with a non-ASCII character, where `parse_url` would fail the run). Join the fact to it for a gold rollup — "which sites get traction on HN, by day":
 
 ```bash
 bin/clavesa node add newsfeed --type transform --name domain_traction_daily

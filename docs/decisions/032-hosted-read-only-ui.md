@@ -2,7 +2,7 @@
 adr: 32
 title: A hosted, read-only clavesa UI at ui.clavesa.dev shows every workspace on the phone, from the same Go handlers and React pages as clavesa ui
 date: 2026-11-15
-status: Accepted
+status: Accepted; section 1 superseded by 033
 deciders: Vesa
 ---
 
@@ -151,10 +151,11 @@ read-only role.**
   - Step Functions `ListExecutions`, `DescribeExecution`,
     `GetExecutionHistory` on the workspace's state machines.
   - CloudWatch Logs `FilterLogEvents` on the workspace's runner log groups.
-  - EventBridge `DescribeRule` on the workspace's pipeline rules, and
-    CloudTrail `LookupEvents` (no resource scope; event history only), so
-    a schedule paused by hand shows as paused, with the time it was
-    paused, instead of as an overdue pipeline (v2.27.4).
+  - EventBridge `DescribeRule` on the workspace's schedule and poller
+    rules, so a schedule paused by hand shows as paused instead of as an
+    overdue pipeline (v2.27.4). Without the time it was paused: CloudTrail
+    `LookupEvents` was granted for that in v2.27.5 and removed on
+    2026-11-17 (Vesa: one date is not worth an account-wide read).
   - `kms:Decrypt` only if the bucket uses a customer key. Lake Formation
     `GetDataAccess` only if slice 4 shows it is needed.
   - No `GetObject` on Terraform state: state can hold secrets.
@@ -387,3 +388,10 @@ All three are accepted as recommended.
    only write the summary files. Recommendation: yes. The other way to show them is to move each
    one to a cloud warehouse, which costs a deploy per site and a monthly
    bill per pipeline for no gain on the phone.
+
+## Update 2026-11-17
+
+Section 1 (the four pages, and "Catalog, Query, Notebooks, Sources,
+Credentials, Runner, Bundles and the DAG editor are not in the hosted
+navigation") is superseded by ADR-033: the hosted UI is the local UI
+minus writes. The rest of this ADR stays.

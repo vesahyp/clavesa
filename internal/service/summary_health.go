@@ -42,16 +42,10 @@ func overdueReason(lastRun *SummaryRun, intervalSeconds int64, loc *time.Locatio
 	return fmt.Sprintf("no run since %s, expected %s", reasonTime(isoMillis(lastRun.StartedAt), loc), everyText(intervalSeconds))
 }
 
-// pausedNote is the note of a pipeline whose schedule is paused:
-// "schedule paused since 9.11 09:21", or "schedule paused" when the time
-// it was paused is not known (CloudTrail keeps 90 days, and the reader
-// may not be allowed to look).
-func pausedNote(since string, loc *time.Location) string {
-	if t, err := time.Parse(time.RFC3339, since); err == nil {
-		return "schedule paused since " + reasonTime(t.UnixMilli(), loc)
-	}
-	return "schedule paused"
-}
+// pausedNote is the note of a pipeline whose schedule or poller is
+// paused. It has no time: when a rule was paused is only in CloudTrail,
+// which the reader role may not read (Vesa, 2026-11-17).
+const pausedNote = "schedule paused"
 
 // recentFailures applies the failed-run rule: a pipeline with a failed
 // run in the card's strip window (summaryStripDays) is never "ok". It

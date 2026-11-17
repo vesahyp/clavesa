@@ -270,6 +270,37 @@ def test_noop_when_warehouse_is_not_s3():
 # ---------------------------------------------------------------------------
 
 
+def test_written_schema_is_the_tables_not_the_rows():
+    """web-traffic, 2026-11-17: a newer runner added node_runs.timing; an
+    older runner's mergeSchema append kept the column in Delta but synced
+    its own 32-column row schema to Glue, and Athena refused the table
+    (INVALID_GLUE_SCHEMA). _written_schema returns the table's schema
+    after the write, so the Glue sync keeps every column."""
+    runner = _load_runner()
+    rows = _Schema([("run_id", "string")])
+    table = _Schema([("run_id", "string"), ("timing", "string")])
+
+    class _Spark:
+        def table(self, name):
+            assert name == "sys.node_runs", name
+            return types.SimpleNamespace(schema=table)
+
+    assert runner._written_schema(_Spark(), "sys.node_runs", rows) is table
+
+
+def test_written_schema_falls_back_to_the_rows():
+    """A table that cannot be read gives the written rows' schema (the
+    behaviour before the fix), never an exception."""
+    runner = _load_runner()
+    rows = _Schema([("run_id", "string")])
+
+    class _Spark:
+        def table(self, name):
+            raise RuntimeError("no such table")
+
+    assert runner._written_schema(_Spark(), "sys.node_runs", rows) is rows
+
+
 def _all_tests():
     g = globals()
     return [(name, fn) for name, fn in sorted(g.items()) if name.startswith("test_") and callable(fn)]

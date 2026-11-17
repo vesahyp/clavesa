@@ -57,7 +57,9 @@ read (ADR-032 section 2).
 | `GET /w/<name>/api/workspace/summary` | The stored summary. `?live=1` computes it live through the reader role (Athena, some seconds); so does a cloud workspace with no stored summary yet. A local workspace has only the stored one. |
 | `GET /w/<name>/api/...` | The same routes as `clavesa ui` (`ui.BuildWorkspaceMux`). A cloud workspace is read live through its reader role; a local workspace is served from its stored summary (see "Adding a local workspace"). |
 
-Anything else is a JSON 404. A cloud workspace is read like this: the
+Anything else is a JSON 404. A `dir` or `path` query parameter that
+leaves the workspace (an absolute path outside it, `..`, or a symlink
+out) answers 400 on every route (`ui.ContainPathParams`). A cloud workspace is read like this: the
 Lambda assumes `clavesa-ui-reader-<name>` (ExternalId = the name, 15
 minutes, renewed before expiry), copies `s3://<bucket>/_clavesa/tree/`
 to `/tmp/ws/<name>/` (again when `deployed.json` changes), and registers
@@ -77,7 +79,12 @@ per-workspace `viewers` list is not built: there is one viewer.)
 
 `infra/workspaces.tf` lists the workspaces: `name`, `kind` (`cloud` or
 `local`), `account`, `region`, and for a cloud workspace
-`reader_role_arn` and `bucket` (its pipeline bucket). The list reaches
+`reader_role_arn` and `bucket` (its pipeline bucket). Set
+`personal_data = true` when the workspace's raw data holds personal data
+(web-traffic: visitor IPs): the Lambda then answers 403 to raw row reads
+of it (`/data/source`, `/preview/*`, `/sources/<name>/preview`, and
+`/data/table` and column statistics of any database that is not gold).
+Its runs, logs, catalog and gold tables still show. The list reaches
 the Lambda as JSON in its `REGISTRY` variable, opens the bus to the
 accounts, and lets the publisher role write the local names.
 

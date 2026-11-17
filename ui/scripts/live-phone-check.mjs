@@ -88,6 +88,8 @@ const REPO = new URL("../../", import.meta.url).pathname;
 const env = (k, d) => process.env[k] || d;
 const BASE = env("BASE_URL", "https://ui.clavesa.dev").replace(/\/$/, "");
 const WS = env("WS", "smoke2");
+// A local-warehouse workspace for the navigation walk (ADR-033).
+const LOCAL_WS = env("LOCAL_WS", "site-traffic");
 const PROFILE = env("PROFILE", "personal");
 const REGION = "eu-north-1";
 const PARAMETER = env("PARAMETER", "/clavesa-ui/check-user");
@@ -705,24 +707,52 @@ try {
       if (t.refreshToken) localStorage.setItem("clavesa.hosted.refresh", t.refreshToken);
     } catch {}
   }, tok);
-  {
+  // ADR-033: the hosted navigation is the local one. Every sidebar entry
+  // opens, on a cloud and on a local-warehouse workspace, with no console
+  // error and no failed API call; Query, Credentials and Runner open a
+  // page that says what to do instead, never a Run button.
+  for (const w of [WS, LOCAL_WS]) {
+    const wsq = encodeURIComponent(w);
     const page = await desk.newPage();
     const out = [];
-    await page.goto(`${BASE}/w/${ws}/`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+    let current = "";
+    page.on("console", (m) => {
+      if (m.type() === "error") out.push(`${current}: console error: ${m.text()}`);
+    });
+    page.on("pageerror", (e) => out.push(`${current}: uncaught exception: ${e.message}`));
+    page.on("response", (r) => {
+      if (isApi(r.url()) && r.status() >= 400) out.push(`${current}: HTTP ${r.status()} ${new URL(r.url()).pathname}`);
+    });
+    page.on("requestfailed", (r) => {
+      const err = r.failure()?.errorText ?? "";
+      if (isApi(r.url()) && !/ERR_ABORTED/.test(err)) out.push(`${current}: request failed (${err}) ${new URL(r.url()).pathname}`);
+    });
+    current = "home";
+    await page.goto(`${BASE}/w/${wsq}/`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
     await page.locator('[data-testid="workspace-home"]').first().waitFor({ state: "visible", timeout: WAIT_MS });
-    const entries = await page.locator("aside a[href]").evaluateAll((els) => els.map((a) => a.getAttribute("href")));
-    for (const bad of ["query", "credentials", "runner"])
-      if (entries.some((h) => h.replace(/\/$/, "").endsWith(`/${bad}`))) out.push(`desktop sidebar has ${bad}`);
-    for (const bad of ["query", "credentials", "runner"]) {
-      await page.goto(`${BASE}/w/${ws}/${bad}`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
-      await page.locator('[data-testid="workspace-home"]').first().waitFor({ state: "visible", timeout: WAIT_MS }).catch(() => {});
-      const path = new URL(page.url()).pathname;
-      if (path.replace(/\/$/, "") !== `/w/${ws}`) out.push(`desktop /${bad} stays at ${path}, want the workspace home`);
-      if (await page.getByRole("button", { name: /^Run\b/ }).count()) out.push(`desktop /${bad} shows a Run button`);
+    const entries = (await page.locator("aside a[href]").evaluateAll((els) => els.map((a) => a.getAttribute("href"))))
+      .filter((h) => h.startsWith(`/w/${wsq}`));
+    for (const want of ["query", "credentials", "runner", "dashboards", "notebooks", "sources", "bundles", "unity-catalog", "pipelines"])
+      if (!entries.some((h) => h.replace(/\/$/, "").endsWith(`/${want}`))) out.push(`sidebar has no ${want}`);
+    for (const href of [...new Set(entries)]) {
+      current = href.replace(`/w/${wsq}`, "") || "/";
+      // Click the sidebar entry, as a person does: client-side navigation,
+      // so the shared queries stay cached. A full load per entry fires a
+      // dozen startup calls each and trips the stage's 10 rps throttle
+      // (429), which a person tapping through never does.
+      await page.locator(`aside a[href="${href}"]`).first().click();
+      await page.waitForLoadState("networkidle", { timeout: WAIT_MS }).catch(() => {});
+      await sleep(1500);
+      const path = new URL(page.url()).pathname.replace(/\/$/, "");
+      if (path !== href.replace(/\/$/, "")) out.push(`${current}: moved to ${path}`);
+      if (/\/(query|credentials|runner)$/.test(current)) {
+        if (!(await page.locator('[data-testid="not-hosted-line"]').count())) out.push(`${current}: no not-hosted line`);
+        if (await page.getByRole("button", { name: /^Run\b/ }).count()) out.push(`${current}: shows a Run button`);
+      }
     }
-    await page.screenshot({ path: `${OUT}08-desktop-workspace.png` });
-    console.log(`${out.length ? "FAIL" : "ok  "} 08-desktop: sidebar ${entries.length} entries, no Query/Credentials/Runner${out.length ? "?" : ""}`);
-    for (const p of out) failures.push(`08-desktop: ${p}`);
+    await page.screenshot({ path: `${OUT}08-desktop-${w}.png` });
+    console.log(`${out.length ? "FAIL" : "ok  "} 08-desktop ${w}: ${entries.length} sidebar entries opened${out.length ? `, ${out.length} problem(s)` : ""}`);
+    for (const p of [...new Set(out)]) failures.push(`08-desktop ${w}: ${p}`);
     await page.close();
   }
   await desk.close();

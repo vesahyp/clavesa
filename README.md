@@ -1,6 +1,6 @@
 # Clavesλ
 
-**Clavesa is a self-hosted lakehouse platform. You write transforms in SQL, or in PySpark when SQL isn't enough, and Clavesa compiles them to the cheapest AWS compute that fits: Lambda, Fargate, or EMR Serverless. The whole stack is Terraform in your repo.**
+**Clavesa is a self-hosted lakehouse platform. You write transforms in SQL, or in PySpark when SQL isn't enough, and Clavesa compiles them to the cheapest AWS compute that fits: Lambda or Fargate (EMR Serverless is planned). The whole stack is Terraform in your repo.**
 
 ![Catalog page showing every Delta table the workspace produced, ops and user data side by side](docs/images/catalog.png)
 
@@ -11,7 +11,7 @@
 A single Go binary that gives a solo engineer or a small team everything needed to operate a production data lakehouse on AWS:
 
 - **Pipeline authoring.** Visual DAG editor and a CLI, both reading and writing the same `.tf` files. Transforms in SQL or PySpark.
-- **Distributed execution.** One PySpark runtime, identical on your laptop and on AWS Lambda, Fargate, or EMR Serverless.
+- **Distributed execution.** One PySpark runtime, identical on your laptop and on AWS Lambda or Fargate.
 - **Data lakehouse.** Every transform output is a Delta table in Glue Data Catalog, queryable from Athena with no DDL.
 - **Observability.** Run history, lineage, freshness SLAs, and SQL-driven dashboards over the same catalog as your data.
 - **Local-cloud parity.** Every authoring and operating capability works against deployed pipelines and against local-only ones. Develop offline; deploy when ready.
@@ -31,8 +31,8 @@ Three ways to run a data platform today, each with a real tradeoff:
 Clavesa is a fourth shape: a lakehouse platform you own, with the authoring ergonomics of a hosted runtime and the cost structure of rolling your own.
 
 - **SQL-first, PySpark when SQL isn't enough.** Analytics engineers write SQL and drop to PySpark only for the transforms that need it. One language for most of the warehouse, one runtime for the rest.
-- **Right-sized backend per transform.** A small filter runs on Lambda; a 100M-row join on Fargate; a multi-TB shuffle on EMR Serverless (roughly 5× cheaper than Glue at the same scale). You pick the target per transform, in the same Terraform that defines the pipeline.
-- **One engine, local and cloud.** PySpark runs on Lambda, on EMR Serverless, and on your laptop. The same SQL produces the same Delta table in every target.
+- **Right-sized backend per transform.** A small filter runs on Lambda; a 100M-row join on Fargate. You pick the target per transform, in the same Terraform that defines the pipeline. EMR Serverless, for multi-TB shuffles, is planned and not built yet: `compute = "emr-serverless"` is refused at deploy.
+- **One engine, local and cloud.** PySpark runs on Lambda, on Fargate, and on your laptop. The same SQL produces the same Delta table in every target.
 - **Observability without a second stack.** Run history, lineage, and freshness live as Delta tables in the same catalog as your data. Query them with the same SQL: `SELECT * FROM clavesa_<pipeline>.runs WHERE status = 'FAILED'`.
 
 ---
@@ -46,7 +46,7 @@ Clavesa is a fourth shape: a lakehouse platform you own, with the authoring ergo
 
 **To deploy pipelines to AWS** (in addition to the above):
 
-- **Terraform 1.x** on your PATH.
+- **Terraform 1.4 or newer** on your PATH.
 - **AWS credentials configured** (e.g. `AWS_PROFILE` or `aws sso login`) with permission to create the resources the modules manage in the target account: Lambda, Step Functions, EventBridge, IAM roles, Glue Data Catalog, S3, ECR, CloudWatch Logs. Nothing is centrally hosted. Every resource lives in your account.
 
 ### Install

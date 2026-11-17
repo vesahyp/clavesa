@@ -58,6 +58,20 @@ export function scheduleText(schedule?: string): string {
   return `Schedule: ${schedule}`;
 }
 
+/**
+ * triggerText says what starts a pipeline: its schedule (scheduleText),
+ * its source poller ("Polls daily at 08:10": a run when new data has
+ * arrived) or its upstream pipelines ("After bronze").
+ */
+export function triggerText(p: { schedule?: string; trigger?: string; batch_window?: string; after?: string[] }): string {
+  if (p.trigger === "poller" && p.batch_window) {
+    const s = scheduleText(p.batch_window);
+    return s.startsWith("Schedule: ") ? `Polls on ${p.batch_window}` : `Polls ${s[0].toLowerCase()}${s.slice(1)}`;
+  }
+  if (p.trigger === "upstream" && p.after?.length) return `After ${p.after.join(", ")}`;
+  return scheduleText(p.schedule);
+}
+
 function cap(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }

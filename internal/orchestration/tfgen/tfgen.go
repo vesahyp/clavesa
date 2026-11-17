@@ -273,7 +273,7 @@ func Emit(p Pipeline) (string, error) {
 	emitTeamS3Locals(&b, p)
 	emitUnityCatalogSchema(&b, p)
 
-	return b.String(), nil
+	return withGrantLifecycles(b.String())
 }
 
 // emitArchitectures sets an image Lambda's architecture to the one the

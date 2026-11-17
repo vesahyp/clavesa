@@ -13,6 +13,7 @@
       "name": "orders",
       "dir": "orders",
       "schedule": "rate(1 day)",
+      "trigger": "schedule",
       "expected_interval_seconds": 86400,
       "status": "warn",
       "status_reasons": [

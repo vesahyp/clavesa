@@ -1,0 +1,31 @@
+# clavesa-managed hosted UI reader, generated from clavesa.json's "hosted"
+# field (ADR-032). Do not edit by hand: clavesa overwrites this file on
+# "workspace hosted enable", on every deploy and upgrade, and removes it on
+# "workspace hosted disable".
+
+module "hosted_reader" {
+  source                 = "./.clavesa/modules/v9.9.9/hosted-reader/aws"
+  workspace_name         = var.workspace_name
+  role_name              = "clavesa-ui-reader-acme"
+  workgroup_name         = "clavesa-ui-acme"
+  pipeline_bucket        = module.workspace.pipeline_bucket
+  glue_database_patterns = ["clavesa_acme__*", "clavesa_acme_system__*"]
+  lf_databases           = concat([module.workspace.system_pipelines_db], ["clavesa_acme__events"])
+  state_machine_patterns = ["clavesa-events", "clavesa-orders"]
+  log_group_patterns     = ["/aws/lambda/clavesa-events-*", "/clavesa/events/sfn", "/aws/lambda/clavesa-orders-*", "/clavesa/orders/sfn"]
+  state_object_patterns  = ["*.tfstate", "*.tfstate.*", "clavesa/*"]
+  reader_principals      = ["arn:aws:iam::111122223333:role/clavesa-ui-hosted"]
+  event_bus_arn          = ""
+  raw_object_patterns    = ["bronze/*", "silver/*"]
+  raw_glue_databases     = ["clavesa_acme__bronze", "clavesa_acme__silver"]
+}
+
+output "hosted_reader_role_arn" {
+  description = "Role the hosted UI assumes to read this workspace (ADR-032); ExternalId = the workspace name."
+  value       = module.hosted_reader.reader_role_arn
+}
+
+output "hosted_workgroup" {
+  description = "Athena workgroup the hosted UI queries through (ADR-032)."
+  value       = module.hosted_reader.workgroup_name
+}

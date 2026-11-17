@@ -177,7 +177,7 @@ export function useTableSnapshots(
     // Snapshot queries hit Athena — don't refetch aggressively.
     staleTime: 60_000,
     retry: false,
-    queryFn: () => {
+    queryFn: () => perTableSlot(() => {
       const params = new URLSearchParams({ limit: String(limit) });
       // Local-pipeline tables route through LocalProvider when `dir` is set;
       // without it the snapshots endpoint defaults to cloud and 500s for
@@ -188,8 +188,29 @@ export function useTableSnapshots(
         SnapshotsResult,
         { errorLabel: "GET snapshots" },
       );
-    },
+    }),
   });
+}
+
+// perTableSlot runs at most PER_TABLE_CONCURRENCY per-table reads
+// (snapshots, column statistics) at a time. A catalog of 25 tables opened
+// them all at once; each reads a Delta log (seconds in the cloud), and the
+// hosted API, capped at 30 concurrent Lambdas, answered 503 (2026-11-17).
+const PER_TABLE_CONCURRENCY = 6;
+let perTableRunning = 0;
+const perTableQueue: Array<() => void> = [];
+
+export async function perTableSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (perTableRunning >= PER_TABLE_CONCURRENCY) {
+    await new Promise<void>((resolve) => perTableQueue.push(resolve));
+  }
+  perTableRunning++;
+  try {
+    return await fn();
+  } finally {
+    perTableRunning--;
+    perTableQueue.shift()?.();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,16 +264,17 @@ export function useColumnStats(
     meta: { spark: true },
     staleTime: 60_000,
     retry: false,
-    queryFn: () => {
-      const params = new URLSearchParams();
-      if (dir) params.set("dir", dir);
-      const qs = params.toString();
-      return requestParsed(
-        `/data/tables/${encodeURIComponent(database)}/${encodeURIComponent(table)}/column-stats${qs ? `?${qs}` : ""}`,
-        ColumnStatsResult,
-        { errorLabel: "GET column-stats" },
-      );
-    },
+    queryFn: () =>
+      perTableSlot(() => {
+        const params = new URLSearchParams();
+        if (dir) params.set("dir", dir);
+        const qs = params.toString();
+        return requestParsed(
+          `/data/tables/${encodeURIComponent(database)}/${encodeURIComponent(table)}/column-stats${qs ? `?${qs}` : ""}`,
+          ColumnStatsResult,
+          { errorLabel: "GET column-stats" },
+        );
+      }),
   });
 }
 

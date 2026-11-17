@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	pathpkg "path"
 	"strings"
 	"sync"
 	"time"
@@ -138,6 +139,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	e, known := s.byName[name]
 	if !known {
 		httputil.WriteError(w, http.StatusNotFound, "unknown workspace: "+name)
+		return
+	}
+	if e.PersonalData && refusesPersonalData(pathpkg.Clean(strings.TrimPrefix(rest, "/api")), r) {
+		httputil.WriteError(w, http.StatusForbidden, personalDataRefusal)
 		return
 	}
 	// A local workspace has only its stored summary: ?live=1 reads it too.

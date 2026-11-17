@@ -962,7 +962,7 @@ recipe_http_changing_source() {
         hit.objectID                         AS objectID,
         hit.title                            AS title,
         hit.url                              AS url,
-        parse_url(hit.url, 'HOST')           AS domain,
+        try_parse_url(hit.url, 'HOST')       AS domain,
         hit.author                           AS author,
         CAST(hit.points       AS INT)        AS points,
         CAST(hit.num_comments AS INT)        AS num_comments,

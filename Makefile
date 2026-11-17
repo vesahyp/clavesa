@@ -276,7 +276,7 @@ hosted-tracking-check: build-ui ## Hosted UI: a ?__throw=1 build sends the e=err
 	cd ui && npx playwright install chromium
 	node ui/scripts/hosted-tracking-check.mjs
 
-hosted-live-check: ## Hosted UI: iPhone 16 run of the five pages against the deployed site as the check user from SSM (/clavesa-ui/check-user), no console error, no failed API call, no horizontal scroll → .shots/live/ (BASE_URL, WS=smoke2, PIPELINE, RUN, PROFILE=personal; needs make hosted-init once)
+hosted-live-check: ## Hosted UI: iPhone 16 run of the five pages against the deployed site as the check user from SSM (/clavesa-ui/check-user), no console error, no failed API call, no horizontal scroll → .shots/live/ (BASE_URL, WS=smoke2, LOCAL_WS=site-traffic, PIPELINE, RUN, PROFILE=personal; needs make hosted-init once). Desktop: every sidebar entry of WS and LOCAL_WS opens with no console error and no failed API call (ADR-033)
 	cd ui && npx playwright install chromium
 	node ui/scripts/live-phone-check.mjs
 

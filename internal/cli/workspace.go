@@ -775,8 +775,11 @@ day, tables past their freshness_sla and the compute cost of the last 30
 days.
 
 The status is the worst of: the last run of a pipeline failed (fail), a
-table is past its freshness_sla (warn), a pipeline with a trigger_schedule
-did not run inside its expected interval (warn).
+table is past its freshness_sla (warn), a pipeline did not run inside its
+expected interval (warn). The expected interval comes from the pipeline's
+trigger_schedule; else from its trigger_batch_window when the pipeline has
+a source poller and the window is an hour or longer; else, in a cloud
+workspace, from the upstream pipelines whose success starts it.
 
 Days are counted, and times written, in one time zone: $CLAVESA_TIME_ZONE
 when set, else "time_zone" in clavesa.json (an IANA name such as

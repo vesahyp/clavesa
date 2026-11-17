@@ -54,6 +54,11 @@ func TestEmit_UpstreamLakeFormationGrants(t *testing.T) {
   database {
     name = "clavesa_demo__` + schema + `"
   }
+
+  lifecycle {
+    ignore_changes       = [permissions, permissions_with_grant_option]
+    replace_triggered_by = [terraform_data.input_` + schema + `_db_permissions]
+  }
 }`
 		if !strings.Contains(got, dbBlock) {
 			t.Errorf("schema %q: db grant block not found verbatim.\nwant:\n%s\n\ngot:\n%s", schema, dbBlock, got)
@@ -64,6 +69,11 @@ func TestEmit_UpstreamLakeFormationGrants(t *testing.T) {
   table {
     database_name = "clavesa_demo__` + schema + `"
     wildcard      = true
+  }
+
+  lifecycle {
+    ignore_changes       = [permissions, permissions_with_grant_option]
+    replace_triggered_by = [terraform_data.input_` + schema + `_tables_permissions]
   }
 }`
 		if !strings.Contains(got, tblBlock) {

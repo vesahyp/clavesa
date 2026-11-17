@@ -31,6 +31,9 @@ type Entry struct {
 	// workspace only.
 	ReaderRoleARN string `json:"reader_role_arn,omitempty"`
 	Bucket        string `json:"bucket,omitempty"`
+	// PersonalData: the workspace's raw data holds personal data, so the
+	// hosted API refuses raw row reads of it (personal.go).
+	PersonalData bool `json:"personal_data,omitempty"`
 }
 
 var (

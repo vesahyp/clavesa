@@ -278,7 +278,7 @@ func TestWorkspaceSummaryCloud(t *testing.T) {
 }
 
 // TestWorkspaceSummaryPausedSchedule: a daily pipeline whose schedule
-// rule is disabled gets the note "schedule paused since <time>" and no
+// rule is disabled gets the note "schedule paused" and no
 // overdue warning (v2.27.4). With the rule enabled, or when its state
 // cannot be read, the same history is overdue as before.
 func TestWorkspaceSummaryPausedSchedule(t *testing.T) {
@@ -295,20 +295,18 @@ func TestWorkspaceSummaryPausedSchedule(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		paused     bool
-		since      string
 		wantStatus string
 		wantNote   string
 	}{
-		{"paused", true, "2026-11-09T07:21:11Z", SummaryOK, "schedule paused since 9.11 09:21"},
-		{"paused, time unknown", true, "", SummaryOK, "schedule paused"},
-		{"enabled", false, "", SummaryWarn, ""},
+		{"paused", true, SummaryOK, "schedule paused"},
+		{"enabled", false, SummaryWarn, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			svc := New(ws).WithResolver(observability.NewResolver(ws, cloud, &fakeProvider{}))
 			var asked string
-			svc.scheduleStateFn = func(_ context.Context, rule string) (bool, string) {
+			svc.scheduleStateFn = func(_ context.Context, rule string) bool {
 				asked = rule
-				return c.paused, c.since
+				return c.paused
 			}
 			sum, err := svc.WorkspaceSummary(context.Background(), WorkspaceSummaryQuery{Now: summaryNow})
 			if err != nil {
@@ -329,8 +327,8 @@ func TestWorkspaceSummaryPausedSchedule(t *testing.T) {
 				if len(p.Notes) != 1 || p.Notes[0] != c.wantNote || !hasReason(sum.Notes, "orders: "+c.wantNote) {
 					t.Errorf("notes = %v / %v, want %q", p.Notes, sum.Notes, c.wantNote)
 				}
-				if !p.SchedulePaused || p.SchedulePausedSince != c.since {
-					t.Errorf("paused fields = %v %q", p.SchedulePaused, p.SchedulePausedSince)
+				if !p.SchedulePaused {
+					t.Errorf("schedule_paused = false")
 				}
 			} else if len(p.Notes) != 0 {
 				t.Errorf("notes = %v, want none", p.Notes)

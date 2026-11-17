@@ -46,4 +46,5 @@ Each ADR follows this structure:
 | [029](029-cheaper-sql-on-unity-catalog-tables.md) | Scheduled SQL moves into clavesa transforms; ad hoc SQL stays on a right-sized serverless warehouse; Athena through Glue federation later | Proposed |
 | [030](030-question-agent-over-mcp.md) | Ad hoc questions go to an agent whose queries run in DuckDB on Lambda through MCP, as the asking user; the warehouse stays for dashboards and fallback | Proposed |
 | [031](031-dab-bundles-on-clavesa.md) | One Databricks bundle, two deploy targets: a DAB job deploys to Databricks, to clavesa in the team's AWS account, or mixed per task | Accepted |
-| [032](032-hosted-read-only-ui.md) | A hosted, read-only UI at ui.clavesa.dev shows every workspace on the phone, from the same handlers and pages as `clavesa ui` | Accepted |
+| [032](032-hosted-read-only-ui.md) | A hosted, read-only UI at ui.clavesa.dev shows every workspace on the phone, from the same handlers and pages as `clavesa ui` | Accepted; section 1 (the four pages) superseded by 033 |
+| [033](033-hosted-ui-parity.md) | The hosted UI is the local UI minus writes; every page is in its navigation, and a page that cannot work hosted says what to do instead | Accepted |

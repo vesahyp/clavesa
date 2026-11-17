@@ -235,12 +235,17 @@ const columns = [
  * UpdateTime and dashes for the data we couldn't fetch.
  */
 
+// One snapshots request per table: the rows, snapshots and updated cells
+// share it (the rows and updated cells read only the newest snapshot and
+// the totals), so the catalog sends one request per table, not two.
+const CATALOG_SNAPSHOT_LIMIT = 20;
+
 function RowsCell({ table }: { table: CatalogTable }) {
   const isClavesaManaged = table.table_type === "DELTA";
   const { data, isLoading } = useTableSnapshots(
     isClavesaManaged ? table.database : "",
     isClavesaManaged ? table.name : "",
-    1,
+    CATALOG_SNAPSHOT_LIMIT,
     { dir: table.dir },
   );
   if (!isClavesaManaged) {
@@ -277,7 +282,7 @@ function SnapshotsCell({ table }: { table: CatalogTable }) {
   const { data, isLoading } = useTableSnapshots(
     isClavesaManaged ? table.database : "",
     isClavesaManaged ? table.name : "",
-    20,
+    CATALOG_SNAPSHOT_LIMIT,
     { dir: table.dir },
   );
   if (!isClavesaManaged) {
@@ -373,7 +378,7 @@ function UpdatedCell({ table }: { table: CatalogTable }) {
   const { data } = useTableSnapshots(
     isClavesaManaged ? table.database : "",
     isClavesaManaged ? table.name : "",
-    1,
+    CATALOG_SNAPSHOT_LIMIT,
     { dir: table.dir },
   );
   // Prefer the latest Delta commit's committed_at when available — it's

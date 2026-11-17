@@ -16,6 +16,10 @@
 #   reader_role_arn  cloud only: clavesa-ui-reader-<name> (the workspace
 #                    deploy creates it; `clavesa workspace hosted show`)
 #   bucket           cloud only: the workspace's pipeline bucket
+#   personal_data    true when the workspace's raw data holds personal
+#                    data (visitor IPs, user agents): the Lambda then
+#                    refuses raw row reads of it, and shows table rows of
+#                    gold databases only (internal/hosted/personal.go)
 #
 # The list reaches the Lambda as JSON (REGISTRY), lets the event bus
 # accept the accounts, and lets the publisher role write the local names.
@@ -56,6 +60,7 @@ locals {
       region          = "eu-north-1"
       reader_role_arn = "arn:aws:iam::471112936790:role/clavesa-ui-reader-web-traffic"
       bucket          = "web-traffic-clavesa"
+      personal_data   = true # bronze and silver hold visitor IPs
     },
     # The nightly site-traffic pipelines on the main Mac (local warehouse).
     # Each run publishes summaries/<name>.json through the publisher role
@@ -83,5 +88,6 @@ locals {
     region          = try(w.region, "")
     reader_role_arn = try(w.reader_role_arn, "")
     bucket          = try(w.bucket, "")
+    personal_data   = try(w.personal_data, false)
   }])
 }

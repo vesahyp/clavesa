@@ -740,11 +740,15 @@ const PipelineSummary = z.object({
   name: z.string(),
   dir: z.string(),
   schedule: z.string().optional(),
+  // What starts the pipeline: "schedule", "poller" (batch_window, an
+  // hour or longer) or "upstream" (after: the pipelines it runs after).
+  trigger: z.string().optional(),
+  batch_window: z.string().optional(),
+  after: z.array(z.string()).optional(),
   expected_interval_seconds: z.number().optional(),
   // The schedule's EventBridge rule is disabled (v2.27.4): no run is
   // expected, so there is no overdue warning.
   schedule_paused: z.boolean().optional(),
-  schedule_paused_since: z.string().optional(),
   status: SummaryStatus,
   status_reasons: z.array(z.string()),
   // Facts that do not change the status: failed runs a later run fixed,

@@ -67,3 +67,15 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "raw_object_patterns" {
+  description = "Object key patterns in the pipeline bucket that hold personal data (a workspace with hosted.personal_data: every pipeline that is not gold, with its Delta logs). The reader gets an explicit Deny on them."
+  type        = list(string)
+  default     = []
+}
+
+variable "raw_glue_databases" {
+  description = "Glue databases whose tables hold personal data. The reader gets an explicit Deny on reading their tables and partitions."
+  type        = list(string)
+  default     = []
+}

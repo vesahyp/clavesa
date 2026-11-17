@@ -12,6 +12,36 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.8] — 2026-11-17
+
+### Changed
+
+- **The hosted UI has the local UI's navigation (ADR-033).** Every sidebar entry is there in read-only mode too. Query, Credentials and Runner open a page that says what to do instead (on the Mac) rather than sending you back to the workspace home. On a local-warehouse workspace, Catalog, tables, Dashboards, Notebooks, Sources, Bundles, Unity Catalog and Backfills say that the data is on the Mac instead of showing empty or failing pages.
+
+### Fixed
+
+- **The Catalog sends one request per table, at most six at a time.** Its cells asked for each table's snapshots twice and all at once; on a workspace with many tables in the cloud that overloaded the hosted API (503s).
+
+- **Lake Formation grants no longer show as "must be replaced" in every plan.** The AWS provider reads a grant back with permissions its principal holds from elsewhere (the database's `IAM_ALLOWED_PRINCIPALS` ALL, an admin's own grants, ALL on a table the principal created), so plans of the hosted reader and of pipelines wanted to revoke and re-grant them. Every grant clavesa emits now ignores that read-back and is replaced only when its declared permissions change (a `terraform_data` beside it holds them). The first deploy after this adds those `terraform_data` resources and replaces nothing. Needs Terraform 1.4 or newer.
+
+## [v2.27.7] — 2026-11-17
+
+### Security
+
+- **`clavesa ui` and the hosted UI read files only inside the workspace.** A `dir` or `path` request parameter could name any directory: `GET /pipeline/script?dir=/proc/self&path=environ` returned the process environment, which in the hosted Lambda holds its AWS keys. Every `dir` and `path` parameter is now resolved inside the workspace root (an absolute path outside it, `..` and symlinks that lead out answer 400), in each handler and once more for every route of the workspace API.
+- **The hosted UI does not show raw rows of a workspace that holds personal data.** A registry entry with `personal_data = true` (web-traffic) answers 403 to raw file and source previews, and to table rows and column statistics of every database except gold. In the workspace, `"hosted": {"personal_data": true}` in `clavesa.json` adds an explicit Deny to the reader role on every pipeline whose schema is not gold: its objects in the pipeline bucket (tables and Delta logs) and its Glue tables. Run `clavesa workspace deploy` once.
+
+### Fixed
+
+- **A runner no longer puts an older schema back in Glue.** After an append with `mergeSchema`, the runner wrote the schema of the rows it had just written to the Glue table, not the table's own schema. When an older runner image ran after a newer one had added a column (node_runs `timing`), Glue lost that column and Athena refused the table with `INVALID_GLUE_SCHEMA`: the run history of the pipeline could not be read, in the CLI and in the hosted UI. The runner now syncs the table's schema after the write. Rebuild the runner image (`clavesa workspace deploy`) to get the fix; the next run of each pipeline repairs Glue.
+- **The hosted reader role can read the pipelines' schedule and poller rules on every workspace.** Its `events:DescribeRule` grant named `rule/<state machine name>`, which matched only a workspace whose names share a `clavesa-<workspace>-*` prefix. It now names `<state machine>-schedule` and `<state machine>-poller`, so a paused schedule or poller shows as paused on workspaces with exact pipeline names too. Run `clavesa workspace deploy` once.
+
+### Removed
+
+- **The hosted reader role has no CloudTrail access.** `cloudtrail:LookupEvents` (added in v2.27.5 to say when a schedule was paused) is an account-wide read, more than one date is worth. A paused schedule now says "schedule paused" with no time, in `clavesa workspace summary` and the hosted UI, and the summary JSON has no `schedule_paused_since`. Run `clavesa workspace deploy` once to remove the grant.
+
+- **A pipeline started by its source poller or by an upstream pipeline has an expected interval.** Before, only a `trigger_schedule` gave one, so a missed day of web-traffic (bronze polls once a day with `trigger_batch_window = "cron(10 6 * * ? *)"`, silver and gold run after it) showed nothing. Now `clavesa workspace summary` and the hosted UI expect a run per poller window when the window is an hour or longer (a one-minute poller runs only when data arrives, so it implies nothing), and in a cloud workspace a pipeline with no trigger of its own inherits the shortest interval of its upstream pipelines. The pipeline card says "Polls daily at 08:10" or "After bronze". A disabled poller rule counts as paused, and so do the pipelines after it. The summary JSON has new `trigger`, `batch_window` and `after` fields.
+
 ## [v2.27.6] — 2026-11-17
 
 ### Fixed
