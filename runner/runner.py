@@ -2461,6 +2461,46 @@ def _split_catalog_schema(db_part: str):
     return db_part[:idx], db_part[idx + 2:], True
 
 
+def _cascade_skip_blocker(t: dict) -> str:
+    """Why transform `t` must run although every upstream skipped, or "".
+
+    A node runs when one of its Delta output tables does not exist, or
+    when a change-feed input has no watermark: both mean it has never
+    consumed what its upstream already holds (after `pipeline reset`,
+    or a run that stopped before reaching it). Any error while checking
+    also returns a reason, so a doubt runs the node rather than skipping.
+    """
+    node = _sanitize_ident(str(t.get("node", "") or "node"))
+    try:
+        spark = _spark()
+        outputs = t.get("outputs") or {}
+        for key, desc in outputs.items():
+            if isinstance(desc, dict):
+                if desc.get("kind", "delta_table") != "delta_table":
+                    continue
+                tid = str(desc.get("table_id") or "")
+            else:
+                tid = str(desc or "")
+            if "/" in tid:
+                continue  # a path destination, not a catalog table
+            if not tid:
+                tid = (
+                    f"{_glue_db()}.{node}"
+                    if key == "default" and list(outputs.keys()) == ["default"]
+                    else f"{_glue_db()}.{node}__{key}"
+                )
+            if not spark.catalog.tableExists(tid):
+                return f"its output table {tid} does not exist"
+        for alias, src in (t.get("inputs") or {}).items():
+            if isinstance(src, dict) and src.get("kind") == "delta_table_cdf":
+                alias_key = str(src.get("alias") or alias)
+                if _read_watermark(_watermark_uri(alias_key)) is None:
+                    return f"input {alias!r} has no watermark yet"
+    except Exception as e:  # noqa: BLE001
+        return f"its state could not be checked ({e})"
+    return ""
+
+
 def _table_id_for(output_key: str, all_outputs: dict | None = None) -> str:
     """Auto-generated Delta table identifier for a transform output.
 
@@ -5020,7 +5060,20 @@ def _run_pipeline_bundle(event, context):
         # (no intra-pipeline parents) fall through to the runner's own
         # per-input skip decision.
         ps = parents_by_node.get(node, [])
+        first_run = ""
         if ps and all(p in skipped_set for p in ps):
+            # "Nothing new upstream" says nothing about a node that has
+            # never consumed its upstream: a reset dropped its table or
+            # cleared its watermark (web-traffic gold, 2026-11-18: a run
+            # after `pipeline reset` skipped 6 nodes and said SUCCEEDED).
+            first_run = _cascade_skip_blocker(t)
+            if first_run:
+                print(
+                    f"[clavesa] node {node!r}: every upstream skipped, but {first_run}; running it",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if ps and all(p in skipped_set for p in ps) and not first_run:
             note = "all upstreams skipped"
             # handler() is NOT invoked for a cascade-skip, so write the
             # terminal progress marker here (every other node's marker is

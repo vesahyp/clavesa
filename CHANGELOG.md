@@ -12,6 +12,12 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.11] — 2026-11-18
+
+### Fixed
+
+- **A node that never consumed its upstream is no longer skipped because the upstream had nothing new.** After `pipeline reset` of downstream nodes (or a run that stopped before reaching them), the next run saw their upstream unchanged, skipped every reset node as "all upstreams skipped", and reported SUCCEEDED with their tables missing. A node now runs when one of its output tables does not exist or a change-feed input has no watermark, on local, `--compute local` and deployed runs; a doubt while checking also runs it.
+
 ## [v2.27.10] — 2026-11-18
 
 ### Fixed

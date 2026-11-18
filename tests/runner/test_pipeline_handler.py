@@ -59,6 +59,10 @@ def _load_runner():
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mod)
+    # No Spark here: by default every node's table and watermark exist, so
+    # cascade-skips behave as before. The reset tests replace this.
+    mod._real_cascade_skip_blocker = mod._cascade_skip_blocker
+    mod._cascade_skip_blocker = lambda t: ""
     return mod
 
 
@@ -231,6 +235,82 @@ def test_cascade_skip_when_all_parents_skip():
     assert result["transforms"][0]["status"] == "skipped"
     assert result["transforms"][1]["status"] == "skipped"
     assert result["transforms"][1]["note"] == "all upstreams skipped"
+
+
+def test_no_cascade_skip_for_a_node_that_never_ran():
+    """web-traffic gold, 2026-11-18: after `pipeline reset` of the
+    downstream nodes their upstream had nothing new and skipped, every
+    reset node was cascade-skipped, and the run said SUCCEEDED with the
+    tables missing. A node whose table is missing (or whose change-feed
+    watermark was cleared) runs; its own children are then not skipped."""
+    mod = _load_runner()
+    transforms = [
+        {"node": "fact", "language": "sql", "logic_path": "/tmp/a.txt", "inputs": {}, "outputs": {"default": ""}, "parents": []},
+        {"node": "dim", "language": "sql", "logic_path": "/tmp/b.txt", "inputs": {"fact": "..."}, "outputs": {"default": ""}, "parents": ["fact"]},
+        {"node": "rollup", "language": "sql", "logic_path": "/tmp/c.txt", "inputs": {"dim": "..."}, "outputs": {"default": ""}, "parents": ["dim"]},
+    ]
+    responses = {
+        "fact": {"status": "skipped", "reason": "upstream unchanged"},
+        "dim": {"status": "ok", "output_rows": 5},
+        "rollup": {"status": "ok", "output_rows": 3},
+    }
+    mod._cascade_skip_blocker = lambda t: "its output table x does not exist" if t["node"] == "dim" else ""
+    result, events, calls = _drive(mod, transforms, responses)
+
+    assert calls == ["fact", "dim", "rollup"], f"dim and rollup must run, calls={calls}"
+    assert [t["status"] for t in result["transforms"]] == ["skipped", "ok", "ok"]
+
+
+def test_cascade_skip_blocker_reads_table_and_watermark():
+    mod = _load_runner()
+    mod._cascade_skip_blocker = mod._real_cascade_skip_blocker
+
+    class _Catalog:
+        def __init__(self, tables):
+            self.tables = tables
+
+        def tableExists(self, tid):  # noqa: N802 (Spark's name)
+            return tid in self.tables
+
+    class _Spark:
+        def __init__(self, tables):
+            self.catalog = _Catalog(tables)
+
+    mod._glue_db = lambda: "cat__gold"
+    marks = {}
+    mod._watermark_uri = lambda alias: alias
+    mod._read_watermark = lambda uri: marks.get(uri)
+    t = {
+        "node": "dim",
+        "outputs": {"default": {"kind": "delta_table", "table_id": ""}},
+        "inputs": {"fact": {"kind": "delta_table_cdf", "table": "cat__gold.fact", "alias": "dim__fact"}},
+    }
+
+    mod._spark = lambda: _Spark(set())
+    assert "cat__gold.dim does not exist" in mod._cascade_skip_blocker(t)
+
+    mod._spark = lambda: _Spark({"cat__gold.dim"})
+    assert "has no watermark" in mod._cascade_skip_blocker(t)
+
+    marks["dim__fact"] = ("7",)
+    assert mod._cascade_skip_blocker(t) == ""
+
+    # Two outputs: the table is <node>__<key>.
+    t2 = {"node": "dim", "outputs": {"a": {"kind": "delta_table", "table_id": ""}, "b": ""}, "inputs": {}}
+    mod._spark = lambda: _Spark({"cat__gold.dim__a"})
+    assert "cat__gold.dim__b does not exist" in mod._cascade_skip_blocker(t2)
+
+    # A path destination is not a catalog table.
+    t3 = {"node": "dim", "outputs": {"default": "s3://b/out/"}, "inputs": {}}
+    mod._spark = lambda: _Spark(set())
+    assert mod._cascade_skip_blocker(t3) == ""
+
+    # A failing check runs the node.
+    def _boom():
+        raise RuntimeError("glue down")
+
+    mod._spark = _boom
+    assert "could not be checked" in mod._cascade_skip_blocker(t)
 
 
 def test_failure_stops_pipeline():
@@ -461,6 +541,8 @@ if __name__ == "__main__":
     test_force_from_top_level_still_works()
     test_three_transforms_all_succeed()
     test_cascade_skip_when_all_parents_skip()
+    test_no_cascade_skip_for_a_node_that_never_ran()
+    test_cascade_skip_blocker_reads_table_and_watermark()
     test_failure_stops_pipeline()
     test_partial_skip_then_continue()
     test_failure_reraises_under_lambda()
