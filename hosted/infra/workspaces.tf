@@ -60,7 +60,7 @@ locals {
       region          = "eu-north-1"
       reader_role_arn = "arn:aws:iam::471112936790:role/clavesa-ui-reader-web-traffic"
       bucket          = "web-traffic-clavesa"
-      personal_data   = true # bronze and silver hold visitor IPs
+      personal_data   = false # Vesa, 2026-11-18: no raw-data block for web-traffic
     },
     # The nightly site-traffic pipelines on the main Mac (local warehouse).
     # personal_data: their sources are CloudFront logs with visitor IPs and

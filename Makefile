@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-build-lambda hosted-tracking-check hosted-live-check ui-day-windows-check errors
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots ui-dashboard-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-viewer hosted-build-lambda hosted-tracking-check hosted-live-check ui-day-windows-check errors
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -221,6 +221,10 @@ ui-new-pipeline-check: $(if $(SKIP_BUILD),,build) ## Editing UI: create a pipeli
 	cd ui && npx playwright install chromium
 	node ui/scripts/new-pipeline-check.mjs
 
+ui-dashboard-shots: build ## iPhone 16 shots of dashboards and of every widget, with y-axis, one-per-row and cut-text checks → .shots/dashboards/ (WS_DIR WS_NAME=web-traffic DASHBOARDS=heineli,heineli-technical; BASE_URL for a running server; AWS_PROFILE passes through)
+	cd ui && npx playwright install chromium
+	node ui/scripts/dashboard-phone-shots.mjs
+
 ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; BASE_URL=<a running server, e.g. make hosted-local> instead of starting clavesa ui; AWS_PROFILE passes through)
 	cd ui && npx playwright install chromium
 	node ui/scripts/phone-shots.mjs
@@ -268,6 +272,10 @@ hosted-deploy-spa: build-ui hosted/infra/.terraform ## Hosted UI: the ui/ build 
 hosted-add-user: hosted/infra/.terraform ## Hosted UI: create a confirmed user that signs in with emailed codes, no mail sent now (EMAIL=<address>)
 	@test -n "$(EMAIL)" || { echo "usage: make hosted-add-user EMAIL=<address>"; exit 2; }
 	bash hosted/scripts/add-user.sh "$(EMAIL)"
+
+hosted-viewer: hosted/infra/.terraform ## Hosted UI: make a user a viewer of one workspace or all (ADR-035), REMOVE=1 takes it away; no mail (EMAIL=<address> WS=<workspace>|all)
+	@test -n "$(EMAIL)" -a -n "$(WS)" || { echo "usage: make hosted-viewer EMAIL=<address> WS=<workspace>|all [REMOVE=1]"; exit 2; }
+	bash hosted/scripts/viewer.sh "$(EMAIL)" "$(WS)" $(if $(REMOVE),remove,)
 
 hosted/infra/.terraform:
 	$(HOSTED_TF) init -input=false $(HOSTED_BACKEND_FLAGS)

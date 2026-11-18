@@ -523,6 +523,12 @@ func warmWorkerRunArgs(labelKV, wsLabelKV, warehouse, image, catalog, systemCata
 		// orphan reaper keys on (GH #59).
 		"--label", labelKV,
 		"--label", wsLabelKV,
+	}
+	// The owner label (owner.go): reaped once this process is gone.
+	if kv := ownerLabelKV(); kv != "" {
+		args = append(args, "--label", kv)
+	}
+	args = append(args,
 		// Bind only to loopback (the Go side always dials 127.0.0.1, and the
 		// warm Spark worker has no business being reachable from the LAN) and
 		// request an ephemeral host port via the empty-host-port form
@@ -538,8 +544,8 @@ func warmWorkerRunArgs(labelKV, wsLabelKV, warehouse, image, catalog, systemCata
 		"-e", "CLAVESA_QUERY_SERVER=1",
 		"-e", "CLAVESA_QUERY_SERVER_PORT=8765",
 		"-e", "CLAVESA_CONNECT_PORT=15002",
-		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
-	}
+		"-e", "CLAVESA_WAREHOUSE="+warehouse,
+	)
 	// ADR-019 Slice 4: register the V2 multi-catalog so warm reads of
 	// three-level addresses ``<catalog>.<schema>.<table>`` resolve. The
 	// runner falls back to spark_catalog for legacy two-segment reads

@@ -27,7 +27,7 @@ import {
 } from "@/components/MiniCharts";
 import { formatDuration, formatRelative } from "@/lib/format";
 import { useWorkspaceSummary, type WorkspaceSummary } from "@/lib/queries";
-import { homePath } from "@/lib/runtimeConfig";
+import { catalogPath, homePath } from "@/lib/runtimeConfig";
 import {
   OTHER_COLOR,
   SERIES_COLORS,
@@ -246,6 +246,29 @@ function Body({ s }: { s: WorkspaceSummary }) {
           )}
         </Panel>
       </div>
+
+      {/* Phone: the sidebar is hidden below md, so these are the way to
+          the workspace's tables, dashboards and notebooks. */}
+      <nav
+        aria-label="Workspace pages"
+        data-testid="workspace-home-pages"
+        className="mt-2 grid grid-cols-3 gap-2 md:hidden"
+      >
+        {[
+          { to: catalogPath, label: "Tables", id: "tables" },
+          { to: "/dashboards", label: "Dashboards", id: "dashboards" },
+          { to: "/notebooks", label: "Notebooks", id: "notebooks" },
+        ].map((p) => (
+          <Link
+            key={p.id}
+            to={p.to}
+            data-testid={`workspace-home-${p.id}`}
+            className="flex min-h-11 items-center justify-center rounded-md border border-border text-sm hover:bg-muted"
+          >
+            {p.label}
+          </Link>
+        ))}
+      </nav>
 
       <div className="mt-2 flex items-baseline justify-between gap-3">
         <h2 className="text-sm font-medium text-muted-foreground">

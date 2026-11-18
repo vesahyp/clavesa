@@ -31,8 +31,11 @@ type WorkspaceEntry struct {
 	Region string `json:"region,omitempty"`
 	// APIBase is where this workspace's API is mounted.
 	APIBase string `json:"api_base"`
-	// Path is the workspace directory on this machine. Not serialized:
-	// the hosted UI must not leak local paths.
+	// Dir is the workspace directory for display, with the home directory
+	// written as "~". Only this local server sends it; the hosted server
+	// has its own list (internal/hosted) and never sends a path.
+	Dir string `json:"dir,omitempty"`
+	// Path is the absolute workspace directory, for the server only.
 	Path string `json:"-"`
 }
 
@@ -61,6 +64,7 @@ func DiscoverWorkspaces(dir string) ([]WorkspaceEntry, error) {
 			Slug:    e.Name(),
 			Kind:    "cloud",
 			APIBase: "/w/" + e.Name() + "/api",
+			Dir:     displayDir(root),
 			Path:    root,
 		}
 		if wspkg.LoadWarehouse(root) == wspkg.WarehouseLocal {
@@ -78,6 +82,18 @@ func DiscoverWorkspaces(dir string) ([]WorkspaceEntry, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
 	return out, nil
+}
+
+// displayDir writes dir with the home directory as "~".
+func displayDir(dir string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return dir
+	}
+	if rel, err := filepath.Rel(home, dir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.Join("~", rel)
+	}
+	return dir
 }
 
 // MuxFactory builds the API handler for one workspace. The router calls

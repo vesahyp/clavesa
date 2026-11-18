@@ -73,6 +73,11 @@ func ParseRegistry(data []byte) ([]Entry, error) {
 }
 
 func (e Entry) validate() error {
+	// "all" is the group that sees every workspace (ADR-035): a workspace
+	// of that name could not be granted alone.
+	if e.Name == GroupAll {
+		return fmt.Errorf("workspace name %q is reserved: it is the viewer group that sees every workspace", e.Name)
+	}
 	if !entryNameRE.MatchString(e.Name) {
 		return fmt.Errorf("name must match %s", entryNameRE)
 	}

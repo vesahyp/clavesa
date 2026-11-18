@@ -107,6 +107,25 @@ func TestMultiRouter_ListWorkspaces(t *testing.T) {
 	if _, ok := body.Workspaces[0]["path"]; ok {
 		t.Errorf("list carries a local path: %+v", body.Workspaces[0])
 	}
+	if d, _ := body.Workspaces[0]["dir"].(string); !strings.HasSuffix(d, string(filepath.Separator)+"alpha") {
+		t.Errorf("dir = %q, want the workspace folder", d)
+	}
+}
+
+func TestDisplayDir(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip(err)
+	}
+	for in, want := range map[string]string{
+		filepath.Join(home, "ws", "a"): filepath.Join("~", "ws", "a"),
+		home + "x/a":                    home + "x/a",
+		"/opt/ws/a":                     "/opt/ws/a",
+	} {
+		if got := displayDir(in); got != want {
+			t.Errorf("displayDir(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 func TestMultiRouter_PrefixRouting(t *testing.T) {

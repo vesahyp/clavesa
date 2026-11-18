@@ -280,6 +280,14 @@ func keepMetastoreRequested(flag bool, env string) bool {
 	return true
 }
 
+// metastoreKept reports whether this command keeps its metastore warm:
+// --keep-metastore (the root's persistent flag, which cmd.Flags() holds
+// for a subcommand too, unlike its PersistentFlags()) or the env var.
+func metastoreKept(cmd *cobra.Command) bool {
+	keep, _ := cmd.Flags().GetBool("keep-metastore")
+	return keepMetastoreRequested(keep, os.Getenv(keepMetastoreEnv))
+}
+
 // releaseMetastores is the post-command hook that takes down the shared
 // metastore container when this process started it and nothing else is
 // using it (GH #99; the decision rules are in
@@ -291,8 +299,7 @@ func keepMetastoreRequested(flag bool, env string) bool {
 // shutdown already removed the container it owns, so the ownership check
 // inside the release finds nothing to do.
 func releaseMetastores(cmd *cobra.Command) {
-	keep, _ := cmd.PersistentFlags().GetBool("keep-metastore")
-	if keepMetastoreRequested(keep, os.Getenv(keepMetastoreEnv)) {
+	if metastoreKept(cmd) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), metastoreReleaseTimeout)
@@ -343,6 +350,9 @@ func newServiceDeps(cmd *cobra.Command) (*serviceDeps, error) {
 	reapOrphansOnce.Do(func() {
 		_, _ = observability.ReapOrphanContainers(cmd.Context())
 	})
+	// A metastore this command keeps warm on purpose carries no owner
+	// label, so the dead-owner reap leaves it (owner.go).
+	observability.KeepMetastore = metastoreKept(cmd)
 	d := wsdeps.New(cmd.Context(), workspace, wsdeps.Options{})
 	for _, fn := range d.Closers {
 		registerCloseable(fn)

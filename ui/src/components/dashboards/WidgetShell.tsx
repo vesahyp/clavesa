@@ -8,6 +8,7 @@
  */
 
 import { ReactNode } from "react";
+import { useIsNarrow, useIsPhone } from "@/hooks/useIsPhone";
 import { FileWarning } from "lucide-react";
 
 import {
@@ -33,6 +34,8 @@ interface WidgetShellProps {
    * cell instead of setting its own CSS-grid lines from `layout`.
    */
   inGrid?: boolean;
+  /** The widget type: a stat tile (big_number) may share a narrow row. */
+  type?: string;
 }
 
 export function WidgetShell({
@@ -44,24 +47,51 @@ export function WidgetShell({
   children,
   headerExtra,
   inGrid = false,
+  type,
 }: WidgetShellProps) {
   // CSS grid is 1-indexed; the spec uses 0-indexed positions for ease of
   // hand-editing the JSON. `gridColumn: "span N / span N"` when we don't
   // care about the absolute column would be simpler, but absolute lets
   // widgets compose neatly without overlap on a hand-authored dashboard.
   // Inside an editor grid cell the wrapper owns placement, so skip this.
+  //
+  // Phone (below 768px): no absolute placement. A widget up to 6 of the
+  // 12 columns wide takes half the row, a wider one the full row, in the
+  // reading order the Dashboard page sorts them into (y, then x), so the
+  // page never scrolls sideways at iPhone width.
+  // Below 640px (useIsNarrow) every widget takes the full row, whatever
+  // the JSON layout says (Vesa, 2026-11-18: "strange to have 2 widgets
+  // when there clearly is not enough room"); only stat tiles up to 6
+  // columns wide stay two per row, their numbers fit in half a phone.
+  const phone = useIsPhone();
+  const narrow = useIsNarrow();
+  const phoneSpan = narrow
+    ? type === "big_number" && layout.w <= 6
+      ? 6
+      : 12
+    : layout.w <= 6
+      ? 6
+      : 12;
   const style = inGrid
     ? undefined
-    : {
-        gridColumn: `${layout.x + 1} / span ${layout.w}`,
-        gridRow: `${layout.y + 1} / span ${layout.h}`,
-      };
+    : phone
+      ? {
+          gridColumn: `span ${phoneSpan}`,
+          gridRow: `span ${layout.h}`,
+        }
+      : {
+          gridColumn: `${layout.x + 1} / span ${layout.w}`,
+          gridRow: `${layout.y + 1} / span ${layout.h}`,
+        };
   return (
     <Card
       style={style}
-      className={inGrid ? "flex h-full w-full flex-col" : "flex flex-col"}
+      className={
+        inGrid ? "flex h-full w-full flex-col" : "flex min-w-0 flex-col"
+      }
       data-testid="dashboard-widget"
       data-widget-title={title}
+      data-widget-type={type}
     >
       <CardHeader className="flex flex-row items-center justify-between gap-3 pb-3">
         <CardTitle className="text-sm font-medium text-foreground">

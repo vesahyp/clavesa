@@ -866,6 +866,8 @@ function SchemaTableSection({
                   onClick={() => navigate(tableHref(row.original))}
                   className="group cursor-pointer"
                   data-testid="catalog-table-row"
+                  data-table-catalog={row.original.catalog}
+                  data-table-schema={row.original.schema}
                   data-table-name={row.original.name}
                 >
                   {row.getVisibleCells().map((cell) => (

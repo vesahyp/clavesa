@@ -49,4 +49,5 @@ Each ADR follows this structure:
 | [032](032-hosted-read-only-ui.md) | A hosted, read-only UI at ui.clavesa.dev shows every workspace on the phone, from the same handlers and pages as `clavesa ui` | Accepted; section 1 (the four pages) superseded by 033 |
 | [033](033-hosted-ui-parity.md) | The hosted UI is the local UI minus writes; every page is in its navigation, and a page that cannot work hosted says what to do instead | Accepted |
 | [034](034-hosted-post-reads.md) | The hosted UI answers two reads that use POST, and runs no SQL that a request writes | Accepted |
+| [035](035-per-workspace-viewers.md) | A hosted UI user sees only the workspaces they are a viewer of, by Cognito group; a workspace they may not see does not exist for them | Accepted |
 | [036](036-local-warehouse-snapshots.md) | A local-warehouse workspace publishes a catalog snapshot and its dashboards' widget results at run end; ad-hoc query stays on the Mac | Accepted |

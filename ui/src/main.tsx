@@ -33,6 +33,7 @@ import { Query } from "@/pages/Query";
 import { Bundles } from "@/pages/Bundles";
 import { Workspaces } from "@/pages/Workspaces";
 import { NOT_HOSTED, NotHosted, OnTheMac } from "@/pages/NotHosted";
+import { hasStats } from "@/components/RootNav";
 import { WorkspaceHome } from "@/pages/WorkspaceHome";
 import { atWorkspacesRoot, runtimeConfig } from "@/lib/runtimeConfig";
 
@@ -115,9 +116,14 @@ const app = (
           <Route
             path="/stats"
             element={
-              <Suspense fallback={null}>
-                <Stats />
-              </Suspense>
+              // Site usage is for "all" only (ADR-035); others go home.
+              hasStats() ? (
+                <Suspense fallback={null}>
+                  <Stats />
+                </Suspense>
+              ) : (
+                <Navigate to="/" replace />
+              )
             }
           />
         )}

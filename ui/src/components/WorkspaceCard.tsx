@@ -1,7 +1,8 @@
 /**
  * WorkspaceCard — one workspace on the Workspaces page (ADR-032 section
  * 1, page 1), compact so ten fit in about two phone screens (review of
- * 2026-11-16): status dot, name and status, the reasons when it is not
+ * 2026-11-16): status dot, name and status, where it runs (Local and its
+ * folder, or Cloud and its AWS account and region), the reasons when it is not
  * healthy, last run, runs and (cloud) cost, and a 14-day run strip. The
  * whole card is the link. Charts, cost per day and freshness are on the
  * Workspace page.
@@ -37,6 +38,48 @@ export interface WorkspaceCardProps {
   isLoading: boolean;
 }
 
+/** "local" or "cloud": the list entry's kind, else the summary's. */
+export function workspaceKind(entry: WorkspaceEntry, summary?: WorkspaceSummary): "local" | "cloud" {
+  return (entry.kind || summary?.kind) === "local" ? "local" : "cloud";
+}
+
+/**
+ * Where the workspace runs, from data the list and the summary already
+ * carry: a local workspace's folder (local server only; the hosted server
+ * sends no path, and the heading already says "runs on a Mac", so a hosted
+ * local card has no line), a cloud workspace's AWS account and region.
+ */
+function Where({ entry, summary }: { entry: WorkspaceEntry; summary?: WorkspaceSummary }) {
+  const kind = workspaceKind(entry, summary);
+  // Hosted local: no folder is sent, and "runs on a Mac" is already the
+  // group heading, so the card has no line to add.
+  if (kind === "local" && !entry.dir) return null;
+  const account = entry.account ?? summary?.account;
+  const region = entry.region ?? summary?.region;
+  const where =
+    kind === "local"
+      ? (entry.dir as string)
+      : [account ? `AWS ${account}` : "AWS", region].filter(Boolean).join(" · ");
+  return (
+    <div
+      data-testid="workspace-card-where"
+      data-kind={kind}
+      className="mt-0.5 truncate text-xs text-muted-foreground"
+      title={where}
+    >
+      <span className="font-medium text-foreground">{kind === "local" ? "Local" : "Cloud"}</span>
+      {" · "}
+      {shortDir(where)}
+    </div>
+  );
+}
+
+/** A long folder keeps its end, where the workspace name is: "…/a/b". */
+function shortDir(dir: string): string {
+  if (dir.length <= 36 || !dir.includes("/")) return dir;
+  return "…/" + dir.split("/").slice(-2).join("/");
+}
+
 function href(entry: WorkspaceEntry): string {
   return `/w/${encodeURIComponent(entry.slug)}/`;
 }
@@ -46,7 +89,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
     "block min-w-0 rounded-lg border border-border bg-card p-4 text-card-foreground";
   if (isLoading) {
     return (
-      <section data-testid="workspace-card" data-slug={entry.slug} data-state="loading" className={shell}>
+      <section data-testid="workspace-card" data-slug={entry.slug} data-state="loading" data-kind={workspaceKind(entry)} className={shell}>
         <CardTitle entry={entry} />
         <div data-testid="workspace-card-skeleton" className="mt-3 space-y-2">
           <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
@@ -59,7 +102,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
   if (error || !summary) {
     const msg = error instanceof Error ? error.message : error ? String(error) : "no summary";
     return (
-      <section data-testid="workspace-card" data-slug={entry.slug} data-state="error" className={shell}>
+      <section data-testid="workspace-card" data-slug={entry.slug} data-state="error" data-kind={workspaceKind(entry)} className={shell}>
         <CardTitle entry={entry} status="fail" />
         <p
           data-testid="workspace-card-error"
@@ -95,7 +138,8 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
       // live check's comparison with `clavesa workspace summary`.
       data-runs-14d={runs14}
       data-runs-30d={s.runs_per_day_30d.reduce((a, d) => a + d.succeeded + d.failed, 0)}
-      aria-label={`${entry.name}, ${STATUS_LABEL[status]}`}
+      data-kind={workspaceKind(entry, s)}
+      aria-label={`${entry.name}, ${workspaceKind(entry, s) === "local" ? "local" : "cloud"}, ${STATUS_LABEL[status]}`}
       className={cn(shell, "px-3 py-2.5 transition-colors hover:border-primary/50 active:bg-muted/40")}
     >
       <div className="flex min-w-0 items-center gap-2">
@@ -108,6 +152,7 @@ export function WorkspaceCard({ entry, summary, error, isLoading }: WorkspaceCar
         </span>
         <ChevronRight className="-mr-1 h-4 w-4 shrink-0 text-muted-foreground" />
       </div>
+      <Where entry={entry} summary={s} />
       {lines.length > 0 && (
         <ul data-testid="workspace-card-reasons" className={cn("mt-1 space-y-0.5 text-xs", REASON_TONE[status === "ok" ? "warn" : status])}>
           {lines.map((r) => (
@@ -213,11 +258,6 @@ function CardTitle({
   status?: "ok" | "warn" | "fail";
   summary?: WorkspaceSummary;
 }) {
-  const where = [
-    summary?.account,
-    summary?.region ?? entry.region,
-  ].filter(Boolean);
-  const kind = (summary?.kind ?? entry.kind) === "local" ? "Local warehouse" : "Cloud";
   return (
     <div className="flex min-w-0 items-start gap-2.5">
       <span
@@ -239,11 +279,8 @@ function CardTitle({
         >
           {entry.name}
         </a>
-        <div className="truncate text-xs text-muted-foreground">
-          {kind}
-          {where.length > 0 && ` · ${where.join(" · ")}`}
-          {status && ` · ${STATUS_LABEL[status]}`}
-        </div>
+        <Where entry={entry} summary={summary} />
+        {status && <div className="text-xs text-muted-foreground">{STATUS_LABEL[status]}</div>}
       </div>
     </div>
   );

@@ -23,6 +23,11 @@ import (
 var binPath string
 
 func TestMain(m *testing.M) {
+	// Containers left by an earlier run that died before its teardown
+	// (killed, timed out, OOM): their owner process is gone (owner.go).
+	if removed, err := observability.ReapDeadOwnerContainers(context.Background()); err == nil && len(removed) > 0 {
+		log.Printf("test-cli start: removed %d helper container(s) of dead processes", len(removed))
+	}
 	binPath = filepath.Join(os.TempDir(), "clavesa-test-bin")
 	cmd := exec.Command("go", "build", "-o", binPath, "./cmd/clavesa")
 	cmd.Dir = repoRoot()

@@ -19,10 +19,25 @@ import type { LucideIcon } from "lucide-react";
 
 import { SignOutButton } from "@/components/SignOutButton";
 import { runtimeConfig } from "@/lib/runtimeConfig";
+import { seesAll } from "@/lib/viewerGroups";
 import { cn } from "@/lib/utils";
 
-/** True where the root pages have Stats beside Workspaces. */
-export const hasStats = runtimeConfig.mode === "hosted";
+/** True where the root pages have the bottom bar: the hosted UI. */
+export const hasSiteNav = runtimeConfig.mode === "hosted";
+
+/**
+ * True where the bar offers Site usage: the hosted UI, for a user in the
+ * group "all" (ADR-035; the server answers 404 to anyone else, since the
+ * page names every workspace).
+ */
+export function hasStats(): boolean {
+  return hasSiteNav && seesAll();
+}
+
+/** The bar's pages for this user. */
+function sitePages() {
+  return hasStats() ? PAGES : PAGES.filter((p) => p.key !== "stats");
+}
 
 type SitePage = "workspaces" | "stats";
 
@@ -38,9 +53,9 @@ export function RootHeader({ title }: { title: string }) {
     <header className="flex h-14 items-center gap-3 border-b border-border px-4 pt-[env(safe-area-inset-top)] md:px-6">
       <span className="text-base font-semibold tracking-tight">Clavesλ</span>
       <span className="text-sm text-muted-foreground md:hidden">{title}</span>
-      {hasStats ? (
+      {hasSiteNav ? (
         <nav aria-label="Pages" className="hidden items-center gap-1 md:flex">
-          {PAGES.map((p) => (
+          {sitePages().map((p) => (
             <NavLink
               key={p.to}
               to={p.to}
@@ -87,7 +102,7 @@ export function SiteNav({ active, inWorkspace }: { active: SitePage; inWorkspace
       aria-label="Main"
       className="fixed inset-x-0 bottom-0 z-40 flex border-t border-border bg-card pb-[env(safe-area-inset-bottom)] md:hidden"
     >
-      {PAGES.map(({ key, to, label, icon: Icon }) => {
+      {sitePages().map(({ key, to, label, icon: Icon }) => {
         const on = key === active;
         const cls = cn(
           "relative flex min-w-0 flex-1 flex-col items-center justify-center gap-0.5 py-2 text-[11px]",
@@ -130,6 +145,6 @@ export function SiteNav({ active, inWorkspace }: { active: SitePage; inWorkspace
 /** The bottom bar of the root pages (Workspaces, Stats). */
 export function RootNav() {
   const { pathname } = useLocation();
-  if (!hasStats) return null;
+  if (!hasSiteNav) return null;
   return <SiteNav active={pathname === "/stats" ? "stats" : "workspaces"} inWorkspace={false} />;
 }

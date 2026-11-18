@@ -742,18 +742,18 @@ func splitTableName(name string) (node, outputKey string) {
 // directory isn't a Delta table (no `_delta_log/`, empty log, malformed
 // commit — happens transiently while a writer is committing).
 //
-// Maps Delta commitInfo.operationMetrics + userMetadata into the same
-// TableInfo fields the v1.x Iceberg path filled from snapshot.summary,
-// keeping the dashboard / catalog UI agnostic of which storage format
-// the table uses (ADR-018, ADR-014).
+// Row count, file count and bytes are the whole table's at the latest
+// version, as in the cloud `tables` row the runner writes (ADR-014);
+// userMetadata gives the writer's run ID.
 func readDeltaCurrentSnapshot(tableDir string) (TableInfo, bool) {
-	_, commits, err := delta.ReadCurrentFromPath(tableDir)
+	st, err := delta.ReadTableStateFromPath(tableDir)
 	if err != nil {
 		// Missing log, malformed commit, or any other read failure —
 		// the catalog walker silently skips this table.
 		_ = errors.Is(err, delta.ErrNotDelta)
 		return TableInfo{}, false
 	}
+	commits := st.Commits
 	if len(commits) == 0 {
 		return TableInfo{}, false
 	}
@@ -764,8 +764,12 @@ func readDeltaCurrentSnapshot(tableDir string) (TableInfo, bool) {
 	if latest.TimestampMs > 0 {
 		info.SnapshotTS = time.UnixMilli(latest.TimestampMs).UTC().Format("2006-01-02T15:04:05.000Z")
 	}
-	if latest.AddedRecords != nil {
-		v := *latest.AddedRecords
+	// The whole table's rows (live files' numRecords, net of deletion
+	// vectors), the number the runner writes to the cloud `tables` row
+	// (_table_wide_counts), not the rows the last commit added. nil when
+	// a live file has no numRecords stat.
+	if st.RowCount != nil {
+		v := *st.RowCount
 		info.RowCount = &v
 	}
 	// File-count / total-bytes come from enumerating the live data-file

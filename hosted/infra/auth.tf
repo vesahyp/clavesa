@@ -18,6 +18,13 @@ resource "aws_cognito_user_pool" "ui" {
   username_attributes      = ["email"]
   auto_verified_attributes = ["email"]
 
+  # A changed email takes effect only once the new address is verified
+  # (slice 6 review, finding 2). With write_attributes = [] on the
+  # clients no user can change it at all; this guards an admin change.
+  user_attribute_update_settings {
+    attributes_require_verification_before_update = ["email"]
+  }
+
   # Self-service sign-up stays open at the pool level so Google
   # federation can create users; the pre-signup Lambda is the gate on
   # every self-service path.
@@ -71,6 +78,12 @@ resource "aws_cognito_user_pool" "ui" {
 resource "aws_cognito_user_pool_client" "spa" {
   name         = var.pool_name
   user_pool_id = aws_cognito_user_pool.ui.id
+  # No user changes their own attributes (email) through this client: the
+  # group grant, the check-user rule and the access log trust the email
+  # (slice 6 review, finding 2). The one writable attribute is locale,
+  # which nothing reads: an empty list would mean "every attribute" to
+  # Cognito, because the provider leaves an empty list unset.
+  write_attributes = ["locale"]
 
   explicit_auth_flows = [
     "ALLOW_USER_AUTH",
@@ -108,6 +121,8 @@ resource "aws_cognito_user_pool_client" "spa" {
 resource "aws_cognito_user_pool_client" "check" {
   name         = "${var.pool_name}-check"
   user_pool_id = aws_cognito_user_pool.ui.id
+  # As the SPA client: no user-writable attribute but locale.
+  write_attributes = ["locale"]
 
   explicit_auth_flows = [
     "ALLOW_ADMIN_USER_PASSWORD_AUTH",
@@ -294,4 +309,21 @@ resource "aws_cognito_identity_provider" "google" {
     username       = "sub"
     email_verified = "email_verified"
   }
+}
+
+# Per-workspace viewers (ADR-035): "all" sees every workspace,
+# "ws-<name>" sees that one. Membership is set with make hosted-viewer
+# (no address in the repository); the Lambda reads cognito:groups from
+# the id token.
+resource "aws_cognito_user_group" "all" {
+  name         = "all"
+  user_pool_id = aws_cognito_user_pool.ui.id
+  description  = "Sees every workspace in the hosted UI."
+}
+
+resource "aws_cognito_user_group" "workspace" {
+  for_each     = toset([for w in local.workspaces : w.name])
+  name         = "ws-${each.value}"
+  user_pool_id = aws_cognito_user_pool.ui.id
+  description  = "Sees workspace ${each.value} in the hosted UI."
 }

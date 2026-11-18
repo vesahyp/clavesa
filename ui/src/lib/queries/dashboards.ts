@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import { request } from "@/api/client";
 import { ServedInfo, requestParsed, requestVoid } from "./core";
+import { runtimeConfig } from "@/lib/runtimeConfig";
 
 const DashboardSummary = z.object({
   slug: z.string(),
@@ -247,12 +248,42 @@ export async function runDashboardQuery(
   if (params && Object.keys(params).length > 0) {
     body.params = params;
   }
-  return requestParsed("/dashboards/query", DashboardQueryResult, {
-    method: "POST",
-    body: JSON.stringify(body),
-    errorLabel: "POST /dashboards/query",
-  });
+  return widgetSlots.run(() =>
+    requestParsed("/dashboards/query", DashboardQueryResult, {
+      method: "POST",
+      body: JSON.stringify(body),
+      errorLabel: "POST /dashboards/query",
+    }),
+  );
 }
+
+/**
+ * Slots — at most `max` tasks run at once; the rest wait in order.
+ */
+export class Slots {
+  private active = 0;
+  private waiting: (() => void)[] = [];
+  constructor(private readonly max: number) {}
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.active >= this.max) {
+      await new Promise<void>((go) => this.waiting.push(go));
+    } else {
+      this.active++;
+    }
+    try {
+      return await task();
+    } finally {
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.active--;
+    }
+  }
+}
+
+// The hosted UI runs at most 6 widget queries at once: a dashboard of 35
+// widgets fired together cold-started a Lambda per widget and went past
+// the API's reserved concurrency (30). Locally there is no cap.
+const widgetSlots = new Slots(runtimeConfig.mode === "hosted" ? 6 : Infinity);
 
 // DashboardInput is the body of a create/replace — the spec without the
 // server-stamped `updated_at`.

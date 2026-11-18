@@ -220,11 +220,11 @@ function TimeRangeControl({
   }
 
   return (
-    <div className="flex items-end gap-2">
+    <div className="flex max-w-full flex-wrap items-end gap-2">
       <div className="space-y-1">
         <Label className="text-xs">{control.label || control.name}</Label>
         <Select value={presetExpr} onValueChange={onPresetPick}>
-          <SelectTrigger className="w-44">
+          <SelectTrigger className="h-11 md:h-9 w-44">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -259,7 +259,7 @@ function TimeRangeControl({
                   rel: null,
                 })
               }
-              className="w-52 font-mono text-xs"
+              className="h-11 w-52 font-mono text-xs md:h-9"
             />
           </div>
           <div className="space-y-1">
@@ -274,7 +274,7 @@ function TimeRangeControl({
                   rel: null,
                 })
               }
-              className="w-52 font-mono text-xs"
+              className="h-11 w-52 font-mono text-xs md:h-9"
             />
           </div>
         </>
@@ -327,7 +327,7 @@ function RefreshControl() {
     <div className="space-y-1">
       <Label className="text-xs">Refresh</Label>
       <Select value={opt.value} onValueChange={onPick}>
-        <SelectTrigger className="w-24">
+        <SelectTrigger className="h-11 md:h-9 w-24">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -394,7 +394,7 @@ function RelativeInput({
         }
       }}
       placeholder="now-1h"
-      className={`w-32 font-mono text-xs${bad ? " border-destructive" : ""}`}
+      className={`h-11 w-32 font-mono text-xs md:h-9${bad ? " border-destructive" : ""}`}
     />
   );
 }
@@ -446,7 +446,7 @@ function SelectControl({
     <div className="space-y-1">
       <Label className="text-xs">{control.label || control.name}</Label>
       <Select value={value || undefined} onValueChange={onChange}>
-        <SelectTrigger className="w-48">
+        <SelectTrigger className="h-11 md:h-9 w-48">
           <SelectValue
             placeholder={query.isLoading ? "loading…" : "pick a value"}
           />

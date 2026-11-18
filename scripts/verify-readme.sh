@@ -128,8 +128,10 @@ cleanup() {
       docker network rm "clavesa-net-$ws_hash" >/dev/null 2>&1 || true
     fi
   fi
-  if [[ "$SUCCESS" == 1 ]]; then
+  if [[ "$SUCCESS" == 1 && "${VERIFY_KEEP:-}" != 1 ]]; then
     [[ -n "$WORK" ]] && rm -rf "$WORK"
+  elif [[ "$SUCCESS" == 1 ]]; then
+    echo "VERIFY_KEEP=1: workdir kept at $WORK" >&2
   elif [[ -n "$WORK" ]]; then
     {
       echo ""

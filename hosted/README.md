@@ -80,8 +80,15 @@ apply to the API too and turn its 401 and 404 into HTML.
 
 ## The registry: adding a workspace
 
-All signed-in users see all registered workspaces. (The ADR's
-per-workspace `viewers` list is not built: there is one viewer.)
+A signed-in user sees only the workspaces they are a viewer of
+(ADR-035): the Cognito group `all` sees every workspace, `ws-<name>`
+sees that one, and a workspace a user may not see answers 404 as if it
+did not exist (`/api/stats` is for `all` only). A user in no group sees
+nothing. `make hosted-viewer EMAIL=<address> WS=<name>|all` adds a user
+to a group (`REMOVE=1` takes it away); no address is written to the
+repository. The change applies at the user's next sign-in or token
+refresh (up to an hour). The SSM allowlist still decides who may sign
+in at all.
 
 `infra/workspaces.tf` lists the workspaces: `name`, `kind` (`cloud` or
 `local`), `account`, `region`, and for a cloud workspace
@@ -205,6 +212,11 @@ The local `clavesa ui` serves its own `index.html` and sends nothing.
   runs the error check against the deployed site.
 
 ## Live check
+
+The check user is a viewer of smoke2 and site-traffic only (ADR-035):
+the check does not walk web-traffic, which only Vesa's own use covers,
+and it asserts a 404 on a workspace the user is not a viewer of
+(`NOT_VIEWER_WS`, default ucpub).
 
 `make hosted-live-check` opens the deployed site on an emulated iPhone 16
 as the scripted check user and walks five pages: Workspaces, the Workspace

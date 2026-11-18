@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 
 import { useChrome, type PageChrome } from "@/components/PageChrome";
-import { catalogPath } from "@/lib/runtimeConfig";
+import { catalogPath, runtimeConfig } from "@/lib/runtimeConfig";
 import { QueryShell } from "@/components/QueryShell";
 import { AdhocQuery } from "@/components/AdhocQuery";
 import { EngineBadge } from "@/components/EngineBadge";
@@ -212,9 +212,9 @@ export function TableDetail() {
 
   return (
     <div className="mx-auto w-full max-w-6xl px-6 py-8">
-        <div className="mb-6 flex items-end justify-between gap-6">
+        <div className="mb-6 flex flex-wrap items-end justify-between gap-6">
           <div className="min-w-0">
-            <h1 className="font-mono text-2xl font-semibold tracking-tight">
+            <h1 className="break-all font-mono text-2xl font-semibold tracking-tight">
               {tableMeta?.owning_node || stripDefaultSuffix(tableName)}
               {tableMeta?.output_key && tableMeta.output_key !== "default" && (
                 <span className="text-muted-foreground"> · {tableMeta.output_key}</span>
@@ -227,7 +227,7 @@ export function TableDetail() {
               >
                 {displayPath}
               </code>
-              <CopyButton value={sqlPath} label="Copy SQL identifier" />
+              <CopyButton value={sqlPath} label="Copy SQL identifier" className="h-11 w-11 shrink-0 md:h-6 md:w-6" />
             </div>
             {tableMeta?.owning_pipeline && (
               <p className="mt-1 text-sm text-muted-foreground">
@@ -294,13 +294,17 @@ export function TableDetail() {
           )}
         </div>
 
-        <div className="mt-6">
-          <TableQueryPane
-            sql={`SELECT * FROM ${database}.${tableName} LIMIT 100`}
-            defaultOpen
-            autoRun
-          />
-        </div>
+        {/* Read-only (hosted and --read-only): the route this pane calls,
+            POST /data/query, is refused there, so no pane. */}
+        {!runtimeConfig.readOnly && (
+          <div className="mt-6">
+            <TableQueryPane
+              sql={`SELECT * FROM ${database}.${tableName} LIMIT 100`}
+              defaultOpen
+              autoRun
+            />
+          </div>
+        )}
 
         {sample.error && (
           <div className="mt-4 flex items-start gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm">
@@ -498,12 +502,12 @@ function StorageMetric({
   emphasis?: "warn" | "none";
 }) {
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex min-w-0 flex-col gap-1">
       <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
         {label}
       </span>
       <span
-        className={`font-mono text-lg ${
+        className={`break-all font-mono text-base md:text-lg ${
           emphasis === "warn"
             ? "text-amber-600 dark:text-amber-400"
             : "text-foreground"
@@ -569,7 +573,7 @@ function SnapshotRow({ snap }: { snap: SnapshotInfo }) {
   const op = snap.operation || "—";
   return (
     <li className="flex items-center justify-between gap-4 px-6 py-2.5">
-      <div className="flex min-w-0 items-center gap-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-3">
         <Badge variant="outline" className="font-mono text-[10px] uppercase">
           {op}
         </Badge>
@@ -670,7 +674,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
           {stat.column_type}
         </div>
       </div>
-      <div className="col-span-2 flex flex-col gap-1">
+      <div className="col-span-2 flex min-w-0 flex-col gap-1 break-words">
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
           Null
         </span>
@@ -690,7 +694,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
           </div>
         )}
       </div>
-      <div className="col-span-2 flex flex-col gap-1">
+      <div className="col-span-2 flex min-w-0 flex-col gap-1 break-words">
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
           Distinct
         </span>
@@ -707,7 +711,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
           </span>
         )}
       </div>
-      <div className="col-span-3 flex flex-col gap-1">
+      <div className="col-span-3 flex min-w-0 flex-col gap-1 break-words">
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
           {top.length > 0 ? "Top values" : "Range"}
         </span>
@@ -802,7 +806,7 @@ function ColumnStatRow({ stat }: { stat: ColumnStat }) {
           </div>
         )}
       </div>
-      <div className="col-span-2 flex flex-col gap-1">
+      <div className="col-span-2 flex min-w-0 flex-col gap-1 break-words">
         <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
           {isNumeric ? "p50 / p95" : "min / max"}
         </span>
@@ -1015,7 +1019,7 @@ function LiteColumnsCard({
                     {c.type}
                   </div>
                 </div>
-                <div className="col-span-2 flex flex-col gap-1">
+                <div className="col-span-2 flex min-w-0 flex-col gap-1 break-words">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
                     Null
                   </span>
@@ -1037,7 +1041,7 @@ function LiteColumnsCard({
                     </div>
                   )}
                 </div>
-                <div className="col-span-7 flex flex-col gap-1">
+                <div className="col-span-7 flex min-w-0 flex-col gap-1">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
                     Examples
                   </span>
@@ -1052,7 +1056,7 @@ function LiteColumnsCard({
                       {examples.map((v, i) => (
                         <code
                           key={i}
-                          className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground"
+                          className="max-w-full truncate rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground"
                           title={v}
                         >
                           {v.length > 60 ? v.slice(0, 57) + "…" : v}
@@ -1135,6 +1139,8 @@ function CreateDashboardButton({
     <Button
       variant="outline"
       size="sm"
+      // 44 px touch target on a phone, the usual small button on desktop.
+      className="h-11 md:h-8"
       onClick={onClick}
       disabled={!owningPipelineDir}
       title={

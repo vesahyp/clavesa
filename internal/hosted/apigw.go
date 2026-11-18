@@ -71,6 +71,12 @@ func RequestFromAPIGatewayV2(ctx context.Context, ev events.APIGatewayV2HTTPRequ
 		}
 		body = bytes.NewReader(raw)
 	}
+	// The viewer (ADR-035): the groups in the JWT claims the authorizer
+	// verified. An event with no JWT authorizer (the well-known document,
+	// EventBridge-made requests) carries none.
+	if a := ev.RequestContext.Authorizer; a != nil && a.JWT != nil {
+		ctx = withViewer(ctx, viewerFromClaims(a.JWT.Claims))
+	}
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err

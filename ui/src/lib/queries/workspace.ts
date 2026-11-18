@@ -837,6 +837,9 @@ export const WorkspaceEntry = z.object({
   kind: z.string(),
   account: z.string().optional(),
   region: z.string().optional(),
+  // Local multi-workspace server only: the workspace folder, home as "~".
+  // The hosted server never sends a path.
+  dir: z.string().optional(),
   api_base: z.string(),
   // Parsed per card (WorkspaceSummary.safeParse in Workspaces.tsx), so
   // one stored summary of an older shape cannot fail the whole list.

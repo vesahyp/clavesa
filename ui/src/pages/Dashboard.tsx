@@ -9,6 +9,7 @@
  */
 
 import { useReadOnly } from "@/hooks/useReadOnly";
+import { useIsPhone } from "@/hooks/useIsPhone";
 import { useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Pencil } from "lucide-react";
@@ -47,6 +48,7 @@ function pipelineScopeLabel(datasets: DashboardDataset[]): string {
 
 export function Dashboard() {
   const readOnly = useReadOnly();
+  const isPhone = useIsPhone();
   const params = useParams<{ slug: string }>();
   const slug = decodeURIComponent(params.slug ?? "");
   const [searchParams, setSearchParams] = useSearchParams();
@@ -242,7 +244,13 @@ export function Dashboard() {
                     gridAutoRows: "minmax(80px, auto)",
                   }}
                 >
-                  {spec.widgets.map((w) => {
+                  {(isPhone
+                    ? [...spec.widgets].sort(
+                        (a, b) =>
+                          a.layout.y - b.layout.y || a.layout.x - b.layout.x,
+                      )
+                    : spec.widgets
+                  ).map((w) => {
                     const ds = datasetMap.get(w.dataset);
                     return (
                       <Widget

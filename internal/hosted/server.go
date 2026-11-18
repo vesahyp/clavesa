@@ -62,6 +62,10 @@ type Server struct {
 	store     SummaryStore
 	opener    Opener
 	handler   http.Handler
+	// RequireViewer (the Lambda, ADR-035): every workspace read checks
+	// the viewer's groups; a request without a viewer sees nothing. Off
+	// in local serving (make hosted-local) and in tests that do not set it.
+	RequireViewer bool
 
 	// Stats reads stats/ui.json for GET /api/stats; nil answers an empty
 	// list.
@@ -128,6 +132,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.serveWorkspaces(w, r)
 		return
 	case path == "/api/stats":
+		if s.RequireViewer && !viewerFrom(r.Context()).All() {
+			httputil.WriteError(w, http.StatusNotFound, "not found: "+path)
+			return
+		}
 		s.serveStats(w, r)
 		return
 	}
@@ -137,6 +145,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e, known := s.byName[name]
+	// A workspace the viewer may not see answers as one that does not
+	// exist (ADR-035).
+	if known && s.RequireViewer && !viewerFrom(r.Context()).Sees(name) {
+		known = false
+	}
 	if !known {
 		httputil.WriteError(w, http.StatusNotFound, "unknown workspace: "+name)
 		return
@@ -261,9 +274,19 @@ func LocalSummaryStale(body []byte, now time.Time) (bool, time.Duration) {
 }
 
 func (s *Server) serveWorkspaces(w http.ResponseWriter, r *http.Request) {
-	cards := make([]WorkspaceCard, len(s.registry))
+	reg := s.registry
+	if s.RequireViewer {
+		v := viewerFrom(r.Context())
+		reg = nil
+		for _, e := range s.registry {
+			if v.Sees(e.Name) {
+				reg = append(reg, e)
+			}
+		}
+	}
+	cards := make([]WorkspaceCard, len(reg))
 	var wg sync.WaitGroup
-	for i, e := range s.registry {
+	for i, e := range reg {
 		cards[i] = WorkspaceCard{Name: e.Name, Slug: e.Name, Kind: e.Kind, Account: e.Account,
 			Region: e.Region, APIBase: "/w/" + e.Name + "/api", Summary: json.RawMessage("null")}
 		wg.Add(1)

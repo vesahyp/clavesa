@@ -212,6 +212,13 @@ func EnsureMetastore(ctx context.Context, workspaceRoot, workspaceName string) (
 		// remove this container once its workspace directory is deleted;
 		// the per-root SweepMetastores keyed by name stays as-is.
 		"--label", workspaceLabelKV(workspaceRoot),
+	}
+	// The owner label (owner.go): reaped once this process is gone, unless
+	// the metastore is kept warm on purpose.
+	if kv := ownerLabelKV(); kv != "" && !KeepMetastore {
+		args = append(args, "--label", kv)
+	}
+	args = append(args,
 		"--network", net,
 		// Stable in-network alias so clients can dial a known name even
 		// if the container name convention ever shifts. The container
@@ -219,16 +226,16 @@ func EnsureMetastore(ctx context.Context, workspaceRoot, workspaceName string) (
 		// alias is belt-and-suspenders and matches MetastoreAddr.
 		"--network-alias", name,
 		"-e", "CLAVESA_METASTORE_SERVER=1",
-		"-e", "CLAVESA_WAREHOUSE=" + warehouse,
+		"-e", "CLAVESA_WAREHOUSE="+warehouse,
 		// Mount the warehouse at the SAME absolute path it has on the
 		// host (matches run.go / local_query_warm.go), so the Derby db
 		// path the metastore opens is identical to the path clients
 		// reference. The metastore needs no AWS creds — it only serves
 		// the local _metastore dir — so we deliberately omit the ~/.aws
 		// mount and AWS_* passthrough the transform runner uses.
-		"-v", warehouse + ":" + warehouse,
+		"-v", warehouse+":"+warehouse,
 		metastoreImage(workspaceName),
-	}
+	)
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdout = &stdout

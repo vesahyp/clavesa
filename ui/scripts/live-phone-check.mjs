@@ -12,10 +12,12 @@
 //      the way ui/src/hosted/auth.ts keeps a session: sessionStorage
 //      `clavesa.hosted.session`, localStorage `clavesa.hosted.refresh`,
 //      before the app loads (addInitScript).
-//   3. Opens five pages: Workspaces, the Workspace page, a pipeline, one run
-//      of it (the four pages of ADR-032 section 1), and /stats. The
-//      pipeline and the run come from the API (the workspace summary), or
-//      from PIPELINE and RUN.
+//   3. Reaches every page the way a person does: it opens only the start
+//      page by URL, then taps through (each page's `taps`) and fails when a
+//      tap target is missing or the taps lead elsewhere. Two checks type an
+//      address on purpose (`typed`): a bad address, and /stats for a user
+//      outside "all". The pipeline and the run come from the API (the
+//      workspace summary), or from PIPELINE and RUN.
 //   Per page: no console error, no uncaught exception, no failed request to
 //   /api or /w/<name>/api, no horizontal scroll (scrollWidth <= innerWidth).
 //   The only failed request the pages are designed to tolerate:
@@ -238,9 +240,12 @@ async function buildPages(tok) {
       if (!runId) throw new Error(`${WS}/${pipeline} has no run; set RUN=<id>`);
     }
   }
-  // The workspace's first dashboard, for the dashboard page (ADR-034).
+  // The dashboards to open (ADR-034): DASHBOARDS=a,b, else the
+  // workspace's first one.
   const dl = await api(tok, `/w/${ws}/api/dashboards`).catch(() => null);
-  const dashSlug = (dl?.dashboards ?? [])[0]?.slug;
+  const dashSlugs = env("DASHBOARDS", "") ? env("DASHBOARDS", "").split(",") : [(dl?.dashboards ?? [])[0]?.slug].filter(Boolean);
+  // TABLE=<catalog>.<schema>.<table>: its table page must show sample rows.
+  const table = env("TABLE", "");
   // The workspace's first notebook, for the read-only notebook view.
   const nl = await api(tok, `/w/${ws}/api/notebooks`).catch(() => null);
   const nbName = (Array.isArray(nl) ? nl : (nl?.notebooks ?? []))[0]?.name;
@@ -251,10 +256,17 @@ async function buildPages(tok) {
   const timings = await api(tok, `/w/${ws}/api/data/run-timings?dir=${encodeURIComponent(pipeline)}&limit=20`).catch(() => null);
   newestRuns = timings?.runs ?? [];
   const dash = `/w/${ws}/pipelines/dashboard?dir=${encodeURIComponent(pipeline)}`;
+  // Taps from the start page (never a typed URL): each page lists the
+  // selectors a person taps, in order, from https://<site>/.
+  const toWs = [`a[data-testid="workspace-card"][data-slug="${ws}"]`];
+  // The pipeline card links by its dir (WorkspaceHome), which is what
+  // `pipeline` holds; its aria-label carries the name, which can differ.
+  const toPipeline = [...toWs, `a[href$="/pipelines/dashboard?dir=${encodeURIComponent(pipeline)}"]`];
   return [
     {
       name: "01-workspaces",
       path: "/",
+      taps: [],
       testids: ["workspaces-page", "workspace-card", "phone-nav"],
       active: "workspaces",
       back: false,
@@ -267,6 +279,9 @@ async function buildPages(tok) {
             slug: el.dataset.slug,
             state: el.dataset.state,
             status: el.querySelector('[data-testid="workspace-card-status"]')?.getAttribute("aria-label") ?? "",
+            kind: el.dataset.kind,
+            group: el.closest('[data-testid="workspaces-group"]')?.dataset.kind ?? "",
+            where: (el.querySelector('[data-testid="workspace-card-where"]')?.textContent ?? "").trim(),
             line: (el.querySelector('[data-testid="workspace-card-reasons"]')?.textContent ?? "").trim().replace(/\s+/g, " "),
           })),
         );
@@ -305,9 +320,22 @@ async function buildPages(tok) {
           if (L.line.top > L.firstCardTop) out.push("summary line is not above the cards");
           console.log(`       summary line: ${L.line.text}`);
         }
+        // Local and Cloud groups (2026-11-18): problems first inside each
+        // group; every card under the heading of its kind, with a line that
+        // says where it runs (folder or "runs on a Mac"; AWS account and region).
         const rankOf = { Failing: 0, "Needs attention": 1, Healthy: 2 };
-        const ranks = (info.cards ?? []).map((c) => rankOf[c.status] ?? 3);
-        if (ranks.some((r, i) => i > 0 && r < ranks[i - 1])) out.push(`cards not problems first: ${(info.cards ?? []).map((c) => c.status).join(", ")}`);
+        for (const kind of ["local", "cloud"]) {
+          const g = (info.cards ?? []).filter((c) => c.group === kind);
+          const ranks = g.map((c) => rankOf[c.status] ?? 3);
+          if (ranks.some((r, i) => i > 0 && r < ranks[i - 1])) out.push(`${kind} cards not problems first: ${g.map((c) => c.status).join(", ")}`);
+        }
+        for (const c of info.cards ?? []) {
+          if (!c.group || c.group !== c.kind) out.push(`${c.slug}: ${c.kind} card is under the "${c.group || "no"}" heading`);
+          // Hosted: a local card has no where line (no path is sent, and the
+          // heading says "runs on a Mac"); a cloud card names its account.
+          if (c.kind === "local" ? c.where !== "" : !/^Cloud · AWS \d{12} · [a-z]+-[a-z]+-\d$/.test(c.where))
+            out.push(`${c.slug}: where line "${c.where}" is wrong for a hosted ${c.kind} card`);
+        }
         for (const c of L?.cards ?? []) {
           if (c.tag !== "A" || c.href !== `/w/${encodeURIComponent(c.slug)}/`)
             out.push(`${c.slug}: the card is not one link to /w/${c.slug}/ (${c.tag} ${c.href})`);
@@ -346,6 +374,10 @@ async function buildPages(tok) {
             continue;
           }
           const ui = info.counts?.[name];
+          if (!ui && !workspaceList.some((w) => w.name === name)) {
+            console.log(`       note: the check user is not a viewer of ${name} (ADR-035), not compared with the CLI`);
+            continue;
+          }
           if (!ui) {
             out.push(`no card for ${name} to compare with the CLI`);
             continue;
@@ -361,6 +393,7 @@ async function buildPages(tok) {
     {
       name: "02-workspace",
       path: `/w/${ws}/`,
+      taps: toWs,
       testids: ["workspace-home", "workspace-home-runs-chart", "pipeline-card", "workspace-home-all-pipelines", "phone-nav"],
       active: "workspaces",
       back: true,
@@ -368,6 +401,7 @@ async function buildPages(tok) {
     {
       name: "03-pipeline",
       path: dash,
+      taps: toPipeline,
       testids: ["deployment-status", "pipeline-phone-duration-bars", "run-timings-chart", "pipeline-phone-run-row", "phone-nav"],
       neverShow: ["Never run"],
       active: "workspaces",
@@ -390,6 +424,7 @@ async function buildPages(tok) {
     {
       name: "04-run",
       path: `${dash}&run=${encodeURIComponent(runId)}`,
+      taps: [...toPipeline, `[data-testid="pipeline-phone-run-row"][data-run-id="${runId}"]`],
       testids: ["run-detail-sheet", "run-phone-timeline-chart", "run-phone-node-row", "phone-nav"],
       active: "workspaces",
       back: true,
@@ -409,13 +444,17 @@ async function buildPages(tok) {
       // The Pipelines page, reached by "All pipelines" on the workspace page.
       name: "06-pipelines",
       path: `/w/${ws}/pipelines`,
+      taps: [...toWs, '[data-testid="workspace-home-all-pipelines"]'],
       testids: ["pipeline-card", "phone-nav"],
       active: "workspaces",
       back: true,
     },
+    ...(seesAll
+      ? [
     {
       name: "05-stats",
       path: "/stats",
+      taps: ['[data-testid="phone-nav-stats"]'],
       testids: ["stats-page", "phone-nav"],
       active: "stats",
       back: false,
@@ -438,11 +477,24 @@ async function buildPages(tok) {
         return out;
       },
     },
-    ...(dashSlug
-      ? [
+        ]
+      : [
           {
-            name: "09-dashboard",
+            // Not in "all" (ADR-035): /stats sends the user to Workspaces.
+            name: "05-stats",
+            path: "/stats",
+            // Typed on purpose: a user outside "all" has no Site usage
+            // button; this checks that the typed address sends them home.
+            typed: "the refused /stats address",
+            testids: ["workspaces-page", "phone-nav"],
+            active: "workspaces",
+            back: false,
+          },
+        ]),
+    ...dashSlugs.map((dashSlug, i) => ({
+            name: i ? `09-dashboard-${dashSlug}` : "09-dashboard",
             path: `/w/${ws}/dashboards/${encodeURIComponent(dashSlug)}`,
+            taps: [...toWs, '[data-testid="workspace-home-dashboards"]', `a[href$="/dashboards/${encodeURIComponent(dashSlug)}"]`],
             testids: ["dashboard-widget", "phone-nav"],
             active: "workspaces",
             back: true,
@@ -453,8 +505,28 @@ async function buildPages(tok) {
             extra: async (page) => {
               const widgets = await page.locator('[data-testid="dashboard-widget"]').count();
               const failed = await page.locator('[data-testid="dashboard-widget"]', { hasText: "Query failed" }).count();
-              console.log(`       dashboard ${dashSlug}: ${widgets} widget(s), ${failed} failed`);
-              return failed ? [`dashboard ${dashSlug}: ${failed} of ${widgets} widget(s) show "Query failed"`] : [];
+              // "No rows" can be true (no errors this month): reported, not failed.
+              const empty = await page.locator('[data-testid="dashboard-widget"]', { hasText: "No rows" }).count();
+              console.log(`       dashboard ${dashSlug}: ${widgets} widget(s), ${failed} failed, ${empty} with no rows`);
+              return [
+                ...(failed ? [`dashboard ${dashSlug}: ${failed} of ${widgets} widget(s) show "Query failed"`] : []),
+              ];
+            },
+          })),
+    ...(table
+      ? [
+          {
+            name: "12-table",
+            path: `/w/${ws}/tables/${table.split(".").map(encodeURIComponent).join("/")}`,
+            taps: [...toWs, '[data-testid="workspace-home-tables"]', `[data-testid="catalog-table-row"][data-table-catalog="${table.split(".")[0]}"][data-table-schema="${table.split(".")[1]}"][data-table-name="${table.split(".")[2]}"]`],
+            testids: ["table-schema", "phone-nav"],
+            active: "workspaces",
+            back: true,
+            ready: () => /examples from first [1-9][0-9]* rows/.test(document.body.innerText),
+            extra: async (page) => {
+              const m = (await page.locator("body").innerText()).match(/examples from first (\d+) rows/);
+              console.log(`       table ${table}: ${m ? m[1] : 0} sample row(s)`);
+              return m && Number(m[1]) > 0 ? [] : [`table ${table}: no sample rows`];
             },
           },
         ]
@@ -464,6 +536,7 @@ async function buildPages(tok) {
           {
             name: "10-notebook",
             path: `/w/${ws}/notebooks/${encodeURIComponent(nbName)}`,
+            taps: [...toWs, '[data-testid="workspace-home-notebooks"]', `a[href$="/notebooks/${encodeURIComponent(nbName)}"]`],
             testids: ["notebook-view", "phone-nav"],
             active: "workspaces",
             back: true,
@@ -479,6 +552,8 @@ async function buildPages(tok) {
     {
       name: "07-not-found",
       path: `/w/${ws}/pipelines/dashboard?dir=no-such-pipeline`,
+      // Typed on purpose: no link leads to a pipeline that does not exist.
+      typed: "a bad address",
       testids: ["pipeline-not-found", "phone-nav"],
       active: "workspaces",
       back: true,
@@ -551,7 +626,8 @@ function navProblems(pg, nav, ref) {
   if (nav.count !== 1) out.push(`bottom bar: ${nav.count} bars on the page, want 1`);
   if (!nav.items.length) return [...out, "bottom bar: no items"];
   const labels = nav.items.map((i) => i.label);
-  if (labels.join("|") !== "Workspaces|Site usage") out.push(`bottom bar labels ${labels.join(" | ")}, want Workspaces | Site usage`);
+  const wantLabels = seesAll ? "Workspaces|Site usage" : "Workspaces";
+  if (labels.join("|") !== wantLabels) out.push(`bottom bar labels ${labels.join(" | ")}, want ${wantLabels.replace("|", " | ")}`);
   const actives = nav.items.filter((i) => i.active).map((i) => i.testid);
   if (actives.length !== 1 || actives[0] !== `phone-nav-${pg.active}`)
     out.push(`bottom bar: active ${actives.join("+") || "none"}, want phone-nav-${pg.active}`);
@@ -598,7 +674,26 @@ async function visit(ctx, pg) {
 
   let info = {};
   try {
-    await page.goto(BASE + pg.path, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+    if (pg.typed) {
+      await page.goto(BASE + pg.path, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+    } else {
+      // A person's way in: the start page, then taps. A page with no tap
+      // path fails: everything a person needs must be reachable.
+      if (!pg.taps) throw new Error("no tap path from the start page");
+      await page.goto(BASE + "/", { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+      for (const sel of pg.taps) {
+        const el = page.locator(sel).first();
+        await el.waitFor({ state: "visible", timeout: WAIT_MS }).catch(() => {
+          throw new Error(`cannot tap ${sel} on ${new URL(page.url()).pathname}`);
+        });
+        await el.click();
+        await page.waitForLoadState("domcontentloaded");
+      }
+      const at = new URL(page.url());
+      const want = new URL(BASE + pg.path);
+      const norm = (u) => decodeURIComponent(u.pathname.replace(/\/$/, "") + u.search);
+      if (norm(at) !== norm(want)) throw new Error(`taps led to ${norm(at)}, want ${norm(want)}`);
+    }
     for (const id of pg.testids) {
       await page.locator(`[data-testid="${id}"]`).first().waitFor({ state: "visible", timeout: WAIT_MS });
     }
@@ -653,6 +748,20 @@ async function visit(ctx, pg) {
       const wide = [...document.querySelectorAll("main, [data-testid='run-phone-view']")]
         .filter((el) => el.scrollWidth > el.clientWidth + 1)
         .map((el) => `${el.tagName.toLowerCase()}${el.dataset.testid ? `[${el.dataset.testid}]` : ""} ${el.scrollWidth}>${el.clientWidth}`);
+      // The innermost elements that reach past the screen's right edge,
+      // so a failure names what to fix.
+      const past = [...document.querySelectorAll("main *")].filter(
+        (el) => el.getBoundingClientRect().right > innerWidth + 1 && ![...el.children].some((c) => c.getBoundingClientRect().right > innerWidth + 1),
+      );
+      if (wide.length && past.length)
+        wide.push(
+          `past the edge (${past.length}, widest first): ` +
+            past
+              .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)
+              .slice(0, 4)
+              .map((el) => `${el.tagName.toLowerCase()}.${(el.getAttribute("class") ?? "").split(" ").slice(0, 3).join(".")} "${(el.textContent ?? "").trim().slice(0, 24)}" right=${Math.round(el.getBoundingClientRect().right)}`)
+              .join("; "),
+        );
       return { doc: document.scrollingElement.scrollWidth, inner: innerWidth, wide };
     })
     .catch(() => ({ doc: 0, inner: 0, wide: [] }));
@@ -670,6 +779,16 @@ const tf = terraformOutputs();
 if (tf.timeZone) HEL = tf.timeZone;
 console.log(`hosted time zone: ${HEL}`);
 const tok = signIn(user, tf);
+// The check user's groups (ADR-035): who sees Site usage.
+const tokGroups = (() => {
+  try {
+    const part = tok.idToken.split(".")[1];
+    return JSON.parse(Buffer.from(part, "base64url").toString("utf8"))["cognito:groups"] ?? [];
+  } catch {
+    return [];
+  }
+})();
+const seesAll = tokGroups.includes("all");
 user.password = "";
 console.log(`signed in as the check user on ${BASE} (tokens not printed)`);
 
@@ -798,6 +917,16 @@ try {
     console.log(`${out.length ? "FAIL" : "ok  "} 08-desktop ${w}: ${entries.length} sidebar entries opened${out.length ? `, ${out.length} problem(s)` : ""}`);
     for (const p of [...new Set(out)]) failures.push(`08-desktop ${w}: ${p}`);
     await page.close();
+  }
+  // ADR-035: the check user is a viewer of the workspaces this check
+  // walks only; another one answers 404 and is not listed.
+  {
+    const other = env("NOT_VIEWER_WS", "ucpub");
+    const r = await fetch(`${BASE}/w/${encodeURIComponent(other)}/api/pipelines`, { headers: { Authorization: `Bearer ${tok.idToken}` } });
+    const listed = workspaceList.some((w) => w.name === other);
+    console.log(`${r.status === 404 && !listed ? "ok  " : "FAIL"} 11-viewers: /w/${other} answers ${r.status}, listed: ${listed}`);
+    if (r.status !== 404) failures.push(`11-viewers: /w/${other} answers ${r.status}, want 404`);
+    if (listed) failures.push(`11-viewers: ${other} is listed for the check user`);
   }
   await desk.close();
 } finally {

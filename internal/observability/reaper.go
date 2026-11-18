@@ -203,6 +203,9 @@ func ReapOrphanContainers(ctx context.Context) (removed []string, err error) {
 	// Touch before reaping; ignore failure (best-effort, never fail the
 	// command over stamp I/O).
 	_ = os.WriteFile(reapStampPath, nil, 0o644)
+	// Containers whose owner process is gone (owner.go), first, so the
+	// listing below does not see them again.
+	removed, _ = ReapDeadOwnerContainers(ctx)
 	byID, err := listWorkspaceLabeledContainers(ctx)
 	if err != nil {
 		return nil, err

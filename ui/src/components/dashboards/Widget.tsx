@@ -7,7 +7,7 @@
  * new widget types in JSON doesn't break old UI builds.
  */
 
-import { useMemo } from "react";
+import { Fragment, useMemo } from "react";
 import {
   BarChart,
   Bar,
@@ -102,6 +102,7 @@ export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps
     return (
       <WidgetShell
         title={widget.title}
+        type={widget.type}
         layout={widget.layout}
         isLoading={false}
         error={null}
@@ -117,6 +118,7 @@ export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps
     return (
       <WidgetShell
         title={widget.title}
+        type={widget.type}
         layout={widget.layout}
         isLoading={false}
         error={null}
@@ -128,14 +130,17 @@ export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps
     );
   }
 
+  // A stat tile shows one value: its "1 row" says nothing and pushes the
+  // title onto three lines in half a phone row.
   const headerExtra =
-    data && data.rows.length > 0
+    data && data.rows.length > 0 && widget.type !== "big_number"
       ? `${formatRowCount(data.rows.length)}${data.truncated ? "+" : ""}`
       : null;
 
   return (
     <WidgetShell
       title={widget.title}
+      type={widget.type}
       layout={widget.layout}
       isLoading={query.isLoading}
       error={query.error}
@@ -144,7 +149,7 @@ export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps
       inGrid={inGrid}
     >
       {data && data.rows.length > 0 && (
-        <WidgetBody widget={widget} data={data} />
+        <WidgetBody widget={widget} data={data} sql={sql} />
       )}
     </WidgetShell>
   );
@@ -153,20 +158,22 @@ export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps
 interface WidgetBodyProps {
   widget: DashboardWidget;
   data: DashboardQueryResult;
+  /** The dataset SQL, read only to name a series called y, x or value. */
+  sql?: string;
 }
 
-function WidgetBody({ widget, data }: WidgetBodyProps) {
+function WidgetBody({ widget, data, sql }: WidgetBodyProps) {
   switch (widget.type) {
     case "big_number":
       return <BigNumberBody widget={widget} data={data} />;
     case "line":
-      return <LineBody widget={widget} data={data} />;
+      return <LineBody widget={widget} data={data} sql={sql} />;
     case "bar":
-      return <BarBody widget={widget} data={data} />;
+      return <BarBody widget={widget} data={data} sql={sql} />;
     case "stacked_bar":
-      return <StackedBarBody widget={widget} data={data} />;
+      return <StackedBarBody widget={widget} data={data} sql={sql} />;
     case "bar_line":
-      return <BarLineBody widget={widget} data={data} />;
+      return <BarLineBody widget={widget} data={data} sql={sql} />;
     case "pie":
       return <PieBody widget={widget} data={data} variant="pie" />;
     case "donut":
@@ -230,10 +237,12 @@ function BigNumberBody({ widget, data }: WidgetBodyProps) {
   }
   // Display compact (79.46M); reveal the exact, separator-grouped value
   // on hover — the same axis/tooltip split the charts use.
-  const display = compactNumber(raw);
-  const exact = formatNumber(raw);
+  // "%" when the title or the field says percent, as on the chart axes.
+  const pct = isPercent(widget.title, data.columns[valueIdx]?.name) ? "%" : "";
+  const display = compactNumber(raw) + pct;
+  const exact = formatNumber(raw) + pct;
   const stat = (
-    <span className="font-mono text-4xl font-semibold tabular-nums tracking-tight">
+    <span className="font-mono text-3xl font-semibold tabular-nums tracking-tight md:text-4xl">
       {display}
     </span>
   );
@@ -259,16 +268,19 @@ function BigNumberBody({ widget, data }: WidgetBodyProps) {
 // line — time-series-ish; x is whatever the user picks (timestamp, ordinal)
 // ---------------------------------------------------------------------------
 
-function LineBody({ widget, data }: WidgetBodyProps) {
+function LineBody({ widget, data, sql }: WidgetBodyProps) {
   const primary = usePrimaryColor();
   const xIdx = pickColumn(data, widget.x_field, 0);
   const yIdx = pickColumn(data, widget.y_field, 1);
   if (xIdx < 0 || yIdx < 0) return <NoFieldsHint />;
+  // A line through a few points (3 days of key events) suggests values
+  // between them that were never measured; under 8 points, bars.
+  if (data.rows.length < SPARSE_POINTS) return <BarBody widget={widget} data={data} sql={sql} />;
 
   // Recharts wants `[{ x, y }]` with numeric y. Coerce strings to numbers
   // here; non-numeric rows render as gaps, no error. `name` on the series
   // is the real column name, so the tooltip reads `trips: 42` not `y: 42`.
-  const yName = data.columns[yIdx]?.name || "value";
+  const yName = seriesLabel(data.columns[yIdx]?.name ?? "", sql, widget.title);
   const xName = data.columns[xIdx]?.name || "x";
   const points = data.rows.map((row) => ({
     x: row[xIdx],
@@ -291,8 +303,7 @@ function LineBody({ widget, data }: WidgetBodyProps) {
           stroke="currentColor"
           tickLine={false}
           axisLine={false}
-          width={48}
-          tickFormatter={compactNumber}
+          {...yAxisProps(points.map((p) => p.y), isPercent(widget.title, yName))}
         />
         <Tooltip
           {...tooltipBase}
@@ -301,7 +312,7 @@ function LineBody({ widget, data }: WidgetBodyProps) {
           labelFormatter={(label) => `${xName}: ${label}`}
         />
         <Line
-          type="monotone"
+          type="linear"
           dataKey="y"
           name={yName}
           stroke={primary}
@@ -318,20 +329,20 @@ function LineBody({ widget, data }: WidgetBodyProps) {
 // bar — categorical x, numeric y
 // ---------------------------------------------------------------------------
 
-function BarBody({ widget, data }: WidgetBodyProps) {
+function BarBody({ widget, data, sql }: WidgetBodyProps) {
   const primary = usePrimaryColor();
   const xIdx = pickColumn(data, widget.x_field, 0);
   const yIdx = pickColumn(data, widget.y_field, 1);
   if (xIdx < 0 || yIdx < 0) return <NoFieldsHint />;
 
-  const yName = data.columns[yIdx]?.name || "value";
+  const yName = seriesLabel(data.columns[yIdx]?.name ?? "", sql, widget.title);
   const xName = data.columns[xIdx]?.name || "x";
   const bars = data.rows.map((row) => ({
     x: row[xIdx],
     y: Number(row[yIdx]),
   }));
   return (
-    <ChartFrame>
+    <ChartFrame pointCount={bars.length}>
       <BarChart data={bars} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
         <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
         <XAxis
@@ -346,8 +357,7 @@ function BarBody({ widget, data }: WidgetBodyProps) {
           stroke="currentColor"
           tickLine={false}
           axisLine={false}
-          width={48}
-          tickFormatter={compactNumber}
+          {...yAxisProps(bars.map((b) => b.y), isPercent(widget.title, yName))}
         />
         <Tooltip
           {...tooltipBase}
@@ -384,7 +394,7 @@ const SERIES_PALETTE = [
 // Wide format: the SQL returns one row per x with a column per series
 // (`SELECT cat, SUM(a), SUM(b), SUM(c) GROUP BY cat`). With no series
 // columns picked it stacks every column except x.
-function StackedBarBody({ widget, data }: WidgetBodyProps) {
+function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
   const xIdx = pickColumn(data, widget.x_field, 0);
   if (xIdx < 0) return <NoFieldsHint />;
 
@@ -408,7 +418,7 @@ function StackedBarBody({ widget, data }: WidgetBodyProps) {
   });
 
   return (
-    <ChartFrame>
+    <ChartFrame pointCount={points.length}>
       <BarChart data={points} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
         <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
         <XAxis
@@ -423,8 +433,10 @@ function StackedBarBody({ widget, data }: WidgetBodyProps) {
           stroke="currentColor"
           tickLine={false}
           axisLine={false}
-          width={48}
-          tickFormatter={compactNumber}
+          {...yAxisProps(
+            points.flatMap((p) => seriesNames.map((n) => Number(p[n]))),
+            isPercent(widget.title, seriesNames.length === 1 ? seriesNames[0] : ""),
+          )}
         />
         <Tooltip
           {...tooltipBase}
@@ -437,7 +449,7 @@ function StackedBarBody({ widget, data }: WidgetBodyProps) {
           <Bar
             key={s}
             dataKey={s}
-            name={s}
+            name={seriesLabel(s, sql, s)}
             stackId="a"
             fill={SERIES_PALETTE[i % SERIES_PALETTE.length]}
             isAnimationActive={false}
@@ -544,15 +556,15 @@ function PieBody({ widget, data, variant }: PieBodyProps) {
 // bar_line — a bar metric and a line metric sharing one x, dual y-axis
 // ---------------------------------------------------------------------------
 
-function BarLineBody({ widget, data }: WidgetBodyProps) {
+function BarLineBody({ widget, data, sql }: WidgetBodyProps) {
   const primary = usePrimaryColor();
   const xIdx = pickColumn(data, widget.x_field, 0);
   const barIdx = pickColumn(data, widget.y_field, 1);
   const lineIdx = pickColumn(data, widget.line_field, 2);
   if (xIdx < 0 || barIdx < 0 || lineIdx < 0) return <NoFieldsHint />;
 
-  const barName = data.columns[barIdx]?.name || "bar";
-  const lineName = data.columns[lineIdx]?.name || "line";
+  const barName = seriesLabel(data.columns[barIdx]?.name ?? "", sql, "bars");
+  const lineName = seriesLabel(data.columns[lineIdx]?.name ?? "", sql, "line");
   const xName = data.columns[xIdx]?.name || "x";
   const lineColor = SERIES_PALETTE[1];
   const points = data.rows.map((row) => ({
@@ -562,7 +574,7 @@ function BarLineBody({ widget, data }: WidgetBodyProps) {
   }));
 
   return (
-    <ChartFrame>
+    <ChartFrame pointCount={points.length}>
       <ComposedChart
         data={points}
         margin={{ top: 8, right: 8, left: 4, bottom: 4 }}
@@ -578,12 +590,12 @@ function BarLineBody({ widget, data }: WidgetBodyProps) {
         />
         <YAxis
           yAxisId="bar"
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
+          // Each axis in its series' colour, so it is clear which is which.
+          tick={{ fill: primary, fontSize: 10 }}
+          stroke={primary}
           tickLine={false}
           axisLine={false}
-          width={44}
-          tickFormatter={compactNumber}
+          {...yAxisProps(points.map((p) => p.bar), isPercent(widget.title, barName))}
         />
         <YAxis
           yAxisId="line"
@@ -592,8 +604,7 @@ function BarLineBody({ widget, data }: WidgetBodyProps) {
           stroke={lineColor}
           tickLine={false}
           axisLine={false}
-          width={44}
-          tickFormatter={compactNumber}
+          {...yAxisProps(points.map((p) => p.line), isPercent("", lineName))}
         />
         <Tooltip
           {...tooltipBase}
@@ -611,7 +622,7 @@ function BarLineBody({ widget, data }: WidgetBodyProps) {
         />
         <Line
           yAxisId="line"
-          type="monotone"
+          type="linear"
           dataKey="line"
           name={lineName}
           stroke={lineColor}
@@ -639,8 +650,8 @@ function TableBody2({ data }: TableBodyProps) {
         <TableHeader className="sticky top-0 z-10 bg-card">
           <TableRow className="hover:bg-transparent">
             {data.columns.map((c) => (
-              <TableHead key={c.name} className="whitespace-nowrap font-mono text-xs">
-                {c.name}
+              <TableHead key={c.name} className="whitespace-normal font-mono text-xs">
+                {breakable(c.name)}
               </TableHead>
             ))}
           </TableRow>
@@ -649,11 +660,20 @@ function TableBody2({ data }: TableBodyProps) {
           {data.rows.map((row, i) => (
             <TableRow key={i} data-testid="recent-runs-row">
               {row.map((cell, j) => (
-                <TableCell key={j} className="whitespace-nowrap font-mono text-xs">
+                // Numbers stay on one line; text wraps, so on a phone the
+                // table fits its row and no number is hidden off the edge.
+                <TableCell
+                  key={j}
+                  className={
+                    String(cell ?? "").trim() !== "" && Number.isFinite(Number(cell))
+                      ? "whitespace-nowrap font-mono text-xs tabular-nums"
+                      : "whitespace-normal font-mono text-xs"
+                  }
+                >
                   {cell === "" || cell == null ? (
                     <span className="text-muted-foreground/50">—</span>
                   ) : (
-                    cell
+                    breakable(String(cell))
                   )}
                 </TableCell>
               ))}
@@ -683,6 +703,124 @@ function usePrimaryColor(): string {
       .trim();
     return v || "#2563eb";
   }, []);
+}
+
+// ---------------------------------------------------------------------------
+// Series names (2026-11-18): a legend never says "y". A column called y, x,
+// value, line or bar is a placeholder alias; its label comes from the
+// expression behind it in the dataset SQL (SUM(p.page_views) AS y → "page
+// views"), else from the fallback (the widget title for a single series).
+// ---------------------------------------------------------------------------
+
+/** Fewer points than this draw a line widget as bars. */
+const SPARSE_POINTS = 8;
+
+const PLACEHOLDER = /^(x|y|value|val|line|bar|bars)$/i;
+
+/** The legend and tooltip name of a series. */
+export function seriesLabel(field: string, sql: string | undefined, fallback: string): string {
+  if (field && !PLACEHOLDER.test(field)) return field;
+  const expr = sql ? selectExpression(sql, field) : null;
+  const named = expr ? expressionName(expr) : null;
+  return named ?? (fallback || field || "value");
+}
+
+/** The expression the first SELECT list aliases to `alias`, or null. */
+function selectExpression(sql: string, alias: string): string | null {
+  const start = sql.search(/\bselect\b/i);
+  if (start < 0 || !alias) return null;
+  const items: string[] = [];
+  let depth = 0;
+  let cur = "";
+  const rest = sql.slice(start + 6);
+  for (let i = 0; i < rest.length; i++) {
+    const ch = rest[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (depth === 0 && /^from\b/i.test(rest.slice(i)) && /\s/.test(rest[i - 1] ?? " ")) break;
+    if (depth === 0 && ch === ",") {
+      items.push(cur);
+      cur = "";
+    } else cur += ch;
+  }
+  items.push(cur);
+  for (const item of items) {
+    const m = /^([\s\S]*?)\s+as\s+["`]?(\w+)["`]?\s*$/i.exec(item.trim());
+    if (m && m[2].toLowerCase() === alias.toLowerCase()) return m[1].trim();
+  }
+  return null;
+}
+
+/** "SUM(p.page_views)" → "page views", "COUNT(*)" → "count"; null for anything else. */
+function expressionName(expr: string): string | null {
+  if (/^count\s*\(\s*\*\s*\)$/i.test(expr)) return "count";
+  const m =
+    /^\w+\s*\(\s*(?:distinct\s+)?(?:\w+\.)?(\w+)\s*\)$/i.exec(expr) ?? /^(?:\w+\.)?(\w+)$/.exec(expr);
+  return m ? m[1].replace(/_/g, " ") : null;
+}
+
+// ---------------------------------------------------------------------------
+// y axis ticks: readable on a phone (2026-11-18). Integers when every value
+// is an integer (a count never shows 0.5), short units (1.2k, 3.4M), at
+// most two decimals, "%" when the widget title or the field says percent,
+// and an axis just wide enough for its longest label so none is cut off.
+// ---------------------------------------------------------------------------
+
+const PERCENT_FIELD = /(^|_)(pct|percent|percentage)($|_)/i;
+
+/** True when the widget's title or the field name says the value is a percent. */
+export function isPercent(title: string | undefined, field: string | undefined): boolean {
+  return /%/.test(title ?? "") || PERCENT_FIELD.test(field ?? "");
+}
+
+/** One y tick: 0, 35, 1.5, 0.25, 1.2k, 3.4M, 12%. */
+export function axisNumber(v: unknown, percent = false): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v ?? "");
+  const a = Math.abs(n);
+  const trim = (x: number, d: number) => String(Number(x.toFixed(d)));
+  let out: string;
+  if (a >= 1e9) out = `${trim(n / 1e9, 1)}B`;
+  else if (a >= 1e6) out = `${trim(n / 1e6, 1)}M`;
+  else if (a >= 1e3) out = `${trim(n / 1e3, a >= 1e4 ? 0 : 1)}k`;
+  else if (a === 0 || a >= 0.01) out = trim(n, 2);
+  else out = String(Number(n.toPrecision(2)));
+  if (/e/i.test(out)) out = n.toFixed(4).replace(/\.?0+$/, "");
+  return percent ? `${out}%` : out;
+}
+
+/**
+ * The props every chart's YAxis takes from the values it draws. A ratio
+ * (all values within 0..1) on a percent axis is shown times 100.
+ */
+export function yAxisProps(values: number[], percent: boolean) {
+  const finite = values.filter(Number.isFinite);
+  const integers = finite.length > 0 && finite.every(Number.isInteger);
+  const ratio = percent && finite.length > 0 && !integers && finite.every((v) => v >= 0 && v <= 1);
+  const fmt = (v: unknown) => axisNumber(ratio ? Number(v) * 100 : v, percent);
+  const max = finite.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  // Recharts rounds the top tick up; size for a label a little past max.
+  const longest = Math.max(fmt(max).length, fmt(max * 1.25).length, fmt(-max).length * (finite.some((v) => v < 0) ? 1 : 0), 1);
+  return {
+    allowDecimals: !integers,
+    tickFormatter: fmt,
+    width: Math.min(64, Math.max(28, Math.ceil(longest * 6.2 + 10))),
+  };
+}
+
+// breakable lets a table cell wrap after "/", "-", "_" and ".", and
+// inside a token longer than 12 characters (a hash or an ID), so paths and
+// IDs fit a phone row while words such as SUCCEEDED stay whole. A table
+// that still does not fit scrolls sideways in its widget.
+function breakable(text: string): React.ReactNode {
+  const parts = text.split(/(?<=[/\-_.])/);
+  if (parts.length === 1 && text.length <= 12) return text;
+  return parts.map((p, i) => (
+    <Fragment key={i}>
+      {p.length > 12 ? <span className="[overflow-wrap:anywhere]">{p}</span> : p}
+      {i < parts.length - 1 && <wbr />}
+    </Fragment>
+  ));
 }
 
 // compactNumber formats an axis tick so a wide value fits a narrow axis:

@@ -3768,13 +3768,68 @@ def _tables_schema():
     ])
 
 
+def _table_wide_counts(spark, table_id: str, version: int) -> tuple[int | None, int | None, int | None]:
+    """The whole table at its latest version: (file_count, total_bytes,
+    row_count). Files and bytes come from `DESCRIBE DETAIL` (numFiles,
+    sizeInBytes); rows are the sum of `numRecords` in the live add
+    actions' stats, net of rows soft-deleted by deletion vectors, the same
+    count the Go reader takes from the log (delta.ReadTableState), so
+    local and cloud agree. row_count is None when any live file has no
+    numRecords stat, or when the snapshot is not at `version` (the commit
+    DESCRIBE HISTORY just returned). Log and checkpoint reads only, no
+    data-file scan.
+
+    Each part is best-effort: a failure leaves that number None.
+    """
+    files = size = rows = None
+    try:
+        detail = spark.sql(f"DESCRIBE DETAIL {table_id}").collect()[0]
+        files = int(detail["numFiles"]) if detail["numFiles"] is not None else None
+        size = int(detail["sizeInBytes"]) if detail["sizeInBytes"] is not None else None
+        location = detail["location"]
+    except Exception as e:  # noqa: BLE001
+        print(f"[clavesa] table state: DESCRIBE DETAIL {table_id}: {e}", file=sys.stderr)
+        return files, size, rows
+    try:
+        from pyspark.sql import DataFrame  # noqa: PLC0415
+        from pyspark.sql import functions as F  # noqa: PLC0415
+
+        jvm = spark.sparkContext._jvm
+        log = jvm.org.apache.spark.sql.delta.DeltaLog.forTable(spark._jsparkSession, location)
+        snapshot = log.unsafeVolatileSnapshot()
+        if int(snapshot.version()) != version:
+            print(
+                f"[clavesa] table state: {table_id} snapshot at {snapshot.version()}, want {version}; row count unknown",
+                file=sys.stderr,
+            )
+            return files, size, rows
+        live = DataFrame(snapshot.allFiles().toDF(), spark)
+        has_dv = "deletionVector" in live.columns
+        n = F.get_json_object(F.col("stats"), "$.numRecords").cast("long")
+        agg = live.agg(
+            F.count(F.lit(1)).alias("files"),
+            F.count(n).alias("with_stats"),
+            F.sum(n).alias("records"),
+            (F.sum(F.coalesce(F.col("deletionVector.cardinality"), F.lit(0))) if has_dv else F.lit(0)).alias("deleted"),
+        ).collect()[0]
+        if agg["files"] == 0:
+            rows = 0
+        elif agg["with_stats"] == agg["files"]:
+            rows = int(agg["records"]) - int(agg["deleted"] or 0)
+    except Exception as e:  # noqa: BLE001
+        print(f"[clavesa] table state: row count of {table_id}: {e}", file=sys.stderr)
+    return files, size, rows
+
+
 def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | None:
-    """Append one row to <pipeline>.tables describing the latest commit of
-    `table_id`. Called after every Delta-mode output write.
+    """Append one row to <pipeline>.tables describing `table_id` after the
+    latest commit. Called after every Delta-mode output write.
 
     Reads Delta's `DESCRIBE HISTORY` for version + timestamp +
-    operationMetrics + userMetadata. Cheap (transaction-log read, no
-    data-file scan).
+    operationMetrics + userMetadata, and `_table_wide_counts` for the
+    file count, bytes and row count of the whole table (not of the last
+    commit: a table rewritten by one run showed "1 file"). Cheap
+    (transaction-log reads, no data-file scan).
 
     Returns the latest commit's added-records count (or None if metrics
     didn't carry it) so the caller can accumulate output_rows across all
@@ -3826,20 +3881,13 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
     #     `numTargetBytesRemoved`. There is no single
     #     "current row count of the table" in metrics — that's a
     #     full-table query, not a commit metric.
-    # For the row_count column we therefore report the rows touched by
-    # the latest commit, not the table-wide count. (v1.x's Iceberg
-    # `total-records` summary key WAS a table-wide count, but the
-    # Iceberg/Delta semantics diverge here; we accept the change.)
+    # So the tables row does not take its counts from the metrics: they
+    # describe the last commit. file_count, total_bytes and row_count are
+    # the whole table's (_table_wide_counts); the metrics only feed the
+    # net-rows return value below (node_runs.output_rows, rows this run
+    # wrote).
     operation = snap["operation"] or ""
-    if "MERGE" in operation.upper():
-        # Touched rows = inserted + updated + deleted post-image side.
-        touched = (
-            (_metric("numTargetRowsInserted") or 0)
-            + (_metric("numTargetRowsUpdated") or 0)
-        )
-        row_count_val: int | None = touched if touched else None
-    else:
-        row_count_val = _metric("numOutputRows")
+    file_count, total_bytes, row_count_val = _table_wide_counts(spark, table_ident, int(snap["version"]))
 
     row = {
         "pipeline": pipeline,
@@ -3850,8 +3898,8 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
         "snapshot_id": int(snap["version"]),
         "snapshot_ts": snap["timestamp"],
         "row_count": row_count_val,
-        "file_count": _metric("numFiles") or _metric("numTargetFilesAdded"),
-        "total_bytes": _metric("numOutputBytes") or _metric("numTargetBytesAdded"),
+        "file_count": file_count,
+        "total_bytes": total_bytes,
         "last_writer_run_id": run_id,
     }
 

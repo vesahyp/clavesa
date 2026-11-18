@@ -1,7 +1,10 @@
 /**
  * Workspaces — the root page of a multi-workspace or hosted server
- * (ADR-032 section 1, page 1). One card per workspace, problems first:
- * failing, then needs attention, then healthy, then by name. A workspace
+ * (ADR-032 section 1, page 1). One card per workspace, under a Local and
+ * a Cloud heading (Vesa, 2026-11-18: the page "should diff between local
+ * and cloud workspaces better"). The group with the worst card comes
+ * first (Local on a tie); inside a group, problems first: failing, then
+ * needs attention, then healthy, then by name. A workspace
  * whose summary fails sorts with the failing ones and shows an error
  * card; one still loading sorts last and shows a skeleton.
  *
@@ -21,8 +24,8 @@ import { useMemo } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 
-import { RootHeader, RootNav, hasStats } from "@/components/RootNav";
-import { WorkspaceCard } from "@/components/WorkspaceCard";
+import { RootHeader, RootNav, hasSiteNav } from "@/components/RootNav";
+import { WorkspaceCard, workspaceKind } from "@/components/WorkspaceCard";
 import { WorkspaceSummary, requestParsed, useWorkspaces } from "@/lib/queries";
 import { STATUS_RANK, cardStatus } from "@/lib/summary";
 
@@ -64,9 +67,15 @@ export function Workspaces() {
       if ((!stored[i] && summaries[i].error) || !data) return STATUS_RANK.fail;
       return STATUS_RANK[cardStatus(data, Date.now(), list[i]).status];
     };
-    return list
+    const cards = list
       .map((ws, i) => ({ ws, i, r: rank(i) }))
       .sort((a, b) => a.r - b.r || a.ws.name.localeCompare(b.ws.name));
+    const groups = (["local", "cloud"] as const)
+      .map((kind) => ({ kind, cards: cards.filter((c) => workspaceKind(c.ws, summaryOf(c.i)) === kind) }))
+      .filter((g) => g.cards.length > 0);
+    // Stable sort: Local stays first unless Cloud holds a worse card.
+    return groups.sort((a, b) => a.cards[0].r - b.cards[0].r);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [list, stored, summaries]);
 
   // "1 needs attention · 9 healthy": the answer before the first card.
@@ -96,7 +105,7 @@ export function Workspaces() {
         className={
           "mx-auto grid max-w-5xl grid-cols-1 gap-2 px-4 py-3 md:grid-cols-2 md:gap-3 md:px-6 md:py-6 " +
           // Room for RootNav below md (hosted), else for the home indicator.
-          (hasStats
+          (hasSiteNav
             ? "pb-[calc(4.75rem+env(safe-area-inset-bottom))] md:pb-6"
             : "pb-[calc(1rem+env(safe-area-inset-bottom))]")
         }
@@ -140,14 +149,33 @@ export function Workspaces() {
             ))}
           </p>
         )}
-        {ordered.map(({ ws, i }) => (
-          <WorkspaceCard
-            key={ws.slug}
-            entry={ws}
-            summary={summaryOf(i)}
-            error={errorOf(i)}
-            isLoading={loadingOf(i)}
-          />
+        {ordered.map((g) => (
+          <section
+            key={g.kind}
+            data-testid="workspaces-group"
+            data-kind={g.kind}
+            aria-labelledby={`workspaces-group-${g.kind}`}
+            className="grid grid-cols-1 gap-2 md:col-span-2 md:grid-cols-2 md:gap-3"
+          >
+            <h2
+              id={`workspaces-group-${g.kind}`}
+              className="mt-2 text-sm font-semibold md:col-span-2"
+            >
+              {g.kind === "local" ? "Local" : "Cloud"}{" "}
+              <span className="font-normal text-muted-foreground">
+                {g.kind === "local" ? "· runs on a Mac" : "· runs in AWS"} · {g.cards.length}
+              </span>
+            </h2>
+            {g.cards.map(({ ws, i }) => (
+              <WorkspaceCard
+                key={ws.slug}
+                entry={ws}
+                summary={summaryOf(i)}
+                error={errorOf(i)}
+                isLoading={loadingOf(i)}
+              />
+            ))}
+          </section>
         ))}
       </main>
       <RootNav />

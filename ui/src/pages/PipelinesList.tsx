@@ -301,9 +301,9 @@ export function PipelinesList() {
                 data-testid="pipeline-card"
                 data-pipeline={p.dir}
               >
-                <CardContent className="flex items-center gap-3 p-4">
+                <CardContent className="flex flex-wrap items-center gap-3 p-4">
                   <Workflow className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-                  <div className="min-w-0 flex-1">
+                  <div className="min-w-0 flex-1 basis-40">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono font-medium">
                         <Highlight text={p.name} query={q} />

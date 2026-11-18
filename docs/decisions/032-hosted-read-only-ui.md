@@ -2,7 +2,7 @@
 adr: 32
 title: A hosted, read-only clavesa UI at ui.clavesa.dev shows every workspace on the phone, from the same Go handlers and React pages as clavesa ui
 date: 2026-11-15
-status: Accepted; section 1 superseded by 033
+status: Accepted; section 1 superseded by 033; "every signed-in user sees every workspace" (section 2) superseded by 035
 deciders: Vesa
 ---
 
@@ -395,3 +395,7 @@ Section 1 (the four pages, and "Catalog, Query, Notebooks, Sources,
 Credentials, Runner, Bundles and the DAG editor are not in the hosted
 navigation") is superseded by ADR-033: the hosted UI is the local UI
 minus writes. The rest of this ADR stays.
+
+Later the same day: the registry note "every signed-in user sees every
+workspace" is superseded by ADR-035 (per-workspace viewers by Cognito
+group).

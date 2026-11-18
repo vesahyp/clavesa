@@ -12,6 +12,23 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.10] — 2026-11-18
+
+### Fixed
+
+- **Helper containers whose owner process died are removed.** Every metastore and warm worker carries the process that started it; when that process is gone (killed, timed out, out of memory) and nothing else of the workspace uses the container, the hourly orphan reap removes it, and so does the start of every CLI test run. A metastore kept warm on purpose (`--keep-metastore`, `CLAVESA_KEEP_METASTORE=1`) is never reaped this way.
+
+- **A table's file count, size and row count are the whole table's, local and cloud.** In the cloud the runner wrote the last commit's numbers into the `tables` row, so a table appended to many times showed "1 file" and the last run's rows, and the small-files check judged that. The runner now records `DESCRIBE DETAIL` (numFiles, sizeInBytes) and the sum of the live files' `numRecords` (net of deletion vectors; empty when a file has no stats). The local catalog row counts rows the same way (it took the last commit's added rows). Rows a run wrote stay on the run (`node_runs.output_rows`). Older `tables` rows keep their old numbers until the table's next run.
+
+### Changed
+
+- **Dashboards on a phone: one widget per row, readable y axes.** Below 640 px every widget takes the full row, whatever the dashboard JSON layout says; stat tiles stay two per row. Y-axis ticks are integers when every value is an integer (a count never shows 0.5), use short units (1.2k, 3.4M) and at most two decimals, carry "%" when the widget title or field says percent, and the axis is as wide as its longest label. Stat tiles show "%" the same way and no "1 row" badge. Table text wraps, so a number column is no longer cut off at the edge. Legends never say "y": a series aliased y, x, value, line or bar is named from the expression behind it in the dataset SQL (`SUM(p.page_views) AS y` → "page views"). On a two-axis chart each axis is drawn in its series' colour. Lines are straight between points, and a line widget with fewer than 8 points draws as bars. `make ui-dashboard-shots` takes iPhone shots of every widget and checks these.
+- **The Workspaces page groups the workspaces under Local and Cloud.** Each card says where it runs: `Local` and its folder (`clavesa ui --workspaces`; the hosted UI never sends a path, so its local cards have no such line), or `Cloud` and its AWS account and region. The group that holds the worst card comes first; inside a group, problems first as before.
+
+### Security
+
+- **Per-workspace viewers in the hosted UI (ADR-035).** A signed-in user sees only the workspaces they are a viewer of, by Cognito group (`all`, or `ws-<name>` per workspace); any other workspace answers 404 as if it did not exist, and a user in no group sees nothing. `make hosted-viewer EMAIL=<address> WS=<name>|all` sets it. Sign-in is unchanged (the SSM allowlist).
+
 ## [v2.27.9] — 2026-11-17
 
 ### Security

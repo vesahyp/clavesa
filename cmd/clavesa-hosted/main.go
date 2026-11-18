@@ -54,6 +54,8 @@ func main() {
 	opener := hosted.NewWorkspaces(cfg, root)
 	opener.Store = store
 	srv := hosted.NewServer(reg, wk, store, opener)
+	// Per-workspace viewers (ADR-035): the Lambda always checks groups.
+	srv.RequireViewer = true
 	srv.Stats = store
 	lambda.StartWithOptions(srv.Invoke, lambda.WithContext(ctx))
 }
