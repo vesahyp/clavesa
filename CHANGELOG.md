@@ -12,6 +12,16 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.12] — 2026-11-19
+
+### Fixed
+
+- **`pipeline run --compute local` on a cloud warehouse fails when a node fails.** The runner in the local docker container reports a failed node in its result instead of raising, and the CLI did not read it: the run printed `Status: SUCCEEDED`, exited 0 and wrote a SUCCEEDED run marker, while the failed node's Delta files could be in S3 with no Glue table and the nodes after it never ran. The run now exits non-zero with `pipeline failed at node "<node>": <error>`, and the run page shows it as failed at that node. The UI's cloud-local runs get the same fix.
+
+### Changed
+
+- **`pipeline reset` help: rebuild a large cloud pipeline with `pipeline run --compute local`**, which has no 15-minute Lambda limit.
+
 ## [v2.27.11] — 2026-11-18
 
 ### Fixed

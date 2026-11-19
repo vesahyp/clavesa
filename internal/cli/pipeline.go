@@ -483,6 +483,12 @@ In local mode this deletes warehouse table directories and watermark
 files; in cloud mode it deletes the S3 warehouse prefixes, the Glue
 catalog entries, and the S3 watermark objects.
 
+On a cloud warehouse, rebuild a large pipeline after a reset with
+'pipeline run --compute local': the whole replay runs in the local
+docker runner against the cloud warehouse, with no 15-minute Lambda
+limit and the Docker VM's memory. A deployed Lambda run that reaches
+its limit fails at the node that was running.
+
 ` + pipelineDirHelp,
 		Args: cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {

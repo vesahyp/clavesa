@@ -201,6 +201,16 @@ func (s *Service) executeCloudLocalRun(ctx context.Context, prep *cloudLocalRunP
 	// aggregate result; the Go side no longer feeds a per-node `_event`
 	// stream. Pass onEvent=nil and capture the final response for the runs row.
 	res, dispErr := s.cloudLocalDispatch(ctx, prep.lambdaEnv, nil, prep.event, nil)
+	if dispErr == nil && res != nil {
+		// The runner raises on a failed node only inside Lambda; in this
+		// docker container it returns {"status":"failed"} and exits 0. Read
+		// it, or a run whose node failed after writing its files (web-traffic
+		// gold, 2026-11-18: Delta files in S3, no Glue table) says SUCCEEDED.
+		if node, class, msg, failed := bundleFailure(res.Response); failed {
+			prep.outcome.markFailed(node, class, msg)
+			dispErr = fmt.Errorf("pipeline failed at node %q: %s: %s", node, class, msg)
+		}
+	}
 	prep.outcome.finish(dispErr)
 
 	// Terminal run-level marker → the SAME S3 bucket the runner PUT its
@@ -213,9 +223,44 @@ func (s *Service) executeCloudLocalRun(ctx context.Context, prep *cloudLocalRunP
 	if res != nil {
 		resp = res.Response
 	}
-	s.recordCloudLocalRun(ctx, prep.lambdaEnv, prep.pipelineDir, prep.outcome, resp)
+	recordCloudLocalRow(s, ctx, prep.lambdaEnv, prep.pipelineDir, prep.outcome, resp)
 
 	return dispErr
+}
+
+// recordCloudLocalRow writes the terminal runs row; a var so tests of the
+// cloud-local run path need no docker.
+var recordCloudLocalRow = (*Service).recordCloudLocalRun
+
+// bundleFailure reads a `_pipeline_run` response: failed is true when the
+// runner's overall status is "failed", with the failed node and that node's
+// error class and message from its transforms[] record. Pure, so the
+// false-SUCCEEDED guard is unit-testable without docker.
+func bundleFailure(resp map[string]any) (node, errClass, errMsg string, failed bool) {
+	if status, _ := resp["status"].(string); status != "failed" {
+		return "", "", "", false
+	}
+	node, _ = resp["failed_node"].(string)
+	errClass, errMsg = "PipelineFailed", "no error message"
+	if ts, ok := resp["transforms"].([]any); ok {
+		for _, raw := range ts {
+			rec, _ := raw.(map[string]any)
+			if rec == nil || rec["status"] != "failed" || (node != "" && rec["node"] != node) {
+				continue
+			}
+			if node == "" {
+				node, _ = rec["node"].(string)
+			}
+			if c, _ := rec["error_class"].(string); c != "" {
+				errClass = c
+			}
+			if m, _ := rec["error_msg"].(string); m != "" {
+				errMsg = truncate(m, 4096)
+			}
+			break
+		}
+	}
+	return node, errClass, errMsg, true
 }
 
 // buildPipelineRunEvent assembles the `_pipeline_run` bundle event the deployed

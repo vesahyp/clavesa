@@ -1,8 +1,14 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/vesahyp/clavesa/internal/observability"
 )
 
 func TestBuildPipelineRunEvent(t *testing.T) {
@@ -116,4 +122,71 @@ func TestAllTransformsFromDefinition(t *testing.T) {
 			t.Fatal("expected a parse error")
 		}
 	})
+}
+
+// TestExecuteCloudLocalRunFailedNode: the runner in the --compute local docker
+// container returns {"status":"failed"} and exits 0 when a node fails (it
+// raises only inside Lambda). web-traffic gold, 2026-11-18: fact_events wrote
+// its Delta files, failed before its Glue table existed, and the CLI said
+// SUCCEEDED. The run must fail, and its _run.json marker must say FAILED at
+// that node.
+func TestExecuteCloudLocalRunFailedNode(t *testing.T) {
+	orig := recordCloudLocalRow
+	recordCloudLocalRow = func(*Service, context.Context, map[string]string, string, *runOutcome, map[string]any) {}
+	t.Cleanup(func() { recordCloudLocalRow = orig })
+
+	cases := []struct {
+		name       string
+		resp       string
+		wantErr    bool
+		wantStatus string
+	}{
+		{"failed node", `{"status":"failed","failed_node":"fact_events","transforms":[` +
+			`{"node":"fact_events","status":"failed","error_class":"AnalysisException","error_msg":"create table denied"}]}`,
+			true, "FAILED"},
+		{"failed node, no record", `{"status":"failed","failed_node":"fact_events","transforms":[]}`, true, "FAILED"},
+		{"ok", `{"status":"ok","failed_node":null,"transforms":[{"node":"fact_events","status":"ok"}]}`, false, "SUCCEEDED"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(t.TempDir())
+			s.cloudLocalDispatch = func(context.Context, map[string]string, map[string]string, any, func(map[string]any)) (*cloudLocalResult, error) {
+				var resp map[string]any
+				if err := json.Unmarshal([]byte(tc.resp), &resp); err != nil {
+					t.Fatal(err)
+				}
+				return &cloudLocalResult{Response: resp, RawResponse: []byte(tc.resp)}, nil
+			}
+			whDir := t.TempDir()
+			prep := &cloudLocalRunPrep{
+				runID:       "local-test",
+				pipelineDir: filepath.Join(t.TempDir(), "gold"),
+				lambdaEnv:   map[string]string{},
+				event:       map[string]any{},
+				outcome:     newRunOutcome("local-test", "gold", "manual"),
+				store:       observability.NewFileProgressStore(whDir),
+			}
+			err := s.executeCloudLocalRun(context.Background(), prep)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want error %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), `"fact_events"`) {
+				t.Errorf("error does not name the failed node: %v", err)
+			}
+			raw, rerr := os.ReadFile(filepath.Join(whDir, "_progress", "local-test", "_run.json"))
+			if rerr != nil {
+				t.Fatalf("read _run.json: %v", rerr)
+			}
+			var m observability.RunMarker
+			if err := json.Unmarshal(raw, &m); err != nil {
+				t.Fatal(err)
+			}
+			if m.Status != tc.wantStatus {
+				t.Errorf("_run.json status = %q, want %q", m.Status, tc.wantStatus)
+			}
+			if tc.wantErr && m.FailedStep != "fact_events" {
+				t.Errorf("_run.json failed_step = %q, want fact_events", m.FailedStep)
+			}
+		})
+	}
 }
