@@ -7,16 +7,16 @@
  * new widget types in JSON doesn't break old UI builds.
  */
 
-import { Fragment, useMemo } from "react";
+import { Fragment, useId, useMemo } from "react";
 import {
+  Area,
+  AreaChart,
   BarChart,
   Bar,
   CartesianGrid,
   Cell,
   ComposedChart,
-  Legend,
   Line,
-  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -44,6 +44,22 @@ import {
   type DashboardQueryResult,
 } from "@/lib/queries";
 import { formatRowCount } from "@/lib/format";
+import { cn } from "@/lib/utils";
+
+import {
+  ChartTooltip,
+  CURSOR_FILL,
+  CURSOR_STROKE,
+  gridProps,
+  OTHER_COLOR,
+  SERIES_PALETTE,
+  SURFACE,
+  ToggleLegend,
+  useHiddenSeries,
+  xAxisStyle,
+  yAxisStyle,
+  type LegendItem,
+} from "./chartKit";
 
 import { WidgetShell } from "./WidgetShell";
 import { WorldMap } from "./WorldMap";
@@ -228,10 +244,8 @@ function BigNumberBody({ widget, data }: WidgetBodyProps) {
   const raw = data.rows[0]?.[valueIdx] ?? "";
   if (raw === "") {
     return (
-      <div className="flex flex-1 items-center justify-center p-6">
-        <span className="font-mono text-4xl font-semibold text-muted-foreground">
-          —
-        </span>
+      <div className="flex flex-1 items-end px-4 pb-4">
+        <span className="text-3xl font-semibold text-muted-foreground">—</span>
       </div>
     );
   }
@@ -242,12 +256,17 @@ function BigNumberBody({ widget, data }: WidgetBodyProps) {
   const display = compactNumber(raw) + pct;
   const exact = formatNumber(raw) + pct;
   const stat = (
-    <span className="font-mono text-3xl font-semibold tabular-nums tracking-tight md:text-4xl">
+    <span
+      className="text-[1.75rem] font-semibold leading-none tracking-tight text-foreground tabular-nums md:text-4xl"
+      data-testid="stat-value"
+    >
       {display}
     </span>
   );
+  // Left-aligned at the foot of the tile, under its label: a row of tiles
+  // reads as one line of numbers.
   return (
-    <div className="flex flex-1 items-center justify-center p-6">
+    <div className="flex flex-1 items-end px-4 pb-4 pt-1">
       {display === exact ? (
         stat
       ) : (
@@ -255,9 +274,7 @@ function BigNumberBody({ widget, data }: WidgetBodyProps) {
           <TooltipTrigger asChild>
             <span className="cursor-default">{stat}</span>
           </TooltipTrigger>
-          <TooltipContent className="font-mono tabular-nums">
-            {exact}
-          </TooltipContent>
+          <TooltipContent className="tabular-nums">{exact}</TooltipContent>
         </UITooltip>
       )}
     </div>
@@ -268,8 +285,12 @@ function BigNumberBody({ widget, data }: WidgetBodyProps) {
 // line — time-series-ish; x is whatever the user picks (timestamp, ordinal)
 // ---------------------------------------------------------------------------
 
+// A line with more points than this draws no dot per point (a row of
+// dots on 90 days is noise); the hovered point still gets one.
+const DOTS_UP_TO = 31;
+
 function LineBody({ widget, data, sql }: WidgetBodyProps) {
-  const primary = usePrimaryColor();
+  const gradientId = `area-${useId().replace(/:/g, "")}`;
   const xIdx = pickColumn(data, widget.x_field, 0);
   const yIdx = pickColumn(data, widget.y_field, 1);
   if (xIdx < 0 || yIdx < 0) return <NoFieldsHint />;
@@ -281,46 +302,43 @@ function LineBody({ widget, data, sql }: WidgetBodyProps) {
   // here; non-numeric rows render as gaps, no error. `name` on the series
   // is the real column name, so the tooltip reads `trips: 42` not `y: 42`.
   const yName = seriesLabel(data.columns[yIdx]?.name ?? "", sql, widget.title);
-  const xName = data.columns[xIdx]?.name || "x";
+  const color = SERIES_PALETTE[0];
   const points = data.rows.map((row) => ({
     x: row[xIdx],
     y: Number(row[yIdx]),
   }));
+  // One series: no legend (the title names it), nothing to turn off.
   return (
-    <ChartFrame pointCount={points.length}>
-      <LineChart data={points} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
-        <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
-        <XAxis
-          dataKey="x"
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
-          minTickGap={24}
-        />
+    <ChartFrame pointCount={points.length} seriesTotal={1} seriesVisible={1}>
+      <AreaChart data={points} margin={{ top: 8, right: 36, left: 0, bottom: 0 }}>
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity={0.28} />
+            <stop offset="100%" stopColor={color} stopOpacity={0.02} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid {...gridProps} />
+        <XAxis dataKey="x" {...xAxisStyle} minTickGap={24} />
         <YAxis
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
+          {...yAxisStyle}
           {...yAxisProps(points.map((p) => p.y), isPercent(widget.title, yName))}
         />
         <Tooltip
-          {...tooltipBase}
-          cursor={{ stroke: "rgb(255 255 255 / 0.25)" }}
-          formatter={(v) => formatNumber(v)}
-          labelFormatter={(label) => `${xName}: ${label}`}
+          cursor={{ stroke: CURSOR_STROKE, strokeDasharray: "3 3" }}
+          content={(p) => <ChartTooltip {...p} format={formatNumber} />}
         />
-        <Line
+        <Area
           type="linear"
           dataKey="y"
           name={yName}
-          stroke={primary}
-          strokeWidth={1.5}
-          dot={{ r: 2, fill: primary }}
+          stroke={color}
+          strokeWidth={2}
+          fill={`url(#${gradientId})`}
+          dot={points.length <= DOTS_UP_TO ? { r: 2.5, fill: color, strokeWidth: 0 } : false}
+          activeDot={{ r: 4.5, fill: color, stroke: SURFACE, strokeWidth: 2 }}
           isAnimationActive={false}
         />
-      </LineChart>
+      </AreaChart>
     </ChartFrame>
   );
 }
@@ -330,42 +348,36 @@ function LineBody({ widget, data, sql }: WidgetBodyProps) {
 // ---------------------------------------------------------------------------
 
 function BarBody({ widget, data, sql }: WidgetBodyProps) {
-  const primary = usePrimaryColor();
   const xIdx = pickColumn(data, widget.x_field, 0);
   const yIdx = pickColumn(data, widget.y_field, 1);
   if (xIdx < 0 || yIdx < 0) return <NoFieldsHint />;
 
   const yName = seriesLabel(data.columns[yIdx]?.name ?? "", sql, widget.title);
-  const xName = data.columns[xIdx]?.name || "x";
   const bars = data.rows.map((row) => ({
     x: row[xIdx],
     y: Number(row[yIdx]),
   }));
   return (
-    <ChartFrame pointCount={bars.length}>
-      <BarChart data={bars} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
-        <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
-        <XAxis
-          dataKey="x"
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
-        />
+    <ChartFrame pointCount={bars.length} seriesTotal={1} seriesVisible={1}>
+      <BarChart data={bars} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+        <CartesianGrid {...gridProps} />
+        <XAxis dataKey="x" {...xAxisStyle} />
         <YAxis
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
+          {...yAxisStyle}
           {...yAxisProps(bars.map((b) => b.y), isPercent(widget.title, yName))}
         />
         <Tooltip
-          {...tooltipBase}
-          cursor={{ fill: "rgb(255 255 255 / 0.06)" }}
-          formatter={(v) => formatNumber(v)}
-          labelFormatter={(label) => `${xName}: ${label}`}
+          cursor={{ fill: CURSOR_FILL }}
+          content={(p) => <ChartTooltip {...p} format={formatNumber} />}
         />
-        <Bar dataKey="y" name={yName} fill={primary} isAnimationActive={false} />
+        <Bar
+          dataKey="y"
+          name={yName}
+          fill={SERIES_PALETTE[0]}
+          radius={[4, 4, 0, 0]}
+          maxBarSize={56}
+          isAnimationActive={false}
+        />
       </BarChart>
     </ChartFrame>
   );
@@ -375,39 +387,25 @@ function BarBody({ widget, data, sql }: WidgetBodyProps) {
 // stacked_bar — several value columns stacked per x
 // ---------------------------------------------------------------------------
 
-// SERIES_PALETTE colors the segments of a stacked bar / the line of a
-// combo. Recharts needs literal colors (it writes SVG fill/stroke
-// attributes, which don't resolve CSS var()), so these are fixed and
-// chosen to stay distinct on the dark theme.
-const SERIES_PALETTE = [
-  "#3b82f6", // blue
-  "#f59e0b", // amber
-  "#10b981", // emerald
-  "#ef4444", // red
-  "#a855f7", // purple
-  "#06b6d4", // cyan
-  "#ec4899", // pink
-  "#84cc16", // lime
-];
-
 // StackedBarBody stacks the chosen value columns into one bar per x.
 // Wide format: the SQL returns one row per x with a column per series
 // (`SELECT cat, SUM(a), SUM(b), SUM(c) GROUP BY cat`). With no series
-// columns picked it stacks every column except x.
+// columns picked it stacks every column except x. The legend turns a
+// series off; the others keep their colours.
 function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
   const xIdx = pickColumn(data, widget.x_field, 0);
-  if (xIdx < 0) return <NoFieldsHint />;
-
   const chosen = widget.series_fields.filter((s) =>
     data.columns.some((c) => c.name === s),
   );
   const seriesNames =
-    chosen.length > 0
-      ? chosen
-      : data.columns.map((c) => c.name).filter((_, i) => i !== xIdx);
-  if (seriesNames.length === 0) return <NoFieldsHint />;
+    xIdx < 0
+      ? []
+      : chosen.length > 0
+        ? chosen
+        : data.columns.map((c) => c.name).filter((_, i) => i !== xIdx);
+  const { hidden, toggle } = useHiddenSeries(seriesNames);
+  if (xIdx < 0 || seriesNames.length === 0) return <NoFieldsHint />;
 
-  const xName = data.columns[xIdx]?.name || "x";
   const points = data.rows.map((row) => {
     const rec: Record<string, string | number> = { __x: row[xIdx] };
     for (const s of seriesNames) {
@@ -416,47 +414,54 @@ function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
     }
     return rec;
   });
+  const shown = seriesNames.filter((s) => !hidden.has(s));
+  const top = shown[shown.length - 1];
+  const items: LegendItem[] = seriesNames.map((s, i) => ({
+    key: s,
+    label: seriesLabel(s, sql, s),
+    color: SERIES_PALETTE[i % SERIES_PALETTE.length],
+  }));
 
   return (
-    <ChartFrame pointCount={points.length}>
-      <BarChart data={points} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
-        <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
-        <XAxis
-          dataKey="__x"
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
-        />
-        <YAxis
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
-          {...yAxisProps(
-            points.flatMap((p) => seriesNames.map((n) => Number(p[n]))),
-            isPercent(widget.title, seriesNames.length === 1 ? seriesNames[0] : ""),
-          )}
-        />
-        <Tooltip
-          {...tooltipBase}
-          cursor={{ fill: "rgb(255 255 255 / 0.06)" }}
-          formatter={(v) => formatNumber(v)}
-          labelFormatter={(label) => `${xName}: ${label}`}
-        />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
-        {seriesNames.map((s, i) => (
-          <Bar
-            key={s}
-            dataKey={s}
-            name={seriesLabel(s, sql, s)}
-            stackId="a"
-            fill={SERIES_PALETTE[i % SERIES_PALETTE.length]}
-            isAnimationActive={false}
+    <>
+      <ChartFrame
+        pointCount={points.length}
+        seriesTotal={seriesNames.length}
+        seriesVisible={shown.length}
+      >
+        <BarChart data={points} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+          <CartesianGrid {...gridProps} />
+          <XAxis dataKey="__x" {...xAxisStyle} />
+          <YAxis
+            {...yAxisStyle}
+            {...yAxisProps(
+              points.map((p) => shown.reduce((sum, n) => sum + (Number(p[n]) || 0), 0)),
+              isPercent(widget.title, seriesNames.length === 1 ? seriesNames[0] : ""),
+            )}
           />
-        ))}
-      </BarChart>
-    </ChartFrame>
+          <Tooltip
+            cursor={{ fill: CURSOR_FILL }}
+            content={(p) => <ChartTooltip {...p} format={formatNumber} />}
+          />
+          {seriesNames.map((s, i) => (
+            <Bar
+              key={s}
+              dataKey={s}
+              name={items[i].label}
+              stackId="a"
+              hide={hidden.has(s)}
+              fill={items[i].color}
+              stroke={SURFACE}
+              strokeWidth={1}
+              radius={s === top ? [4, 4, 0, 0] : 0}
+              maxBarSize={56}
+              isAnimationActive={false}
+            />
+          ))}
+        </BarChart>
+      </ChartFrame>
+      <ToggleLegend items={items} hidden={hidden} onToggle={toggle} />
+    </>
   );
 }
 
@@ -477,6 +482,39 @@ interface PieBodyProps extends WidgetBodyProps {
 function PieBody({ widget, data, variant }: PieBodyProps) {
   const nameIdx = pickColumn(data, widget.x_field, 0);
   const valueIdx = pickColumn(data, widget.value_field, 1);
+
+  // Numeric-coerce values; drop rows whose value isn't a number (Recharts
+  // would draw zero-sized slices for them). Top-N by value; the long tail
+  // folds into "Other", in grey so the eye reads it as the rest. Each
+  // slice's colour is fixed here, before any is turned off, so a slice
+  // keeps its colour when another one goes.
+  const slices = useMemo(() => {
+    if (nameIdx < 0 || valueIdx < 0) return [];
+    const all = data.rows
+      .map((row) => ({
+        name: String(row[nameIdx] ?? ""),
+        value: Number(row[valueIdx]),
+      }))
+      .filter((p) => Number.isFinite(p.value) && p.value > 0)
+      .sort((a, b) => b.value - a.value);
+    let list = all;
+    if (all.length > PIE_MAX_SLICES) {
+      const otherValue = all
+        .slice(PIE_MAX_SLICES)
+        .reduce((s, p) => s + p.value, 0);
+      list = [...all.slice(0, PIE_MAX_SLICES), { name: "Other", value: otherValue }];
+    }
+    return list.map((s, i) => ({
+      ...s,
+      key: `${i}:${s.name}`,
+      color:
+        s.name === "Other" && i === PIE_MAX_SLICES
+          ? OTHER_COLOR
+          : SERIES_PALETTE[i % SERIES_PALETTE.length],
+    }));
+  }, [data, nameIdx, valueIdx]);
+  const { hidden, toggle } = useHiddenSeries(slices.map((s) => s.key));
+
   if (nameIdx < 0 || valueIdx < 0) {
     return (
       <div className="flex flex-1 items-center justify-center p-4 text-xs text-muted-foreground">
@@ -484,16 +522,7 @@ function PieBody({ widget, data, variant }: PieBodyProps) {
       </div>
     );
   }
-
-  // Numeric-coerce values; drop rows whose value isn't a number (Recharts
-  // would draw zero-sized slices for them).
-  const all = data.rows
-    .map((row) => ({
-      name: String(row[nameIdx] ?? ""),
-      value: Number(row[valueIdx]),
-    }))
-    .filter((p) => Number.isFinite(p.value) && p.value > 0);
-  if (all.length === 0) {
+  if (slices.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center p-4 text-xs text-muted-foreground">
         No positive values to chart
@@ -501,54 +530,66 @@ function PieBody({ widget, data, variant }: PieBodyProps) {
     );
   }
 
-  // Top-N by value; collapse the long tail into "Other" so the chart
-  // stays legible. The "Other" slice is rendered in muted gray so the
-  // eye treats it as a residual, not another category.
-  const sorted = [...all].sort((a, b) => b.value - a.value);
-  let slices = sorted;
-  if (sorted.length > PIE_MAX_SLICES) {
-    const top = sorted.slice(0, PIE_MAX_SLICES);
-    const otherValue = sorted
-      .slice(PIE_MAX_SLICES)
-      .reduce((s, p) => s + p.value, 0);
-    slices = [...top, { name: "Other", value: otherValue }];
-  }
-
-  const innerRadius = variant === "donut" ? "55%" : 0;
-  const outerRadius = "80%";
-  const OTHER_COLOR = "rgb(120 120 120)";
+  const shown = slices.filter((s) => !hidden.has(s.key));
+  const total = shown.reduce((sum, s) => sum + s.value, 0);
+  const share = (v: number) => {
+    const p = total > 0 ? (v / total) * 100 : 0;
+    return `${p >= 10 || p === 0 ? Math.round(p) : p.toFixed(1)}%`;
+  };
+  const items: LegendItem[] = slices.map((s) => ({
+    key: s.key,
+    label: s.name || "(blank)",
+    color: s.color,
+    detail: hidden.has(s.key) ? undefined : share(s.value),
+  }));
+  const donut = variant === "donut";
+  const pct = isPercent(widget.title, data.columns[valueIdx]?.name) ? "%" : "";
 
   return (
-    <ChartFrame>
-      <PieChart>
-        <Pie
-          data={slices}
-          dataKey="value"
-          nameKey="name"
-          innerRadius={innerRadius}
-          outerRadius={outerRadius}
-          isAnimationActive={false}
-          stroke="rgb(20 20 22)"
-          strokeWidth={1}
-        >
-          {slices.map((s, i) => (
-            <Cell
-              key={`${s.name}-${i}`}
-              fill={
-                s.name === "Other"
-                  ? OTHER_COLOR
-                  : SERIES_PALETTE[i % SERIES_PALETTE.length]
-              }
-            />
-          ))}
-        </Pie>
-        <Tooltip
-          {...tooltipBase}
-          formatter={(v: unknown) => formatNumber(v)}
-        />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
-      </PieChart>
-    </ChartFrame>
+    <>
+      <ChartFrame seriesTotal={slices.length} seriesVisible={shown.length}>
+        <PieChart>
+          <Pie
+            data={shown}
+            dataKey="value"
+            nameKey="name"
+            innerRadius={donut ? "62%" : 0}
+            outerRadius="88%"
+            paddingAngle={donut && shown.length > 1 ? 1.5 : 0}
+            cornerRadius={donut ? 3 : 0}
+            isAnimationActive={false}
+            stroke={SURFACE}
+            strokeWidth={donut ? 0 : 2}
+          >
+            {shown.map((s) => (
+              <Cell key={s.key} fill={s.color} />
+            ))}
+          </Pie>
+          <Tooltip
+            content={(p) => (
+              <ChartTooltip
+                {...p}
+                label={null}
+                format={formatNumber}
+                extra={(e) => share(Number(e.value))}
+              />
+            )}
+          />
+        </PieChart>
+        {donut && (
+          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+            <span className="text-lg font-semibold leading-tight tabular-nums text-foreground md:text-xl">
+              {compactNumber(total)}
+              {pct}
+            </span>
+            <span className="text-[11px] text-muted-foreground">
+              {hidden.size > 0 ? "shown" : "total"}
+            </span>
+          </div>
+        )}
+      </ChartFrame>
+      <ToggleLegend items={items} hidden={hidden} onToggle={toggle} />
+    </>
   );
 }
 
@@ -557,81 +598,85 @@ function PieBody({ widget, data, variant }: PieBodyProps) {
 // ---------------------------------------------------------------------------
 
 function BarLineBody({ widget, data, sql }: WidgetBodyProps) {
-  const primary = usePrimaryColor();
   const xIdx = pickColumn(data, widget.x_field, 0);
   const barIdx = pickColumn(data, widget.y_field, 1);
   const lineIdx = pickColumn(data, widget.line_field, 2);
+  const { hidden, toggle } = useHiddenSeries(["bar", "line"]);
   if (xIdx < 0 || barIdx < 0 || lineIdx < 0) return <NoFieldsHint />;
 
   const barName = seriesLabel(data.columns[barIdx]?.name ?? "", sql, "bars");
   const lineName = seriesLabel(data.columns[lineIdx]?.name ?? "", sql, "line");
-  const xName = data.columns[xIdx]?.name || "x";
+  const barColor = SERIES_PALETTE[0];
   const lineColor = SERIES_PALETTE[1];
   const points = data.rows.map((row) => ({
     x: row[xIdx],
     bar: Number(row[barIdx]),
     line: Number(row[lineIdx]),
   }));
+  const barOff = hidden.has("bar");
+  const lineOff = hidden.has("line");
+  const items: LegendItem[] = [
+    { key: "bar", label: barName, color: barColor },
+    { key: "line", label: lineName, color: lineColor },
+  ];
 
   return (
-    <ChartFrame pointCount={points.length}>
-      <ComposedChart
-        data={points}
-        margin={{ top: 8, right: 8, left: 4, bottom: 4 }}
+    <>
+      <ChartFrame
+        pointCount={points.length}
+        seriesTotal={2}
+        seriesVisible={2 - hidden.size}
       >
-        <CartesianGrid stroke="rgb(255 255 255 / 0.06)" vertical={false} />
-        <XAxis
-          dataKey="x"
-          tick={{ fill: "currentColor", fontSize: 10 }}
-          stroke="currentColor"
-          tickLine={false}
-          axisLine={false}
-          minTickGap={24}
-        />
-        <YAxis
-          yAxisId="bar"
-          // Each axis in its series' colour, so it is clear which is which.
-          tick={{ fill: primary, fontSize: 10 }}
-          stroke={primary}
-          tickLine={false}
-          axisLine={false}
-          {...yAxisProps(points.map((p) => p.bar), isPercent(widget.title, barName))}
-        />
-        <YAxis
-          yAxisId="line"
-          orientation="right"
-          tick={{ fill: lineColor, fontSize: 10 }}
-          stroke={lineColor}
-          tickLine={false}
-          axisLine={false}
-          {...yAxisProps(points.map((p) => p.line), isPercent("", lineName))}
-        />
-        <Tooltip
-          {...tooltipBase}
-          cursor={{ fill: "rgb(255 255 255 / 0.06)" }}
-          formatter={(v) => formatNumber(v)}
-          labelFormatter={(label) => `${xName}: ${label}`}
-        />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
-        <Bar
-          yAxisId="bar"
-          dataKey="bar"
-          name={barName}
-          fill={primary}
-          isAnimationActive={false}
-        />
-        <Line
-          yAxisId="line"
-          type="linear"
-          dataKey="line"
-          name={lineName}
-          stroke={lineColor}
-          strokeWidth={1.5}
-          dot={{ r: 2, fill: lineColor }}
-          isAnimationActive={false}
-        />
-      </ComposedChart>
-    </ChartFrame>
+        <ComposedChart data={points} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
+          <CartesianGrid {...gridProps} />
+          <XAxis dataKey="x" {...xAxisStyle} minTickGap={24} />
+          <YAxis
+            yAxisId="bar"
+            hide={barOff}
+            {...yAxisStyle}
+            // Each axis in its series' colour, so it is clear which is which.
+            tick={{ fill: barColor, fontSize: 11 }}
+            {...yAxisProps(points.map((p) => p.bar), isPercent(widget.title, barName))}
+          />
+          <YAxis
+            yAxisId="line"
+            orientation="right"
+            hide={lineOff}
+            {...yAxisStyle}
+            tick={{ fill: lineColor, fontSize: 11 }}
+            {...yAxisProps(points.map((p) => p.line), isPercent("", lineName))}
+          />
+          <Tooltip
+            cursor={{ fill: CURSOR_FILL }}
+            content={(p) => <ChartTooltip {...p} format={formatNumber} />}
+          />
+          <Bar
+            yAxisId="bar"
+            dataKey="bar"
+            name={barName}
+            hide={barOff}
+            fill={barColor}
+            fillOpacity={0.9}
+            radius={[4, 4, 0, 0]}
+            maxBarSize={48}
+            isAnimationActive={false}
+          />
+          <Line
+            yAxisId="line"
+            type="linear"
+            dataKey="line"
+            name={lineName}
+            hide={lineOff}
+            stroke={lineColor}
+            strokeWidth={2}
+            dot={points.length <= DOTS_UP_TO ? { r: 2.5, fill: lineColor, strokeWidth: 0 } : false}
+            activeDot={{ r: 4.5, fill: lineColor, stroke: SURFACE, strokeWidth: 2 }}
+            isAnimationActive={false}
+          />
+        </ComposedChart>
+      </ChartFrame>
+      <ToggleLegend items={items} hidden={hidden} onToggle={toggle} />
+    </>
   );
 }
 
@@ -643,14 +688,35 @@ interface TableBodyProps {
   data: DashboardQueryResult;
 }
 
+const isNumberCell = (cell: unknown) =>
+  String(cell ?? "").trim() !== "" && Number.isFinite(Number(cell));
+
 function TableBody2({ data }: TableBodyProps) {
+  // A column whose filled cells are all numbers is right-aligned, header
+  // included, so its digits line up.
+  const numeric = data.columns.map((_, j) => {
+    let seen = false;
+    for (const row of data.rows) {
+      const c = row[j];
+      if (c === "" || c == null) continue;
+      if (!isNumberCell(c)) return false;
+      seen = true;
+    }
+    return seen;
+  });
   return (
-    <div className="flex-1 overflow-auto">
+    <div className="flex-1 overflow-auto px-1 pb-1">
       <Table>
         <TableHeader className="sticky top-0 z-10 bg-card">
-          <TableRow className="hover:bg-transparent">
-            {data.columns.map((c) => (
-              <TableHead key={c.name} className="whitespace-normal font-mono text-xs">
+          <TableRow className="border-white/[0.06] hover:bg-transparent">
+            {data.columns.map((c, j) => (
+              <TableHead
+                key={c.name}
+                className={cn(
+                  "h-9 whitespace-normal text-xs font-medium text-muted-foreground",
+                  numeric[j] && "text-right",
+                )}
+              >
                 {breakable(c.name)}
               </TableHead>
             ))}
@@ -658,16 +724,20 @@ function TableBody2({ data }: TableBodyProps) {
         </TableHeader>
         <TableBody>
           {data.rows.map((row, i) => (
-            <TableRow key={i} data-testid="recent-runs-row">
+            <TableRow
+              key={i}
+              data-testid="recent-runs-row"
+              className="border-white/[0.05] hover:bg-white/[0.03]"
+            >
               {row.map((cell, j) => (
                 // Numbers stay on one line; text wraps, so on a phone the
                 // table fits its row and no number is hidden off the edge.
                 <TableCell
                   key={j}
                   className={
-                    String(cell ?? "").trim() !== "" && Number.isFinite(Number(cell))
-                      ? "whitespace-nowrap font-mono text-xs tabular-nums"
-                      : "whitespace-normal font-mono text-xs"
+                    isNumberCell(cell)
+                      ? cn("whitespace-nowrap py-2 text-xs tabular-nums text-foreground", numeric[j] && "text-right")
+                      : "whitespace-normal py-2 text-xs text-foreground/85"
                   }
                 >
                   {cell === "" || cell == null ? (
@@ -688,22 +758,6 @@ function TableBody2({ data }: TableBodyProps) {
 // ---------------------------------------------------------------------------
 // Shared bits
 // ---------------------------------------------------------------------------
-
-// usePrimaryColor resolves the theme's `--primary` token to a literal
-// color string. Recharts writes `fill` / `stroke` as SVG presentation
-// attributes, and those do not resolve CSS `var()` — passing
-// `hsl(var(--primary))` (or any `var()`) leaves a bar default-black and a
-// line with no stroke at all. getComputedStyle gives the resolved value
-// (an `oklch(...)` literal here), which is a valid SVG attribute color.
-function usePrimaryColor(): string {
-  return useMemo(() => {
-    if (typeof document === "undefined") return "#2563eb"; // blue-600 fallback
-    const v = getComputedStyle(document.documentElement)
-      .getPropertyValue("--primary")
-      .trim();
-    return v || "#2563eb";
-  }, []);
-}
 
 // ---------------------------------------------------------------------------
 // Series names (2026-11-18): a legend never says "y". A column called y, x,
@@ -804,7 +858,7 @@ export function yAxisProps(values: number[], percent: boolean) {
   return {
     allowDecimals: !integers,
     tickFormatter: fmt,
-    width: Math.min(64, Math.max(28, Math.ceil(longest * 6.2 + 10))),
+    width: Math.min(68, Math.max(30, Math.ceil(longest * 6.8 + 10))),
   };
 }
 
@@ -845,39 +899,35 @@ function formatNumber(v: unknown): string {
     : s;
 }
 
-// tooltipBase styles the recharts tooltip for the dark theme. The default
-// tooltip box is white with black text; contentStyle + labelStyle fix
-// that. The hover `cursor` (white by default — a bright block behind the
-// hovered bar) is set per chart by the caller.
-const tooltipBase = {
-  contentStyle: {
-    background: "rgb(20 20 22)",
-    border: "1px solid rgb(255 255 255 / 0.1)",
-    borderRadius: 6,
-    fontSize: 12,
-  },
-  labelStyle: { color: "rgb(255 255 255 / 0.55)" },
-};
-
 // `pointCount` stamps the container with data-point-count so automated
 // walkthroughs (verify-readme.sh) can assert "chart has N points" without
-// counting recharts SVG internals, which are brittle.
+// counting recharts SVG internals, which are brittle. data-series-total and
+// data-series-visible say how many series the chart has and how many are
+// on, for the legend checks in dashboard-phone-shots.
 function ChartFrame({
   children,
   pointCount,
+  seriesTotal,
+  seriesVisible,
 }: {
-  children: React.ReactElement;
+  children: React.ReactNode;
   pointCount?: number;
+  seriesTotal?: number;
+  seriesVisible?: number;
 }) {
+  const [chart, ...overlay] = Array.isArray(children) ? children : [children];
   return (
     <div
-      className="flex-1 px-2 pb-2 text-muted-foreground"
+      className="relative min-h-0 flex-1 px-2 pb-2 text-muted-foreground [font-variant-numeric:tabular-nums]"
       data-testid="widget-chart"
       data-point-count={pointCount}
+      data-series-total={seriesTotal}
+      data-series-visible={seriesVisible}
     >
       <ResponsiveContainer width="100%" height="100%">
-        {children}
+        {chart as React.ReactElement}
       </ResponsiveContainer>
+      {overlay}
     </div>
   );
 }

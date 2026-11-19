@@ -112,3 +112,18 @@
 [data-testid="pipeline-graph"] .react-flow__controls-button:hover {
   background: var(--muted);
 }
+
+/*
+ * Dashboard widgets rise into place once, when the card mounts. Not for
+ * anyone who asked the system for less motion.
+ */
+@keyframes widget-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.widget-rise {
+  animation: widget-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .widget-rise { animation: none; }
+}

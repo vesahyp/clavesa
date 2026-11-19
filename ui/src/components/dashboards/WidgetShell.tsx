@@ -1,15 +1,19 @@
 /**
  * WidgetShell — common card frame for every dashboard widget.
  *
- * Owns the loading skeleton, error state, and empty state so individual
- * widget components can focus on their viz. The shell sets the grid
+ * Owns the loading skeleton (shaped like the widget: bars, a ring, rows or
+ * a number), the error state and the empty state, so individual widget
+ * components can focus on their viz. The shell sets the grid
  * placement from the widget's layout (1-indexed CSS-grid lines, since
  * the JSON layout uses 0-indexed coordinates this component translates).
  */
 
 import { ReactNode } from "react";
 import { useIsNarrow, useIsPhone } from "@/hooks/useIsPhone";
-import { FileWarning } from "lucide-react";
+import { Inbox, TriangleAlert } from "lucide-react";
+
+import { cn } from "@/lib/utils";
+import { WidgetSkeleton } from "./chartKit";
 
 import {
   Card,
@@ -17,7 +21,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
 
 interface WidgetShellProps {
   title: string;
@@ -83,50 +86,73 @@ export function WidgetShell({
           gridColumn: `${layout.x + 1} / span ${layout.w}`,
           gridRow: `${layout.y + 1} / span ${layout.h}`,
         };
+  const tile = type === "big_number";
   return (
     <Card
       style={style}
-      className={
-        inGrid ? "flex h-full w-full flex-col" : "flex min-w-0 flex-col"
-      }
+      className={cn(
+        "widget-rise rounded-xl border-white/[0.08] shadow-none",
+        "bg-[linear-gradient(180deg,rgb(255_255_255/0.025),transparent_40%)] bg-card",
+        inGrid ? "flex h-full w-full flex-col" : "flex min-w-0 flex-col",
+      )}
       data-testid="dashboard-widget"
       data-widget-title={title}
       data-widget-type={type}
     >
-      <CardHeader className="flex flex-row items-center justify-between gap-3 pb-3">
-        <CardTitle className="text-sm font-medium text-foreground">
+      <CardHeader
+        className={cn(
+          "flex flex-row items-baseline justify-between gap-3 space-y-0 px-4 pt-3.5",
+          tile ? "pb-1" : "pb-2",
+        )}
+      >
+        <CardTitle
+          className={cn(
+            "min-w-0 font-medium leading-snug tracking-normal",
+            tile ? "text-xs text-muted-foreground" : "text-[13px] text-foreground/90",
+          )}
+        >
           {title}
         </CardTitle>
         {headerExtra && (
-          <div className="text-xs text-muted-foreground">{headerExtra}</div>
-        )}
-      </CardHeader>
-      <CardContent className="flex flex-1 flex-col p-0">
-        {isLoading && (
-          <div className="space-y-2 p-6">
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-3/4" />
-            <Skeleton className="h-4 w-2/3" />
+          <div className="flex-shrink-0 whitespace-nowrap text-[11px] tabular-nums text-muted-foreground/70">
+            {headerExtra}
           </div>
         )}
+      </CardHeader>
+      <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+        {isLoading && <WidgetSkeleton type={type} />}
         {error != null && (
-          <div className="m-4 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
-            <FileWarning className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-destructive" />
+          <div className="mx-4 mb-4 flex items-start gap-2.5 rounded-lg border border-destructive/30 bg-destructive/[0.07] p-3 text-xs">
+            <TriangleAlert className="mt-0.5 h-4 w-4 flex-shrink-0 text-destructive" />
             <div className="min-w-0">
               <div className="font-medium text-destructive">Query failed</div>
-              <p className="mt-0.5 break-words text-muted-foreground">
+              <p className="mt-1 line-clamp-6 break-words text-muted-foreground [overflow-wrap:anywhere]">
                 {error instanceof Error ? error.message : String(error)}
               </p>
             </div>
           </div>
         )}
         {!isLoading && !error && isEmpty && (
-          <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted-foreground">
-            No rows
+          <div
+            className={cn(
+              "flex flex-1 items-center gap-2.5 text-muted-foreground",
+              tile ? "px-4 pb-4" : "flex-col justify-center p-6 text-center",
+            )}
+            data-testid="widget-empty"
+          >
+            <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/[0.05]">
+              <Inbox className="h-4 w-4" />
+            </span>
+            <div>
+              <div className="text-xs font-medium text-foreground/80">No rows</div>
+              {!tile && (
+                <div className="mt-0.5 text-[11px]">Nothing in this range yet</div>
+              )}
+            </div>
           </div>
         )}
         {!isLoading && !error && !isEmpty && (
-          <div className="flex flex-1 flex-col">{children}</div>
+          <div className="flex min-h-0 flex-1 flex-col">{children}</div>
         )}
       </CardContent>
     </Card>

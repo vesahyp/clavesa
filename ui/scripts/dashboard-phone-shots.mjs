@@ -6,10 +6,15 @@
 // Run via `make ui-dashboard-shots`. It starts
 // `bin/clavesa ui --no-browser --workspaces <WS_DIR> --read-only` on a free
 // port (or uses BASE_URL), opens /w/<WS_NAME>/dashboards/<slug> for each
-// slug in DASHBOARDS, waits until no widget is loading, and writes
-//   .shots/dashboards/<slug>.png            the whole dashboard
-//   .shots/dashboards/<slug>/NN-<title>.png  each widget
-// (gitignored; emptied first).
+// slug in DASHBOARDS on an iPhone 16 and on a 1440 x 900 desktop, waits
+// until no widget is loading, and writes
+//   .shots/dashboards/<LABEL>/<view>/<slug>.png             the whole dashboard
+//   .shots/dashboards/<LABEL>/<view>/<slug>/NN-<title>.png   each widget
+//   .shots/dashboards/<LABEL>/<view>/<slug>/NN-<title>-off.png
+//        a chart with its first series turned off
+// where <view> is phone or desktop (gitignored; <LABEL> emptied first).
+// LABEL=before on the old build and LABEL=after on the new one give the
+// before and after shots of a change side by side.
 //
 // Checks, per widget (exit 1, one line per failure):
 //   - y axis: every chart with a y axis has at least two tick labels, none
@@ -22,11 +27,20 @@
 //     sideways, printed as a note);
 //   - legends name their series (never "y", "x", "value", "line", "bar");
 //   - lines are straight between points (no smoothing);
-//   - no horizontal scroll, no console error.
+//   - no horizontal scroll, no console error;
+//   - series can be turned off (Vesa, 2026-11-19: "Clavesa dashboard
+//     graphs dont allow deselecting things"): every chart with more than
+//     one series (stacked_bar, bar_line, pie, donut) has a legend of
+//     toggle buttons. A tap turns a series off (aria-pressed=false, the
+//     chart draws one series fewer), the last series left on cannot be
+//     turned off, and a second tap brings each one back. On the phone
+//     every legend button is at least 44 px tall.
 //
 // Env (all optional):
-//   WS_DIR      the workspaces directory (default ~/clavesa-workspaces)
+//   WS_DIR      the workspaces directory (default ~/Repositories/monorepo/analytics)
 //   WS_NAME     the workspace (default web-traffic)
+//   LABEL       the shots' folder under .shots/dashboards (default current)
+//   VIEWS       comma-separated, phone and/or desktop (default both)
 //   DASHBOARDS  comma-separated slugs (default heineli,heineli-technical)
 //   BASE_URL    a server that is already running
 //   WAIT_MS     how long a dashboard may load (default 240000)
@@ -41,15 +55,24 @@ import { homedir } from "node:os";
 const REPO = new URL("../../", import.meta.url).pathname;
 const env = (k, d) => process.env[k] || d;
 const BIN = env("CLAVESA_BIN", `${REPO}bin/clavesa`);
-const WS_DIR = env("WS_DIR", `${homedir()}/clavesa-workspaces`);
+const WS_DIR = env("WS_DIR", `${homedir()}/Repositories/monorepo/analytics`);
 const WS_NAME = env("WS_NAME", "web-traffic");
 const DASHBOARDS = env("DASHBOARDS", "heineli,heineli-technical").split(",").map((s) => s.trim()).filter(Boolean);
 const WAIT_MS = Number(env("WAIT_MS", "240000"));
 const NARROW = 640;
-const OUT = `${REPO}.shots/dashboards/`;
+const LABEL = env("LABEL", "current").replace(/[^a-zA-Z0-9_-]/g, "");
+const ROOT = `${REPO}.shots/dashboards/${LABEL}/`;
+const VIEWS = env("VIEWS", "phone,desktop").split(",").map((s) => s.trim()).filter(Boolean);
+// Chart types whose series a legend can turn off.
+const MULTI = new Set(["stacked_bar", "bar_line", "pie", "donut"]);
 
 const iphone = devices["iPhone 16"];
 if (!iphone) throw new Error('playwright has no "iPhone 16" device descriptor');
+const VIEWPORTS = {
+  phone: { ...iphone, colorScheme: "dark" },
+  desktop: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2, colorScheme: "dark" },
+};
+for (const v of VIEWS) if (!VIEWPORTS[v]) throw new Error(`unknown view "${v}" (phone, desktop)`);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -108,8 +131,7 @@ async function fitHeight(page) {
 const fileSafe = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 50) || "widget";
 
 const browser = await chromium.launch();
-rmSync(OUT, { recursive: true, force: true });
-mkdirSync(OUT, { recursive: true });
+rmSync(ROOT, { recursive: true, force: true });
 let BASE = process.env.BASE_URL?.replace(/\/$/, "");
 let ui = { kill() {} };
 if (BASE) console.log(`using the server at ${BASE}`);
@@ -123,7 +145,10 @@ process.on("exit", () => ui.kill());
 
 const failures = [];
 try {
-  const ctx = await browser.newContext({ ...iphone, colorScheme: "dark" });
+  for (const view of VIEWS) {
+  const OUT = `${ROOT}${view}/`;
+  mkdirSync(OUT, { recursive: true });
+  const ctx = await browser.newContext(VIEWPORTS[view]);
   for (const slug of DASHBOARDS) {
     const page = await ctx.newPage();
     const errors = [];
@@ -208,7 +233,7 @@ try {
       };
     }, NARROW);
 
-    const label = slug;
+    const label = `${view} ${slug}`;
     if (info.doc > info.vw) failures.push(`${label}: horizontal scroll (${info.doc} > ${info.vw})`);
     if (errors.length) failures.push(`${label}: ${errors.length} console error(s): ${errors.slice(0, 5).join(" | ")}`);
     console.log(`${label}: ${info.widgets.length} widgets at ${info.vw} px`);
@@ -254,7 +279,52 @@ try {
       const title = info.widgets[i]?.title ?? `widget-${i + 1}`;
       await els.nth(i).screenshot({ path: `${OUT}${slug}/${String(i + 1).padStart(2, "0")}-${fileSafe(title)}.png` });
     }
+
+    // Series on and off, per chart with more than one series.
+    for (let i = 0; i < count; i++) {
+      const w = info.widgets[i];
+      if (!w || !MULTI.has(w.type) || w.empty || w.failed) continue;
+      const n = String(i + 1).padStart(2, "0");
+      const name = `${label} ${n} "${w.title}"`;
+      const el = els.nth(i);
+      const items = el.locator('[data-testid="legend-item"]');
+      const k = await items.count();
+      if (k < 2) {
+        // A pie of one slice has nothing to turn off; anything else must.
+        const one = await el.locator(".recharts-pie-sector, .recharts-bar-rectangle, .recharts-line").count();
+        if (!(k === 1 && one <= 1)) failures.push(`${name}: series cannot be turned off (no toggle legend)`);
+        continue;
+      }
+      const frame = el.locator('[data-testid="widget-chart"]');
+      const visible = async () => Number(await frame.getAttribute("data-series-visible"));
+      const pressed = async (j) => (await items.nth(j).getAttribute("aria-pressed")) === "true";
+      const probs = [];
+      if (view === "phone") {
+        for (let j = 0; j < k; j++) {
+          const b = await items.nth(j).boundingBox();
+          if (b && b.height < 43.5) probs.push(`legend button ${j + 1} is ${Math.round(b.height)} px tall, under 44`);
+        }
+      }
+      if ((await visible()) !== k) probs.push(`chart says ${await visible()} series shown, legend has ${k}`);
+      await items.nth(0).click();
+      await sleep(250);
+      if (await pressed(0)) probs.push("first legend button still on after a tap");
+      if ((await visible()) !== k - 1) probs.push(`after one tap the chart shows ${await visible()} series, not ${k - 1}`);
+      await el.screenshot({ path: `${OUT}${slug}/${n}-${fileSafe(w.title)}-off.png` });
+      for (let j = 1; j < k - 1; j++) await items.nth(j).click();
+      await items.nth(k - 1).click({ force: true });
+      await sleep(250);
+      if (!(await pressed(k - 1))) probs.push("the last series left on was turned off");
+      if ((await visible()) !== 1) probs.push(`with all but one off the chart shows ${await visible()} series`);
+      for (let j = 0; j < k - 1; j++) await items.nth(j).click();
+      await sleep(250);
+      if ((await visible()) !== k) probs.push(`after turning all back on the chart shows ${await visible()} of ${k}`);
+      console.log(`  ${probs.length ? "FAIL" : "ok  "} ${n} legend: ${k} series turn off and on`);
+      for (const p of probs) failures.push(`${name}: ${p}`);
+    }
     await page.close();
+  }
+  await ctx.close();
   }
 } finally {
   await browser.close();
@@ -265,4 +335,4 @@ if (failures.length) {
   console.log(`\n${failures.length} problem(s):\n  ${failures.join("\n  ")}`);
   process.exit(1);
 }
-console.log(`\nAll dashboards pass. Shots in ${OUT}`);
+console.log(`\nAll dashboards pass. Shots in ${ROOT}`);

@@ -221,7 +221,7 @@ ui-new-pipeline-check: $(if $(SKIP_BUILD),,build) ## Editing UI: create a pipeli
 	cd ui && npx playwright install chromium
 	node ui/scripts/new-pipeline-check.mjs
 
-ui-dashboard-shots: build ## iPhone 16 shots of dashboards and of every widget, with y-axis, one-per-row and cut-text checks → .shots/dashboards/ (WS_DIR WS_NAME=web-traffic DASHBOARDS=heineli,heineli-technical; BASE_URL for a running server; AWS_PROFILE passes through)
+ui-dashboard-shots: build ## Shots of dashboards and of every widget on an iPhone 16 and a 1440 px desktop, with y-axis, one-per-row, cut-text and series on/off (legend) checks → .shots/dashboards/<LABEL>/{phone,desktop}/ (LABEL=before|after, VIEWS=phone,desktop, WS_DIR=~/Repositories/monorepo/analytics WS_NAME=web-traffic DASHBOARDS=heineli,heineli-technical; BASE_URL for a running server; AWS_PROFILE=webbaa for web-traffic)
 	cd ui && npx playwright install chromium
 	node ui/scripts/dashboard-phone-shots.mjs
 

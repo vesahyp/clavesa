@@ -238,7 +238,7 @@ export function Dashboard() {
                 </Card>
               ) : (
                 <div
-                  className="grid gap-4"
+                  className="grid gap-3 md:gap-4"
                   style={{
                     gridTemplateColumns: "repeat(12, minmax(0, 1fr))",
                     gridAutoRows: "minmax(80px, auto)",

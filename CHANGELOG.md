@@ -12,6 +12,16 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.13] — 2026-11-19
+
+### Added
+
+- **Dashboard charts: turn a series off and on.** Every chart with more than one series (stacked bar, bar + line, pie, donut) has a legend of buttons under it. A tap hides that series (its dot goes hollow and its name is struck through), a second tap brings it back, and the last series left on cannot be hidden. The other series keep their colours. A pie or donut recomputes its shares and its total from the slices shown. On a phone each legend button is 44 px tall.
+
+### Changed
+
+- **Dashboard widgets redrawn.** Rounded cards with a hairline border, quieter titles, stat tiles with the value large at the foot of the tile, charts with dashed horizontal gridlines, rounded bar tops, a shaded area under a single line, 11 px tabular axis labels and a hover card that lists each series with its colour dot. Donuts show their total in the middle and pies list each slice's share. Number columns in tables are right-aligned. Loading placeholders take the shape of the widget (bars, a ring, rows or a number), and an empty widget says "No rows" with an icon. A new colour-blind-safe series palette for the dark theme, in a fixed order. `make ui-dashboard-shots` takes the shots on a phone and a desktop, `LABEL=before` / `LABEL=after` side by side, and checks the series toggles.
+
 ## [v2.27.12] — 2026-11-19
 
 ### Fixed
