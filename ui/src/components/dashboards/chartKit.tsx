@@ -8,12 +8,15 @@
  * click. ToggleLegend is a row of real buttons (aria-pressed) under the
  * chart: a tap turns a series off (hollow dot, struck-through name), a
  * second tap brings it back, and the last series left on cannot be turned
- * off, so a chart never goes blank. On a phone each button is 44 px tall.
+ * off, so a chart never goes blank. On a touch screen (phone, tablet) each
+ * button is 44 px tall; only with a mouse or trackpad is it compact.
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useMemo, useState, useSyncExternalStore } from "react";
 
 import { cn } from "@/lib/utils";
+
+import { liveHidden, toggleHidden } from "./chartLogic";
 
 // SERIES_PALETTE: the categorical colours, in a fixed order, for the dark
 // card surface. The order is part of the colour-blind safety (every
@@ -48,6 +51,8 @@ export const xAxisStyle = {
   tickLine: false,
   axisLine: false,
   tickMargin: 8,
+  // Labels that would touch are dropped, never drawn over each other.
+  minTickGap: 16,
 } as const;
 
 /** Recharts props for a quiet y axis (the caller adds yAxisProps). */
@@ -58,6 +63,73 @@ export const yAxisStyle = {
   axisLine: false,
   tickMargin: 4,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Motion (Vesa, 2026-11-19: "I do like the animation changes of the
+// ecarbrowser graphs"). ecarbrowser's charts run on Recharts' own
+// defaults, so these are those defaults, written down so they stay put:
+// a line or area draws from left to right in 1.5 s, bars grow from the
+// axis in 0.4 s, both with the CSS "ease" curve, and new data (a control
+// change, a series turned off or on) moves the marks from where they are
+// to where they go in the same time. All of it is off for anyone whose
+// system asks for less motion (prefers-reduced-motion). ecarbrowser has
+// no pie: a pie takes the line's 1.5 s, with no start delay (Recharts'
+// 0.4 s pie delay makes a legend tap feel slow).
+//
+// Not Recharts' own isAnimationActive="auto": its Line reads "auto" as on
+// when it sets the stroke dash, so with reduced motion a line whose plot
+// got wider (an axis turned off) kept its old length and lost its end.
+// ---------------------------------------------------------------------------
+
+const REDUCE = "(prefers-reduced-motion: reduce)";
+
+function subscribeReduced(onChange: () => void) {
+  const mq = window.matchMedia?.(REDUCE);
+  mq?.addEventListener("change", onChange);
+  return () => mq?.removeEventListener("change", onChange);
+}
+
+/**
+ * Whether the widget is on screen now. Widget provides it from its card;
+ * with no card yet (a cached result drawn on mount) it says no.
+ */
+export const InViewContext = createContext<() => boolean>(() => true);
+
+/** True when the element overlaps the viewport. */
+export function inViewport(el: Element | null): boolean {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+}
+
+/**
+ * The Recharts animation props for each kind of mark. A chart animates
+ * only when it is on screen at the moment its data or its hidden series
+ * change (review 2026-11-19: all 35 heineli charts animated at once,
+ * most of them off screen); the others draw final. The answer is kept
+ * until the next such change: Recharts restarts the draw whenever
+ * isAnimationActive turns on, so it must not turn on just because a
+ * chart scrolled into view.
+ */
+export function useChartMotion(data: unknown, hidden?: unknown) {
+  const reduced = useSyncExternalStore(
+    subscribeReduced,
+    () => window.matchMedia?.(REDUCE).matches ?? false,
+    () => true,
+  );
+  const inView = useContext(InViewContext);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-read only on a change
+  const animate = useMemo(() => !reduced && inView(), [reduced, data, hidden]);
+  return useMemo(() => {
+    const line = {
+      isAnimationActive: animate,
+      animationBegin: 0,
+      animationDuration: 1500,
+      animationEasing: "ease",
+    } as const;
+    return { line, bar: { ...line, animationDuration: 400 }, pie: line };
+  }, [animate]);
+}
 
 /** Horizontal hairlines only, dashed. */
 export const gridProps = {
@@ -73,29 +145,19 @@ export const gridProps = {
 /**
  * The series a viewer turned off. toggle() refuses to turn off the last
  * series that is on. Keys that are no longer in `keys` (the data changed)
- * do not count.
+ * do not count, and when the hidden ones would be all of them, none do
+ * (chartLogic.liveHidden), so a chart never goes blank.
  */
 export function useHiddenSeries(keys: string[]) {
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
-  const keyList = keys.join("\u0000");
-  const live = useMemo(() => {
-    const ks = new Set(keyList.split("\u0000"));
-    return new Set([...hidden].filter((k) => ks.has(k)));
-  }, [hidden, keyList]);
+  const keyList = JSON.stringify(keys);
+  const live = useMemo(
+    () => liveHidden(hidden, JSON.parse(keyList) as string[]),
+    [hidden, keyList],
+  );
   const toggle = useCallback(
     (key: string) => {
-      setHidden((prev) => {
-        const next = new Set(prev);
-        if (next.has(key)) {
-          next.delete(key);
-          return next;
-        }
-        const ks = keyList.split("\u0000");
-        const on = ks.filter((k) => !next.has(k)).length;
-        if (on <= 1) return prev;
-        next.add(key);
-        return next;
-      });
+      setHidden((prev) => toggleHidden(prev, JSON.parse(keyList) as string[], key));
     },
     [keyList],
   );
@@ -149,7 +211,7 @@ export function ToggleLegend({
               if (!last) onToggle(it.key);
             }}
             className={cn(
-              "group flex min-h-11 max-w-full items-center outline-none md:min-h-0",
+              "group flex min-h-11 max-w-full items-center outline-none pointer-fine:min-h-0",
               last ? "cursor-default" : "cursor-pointer",
             )}
           >
@@ -207,8 +269,15 @@ interface ChartTooltipProps {
   label?: unknown;
   /** Formats each value. */
   format: (v: unknown) => string;
-  /** Shown under the value, e.g. a pie slice's share. */
+  /** Shown after the value, e.g. a pie slice's share. */
   extra?: (e: TooltipEntry) => string | undefined;
+  /** Writes the heading (the x value), e.g. a timestamp in local time. */
+  labelFormat?: (v: unknown) => string;
+  /**
+   * Series turned off. They stay drawn (at zero, or faded out) so they can
+   * animate out and back in, and are left out of the hover card here.
+   */
+  hidden?: Set<string>;
 }
 
 /**
@@ -222,9 +291,13 @@ export function ChartTooltip({
   label,
   format,
   extra,
+  labelFormat,
+  hidden,
 }: ChartTooltipProps) {
+  if (hidden && payload) payload = payload.filter((p) => !hidden.has(String(p.dataKey)));
   if (!active || !payload || payload.length === 0) return null;
-  const heading = label == null || label === "" ? null : String(label);
+  const heading =
+    label == null || label === "" ? null : labelFormat ? labelFormat(label) : String(label);
   return (
     <div
       className="min-w-[9rem] max-w-[16rem] rounded-lg border border-white/10 bg-popover/95 px-3 py-2 text-xs shadow-xl shadow-black/40 backdrop-blur-sm"

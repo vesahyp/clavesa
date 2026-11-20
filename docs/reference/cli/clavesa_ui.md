@@ -19,6 +19,15 @@ an account.
 the controls that change state. It also refuses the two read POSTs
 (the SQL query editor and dashboard widget queries).
 
+CLAVESA_ATHENA_OUTPUT=s3://<bucket>/<prefix>/ sends the results of every
+Athena query the UI runs to that prefix in place of
+s3://<pipeline bucket>/athena-results/. Use it when your role may read
+only its own prefix, so you never read other people's past results. The
+role needs s3:PutObject, GetObject, ListBucket and GetBucketLocation on
+that prefix. With --workspaces it applies to every workspace. A hosted
+tree copy keeps its workgroup's location, and its queries fail while the
+setting is set.
+
 Examples:
   clavesa ui
   clavesa ui --workspace /path/to/project

@@ -415,10 +415,16 @@ func TestResolveTimePreset(t *testing.T) {
 		wantSpan time.Duration
 	}{
 		// Canonical now-<n><unit> form (Slice E).
-		{"now-5m", 5 * time.Minute},
-		{"now-15m", 15 * time.Minute},
+		// Retired presets take the nearest one left; anything under an
+		// hour is an hour.
+		{"now-5m", time.Hour},
+		{"now-15m", time.Hour},
+		{"now-10m", time.Hour},
 		{"now-1h", time.Hour},
-		{"now-3h", 3 * time.Hour},
+		{"now-3h", time.Hour},
+		{"now-12h", 24 * time.Hour},
+		{"now-3d", 7 * 24 * time.Hour},
+		{"now-6h", 6 * time.Hour},
 		{"now-24h", 24 * time.Hour},
 		{"now-7d", 7 * 24 * time.Hour},
 		{"now-30d", 30 * 24 * time.Hour},
@@ -430,10 +436,10 @@ func TestResolveTimePreset(t *testing.T) {
 		{"last_7d", 7 * 24 * time.Hour},
 		{"last_30d", 30 * 24 * time.Hour},
 		{"last_90d", 90 * 24 * time.Hour},
-		// Empty + bogus fall back to 30d (don't crash a freshly-added
+		// Empty + bogus fall back to 7d (don't crash a freshly-added
 		// control whose Default the author hasn't set yet).
-		{"", 30 * 24 * time.Hour},
-		{"bogus", 30 * 24 * time.Hour},
+		{"", 7 * 24 * time.Hour},
+		{"bogus", 7 * 24 * time.Hour},
 	} {
 		t.Run(c.preset, func(t *testing.T) {
 			start, end := resolveTimePreset(c.preset, now)
@@ -476,7 +482,7 @@ func TestResolveControlDefaults(t *testing.T) {
 	}
 	t.Run("fills declared defaults when params are empty", func(t *testing.T) {
 		out := map[string]string{}
-		resolveControlDefaults(controls, out, now)
+		resolveControlDefaults(controls, nil, out, now)
 		if _, ok := out["tr.start"]; !ok {
 			t.Error("tr.start should be filled")
 		}
@@ -497,7 +503,7 @@ func TestResolveControlDefaults(t *testing.T) {
 			"tr.end":   "2025-02-01T00:00:00Z",
 			"site":     "globex",
 		}
-		resolveControlDefaults(controls, out, now)
+		resolveControlDefaults(controls, nil, out, now)
 		if out["tr.start"] != "2025-01-01T00:00:00Z" {
 			t.Errorf("explicit start overwritten: %q", out["tr.start"])
 		}

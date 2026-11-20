@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,10 +32,17 @@ import (
 // which the host cannot check; no such setup runs today.
 const ownerLabel = "clavesa.owner"
 
-// KeepMetastore is set by the CLI when the command keeps its metastore
+// keepMetastore is set by the CLI when the command keeps its metastore
 // warm (--keep-metastore or CLAVESA_KEEP_METASTORE): such a metastore has
-// no owner, so it outlives the process on purpose.
-var KeepMetastore bool
+// no owner, so it outlives the process on purpose. Atomic: the CLI's unit
+// tests run commands in parallel, each setting it.
+var keepMetastore atomic.Bool
+
+// SetKeepMetastore records whether this process keeps its metastore warm.
+func SetKeepMetastore(keep bool) { keepMetastore.Store(keep) }
+
+// KeepMetastore reports what SetKeepMetastore last recorded.
+func KeepMetastore() bool { return keepMetastore.Load() }
 
 var (
 	selfOwnerOnce sync.Once

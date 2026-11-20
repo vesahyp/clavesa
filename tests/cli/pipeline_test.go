@@ -42,7 +42,17 @@ func TestMain(m *testing.M) {
 		log.Fatalf("history dir: %v", err)
 	}
 	os.Setenv("CLAVESA_RUN_HISTORY_DIR", historyDir)
+	// `workspace init` / `use` record the current workspace in
+	// $XDG_CONFIG_HOME/clavesa/current-workspace. The binary inherits this
+	// environment, so point it at a temp dir: the suite never writes the
+	// developer's real ~/.config/clavesa/ (internal/cli/main_test.go).
+	xdgDir, err := os.MkdirTemp("", "clavesa-test-xdg-")
+	if err != nil {
+		log.Fatalf("xdg dir: %v", err)
+	}
+	os.Setenv("XDG_CONFIG_HOME", xdgDir)
 	code := m.Run()
+	os.RemoveAll(xdgDir)
 	os.RemoveAll(historyDir)
 	reapTestWorkspaceContainers()
 	os.Exit(code)

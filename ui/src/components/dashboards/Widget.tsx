@@ -7,7 +7,7 @@
  * new widget types in JSON doesn't break old UI builds.
  */
 
-import { Fragment, useId, useMemo } from "react";
+import { Fragment, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -44,6 +44,7 @@ import {
   type DashboardQueryResult,
 } from "@/lib/queries";
 import { formatRowCount } from "@/lib/format";
+import { useIsNarrow } from "@/hooks/useIsPhone";
 import { cn } from "@/lib/utils";
 
 import {
@@ -54,13 +55,17 @@ import {
   OTHER_COLOR,
   SERIES_PALETTE,
   SURFACE,
+  InViewContext,
+  inViewport,
   ToggleLegend,
+  useChartMotion,
   useHiddenSeries,
   xAxisStyle,
   yAxisStyle,
   type LegendItem,
 } from "./chartKit";
 
+import { isIdLike, pieSlices, xFormat } from "./chartLogic";
 import { WidgetShell } from "./WidgetShell";
 import { WorldMap } from "./WorldMap";
 
@@ -84,6 +89,8 @@ interface WidgetProps {
   params?: Record<string, string>;
   /** Rendered inside the editor's drag/resize grid — fills the cell. */
   inGrid?: boolean;
+  /** Place in reading order: the cards rise one after another. */
+  order?: number;
 }
 
 // Widget types we actually know how to render. Unknown types skip the
@@ -100,7 +107,10 @@ const KNOWN_TYPES = new Set([
   "world_map",
 ]);
 
-export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps) {
+export function Widget({ widget, sql, dir, params, inGrid = false, order = 0 }: WidgetProps) {
+  // The card, so a chart can ask whether it is on screen (useChartMotion).
+  const cardRef = useRef<HTMLDivElement>(null);
+  const inView = useCallback(() => inViewport(cardRef.current), []);
   const known = KNOWN_TYPES.has(widget.type);
   // A widget whose `dataset` doesn't resolve gets no SQL — surface that
   // as its own hint rather than firing an empty query.
@@ -163,9 +173,24 @@ export function Widget({ widget, sql, dir, params, inGrid = false }: WidgetProps
       isEmpty={isEmpty}
       headerExtra={headerExtra}
       inGrid={inGrid}
+      order={order}
+      cardRef={cardRef}
     >
       {data && data.rows.length > 0 && (
-        <WidgetBody widget={widget} data={data} sql={sql} />
+        // The previous result, shown while a control change runs: dimmed.
+        <div
+          className={cn(
+            "flex min-h-0 flex-1 flex-col transition-opacity duration-300 motion-reduce:transition-none",
+            query.isPlaceholderData && "opacity-50",
+          )}
+          aria-busy={query.isPlaceholderData || undefined}
+          data-stale={query.isPlaceholderData ? "" : undefined}
+          data-testid="widget-body"
+        >
+          <InViewContext.Provider value={inView}>
+            <WidgetBody widget={widget} data={data} sql={sql} />
+          </InViewContext.Provider>
+        </div>
       )}
     </WidgetShell>
   );
@@ -291,6 +316,7 @@ const DOTS_UP_TO = 31;
 
 function LineBody({ widget, data, sql }: WidgetBodyProps) {
   const gradientId = `area-${useId().replace(/:/g, "")}`;
+  const motion = useChartMotion(data);
   const xIdx = pickColumn(data, widget.x_field, 0);
   const yIdx = pickColumn(data, widget.y_field, 1);
   if (xIdx < 0 || yIdx < 0) return <NoFieldsHint />;
@@ -303,6 +329,7 @@ function LineBody({ widget, data, sql }: WidgetBodyProps) {
   // is the real column name, so the tooltip reads `trips: 42` not `y: 42`.
   const yName = seriesLabel(data.columns[yIdx]?.name ?? "", sql, widget.title);
   const color = SERIES_PALETTE[0];
+  const xf = xFormat(data.rows.map((row) => row[xIdx]));
   const points = data.rows.map((row) => ({
     x: row[xIdx],
     y: Number(row[yIdx]),
@@ -318,14 +345,14 @@ function LineBody({ widget, data, sql }: WidgetBodyProps) {
           </linearGradient>
         </defs>
         <CartesianGrid {...gridProps} />
-        <XAxis dataKey="x" {...xAxisStyle} minTickGap={24} />
+        <XAxis dataKey="x" {...xAxisStyle} tickFormatter={xf.tick} />
         <YAxis
           {...yAxisStyle}
           {...yAxisProps(points.map((p) => p.y), isPercent(widget.title, yName))}
         />
         <Tooltip
           cursor={{ stroke: CURSOR_STROKE, strokeDasharray: "3 3" }}
-          content={(p) => <ChartTooltip {...p} format={formatNumber} />}
+          content={(p) => <ChartTooltip {...p} format={formatNumber} labelFormat={xf.heading} />}
         />
         <Area
           type="linear"
@@ -336,7 +363,7 @@ function LineBody({ widget, data, sql }: WidgetBodyProps) {
           fill={`url(#${gradientId})`}
           dot={points.length <= DOTS_UP_TO ? { r: 2.5, fill: color, strokeWidth: 0 } : false}
           activeDot={{ r: 4.5, fill: color, stroke: SURFACE, strokeWidth: 2 }}
-          isAnimationActive={false}
+          {...motion.line}
         />
       </AreaChart>
     </ChartFrame>
@@ -348,27 +375,29 @@ function LineBody({ widget, data, sql }: WidgetBodyProps) {
 // ---------------------------------------------------------------------------
 
 function BarBody({ widget, data, sql }: WidgetBodyProps) {
+  const motion = useChartMotion(data);
   const xIdx = pickColumn(data, widget.x_field, 0);
   const yIdx = pickColumn(data, widget.y_field, 1);
   if (xIdx < 0 || yIdx < 0) return <NoFieldsHint />;
 
   const yName = seriesLabel(data.columns[yIdx]?.name ?? "", sql, widget.title);
+  const xf = xFormat(data.rows.map((row) => row[xIdx]));
   const bars = data.rows.map((row) => ({
     x: row[xIdx],
     y: Number(row[yIdx]),
   }));
   return (
     <ChartFrame pointCount={bars.length} seriesTotal={1} seriesVisible={1}>
-      <BarChart data={bars} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+      <BarChart data={bars} margin={{ top: 8, right: 36, left: 0, bottom: 0 }}>
         <CartesianGrid {...gridProps} />
-        <XAxis dataKey="x" {...xAxisStyle} />
+        <XAxis dataKey="x" {...xAxisStyle} tickFormatter={xf.tick} />
         <YAxis
           {...yAxisStyle}
           {...yAxisProps(bars.map((b) => b.y), isPercent(widget.title, yName))}
         />
         <Tooltip
           cursor={{ fill: CURSOR_FILL }}
-          content={(p) => <ChartTooltip {...p} format={formatNumber} />}
+          content={(p) => <ChartTooltip {...p} format={formatNumber} labelFormat={xf.heading} />}
         />
         <Bar
           dataKey="y"
@@ -376,7 +405,7 @@ function BarBody({ widget, data, sql }: WidgetBodyProps) {
           fill={SERIES_PALETTE[0]}
           radius={[4, 4, 0, 0]}
           maxBarSize={56}
-          isAnimationActive={false}
+          {...motion.bar}
         />
       </BarChart>
     </ChartFrame>
@@ -404,13 +433,17 @@ function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
         ? chosen
         : data.columns.map((c) => c.name).filter((_, i) => i !== xIdx);
   const { hidden, toggle } = useHiddenSeries(seriesNames);
+  const motion = useChartMotion(data, hidden);
   if (xIdx < 0 || seriesNames.length === 0) return <NoFieldsHint />;
 
+  const xf = xFormat(data.rows.map((row) => row[xIdx]));
+  // A series turned off stays in the stack at zero, so its bars shrink
+  // away and the ones above settle down (and grow back on), animated.
   const points = data.rows.map((row) => {
     const rec: Record<string, string | number> = { __x: row[xIdx] };
     for (const s of seriesNames) {
       const ci = data.columns.findIndex((c) => c.name === s);
-      rec[s] = Number(row[ci]);
+      rec[s] = hidden.has(s) ? 0 : Number(row[ci]);
     }
     return rec;
   });
@@ -429,9 +462,9 @@ function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
         seriesTotal={seriesNames.length}
         seriesVisible={shown.length}
       >
-        <BarChart data={points} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+        <BarChart data={points} margin={{ top: 8, right: 36, left: 0, bottom: 0 }}>
           <CartesianGrid {...gridProps} />
-          <XAxis dataKey="__x" {...xAxisStyle} />
+          <XAxis dataKey="__x" {...xAxisStyle} tickFormatter={xf.tick} />
           <YAxis
             {...yAxisStyle}
             {...yAxisProps(
@@ -441,7 +474,9 @@ function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
           />
           <Tooltip
             cursor={{ fill: CURSOR_FILL }}
-            content={(p) => <ChartTooltip {...p} format={formatNumber} />}
+            content={(p) => (
+              <ChartTooltip {...p} hidden={hidden} format={formatNumber} labelFormat={xf.heading} />
+            )}
           />
           {seriesNames.map((s, i) => (
             <Bar
@@ -449,13 +484,12 @@ function StackedBarBody({ widget, data, sql }: WidgetBodyProps) {
               dataKey={s}
               name={items[i].label}
               stackId="a"
-              hide={hidden.has(s)}
               fill={items[i].color}
               stroke={SURFACE}
               strokeWidth={1}
               radius={s === top ? [4, 4, 0, 0] : 0}
               maxBarSize={56}
-              isAnimationActive={false}
+              {...motion.bar}
             />
           ))}
         </BarChart>
@@ -490,30 +524,23 @@ function PieBody({ widget, data, variant }: PieBodyProps) {
   // keeps its colour when another one goes.
   const slices = useMemo(() => {
     if (nameIdx < 0 || valueIdx < 0) return [];
-    const all = data.rows
-      .map((row) => ({
+    // Same-name rows summed, the biggest first, the tail folded into a
+    // grey "Other". Keys are names and colours come from the names'
+    // alphabetical order (chartLogic.pieSlices), so a slice keeps its
+    // colour, and stays hidden, when the values change order.
+    return pieSlices(
+      data.rows.map((row) => ({
         name: String(row[nameIdx] ?? ""),
         value: Number(row[valueIdx]),
-      }))
-      .filter((p) => Number.isFinite(p.value) && p.value > 0)
-      .sort((a, b) => b.value - a.value);
-    let list = all;
-    if (all.length > PIE_MAX_SLICES) {
-      const otherValue = all
-        .slice(PIE_MAX_SLICES)
-        .reduce((s, p) => s + p.value, 0);
-      list = [...all.slice(0, PIE_MAX_SLICES), { name: "Other", value: otherValue }];
-    }
-    return list.map((s, i) => ({
+      })),
+      PIE_MAX_SLICES,
+    ).map((s) => ({
       ...s,
-      key: `${i}:${s.name}`,
-      color:
-        s.name === "Other" && i === PIE_MAX_SLICES
-          ? OTHER_COLOR
-          : SERIES_PALETTE[i % SERIES_PALETTE.length],
+      color: s.slot < 0 ? OTHER_COLOR : SERIES_PALETTE[s.slot % SERIES_PALETTE.length],
     }));
   }, [data, nameIdx, valueIdx]);
   const { hidden, toggle } = useHiddenSeries(slices.map((s) => s.key));
+  const motion = useChartMotion(data, hidden);
 
   if (nameIdx < 0 || valueIdx < 0) {
     return (
@@ -549,19 +576,21 @@ function PieBody({ widget, data, variant }: PieBodyProps) {
     <>
       <ChartFrame seriesTotal={slices.length} seriesVisible={shown.length}>
         <PieChart>
+          {/* Every slice stays in the pie; one turned off goes to zero, so
+              the others widen into its room and it grows back, animated. */}
           <Pie
-            data={shown}
+            data={slices.map((s) => (hidden.has(s.key) ? { ...s, value: 0 } : s))}
             dataKey="value"
             nameKey="name"
             innerRadius={donut ? "62%" : 0}
             outerRadius="88%"
             paddingAngle={donut && shown.length > 1 ? 1.5 : 0}
             cornerRadius={donut ? 3 : 0}
-            isAnimationActive={false}
+            {...motion.pie}
             stroke={SURFACE}
             strokeWidth={donut ? 0 : 2}
           >
-            {shown.map((s) => (
+            {slices.map((s) => (
               <Cell key={s.key} fill={s.color} />
             ))}
           </Pie>
@@ -602,19 +631,29 @@ function BarLineBody({ widget, data, sql }: WidgetBodyProps) {
   const barIdx = pickColumn(data, widget.y_field, 1);
   const lineIdx = pickColumn(data, widget.line_field, 2);
   const { hidden, toggle } = useHiddenSeries(["bar", "line"]);
+  const motion = useChartMotion(data, hidden);
+  // The line comes back drawn from the left, as on first show: a new key
+  // each time it is turned on mounts it fresh.
+  const lineShows = useRef({ off: false, n: 0 });
+  if (lineShows.current.off && !hidden.has("line")) lineShows.current.n++;
+  lineShows.current.off = hidden.has("line");
   if (xIdx < 0 || barIdx < 0 || lineIdx < 0) return <NoFieldsHint />;
 
   const barName = seriesLabel(data.columns[barIdx]?.name ?? "", sql, "bars");
   const lineName = seriesLabel(data.columns[lineIdx]?.name ?? "", sql, "line");
   const barColor = SERIES_PALETTE[0];
   const lineColor = SERIES_PALETTE[1];
-  const points = data.rows.map((row) => ({
-    x: row[xIdx],
-    bar: Number(row[barIdx]),
-    line: Number(row[lineIdx]),
-  }));
+  const xf = xFormat(data.rows.map((row) => row[xIdx]));
   const barOff = hidden.has("bar");
   const lineOff = hidden.has("line");
+  // Bars turned off go to zero (they shrink into the axis and grow back);
+  // the line turned off fades out where it is.
+  const points = data.rows.map((row) => ({
+    x: row[xIdx],
+    bar: barOff ? 0 : Number(row[barIdx]),
+    line: Number(row[lineIdx]),
+  }));
+  const barValues = data.rows.map((row) => Number(row[barIdx]));
   const items: LegendItem[] = [
     { key: "bar", label: barName, color: barColor },
     { key: "line", label: lineName, color: lineColor },
@@ -629,14 +668,14 @@ function BarLineBody({ widget, data, sql }: WidgetBodyProps) {
       >
         <ComposedChart data={points} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
           <CartesianGrid {...gridProps} />
-          <XAxis dataKey="x" {...xAxisStyle} minTickGap={24} />
+          <XAxis dataKey="x" {...xAxisStyle} tickFormatter={xf.tick} />
           <YAxis
             yAxisId="bar"
             hide={barOff}
             {...yAxisStyle}
             // Each axis in its series' colour, so it is clear which is which.
             tick={{ fill: barColor, fontSize: 11 }}
-            {...yAxisProps(points.map((p) => p.bar), isPercent(widget.title, barName))}
+            {...yAxisProps(barValues, isPercent(widget.title, barName))}
           />
           <YAxis
             yAxisId="line"
@@ -648,30 +687,32 @@ function BarLineBody({ widget, data, sql }: WidgetBodyProps) {
           />
           <Tooltip
             cursor={{ fill: CURSOR_FILL }}
-            content={(p) => <ChartTooltip {...p} format={formatNumber} />}
+            content={(p) => (
+              <ChartTooltip {...p} hidden={hidden} format={formatNumber} labelFormat={xf.heading} />
+            )}
           />
           <Bar
             yAxisId="bar"
             dataKey="bar"
             name={barName}
-            hide={barOff}
             fill={barColor}
             fillOpacity={0.9}
             radius={[4, 4, 0, 0]}
             maxBarSize={48}
-            isAnimationActive={false}
+            {...motion.bar}
           />
           <Line
+            key={lineShows.current.n}
             yAxisId="line"
+            className={cn("chart-series", lineOff && "chart-series-off")}
             type="linear"
             dataKey="line"
             name={lineName}
-            hide={lineOff}
             stroke={lineColor}
             strokeWidth={2}
             dot={points.length <= DOTS_UP_TO ? { r: 2.5, fill: lineColor, strokeWidth: 0 } : false}
-            activeDot={{ r: 4.5, fill: lineColor, stroke: SURFACE, strokeWidth: 2 }}
-            isAnimationActive={false}
+            activeDot={lineOff ? false : { r: 4.5, fill: lineColor, stroke: SURFACE, strokeWidth: 2 }}
+            {...motion.line}
           />
         </ComposedChart>
       </ChartFrame>
@@ -691,7 +732,27 @@ interface TableBodyProps {
 const isNumberCell = (cell: unknown) =>
   String(cell ?? "").trim() !== "" && Number.isFinite(Number(cell));
 
+// TableBody2 draws the rows as a table. On a phone (below 640 px), a
+// table that does not fit its widget even with its text wrapped turns
+// into a list (Vesa, 2026-11-19: the smoke2 "Recent runs" table scrolled
+// sideways): each row's first column is its title, the other columns sit
+// under it as small "name value" pairs. Nothing is cut or scrolled.
 function TableBody2({ data }: TableBodyProps) {
+  const narrow = useIsNarrow();
+  const boxRef = useRef<HTMLDivElement>(null);
+  // The data the table was found too wide for; a new result is measured
+  // again.
+  const [stackFor, setStackFor] = useState<DashboardQueryResult | null>(null);
+  const stack = narrow && stackFor === data;
+  useLayoutEffect(() => {
+    if (!narrow || stack) return;
+    // The table primitive scrolls inside its own wrapper, so compare the
+    // table's width with the box, not the box's scroll width.
+    const el = boxRef.current;
+    const table = el?.querySelector("table");
+    if (el && table && table.scrollWidth > el.clientWidth + 1) setStackFor(data);
+  });
+  if (stack) return <StackedRows data={data} />;
   // A column whose filled cells are all numbers is right-aligned, header
   // included, so its digits line up.
   const numeric = data.columns.map((_, j) => {
@@ -705,7 +766,7 @@ function TableBody2({ data }: TableBodyProps) {
     return seen;
   });
   return (
-    <div className="flex-1 overflow-auto px-1 pb-1">
+    <div ref={boxRef} className="flex-1 overflow-auto px-1 pb-1">
       <Table>
         <TableHeader className="sticky top-0 z-10 bg-card">
           <TableRow className="border-white/[0.06] hover:bg-transparent">
@@ -752,6 +813,59 @@ function TableBody2({ data }: TableBodyProps) {
         </TableBody>
       </Table>
     </div>
+  );
+}
+
+function StackedRows({ data }: TableBodyProps) {
+  const rest = data.columns.slice(1);
+  return (
+    <ul
+      className="flex-1 divide-y divide-white/[0.06] overflow-y-auto px-4 pb-2"
+      data-testid="table-stacked"
+    >
+      {data.rows.map((row, i) => {
+        const head = row[0] === "" || row[0] == null ? "—" : String(row[0]);
+        return (
+          <li key={i} className="min-w-0 py-2.5" data-testid="recent-runs-row">
+            {/* One line: a long title ends in an ellipsis, the whole value
+                is in the title attribute (hover, long press). */}
+            <div
+              className={cn(
+                "truncate text-xs font-medium text-foreground",
+                isIdLike(head) && "font-mono tracking-tight",
+                isNumberCell(head) && "tabular-nums",
+              )}
+              title={head}
+              data-testid="stacked-title"
+            >
+              {head}
+            </div>
+            {rest.length > 0 && (
+              <dl className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] leading-4">
+                {rest.map((c, k) => {
+                  const cell = row[k + 1];
+                  const empty = cell === "" || cell == null;
+                  return (
+                    <div key={c.name} className="flex min-w-0 gap-1.5">
+                      <dt className="text-muted-foreground">{c.name}</dt>
+                      <dd
+                        className={cn(
+                          "min-w-0 text-foreground/85 [overflow-wrap:anywhere]",
+                          !empty && isNumberCell(cell) && "tabular-nums",
+                          !empty && isIdLike(cell) && "font-mono",
+                        )}
+                      >
+                        {empty ? "—" : String(cell)}
+                      </dd>
+                    </div>
+                  );
+                })}
+              </dl>
+            )}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 

@@ -9,6 +9,7 @@
  */
 
 import { useReadOnly } from "@/hooks/useReadOnly";
+import { withPeriodDefaults } from "@/lib/timeRange";
 import { useIsPhone } from "@/hooks/useIsPhone";
 import { useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -45,6 +46,9 @@ function pipelineScopeLabel(datasets: DashboardDataset[]): string {
   if (dirs.length === 1) return dirs[0];
   return `${dirs.length} pipelines`;
 }
+
+/** Sent by the hosted API for a dashboard of a personal_data workspace. */
+const LOCAL_ONLY_NOTICE = "This dashboard holds visitor data and opens only in the local clavesa UI";
 
 export function Dashboard() {
   const readOnly = useReadOnly();
@@ -112,7 +116,13 @@ export function Dashboard() {
   // Computed on every render so the first paint of a widget already
   // has the right values — no useEffect race that fires a query with
   // an empty param map and 400s on the missing placeholder.
-  const controlParams = useDashboardParams(dashboard.data?.controls ?? []);
+  // A time_range with no default takes one from its datasets' grain; a
+  // retired period (5 minutes, 3 hours) the nearest one left.
+  const viewControls = useMemo(
+    () => withPeriodDefaults(dashboard.data?.controls ?? [], dashboard.data?.datasets ?? []),
+    [dashboard.data?.controls, dashboard.data?.datasets],
+  );
+  const controlParams = useDashboardParams(viewControls);
 
   // Resolve widget.dataset → {sql, dir} once per spec change.
   const datasetMap = useMemo(() => {
@@ -186,13 +196,26 @@ export function Dashboard() {
               <Skeleton className="h-64 w-full" />
             </div>
           }
-          renderError={(error) => (
-            <Card>
-              <CardContent className="p-6 text-sm text-destructive">
-                {error instanceof Error ? error.message : String(error)}
-              </CardContent>
-            </Card>
-          )}
+          renderError={(error) => {
+            const msg = error instanceof Error ? error.message : String(error);
+            // The hosted site keeps a personal_data workspace's dashboards
+            // to the Mac (internal/hosted/local_snapshot.go): a notice, not
+            // a failure.
+            if (msg.includes(LOCAL_ONLY_NOTICE)) {
+              return (
+                <Card data-testid="dashboard-notice">
+                  <CardContent className="p-6 text-sm text-muted-foreground">
+                    {LOCAL_ONLY_NOTICE}.
+                  </CardContent>
+                </Card>
+              );
+            }
+            return (
+              <Card>
+                <CardContent className="p-6 text-sm text-destructive">{msg}</CardContent>
+              </Card>
+            );
+          }}
         >
           {(spec) => (
             <>
@@ -225,7 +248,7 @@ export function Dashboard() {
 
               {spec.controls.length > 0 && (
                 <ControlStrip
-                  controls={spec.controls}
+                  controls={viewControls}
                   params={controlParams}
                 />
               )}
@@ -250,12 +273,13 @@ export function Dashboard() {
                           a.layout.y - b.layout.y || a.layout.x - b.layout.x,
                       )
                     : spec.widgets
-                  ).map((w) => {
+                  ).map((w, i) => {
                     const ds = datasetMap.get(w.dataset);
                     return (
                       <Widget
                         key={w.id}
                         widget={w}
+                        order={i}
                         sql={ds?.sql ?? ""}
                         dir={ds?.dir ?? ""}
                         params={

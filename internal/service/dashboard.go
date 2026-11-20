@@ -105,9 +105,9 @@ type DashboardWidget struct {
 // `{{<name>.start}}` and `{{<name>.end}}`). URL-syncable so a filtered
 // view is shareable.
 //
-//   - `time_range`: `Default` is a preset key (`last_24h` / `last_7d` /
-//     `last_30d` / `last_90d`) resolved to a start/end ISO timestamp at
-//     render time.
+//   - `time_range`: `Default` is a period (`now-24h`, or a legacy key such
+//     as `last_7d`) resolved to a start/end ISO timestamp at render time.
+//     Empty: DefaultPeriod picks it from the grain of the datasets' SQL.
 //   - `select`: options come from running `SQL` against `Dir` (first
 //     column used); a non-empty `Options` slice is a static fallback when
 //     no SQL is set.
@@ -301,7 +301,7 @@ func (s *Service) validateDashboardSQL(ctx context.Context, d Dashboard) error {
 	// runs on the RAW template — the sentinel scheme handles `{{ }}` and keeps
 	// the cache param-independent.)
 	effective := map[string]string{}
-	resolveControlDefaults(d.Controls, effective, time.Now())
+	resolveControlDefaults(d.Controls, d.Datasets, effective, time.Now())
 
 	var failures []string
 	checkOne := func(label, sql, dir string) {
@@ -453,7 +453,7 @@ func (s *Service) RenderDashboard(ctx context.Context, slug string, params map[s
 	for k, v := range params {
 		effective[k] = v
 	}
-	resolveControlDefaults(d.Controls, effective, time.Now())
+	resolveControlDefaults(d.Controls, d.Datasets, effective, time.Now())
 	datasets := map[string]DashboardDataset{}
 	for _, ds := range d.Datasets {
 		datasets[ds.Name] = ds
@@ -824,8 +824,13 @@ func expandPlaceholders(sql string, params map[string]string) (string, error) {
 // defaults into a param map. Already-set keys in `out` are kept (an
 // explicit --param or URL value wins over the dashboard's default).
 // `time_range` controls produce two params (`<name>.start` and
-// `<name>.end`); the preset key is interpreted at `now`.
-func resolveControlDefaults(controls []DashboardControl, out map[string]string, now time.Time) {
+// `<name>.end`); the preset key is interpreted at `now`. A time_range
+// with no default takes DefaultPeriod from the datasets' SQL.
+func resolveControlDefaults(controls []DashboardControl, datasets []DashboardDataset, out map[string]string, now time.Time) {
+	sqls := make([]string, 0, len(datasets))
+	for _, ds := range datasets {
+		sqls = append(sqls, ds.SQL)
+	}
 	for _, c := range controls {
 		switch c.Type {
 		case "time_range":
@@ -836,7 +841,11 @@ func resolveControlDefaults(controls []DashboardControl, out map[string]string, 
 			if hasStart && hasEnd {
 				continue
 			}
-			start, end := resolveTimePreset(c.Default, now)
+			preset := c.Default
+			if strings.TrimSpace(preset) == "" {
+				preset = DefaultPeriod(c.Name, sqls)
+			}
+			start, end := resolveTimePreset(preset, now)
 			if !hasStart {
 				out[startKey] = start
 			}
@@ -859,7 +868,7 @@ func resolveControlDefaults(controls []DashboardControl, out map[string]string, 
 // resolveTimePreset turns a canonical `now-<n><unit>` expression (or
 // one of the legacy preset keys `last_24h` / `last_7d` / `last_30d` /
 // `last_90d`) into a {start, end} pair of ISO timestamps at `now`.
-// Empty or invalid input defaults to `now-30d` so a freshly-added
+// Empty or invalid input defaults to FallbackPeriod so a freshly-added
 // time_range control works before the author touches the default.
 //
 // Thin wrapper over ResolveTimeRange — kept for stable internal call

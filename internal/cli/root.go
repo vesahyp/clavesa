@@ -84,7 +84,7 @@ func Execute() error {
 	// spawned by the Slice 3 SQL parser, etc) before returning. Always
 	// runs, even on error — leaking a ~1GB container on every failed
 	// `clavesa node edit` would shred Docker Desktop's memory budget.
-	runCloseables()
+	runCloseables(cmd)
 	// Then the metastore this command may have started (GH #99). After
 	// runCloseables on purpose: the release check looks for other running
 	// containers of the workspace, and our own warm workers must be gone
@@ -103,7 +103,7 @@ func Run(args []string) error {
 	cmd := newRootCmd()
 	cmd.SetArgs(args)
 	err := cmd.Execute()
-	runCloseables()
+	runCloseables(cmd)
 	releaseMetastores(cmd)
 	return err
 }

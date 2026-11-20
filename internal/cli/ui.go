@@ -57,12 +57,26 @@ an account.
 the controls that change state. It also refuses the two read POSTs
 (the SQL query editor and dashboard widget queries).
 
+CLAVESA_ATHENA_OUTPUT=s3://<bucket>/<prefix>/ sends the results of every
+Athena query the UI runs to that prefix in place of
+s3://<pipeline bucket>/athena-results/. Use it when your role may read
+only its own prefix, so you never read other people's past results. The
+role needs s3:PutObject, GetObject, ListBucket and GetBucketLocation on
+that prefix. With --workspaces it applies to every workspace. A hosted
+tree copy keeps its workgroup's location, and its queries fail while the
+setting is set.
+
 Examples:
   clavesa ui
   clavesa ui --workspace /path/to/project
   clavesa ui --no-browser
   clavesa ui --workspaces ~/clavesa-workspaces --read-only`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Check CLAVESA_ATHENA_OUTPUT at startup, so a bad value fails
+			// before the first query.
+			if _, err := observability.AthenaOutputLocation(""); err != nil {
+				return err
+			}
 			addr := ":8080"
 			if a := os.Getenv("CLAVESA_ADDR"); a != "" {
 				addr = a
@@ -226,7 +240,7 @@ func runLocalUI(cmd *cobra.Command, addr string, static fs.FS, readOnly, noBrows
 	// metastore is stopped explicitly so it does not keep holding the
 	// workspace's Derby lock after `clavesa ui` exits (#21).
 	return serveUI(addr, handler, noBrowser, func() {
-		runCloseables()
+		runCloseables(cmd)
 		observability.StopMetastore(workspace)
 	})
 }

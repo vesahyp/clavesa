@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/vesahyp/clavesa/internal/access"
 	"github.com/vesahyp/clavesa/internal/identutil"
 	"github.com/vesahyp/clavesa/internal/modules"
 	"github.com/vesahyp/clavesa/internal/runner"
@@ -87,6 +88,10 @@ type Manifest struct {
 	// Nil means not hosted: no reader role, no tree copy on deploy.
 	// Written by `clavesa workspace hosted enable` and its UI twin.
 	Hosted *Hosted `json:"hosted,omitempty"`
+	// Access declares the column tag values and the audiences that read
+	// them (docs/ideas/column-tags.md). Nil: the workspace uses no tags.
+	// Written by hand; `clavesa workspace access show` checks it.
+	Access *access.Config `json:"access,omitempty"`
 	// Region is the AWS region the workspace stack is applied in (GH
 	// #107). Every AWS call and Terraform run of the workspace uses it,
 	// ahead of AWS_REGION and the profile's region (see region.go).

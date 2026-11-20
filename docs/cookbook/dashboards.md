@@ -94,9 +94,11 @@ Add interactive filters with a `controls` array. A `time_range` control exposes 
 
 ```json
 "controls": [
-  {"name": "tr", "type": "time_range", "label": "Date range", "default": "last_30d"}
+  {"name": "tr", "type": "time_range", "label": "Date range", "default": "now-30d"}
 ]
 ```
+
+The period picker offers the last 1 hour, 24 hours, 7, 30 and 90 days, plus a custom range. Leave `default` out and the period comes from the time column of the SQL that uses the control (an item of its SELECT list or GROUP BY: `event_hour` or `date_trunc('hour', ts)`, `event_date` or `CAST(ts AS DATE)`, `date_trunc('month', ts)`): 24 hours for data by the hour or finer, 7 days for daily data, 90 days for weekly or monthly data, and 7 days when there is no such column. Table names and WHERE filters do not count, nor does a breakdown such as `hour(ts)`. A period under an hour is read as an hour (the picker shows "Last 1 hour"), and an older default the picker no longer offers (`now-5m`, `now-3h`, `now-12h`, `now-3d`) takes the nearest one left. The page refreshes itself only if the viewer asks (Refresh: off, 5 min, 15 min or 1 hour); each refresh moves a relative period to the new time, so the charts show the newer rows.
 
 Then reference it: `... WHERE trip_date BETWEEN '{{tr.start}}' AND '{{tr.end}}'`. From the CLI, pass values with `--param`:
 
@@ -104,7 +106,7 @@ Then reference it: `... WHERE trip_date BETWEEN '{{tr.start}}' AND '{{tr.end}}'`
 bin/clavesa dashboards render taxi-revenue --param tr.start=2024-02-01 --param tr.end=2024-02-29 --workspace $WS
 ```
 
-Missing params fall back to the control's `default`. Select controls take a static `options` list or a `sql` query that populates them.
+Missing params fall back to the control's `default`, with the same rules as the picker. Select controls take a static `options` list or a `sql` query that populates them.
 
 ## Verify
 
@@ -124,6 +126,7 @@ Assertable signals: `render` exits 0 when every widget's SQL succeeds and **non-
 - **Local renders through warm Spark; deployed pipelines render through Athena.** The spec is portable, but keep widget SQL Trino-compatible if the dashboard will run against a deployed pipeline (see the dialect note in [query-your-data](query-your-data.md#what-to-expect--and-the-limits)).
 - **No automatic row cap.** A `table` widget over a million-row dataset will try to return all of it — add `LIMIT` / aggregate in the dataset SQL.
 - **First render pays the Spark warm-up** (tens of seconds), then it's quick.
+- **Charts animate.** A chart draws in on first show, moves to new values when a control changes (the old values stay on screen, dimmed, while the query runs), and a series turned off from the legend animates out and back in. With "reduce motion" set in the system, charts draw at once.
 
 ## Troubleshooting
 

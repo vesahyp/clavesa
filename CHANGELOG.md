@@ -12,6 +12,37 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.14] — 2026-11-20
+
+### Added
+
+- **`CLAVESA_ATHENA_OUTPUT` sends Athena query results to a prefix of your choice.** Set `CLAVESA_ATHENA_OUTPUT=s3://<bucket>/<prefix>/` and every Athena query that `clavesa ui` and the CLI run (table pages, dashboards, the query editor, notebooks, backfill checks) writes its results there in place of `s3://<pipeline bucket>/athena-results/`. A role that may read only its own prefix then never reads other people's past results. The role needs `s3:PutObject`, `GetObject`, `ListBucket` and `GetBucketLocation` on the prefix. With `--workspaces` it applies to every workspace. A value that is not an `s3://<bucket>/` URI stops `clavesa ui` at start. A hosted tree copy keeps its workgroup's location, and its queries fail with a clear error while the setting is set.
+
+### Fixed
+
+- **Hosted UI: a workspace with visitor data keeps its dashboards on the Mac, with no failing widgets.** A local workspace the registry marks `personal_data` showed "Query failed" on every widget of every dashboard. Now the hosted site lists none of its dashboards, and a link to one shows one notice: "This dashboard holds visitor data and opens only in the local clavesa UI". `make hosted-live-check` checks both on the local workspace it walks.
+
+- **Dashboard auto refresh shows newer data.** A refresh ran the same period again (an Athena scan with the same answer); now each refresh moves a relative period such as "Last 24 hours" to the new time, and the charts query that. `make ui-dashboard-shots` moves the clock 5 minutes on and fails if the same window is queried again.
+- **A period default from the data reads only the time column.** A period control with no default took 7 days from a `current_date` filter and 24 hours from an `hour(ts)` breakdown or a table called `*_hourly`; now only an item of the outer SELECT list or GROUP BY counts (`event_hour`, `CAST(ts AS DATE)`, `date_trunc('month', ts)`), else 7 days.
+- **A link with a period under an hour shows "Last 1 hour"** in the picker, the window it loads (it showed "Custom range" with `now-10m`).
+- **Only charts on screen animate.** A chart off screen when its data or series change draws in its final state, and does not draw again when it is scrolled into view (all 35 charts of a long dashboard animated at once). `make ui-chart-motion` checks both.
+- **With reduced motion, a widget waiting for new data dims without a fade.**
+
+### Changed
+
+- **Dashboard periods start at an hour, and the default fits the data.** The period picker offers the last 1 hour, 24 hours, 7, 30 and 90 days (no more 5, 15 or 30 minutes, 3 or 12 hours, or 3 days). A dashboard or link that names a period since removed opens on the nearest one left, and any window under an hour is read as an hour, with no error. A period control with no default takes one from the SQL that uses it: 24 hours for data by the hour or finer, 7 days for daily data, 90 days for weekly or monthly data, 7 days when the SQL does not say (it was 30 days). `clavesa dashboards render` uses the same rules (`make ui-time-range-check` and `TestPeriodFixture` check both against one fixture). In the editor, "From the data" is the default for a new period control. Auto refresh offers off, 5 min, 15 min and 1 hour; 30 s and 1 min are gone (each refresh runs every widget's query again) and a link that asks for them gets 5 min. `make ui-dashboard-shots` checks the period and refresh pickers.
+
+- **Dashboard charts move.** A line or area draws in from the left in 1.5 s, bars grow from the axis in 0.4 s, and new values move the marks from where they were, with the CSS "ease" curve (the same Recharts timings as ecarbrowser's charts). A series turned off from the legend animates out and back in: a pie or donut slice shrinks away while the others widen into its room, stacked and bar + line bars shrink into the axis, a line fades out and draws in again from the left. A period or filter change keeps the old chart on screen, dimmed, while the new query runs, and then moves it to the new values (no skeleton in between). The cards rise one after another, 60 ms apart. With "reduce motion" set in the system nothing animates. `make ui-chart-motion` checks the motion frame by frame on an iPhone 16 and records a video to `.shots/motion/`; `make ui-dashboard-shots` takes its shots with reduced motion, so no shot catches a chart halfway.
+
+### Fixed
+
+- **The CLI's tests no longer write the developer's current workspace.** `workspace init` and `use` record the current workspace in `~/.config/clavesa/current-workspace`; parallel unit tests, the CLI integration suite, the UI new-pipeline check and the stream test each wrote the real file, which then pointed at a deleted temp directory, and a parallel test could write into another test's directory while it was being removed (an intermittent "directory not empty" failure). The parallel unit tests also shared one list of warm workers to stop, so one test could stop another's. `make test-go-race` runs the CLI package three times under the race detector.
+
+- **Dashboard tables fit a phone.** Below 640 px, a table that does not fit its widget even with its text wrapped turns into a list: each row's first column is its title, on one line with an ellipsis when long (the full value on hover or long press), and the other columns sit under it as small name and value pairs. Nothing scrolls sideways (the smoke2 "Recent runs" table did). `make ui-dashboard-shots` fails on a table that scrolls sideways on a phone. Values that look like IDs (a run ID, a hash), judged from the value and not the column name, are set in a monospace font.
+
+- **Dashboard x axes: no label cut off or drawn over another.** A timestamp on the x axis (`2026-11-19 10:25:11.727 UTC`) shows as `19.11 12:25` and in the hover card as `19.11.2026 12:25:11`, in the viewer's time zone when the value is UTC. One row per day at midnight shows as `19.11`, with no `00:00`. The last label of a line or bar chart is no longer cut at the right edge, and labels that would touch are dropped. `make ui-dashboard-shots` fails on a cut x label.
+- **Dashboard series toggles hold up when the data changes.** When a new result leaves only series that were hidden, they show again, so a chart never goes blank. Pie and donut slices keep their colour, and stay hidden, when their values change order. Legend buttons are 44 px tall on any touch screen, an iPad included; only with a mouse or trackpad are they compact. `make ui-chart-logic-check` (part of `make test`) checks these rules.
+
 ## [v2.27.13] — 2026-11-19
 
 ### Added

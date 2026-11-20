@@ -93,3 +93,36 @@ func TestLocalSnapshotRoutes(t *testing.T) {
 		t.Errorf("no snapshot, widget: %d, want 403", c)
 	}
 }
+
+// A personal_data local workspace lists no dashboards, and a link to one
+// (its spec or a widget query) answers 403 with the notice.
+func TestLocalSnapshotHidesPersonalDashboards(t *testing.T) {
+	spec := `{"slug":"traffic","title":"Traffic","datasets":[],"widgets":[]}`
+	sum := service.WorkspaceSummary{
+		Name: "site-traffic", Kind: "local",
+		Drill: &service.SummaryDrill{
+			Version:   service.DrillVersion,
+			Tree:      map[string]string{"clavesa.json": `{"name":"site-traffic","cloud":"aws","version":1}`, ".clavesa/dashboards/traffic.json": spec},
+			Pipelines: map[string]service.PipelineDrill{},
+			Snapshot:  &service.DrillSnapshot{At: "2026-11-17T04:00:00Z"},
+		},
+	}
+	body, _ := json.Marshal(sum)
+	ws, _, err := OpenLocal(context.Background(), filepath.Join(t.TempDir(), "site-traffic"), Entry{Name: "site-traffic", Kind: KindLocal, PersonalData: true}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := func(method, path, b string) (int, string) {
+		w := httptest.NewRecorder()
+		ws.Handler.ServeHTTP(w, httptest.NewRequest(method, path, strings.NewReader(b)))
+		return w.Code, w.Body.String()
+	}
+	if c, b := do(http.MethodGet, "/dashboards", ""); c != 200 || strings.Contains(b, "traffic") || !strings.Contains(b, `"dashboards":[]`) {
+		t.Errorf("GET /dashboards: %d %s, want an empty list", c, b)
+	}
+	for _, req := range [][3]string{{http.MethodGet, "/dashboards/traffic", ""}, {http.MethodPost, "/dashboards/query", `{"dir":"traffic","sql":"SELECT 1"}`}} {
+		if c, b := do(req[0], req[1], req[2]); c != http.StatusForbidden || !strings.Contains(b, "opens only in the local clavesa UI") {
+			t.Errorf("%s %s: %d %s, want 403 with the notice", req[0], req[1], c, b)
+		}
+	}
+}

@@ -37,10 +37,13 @@ interface ControlsPanelProps {
 // viewing agree on what's offered. The Default is stored in canonical
 // `now-<n><unit>` form; legacy `last_*` keys still resolve at runtime
 // via the back-compat alias map in `lib/timeRange.ts`.
-const TIME_PRESET_OPTIONS = TIME_RANGE_PRESETS.map((p) => ({
-  value: p.expr,
-  label: p.label,
-}));
+// "From the data" saves no default: the viewer then picks the period
+// from the grain of the datasets' SQL (defaultPeriod in lib/timeRange).
+const AUTO = "auto";
+const TIME_PRESET_OPTIONS = [
+  { value: AUTO, label: "From the data" },
+  ...TIME_RANGE_PRESETS.map((p) => ({ value: p.expr, label: p.label })),
+];
 
 export function ControlsPanel({
   controls,
@@ -61,7 +64,8 @@ export function ControlsPanel({
         name,
         type: "time_range",
         label: "Time range",
-        default: "now-30d",
+        // Empty: the viewer picks the period from the data's grain.
+        default: "",
         dir: "",
         sql: "",
         options: [],
@@ -161,8 +165,8 @@ export function ControlsPanel({
             <div className="w-48 space-y-1">
               <Label className="text-xs">Default preset</Label>
               <Select
-                value={normaliseExpr(c.default) || "now-30d"}
-                onValueChange={(v) => update(i, { default: v })}
+                value={normaliseExpr(c.default) || AUTO}
+                onValueChange={(v) => update(i, { default: v === AUTO ? "" : v })}
               >
                 <SelectTrigger>
                   <SelectValue />

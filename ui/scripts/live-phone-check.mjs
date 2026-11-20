@@ -60,6 +60,13 @@
 //     Credentials or Runner entry, and /query, /credentials and /runner
 //     land on the workspace home with no Run button.
 //   - the second tab is "Site usage" (not "Stats"), on every page.
+//   - 12-personal: LOCAL_WS is personal_data in the registry, so its
+//     dashboards are kept to the Mac: GET /dashboards lists none, and a
+//     link to one (LOCAL_DASHBOARD, default pipeline-runs-traffic) shows
+//     one notice and no widget, never "Query failed": "This dashboard
+//     holds visitor data and opens only in the local clavesa UI" when the
+//     Mac publishes a snapshot, else the page's "data of this workspace is
+//     on the Mac" line (no snapshot: the page runs no query at all).
 //   A 503 (Lambda throttling on a cold load) on a page makes the script load
 //   that page once more and say so; a failure that persists fails the run.
 //
@@ -801,6 +808,8 @@ try {
     ...iphone,
     userAgent: `${iphone.userAgent} HeadlessChrome`,
     colorScheme: "dark",
+    // Charts draw at once, so no shot catches one mid-animation.
+    reducedMotion: "reduce",
   });
   // Texts a page must never show, even for a frame while it loads.
   await ctx.addInitScript(() => {
@@ -860,7 +869,7 @@ try {
   await ctx.close();
 
   // Desktop: read-only shows no page whose point is to run or change.
-  const desk = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: "dark" });
+  const desk = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: "dark", reducedMotion: "reduce" });
   await desk.addInitScript((t) => {
     try {
       sessionStorage.setItem(
@@ -916,6 +925,28 @@ try {
     await page.screenshot({ path: `${OUT}08-desktop-${w}.png` });
     console.log(`${out.length ? "FAIL" : "ok  "} 08-desktop ${w}: ${entries.length} sidebar entries opened${out.length ? `, ${out.length} problem(s)` : ""}`);
     for (const p of [...new Set(out)]) failures.push(`08-desktop ${w}: ${p}`);
+    await page.close();
+  }
+  // A personal_data local workspace: no dashboards listed, a link to one
+  // shows the notice and no failing widget.
+  {
+    const lw = encodeURIComponent(LOCAL_WS);
+    const slug = env("LOCAL_DASHBOARD", "pipeline-runs-traffic");
+    const probs = [];
+    const list = await api(tok, `/w/${lw}/api/dashboards`);
+    if ((list.dashboards ?? []).length) probs.push(`GET /dashboards lists ${list.dashboards.length} dashboard(s), want none`);
+    const page = await desk.newPage();
+    await page.setViewportSize({ width: 393, height: 852 });
+    await page.goto(`${BASE}/w/${lw}/dashboards/${encodeURIComponent(slug)}`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
+    const notice = page.locator('[data-testid="dashboard-notice"], [data-testid="not-hosted-line"]').first();
+    await notice.waitFor({ state: "visible", timeout: WAIT_MS }).catch(() => probs.push("no notice on the dashboard page"));
+    const text = ((await notice.textContent().catch(() => "")) ?? "").trim();
+    if (!/holds visitor data and opens only in the local clavesa UI|data of this workspace is on the Mac/.test(text)) probs.push(`notice reads "${text}"`);
+    if (await page.locator('[data-testid="dashboard-widget"]').count()) probs.push("widgets are drawn");
+    if (await page.getByText("Query failed").count()) probs.push('"Query failed" shown');
+    await page.screenshot({ path: `${OUT}12-personal-dashboard.png` });
+    console.log(`${probs.length ? "FAIL" : "ok  "} 12-personal: ${LOCAL_WS} lists no dashboards, /dashboards/${slug} shows "${text.slice(0, 60)}…"`);
+    for (const p of probs) failures.push(`12-personal ${LOCAL_WS}: ${p}`);
     await page.close();
   }
   // ADR-035: the check user is a viewer of the workspaces this check

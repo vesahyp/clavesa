@@ -149,7 +149,10 @@ widget's query failed.
 
 Pass dashboard control values with --param key=value (repeatable). Keys
 not provided fall back to each control's declared default — a
-time_range with default "last_30d" expands to {start, end} at "now".
+time_range with default "now-30d" expands to {start, end} at "now".
+A time_range with no default takes 24 hours for data by the hour, 7
+days for daily data and 90 days for monthly data, from its datasets'
+SQL. Periods under an hour are read as an hour.
 For a time_range control named "tr", the two keys are "tr.start" and
 "tr.end"; for a select control, the key is the control name.`,
 		Args: cobra.ExactArgs(1),

@@ -4,6 +4,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
+import { resolveTimeRange, withPeriodDefaults } from "@/lib/timeRange";
 import { z } from "zod";
 
 import { request } from "@/api/client";
@@ -98,12 +99,13 @@ export type Dashboard = z.infer<typeof Dashboard>;
  */
 export function resolveControlDefaults(
   controls: DashboardControl[],
+  datasets: { sql: string }[] = [],
 ): Record<string, string> {
   const out: Record<string, string> = {};
   const now = new Date();
-  for (const c of controls) {
+  for (const c of withPeriodDefaults(controls, datasets)) {
     if (c.type === "time_range") {
-      const { start, end } = resolveTimePreset(c.default || "last_30d", now);
+      const { start, end } = resolveTimeRange(c.default, now);
       out[`${c.name}.start`] = start;
       out[`${c.name}.end`] = end;
     } else if (c.type === "select") {
@@ -115,29 +117,6 @@ export function resolveControlDefaults(
     }
   }
   return out;
-}
-
-function resolveTimePreset(
-  preset: string,
-  now: Date,
-): { start: string; end: string } {
-  const end = now.toISOString();
-  let ms = 30 * 24 * 60 * 60 * 1000;
-  switch (preset) {
-    case "last_24h":
-      ms = 24 * 60 * 60 * 1000;
-      break;
-    case "last_7d":
-      ms = 7 * 24 * 60 * 60 * 1000;
-      break;
-    case "last_90d":
-      ms = 90 * 24 * 60 * 60 * 1000;
-      break;
-    case "last_30d":
-    default:
-      ms = 30 * 24 * 60 * 60 * 1000;
-  }
-  return { start: new Date(now.getTime() - ms).toISOString(), end };
 }
 
 const DashboardQueryColumn = z.object({
@@ -210,6 +189,12 @@ export function useDashboardQuery(
     staleTime: 5 * 60_000,
     retry: false,
     queryFn: () => runDashboardQuery(dir, sql, params),
+    // A control change (other params, same dataset) keeps the last result
+    // on screen while the new one runs, so the chart moves from the old
+    // values to the new ones instead of blinking through a skeleton.
+    // isPlaceholderData says the values shown are the old ones.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey[2] === dir && prevQuery?.queryKey[3] === sql ? prev : undefined,
   });
 }
 

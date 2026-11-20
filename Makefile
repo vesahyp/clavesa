@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots ui-dashboard-shots hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-viewer hosted-build-lambda hosted-tracking-check hosted-live-check ui-day-windows-check errors
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-go-race test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots ui-dashboard-shots ui-chart-motion hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-viewer hosted-build-lambda hosted-tracking-check hosted-live-check ui-day-windows-check ui-chart-logic-check ui-time-range-check errors
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -75,11 +75,14 @@ build: build-ui sync-modules sync-runner ## Build everything → bin/clavesa (UI
 # then launches the gates with SKIP_BUILD=1 so three concurrent sub-makes
 # don't race each other rewriting bin/clavesa. NEVER set it manually — the
 # build dep is what keeps every gate off a stale binary.
-test: test-go test-runner-py test-cli test-runner ui-new-pipeline-check ui-day-windows-check ## Run all tests (incl. docker-gated runner suite — GH #27)
+test: test-go test-runner-py test-cli test-runner ui-new-pipeline-check ui-day-windows-check ui-chart-logic-check ui-time-range-check ## Run all tests (incl. docker-gated runner suite — GH #27)
 	@./scripts/green-stamp.sh write test
 
 test-go: ## Go unit tests (fast, no binary)
 	go test -v ./...
+
+test-go-race: ## The CLI package's unit tests three times under the race detector: parallel tests must not share state (the current-workspace file); PKG=./internal/cli COUNT=3
+	go test -race -count=$(or $(COUNT),3) $(or $(PKG),./internal/cli/)
 
 # -count=1 on the integration suites: they exercise bin/clavesa and the
 # runner image — external artifacts Go's test cache can't see — so a
@@ -217,6 +220,12 @@ shadow-compare: ## Shadow mode: compare the Databricks step's table with clavesa
 ui-day-windows-check: ## The UI counts the same 14 and 30 days as the CLI at 00:10 Helsinki time (internal/service/testdata/day_windows_0010.json; the Go half is TestDayWindowsAt0010; part of make test)
 	node ui/scripts/day-windows-check.mjs
 
+ui-time-range-check: ## Dashboard periods in node: the picker offers 1h, 24h, 7d, 30d, 90d, a retired period (5 min, 3 h) takes the nearest one left, a control with no default takes it from its SQL's grain; same fixture as the Go TestPeriodFixture (internal/service/testdata/time_range_defaults.json; part of make test)
+	node ui/scripts/time-range-check.mjs
+
+ui-chart-logic-check: ## Dashboard chart rules in node: hidden series never blank a chart, timestamps in local time (no 00:00 on daily values), pie colours stay with their names (ui/src/components/dashboards/chartLogic.ts; part of make test)
+	node ui/scripts/chart-logic-check.mjs
+
 ui-new-pipeline-check: $(if $(SKIP_BUILD),,build) ## Editing UI: create a pipeline from the Pipelines page with the list already cached, its page opens the editor at once and after a reload, never "No pipeline with this name" (part of make test)
 	cd ui && npx playwright install chromium
 	node ui/scripts/new-pipeline-check.mjs
@@ -224,6 +233,10 @@ ui-new-pipeline-check: $(if $(SKIP_BUILD),,build) ## Editing UI: create a pipeli
 ui-dashboard-shots: build ## Shots of dashboards and of every widget on an iPhone 16 and a 1440 px desktop, with y-axis, one-per-row, cut-text and series on/off (legend) checks → .shots/dashboards/<LABEL>/{phone,desktop}/ (LABEL=before|after, VIEWS=phone,desktop, WS_DIR=~/Repositories/monorepo/analytics WS_NAME=web-traffic DASHBOARDS=heineli,heineli-technical; BASE_URL for a running server; AWS_PROFILE=webbaa for web-traffic)
 	cd ui && npx playwright install chromium
 	node ui/scripts/dashboard-phone-shots.mjs
+
+ui-chart-motion: build ## Dashboard chart motion on an iPhone 16: first draw, a pie slice and bar_line series off and on, a period change, each sampled per frame (must move), and one step under prefers-reduced-motion; records .shots/motion/<DASHBOARD>-phone.webm (+ .mp4 with ffmpeg) and frames/ (WS_DIR, WS_NAME, DASHBOARD=heineli, PERIOD="Last 7 days", BASE_URL, AWS_PROFILE=webbaa for web-traffic)
+	cd ui && npx playwright install chromium
+	node ui/scripts/chart-motion.mjs
 
 ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; BASE_URL=<a running server, e.g. make hosted-local> instead of starting clavesa ui; AWS_PROFILE passes through)
 	cd ui && npx playwright install chromium

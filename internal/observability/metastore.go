@@ -215,7 +215,7 @@ func EnsureMetastore(ctx context.Context, workspaceRoot, workspaceName string) (
 	}
 	// The owner label (owner.go): reaped once this process is gone, unless
 	// the metastore is kept warm on purpose.
-	if kv := ownerLabelKV(); kv != "" && !KeepMetastore {
+	if kv := ownerLabelKV(); kv != "" && !KeepMetastore() {
 		args = append(args, "--label", kv)
 	}
 	args = append(args,

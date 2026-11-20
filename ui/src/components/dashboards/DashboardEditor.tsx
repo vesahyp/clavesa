@@ -15,6 +15,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { withPeriodDefaults } from "@/lib/timeRange";
 import { useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, CheckCircle2, Loader2, Plus, Settings2 } from "lucide-react";
@@ -153,14 +154,20 @@ export function DashboardEditor({
   // controls' defaults so the editor's field pickers populate without
   // a 400 from /api/dashboards/query.
   const datasetProbeParams = useMemo(
-    () => resolveControlDefaults(controls),
-    [controls],
+    () => resolveControlDefaults(controls, datasets),
+    [controls, datasets],
   );
   const columnsByDataset = useDatasetColumns(datasets, datasetProbeParams);
 
   // Same control-resolution the viewer uses, so the strip in the editor
   // behaves identically (URL state + declared defaults).
-  const controlParams = useDashboardParams(controls);
+  // The viewer's controls: a time_range with no default gets one from
+  // its datasets' grain (the saved spec keeps it empty).
+  const viewControls = useMemo(
+    () => withPeriodDefaults(controls, datasets),
+    [controls, datasets],
+  );
+  const controlParams = useDashboardParams(viewControls);
 
   const namedDatasets = useMemo(
     () => datasets.filter((d) => !isInlineDataset(d.name)),
@@ -398,7 +405,7 @@ export function DashboardEditor({
         <div className="flex items-start gap-2">
           <div className="flex-1">
             {controls.length > 0 ? (
-              <ControlStrip controls={controls} params={controlParams} />
+              <ControlStrip controls={viewControls} params={controlParams} />
             ) : (
               <p className="text-xs text-muted-foreground">
                 No controls yet. Add one to let viewers filter the dashboard.

@@ -1255,11 +1255,25 @@ func freshReads(ctx context.Context) bool {
 // runAthenaQuery starts a query, polls for completion, and returns the result
 // set. Shared across NodeRuns/Runs/Snapshots.
 func runAthenaQuery(ctx context.Context, ac AthenaClient, outputBucket, workgroup, sql string) (*athenatypes.ResultSet, error) {
+	// $CLAVESA_ATHENA_OUTPUT moves the results to a prefix of the user's
+	// choice (athena_output.go). A hosted workgroup enforces its own
+	// location, so the setting cannot apply there: that is an error, so
+	// the user does not think the results are in their own prefix.
+	var resultConfig *athenatypes.ResultConfiguration
+	if workgroup != "" {
+		if AthenaOutputSet() {
+			return nil, fmt.Errorf("%s is set, but this workspace reads through the hosted workgroup %s, which keeps its own result location; unset %s", AthenaOutputEnv, workgroup, AthenaOutputEnv)
+		}
+	} else {
+		outputLocation, err := AthenaOutputLocation(DefaultAthenaOutput(outputBucket))
+		if err != nil {
+			return nil, err
+		}
+		resultConfig = &athenatypes.ResultConfiguration{OutputLocation: aws.String(outputLocation)}
+	}
 	in := &athena.StartQueryExecutionInput{
-		QueryString: aws.String(sql),
-		ResultConfiguration: &athenatypes.ResultConfiguration{
-			OutputLocation: aws.String("s3://" + outputBucket + "/athena-results/"),
-		},
+		QueryString:         aws.String(sql),
+		ResultConfiguration: resultConfig,
 		// Reuse a cached result for an identical query within the window
 		// instead of re-scanning. The observability tables (runs, node_runs,
 		// snapshots) are append-mostly and the UI polls the same queries
@@ -1281,7 +1295,6 @@ func runAthenaQuery(ctx context.Context, ac AthenaClient, outputBucket, workgrou
 	if workgroup != "" {
 		// The workgroup enforces its own output location (ADR-032).
 		in.WorkGroup = aws.String(workgroup)
-		in.ResultConfiguration = nil
 	}
 	startOut, err := ac.StartQueryExecution(ctx, in)
 	if err != nil {

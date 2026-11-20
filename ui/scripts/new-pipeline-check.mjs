@@ -50,7 +50,10 @@ const ws = join(tmp, "ws");
 let ui = null;
 let browser = null;
 try {
-  const init = spawnSync(BIN, ["workspace", "init", "newpipe-ws"], { cwd: tmp, encoding: "utf8" });
+  // `workspace init` records the current workspace under XDG_CONFIG_HOME;
+  // keep it in the temp dir, never the developer's ~/.config/clavesa/.
+  const childEnv = { ...process.env, XDG_CONFIG_HOME: `${tmp}/xdg-config` };
+  const init = spawnSync(BIN, ["workspace", "init", "newpipe-ws"], { cwd: tmp, encoding: "utf8", env: childEnv });
   if (init.status !== 0) throw new Error(`workspace init failed:\n${init.stdout}${init.stderr}`);
   // init creates <cwd>/<something>; find the workspace dir from its output.
   const m = /Initialized workspace "[^"]+" at (\S+)/.exec(init.stdout);
@@ -61,7 +64,7 @@ try {
   let log = "";
   ui = spawn(BIN, ["ui", "--no-browser", "--workspace", wsDir], {
     cwd: wsDir,
-    env: { ...process.env, CLAVESA_ADDR: `127.0.0.1:${port}` },
+    env: { ...childEnv, CLAVESA_ADDR: `127.0.0.1:${port}` },
     stdio: ["ignore", "pipe", "pipe"],
   });
   ui.stdout.on("data", (d) => (log += d));

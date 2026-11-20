@@ -17,6 +17,8 @@
 // before and after shots of a change side by side.
 //
 // Checks, per widget (exit 1, one line per failure):
+//   - x axis: no label cut off at the chart's edge (a long timestamp
+//     tick shows as "19.11 10:25");
 //   - y axis: every chart with a y axis has at least two tick labels, none
 //     empty, none like 0.30000000000000004 or 1e3, none cut off at the
 //     left edge of the chart;
@@ -33,24 +35,39 @@
 //     one series (stacked_bar, bar_line, pie, donut) has a legend of
 //     toggle buttons. A tap turns a series off (aria-pressed=false, the
 //     chart draws one series fewer), the last series left on cannot be
-//     turned off, and a second tap brings each one back. On the phone
-//     every legend button is at least 44 px tall.
+//     turned off, and a second tap brings each one back; no line is cut
+//     short before its last point after a tap. On a touch
+//     screen (phone, tablet) every legend button is at least 44 px tall;
+//   - periods (Vesa, 2026-11-19: "Last 5min? Smallest should be 1h"): the
+//     period picker offers Last 1 hour, 24 hours, 7, 30 and 90 days and
+//     Custom, nothing under an hour; it shows the dashboard's default (or,
+//     with none, a preset picked from the data); the refresh picker offers
+//     Off, 5 min, 15 min, 1 hour and is Off; on the phone, a link naming a
+//     retired period (?<name>.rel=now-5m) or one under an hour (now-10m)
+//     opens on Last 1 hour; with auto refresh on, a tick (the clock moved
+//     5 minutes on) queries the moved window and never the same one again
+//     (last dashboard, first view);
+//   - reduced motion: no widget body has a transition (the dim fade);
+//   - tables: below 640 px no table scrolls sideways (one too wide turns
+//     into a list of rows); each row's title is one line, ending in an
+//     ellipsis when long, with the whole value in its title attribute.
 //
 // Env (all optional):
 //   WS_DIR      the workspaces directory (default ~/Repositories/monorepo/analytics)
 //   WS_NAME     the workspace (default web-traffic)
 //   LABEL       the shots' folder under .shots/dashboards (default current)
-//   VIEWS       comma-separated, phone and/or desktop (default both)
+//   VIEWS       comma-separated: phone, tablet (iPad Pro 11), desktop
+//               (default phone,desktop)
 //   DASHBOARDS  comma-separated slugs (default heineli,heineli-technical)
 //   BASE_URL    a server that is already running
 //   WAIT_MS     how long a dashboard may load (default 240000)
 //   AWS_PROFILE passed through to clavesa, as for any command
 
 import { chromium, devices } from "playwright";
-import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
 import { homedir } from "node:os";
+
+import { uiServer } from "./lib/ui-server.mjs";
 
 const REPO = new URL("../../", import.meta.url).pathname;
 const env = (k, d) => process.env[k] || d;
@@ -68,47 +85,21 @@ const MULTI = new Set(["stacked_bar", "bar_line", "pie", "donut"]);
 
 const iphone = devices["iPhone 16"];
 if (!iphone) throw new Error('playwright has no "iPhone 16" device descriptor');
+const ipad = devices["iPad Pro 11"];
+if (!ipad) throw new Error('playwright has no "iPad Pro 11" device descriptor');
+// reducedMotion: the charts and cards draw at once (Recharts' "auto" and
+// the CSS both follow prefers-reduced-motion), so a shot never catches a
+// chart halfway through its animation. make ui-chart-motion checks the
+// animation itself.
+const still = { colorScheme: "dark", reducedMotion: "reduce" };
 const VIEWPORTS = {
-  phone: { ...iphone, colorScheme: "dark" },
-  desktop: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2, colorScheme: "dark" },
+  phone: { ...iphone, ...still },
+  tablet: { ...ipad, ...still },
+  desktop: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 2, ...still },
 };
-for (const v of VIEWS) if (!VIEWPORTS[v]) throw new Error(`unknown view "${v}" (phone, desktop)`);
+for (const v of VIEWS) if (!VIEWPORTS[v]) throw new Error(`unknown view "${v}" (phone, tablet, desktop)`);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.once("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-async function startUI(port) {
-  const ui = spawn(BIN, ["ui", "--no-browser", "--workspaces", WS_DIR, "--read-only"], {
-    cwd: WS_DIR,
-    env: { ...process.env, CLAVESA_ADDR: `127.0.0.1:${port}` },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let log = "";
-  ui.stdout.on("data", (d) => (log += d));
-  ui.stderr.on("data", (d) => (log += d));
-  let exited = false;
-  ui.on("exit", () => (exited = true));
-  for (let i = 0; i < 120; i++) {
-    if (exited) break;
-    try {
-      const r = await fetch(`http://127.0.0.1:${port}/api/workspaces`);
-      if (r.ok) return ui;
-    } catch {}
-    await sleep(500);
-  }
-  ui.kill();
-  throw new Error(`clavesa ui did not start on :${port}\n${log.slice(-4000)}`);
-}
 
 // Grow the viewport to the page's full scroll length, so one shot shows it all.
 async function fitHeight(page) {
@@ -128,20 +119,44 @@ async function fitHeight(page) {
   }
 }
 
+// Lines whose stroke dash shows less than the whole path: a line cut short
+// before its last point (Recharts kept the dash of a shorter path once).
+const cutLines = (el) =>
+  el.evaluate((w) =>
+    [...w.querySelectorAll("path.recharts-line-curve, path.recharts-curve.recharts-area-curve")]
+      .filter((p) => {
+        const dash = p.getAttribute("stroke-dasharray");
+        if (!dash || !/px/.test(dash)) return false;
+        const shown = parseFloat(dash);
+        return shown + 1 < p.getTotalLength();
+      }).length,
+  );
+
+const PERIODS = ["Last 1 hour", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days", "Custom range"];
+const PERIOD_OF = {
+  "now-1h": "Last 1 hour", "now-24h": "Last 24 hours", "now-7d": "Last 7 days", "now-30d": "Last 30 days", "now-90d": "Last 90 days",
+  last_24h: "Last 24 hours", last_7d: "Last 7 days", last_30d: "Last 30 days", last_90d: "Last 90 days",
+  "now-5m": "Last 1 hour", "now-15m": "Last 1 hour", "now-30m": "Last 1 hour", "now-3h": "Last 1 hour", "now-12h": "Last 24 hours", "now-3d": "Last 7 days",
+};
+const REFRESH = ["Off", "5 min", "15 min", "1 hour"];
+
+// The options of a Radix select: open it, read them, close it.
+async function selectOptions(page, trigger) {
+  await trigger.click();
+  const opts = page.getByRole("option");
+  await opts.first().waitFor({ timeout: 5000 });
+  const texts = (await opts.allTextContents()).map((t) => t.trim());
+  await page.keyboard.press("Escape");
+  await sleep(200);
+  return texts;
+}
+
 const fileSafe = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 50) || "widget";
 
 const browser = await chromium.launch();
 rmSync(ROOT, { recursive: true, force: true });
-let BASE = process.env.BASE_URL?.replace(/\/$/, "");
-let ui = { kill() {} };
-if (BASE) console.log(`using the server at ${BASE}`);
-else {
-  const port = await freePort();
-  BASE = `http://127.0.0.1:${port}`;
-  console.log(`clavesa ui --workspaces ${WS_DIR} --read-only on ${BASE}`);
-  ui = await startUI(port);
-}
-process.on("exit", () => ui.kill());
+const server = await uiServer(BIN, WS_DIR);
+const BASE = server.base;
 
 const failures = [];
 try {
@@ -187,11 +202,20 @@ try {
             return { text: (t.textContent ?? "").trim(), cut: s ? b.left < s.left - 0.5 || b.right > s.right + 0.5 : false };
           });
           const yAxes = w.querySelectorAll(".recharts-yAxis").length;
+          const xCut = [...w.querySelectorAll(".recharts-xAxis-tick-labels text.recharts-cartesian-axis-tick-value")]
+            .filter((t) => {
+              const b = t.getBoundingClientRect();
+              const s = t.ownerSVGElement?.getBoundingClientRect() ?? sr;
+              return s ? b.left < s.left - 0.5 || b.right > s.right + 0.5 : false;
+            })
+            .map((t) => (t.textContent ?? "").trim());
           const wide = [...w.querySelectorAll("*")]
             .filter((el) => {
               if (el.closest("svg") || el.closest("table") || el.closest('[data-scroll-x]')) return false;
               const cs = getComputedStyle(el);
               if (cs.overflowX === "auto" || cs.overflowX === "scroll") return false;
+              // An ellipsis on purpose (a stacked row's title) is not a cut.
+              if (cs.textOverflow === "ellipsis" && el.title === (el.textContent ?? "")) return false;
               return el.scrollWidth > el.clientWidth + 1 && el.clientWidth > 0 && el.children.length === 0;
             })
             .map((el) => (el.textContent ?? "").trim().slice(0, 30));
@@ -209,6 +233,16 @@ try {
               return tops.size > 1;
             })
             .map((td) => (td.textContent ?? "").trim());
+          // A stacked table row's title: one line, the full value in its
+          // title attribute.
+          const titles = [...w.querySelectorAll('[data-testid="stacked-title"]')].map((el) => {
+            const lh = parseFloat(getComputedStyle(el).lineHeight) || 16;
+            return {
+              text: (el.textContent ?? "").trim(),
+              oneLine: el.getBoundingClientRect().height <= lh * 1.5,
+              titled: el.title === (el.textContent ?? ""),
+            };
+          });
           const legend = [...w.querySelectorAll(".recharts-legend-item-text")].map((e) => (e.textContent ?? "").trim());
           // A smoothed line is a path with cubic segments ("C").
           const curved = [...w.querySelectorAll("path.recharts-line-curve, .recharts-line path.recharts-curve")].some((p) =>
@@ -225,6 +259,8 @@ try {
             full: r.width >= rowW - 2,
             yAxes,
             ticks,
+            xCut,
+            titles,
             wide,
             empty: /No rows/.test(w.textContent ?? ""),
             failed: /Query failed/.test(w.textContent ?? ""),
@@ -250,12 +286,17 @@ try {
           if (t.cut) probs.push(`y tick "${t.text}" cut off`);
         }
       }
+      for (const t of w.xCut) probs.push(`x label "${t}" cut off`);
+      for (const t of w.titles) {
+        if (!t.oneLine) probs.push(`stacked row title "${t.text.slice(0, 24)}" wraps`);
+        if (!t.titled) probs.push(`stacked row title "${t.text.slice(0, 24)}" has no full-value title`);
+      }
       const tile = w.type === "big_number";
       if (info.vw < NARROW && !w.full && !tile) probs.push(`takes ${w.width} px, not the full row`);
       for (const t of w.wide) probs.push(`text "${t}" wider than its box`);
-      // A table too wide for a phone even with its text wrapped scrolls
-      // sideways in its widget: said, not failed.
-      if (w.tableCut) console.log(`         note: table scrolls sideways`);
+      // A table too wide for a phone even with its text wrapped turns into
+      // a list of rows; one that scrolls sideways is a failure.
+      if (w.tableCut && info.vw < NARROW) probs.push("table scrolls sideways");
       for (const t of w.splitWords) probs.push(`table word "${t}" broken over two lines`);
       if (w.failed) probs.push("query failed");
       for (const l of w.legend) if (/^(x|y|value|val|line|bar|bars)$/i.test(l)) probs.push(`legend says "${l}", a placeholder`);
@@ -299,7 +340,7 @@ try {
       const visible = async () => Number(await frame.getAttribute("data-series-visible"));
       const pressed = async (j) => (await items.nth(j).getAttribute("aria-pressed")) === "true";
       const probs = [];
-      if (view === "phone") {
+      if (VIEWPORTS[view].hasTouch) {
         for (let j = 0; j < k; j++) {
           const b = await items.nth(j).boundingBox();
           if (b && b.height < 43.5) probs.push(`legend button ${j + 1} is ${Math.round(b.height)} px tall, under 44`);
@@ -310,6 +351,7 @@ try {
       await sleep(250);
       if (await pressed(0)) probs.push("first legend button still on after a tap");
       if ((await visible()) !== k - 1) probs.push(`after one tap the chart shows ${await visible()} series, not ${k - 1}`);
+      if (await cutLines(el)) probs.push("with one series off, a line is cut short before its last point");
       await el.screenshot({ path: `${OUT}${slug}/${n}-${fileSafe(w.title)}-off.png` });
       for (let j = 1; j < k - 1; j++) await items.nth(j).click();
       await items.nth(k - 1).click({ force: true });
@@ -319,8 +361,94 @@ try {
       for (let j = 0; j < k - 1; j++) await items.nth(j).click();
       await sleep(250);
       if ((await visible()) !== k) probs.push(`after turning all back on the chart shows ${await visible()} of ${k}`);
+      if (await cutLines(el)) probs.push("after turning all back on, a line is cut short before its last point");
       console.log(`  ${probs.length ? "FAIL" : "ok  "} ${n} legend: ${k} series turn off and on`);
       for (const p of probs) failures.push(`${name}: ${p}`);
+    }
+    // Periods and refresh.
+    {
+      const probs = [];
+      const spec = await (await page.request.get(`${BASE}/w/${encodeURIComponent(WS_NAME)}/api/dashboards/${encodeURIComponent(slug)}`)).json();
+      const tr = (spec.controls ?? []).find((c) => c.type === "time_range");
+      const picker = page.locator('[data-testid="time-range-picker"]').first();
+      if (tr) {
+        await page.evaluate(() => scrollTo(0, 0));
+        const shown = (await picker.textContent())?.trim() ?? "";
+        const want = tr.default ? PERIOD_OF[tr.default.trim()] : null;
+        if (want && shown !== want) probs.push(`period picker shows "${shown}", the default is ${tr.default} ("${want}")`);
+        if (!want && !PERIODS.slice(0, 5).includes(shown)) probs.push(`period picker shows "${shown}", not a preset, with no default set`);
+        const opts = await selectOptions(page, picker);
+        if (JSON.stringify(opts) !== JSON.stringify(PERIODS)) probs.push(`period options [${opts.join(", ")}], want [${PERIODS.join(", ")}]`);
+        if (opts.some((o) => /minute/i.test(o))) probs.push("a period under an hour is offered");
+      }
+      const refresh = page.locator('[data-testid="refresh-picker"]').first();
+      if (await refresh.count()) {
+        const shown = (await refresh.textContent())?.trim();
+        if (shown !== "Off") probs.push(`refresh is "${shown}", not Off`);
+        const opts = await selectOptions(page, refresh);
+        if (JSON.stringify(opts) !== JSON.stringify(REFRESH)) probs.push(`refresh options [${opts.join(", ")}], want [${REFRESH.join(", ")}]`);
+      }
+      const dashUrl = `${BASE}/w/${encodeURIComponent(WS_NAME)}/dashboards/${encodeURIComponent(slug)}`;
+      if (tr && view === VIEWS[0]) {
+        for (const rel of ["now-5m", "now-10m"]) {
+          const old = await ctx.newPage();
+          const oldErrors = [];
+          old.on("pageerror", (e) => oldErrors.push(e.message));
+          await old.goto(`${dashUrl}?${encodeURIComponent(tr.name)}.rel=${rel}`, { waitUntil: "domcontentloaded" });
+          const p2 = old.locator('[data-testid="time-range-picker"]').first();
+          await p2.waitFor({ timeout: WAIT_MS });
+          const shown = (await p2.textContent())?.trim();
+          if (shown !== "Last 1 hour") probs.push(`a link with ${tr.name}.rel=${rel} shows "${shown}", not "Last 1 hour"`);
+          if (oldErrors.length) probs.push(`a link with ${tr.name}.rel=${rel}: ${oldErrors[0]}`);
+          await old.close();
+        }
+      }
+      // Auto refresh moves the window (review 2026-11-19: it ran the same
+      // window again, an Athena scan that never showed newer data).
+      if (tr && view === VIEWS[0] && slug === DASHBOARDS[DASHBOARDS.length - 1]) {
+        const rp = await ctx.newPage();
+        await rp.clock.install();
+        const sent = [];
+        rp.on("request", (r) => {
+          if (r.method() === "POST" && /\/dashboards\/query$/.test(r.url())) {
+            try {
+              sent.push(JSON.parse(r.postData() ?? "{}"));
+            } catch {}
+          }
+        });
+        const settled = () =>
+          rp.waitForFunction(
+            () => !document.querySelector('[data-testid="dashboard-widget"] .animate-pulse, [data-testid="widget-body"][aria-busy]'),
+            null,
+            { timeout: WAIT_MS },
+          );
+        await rp.goto(`${dashUrl}?refresh=5m`, { waitUntil: "domcontentloaded" });
+        await rp.locator('[data-testid="dashboard-widget"]').first().waitFor({ timeout: WAIT_MS });
+        await settled();
+        await sleep(500);
+        const before = sent.splice(0);
+        const key = (b) => JSON.stringify([b.dir, b.sql, b.params ?? {}]);
+        const startOf = (list) => list.map((b) => b.params?.[`${tr.name}.start`]).filter(Boolean).sort()[0];
+        await rp.clock.fastForward("05:01");
+        for (let i = 0; i < 60 && sent.length === 0; i++) await sleep(250);
+        await settled();
+        const after = sent.splice(0);
+        const old = new Set(before.map(key));
+        if (after.length === 0) probs.push("auto refresh: a 5 min tick sent no query");
+        if (after.some((b) => old.has(key(b)))) probs.push("auto refresh: a tick queried the same window again");
+        if (after.length && !(startOf(after) > startOf(before))) probs.push(`auto refresh: the window did not move (${startOf(before)} → ${startOf(after)})`);
+        console.log(`       refresh: ${before.length} queries, then ${after.length} on the tick, window ${startOf(before)} → ${startOf(after)}`);
+        await rp.close();
+      }
+      const fading = await page.evaluate(() =>
+        [...document.querySelectorAll('[data-testid="widget-body"]')].filter((el) => {
+          const cs = getComputedStyle(el);
+          return cs.transitionProperty !== "none" && cs.transitionDuration !== "0s";
+        }).length,
+      );
+      if (fading) probs.push(`reduced motion: ${fading} widget bodies still fade (transition on)`);
+      console.log(`  ${probs.length ? "FAIL" : "ok  "} periods and refresh${tr ? ` (${tr.name}, default ${tr.default || "from the data"})` : " (no period control)"}`);
+      for (const p of probs) failures.push(`${label}: ${p}`);
     }
     await page.close();
   }
@@ -328,7 +456,7 @@ try {
   }
 } finally {
   await browser.close();
-  ui.kill();
+  server.stop();
 }
 
 if (failures.length) {

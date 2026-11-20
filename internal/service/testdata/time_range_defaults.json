@@ -1,0 +1,161 @@
+{
+  "_comment": "Dashboard periods (Vesa, 2026-11-19). Checked by TestPeriodFixture (Go) and make ui-time-range-check (ui/src/lib/timeRange.ts), so the CLI and the UI agree. presets: what the picker offers. canonical: what a saved default or a ?<name>.rel= value means now. defaults: the period a time_range control with no default takes from the time column (outer SELECT list or GROUP BY item) of its datasets' SQL.",
+  "presets": [
+    "now-1h",
+    "now-24h",
+    "now-7d",
+    "now-30d",
+    "now-90d"
+  ],
+  "fallback": "now-7d",
+  "canonical": {
+    "now-5m": "now-1h",
+    "now-15m": "now-1h",
+    "now-30m": "now-1h",
+    "now-3h": "now-1h",
+    "now-12h": "now-24h",
+    "now-3d": "now-7d",
+    "last_24h": "now-24h",
+    "last_7d": "now-7d",
+    "last_30d": "now-30d",
+    "last_90d": "now-90d",
+    "now-1h": "now-1h",
+    "now-2w": "now-2w",
+    " now-30d ": "now-30d",
+    "now-10m": "now-1h",
+    "now-59m": "now-1h",
+    "now-90m": "now-90m"
+  },
+  "spans_seconds": {
+    "now-10m": 3600,
+    "now-59m": 3600,
+    "now-6h": 21600,
+    "now-12h": 86400,
+    "": 604800,
+    "bogus": 604800
+  },
+  "defaults": [
+    {
+      "name": "daily rollup table, date cast",
+      "control": "period",
+      "sqls": [
+        "SELECT event_date, SUM(n) FROM gold.rollup_page_views_daily WHERE event_date >= CAST(substr({{period.start}}, 1, 10) AS DATE) GROUP BY 1"
+      ],
+      "want": "now-7d"
+    },
+    {
+      "name": "hourly table",
+      "control": "period",
+      "sqls": [
+        "SELECT event_hour, SUM(n) FROM gold.traffic_hourly WHERE event_hour >= {{period.start}} GROUP BY 1"
+      ],
+      "want": "now-24h"
+    },
+    {
+      "name": "minute truncation",
+      "control": "tr",
+      "sqls": [
+        "SELECT date_trunc('minute', ts) AS m, COUNT(*) FROM runs WHERE ts BETWEEN {{tr.start}} AND {{tr.end}} GROUP BY 1"
+      ],
+      "want": "now-24h"
+    },
+    {
+      "name": "monthly truncation",
+      "control": "tr",
+      "sqls": [
+        "SELECT DATE_TRUNC('month', trip_date) AS m, SUM(fare) FROM trips WHERE trip_date >= {{tr.start}} GROUP BY 1"
+      ],
+      "want": "now-90d"
+    },
+    {
+      "name": "hourly and daily datasets: the longer period, so the daily chart is not one bar",
+      "control": "period",
+      "sqls": [
+        "SELECT event_hour, n FROM t_hourly WHERE event_hour >= {{period.start}}",
+        "SELECT event_date, n FROM t_daily WHERE event_date >= {{period.start}}"
+      ],
+      "want": "now-7d"
+    },
+    {
+      "name": "only datasets that use the control count",
+      "control": "period",
+      "sqls": [
+        "SELECT event_hour, n FROM t_hourly WHERE event_hour >= {{period.start}}",
+        "SELECT month, n FROM totals_monthly"
+      ],
+      "want": "now-24h"
+    },
+    {
+      "name": "nothing to go by",
+      "control": "period",
+      "sqls": [
+        "SELECT ts, n FROM events WHERE ts >= {{period.start}}"
+      ],
+      "want": "now-7d"
+    },
+    {
+      "name": "no datasets",
+      "control": "period",
+      "sqls": [],
+      "want": "now-7d"
+    },
+    {
+      "name": "current_date in a filter is not a time column",
+      "control": "period",
+      "sqls": [
+        "SELECT event_hour, n FROM t WHERE event_hour >= {{period.start}}",
+        "SELECT page, COUNT(*) AS n FROM pv WHERE event_ts >= current_date AND event_ts >= {{period.start}} GROUP BY page"
+      ],
+      "want": "now-24h"
+    },
+    {
+      "name": "an hour(ts) breakdown is not hourly data",
+      "control": "period",
+      "sqls": [
+        "SELECT hour(ts) AS h, COUNT(*) AS n FROM events WHERE ts >= {{period.start}} GROUP BY hour(ts)"
+      ],
+      "want": "now-7d"
+    },
+    {
+      "name": "a month(ts) breakdown is not monthly data",
+      "control": "period",
+      "sqls": [
+        "SELECT event_hour, n FROM t WHERE event_hour >= {{period.start}}",
+        "SELECT month(ts) AS m, COUNT(*) AS n FROM events WHERE ts >= {{period.start}} GROUP BY month(ts)"
+      ],
+      "want": "now-24h"
+    },
+    {
+      "name": "a table name says nothing",
+      "control": "period",
+      "sqls": [
+        "SELECT ts, n FROM gold.rollup_hourly WHERE ts >= {{period.start}}"
+      ],
+      "want": "now-7d"
+    },
+    {
+      "name": "the outer SELECT counts, not a CTE's",
+      "control": "period",
+      "sqls": [
+        "WITH d AS (SELECT event_hour, n FROM t WHERE event_hour >= {{period.start}}) SELECT CAST(event_hour AS DATE) AS day, SUM(n) AS n FROM d GROUP BY 1"
+      ],
+      "want": "now-7d"
+    },
+    {
+      "name": "a column named in GROUP BY",
+      "control": "period",
+      "sqls": [
+        "SELECT SUM(n) AS n FROM t WHERE ts >= {{period.start}} GROUP BY t.event_hour"
+      ],
+      "want": "now-24h"
+    },
+    {
+      "name": "a string literal is not an item",
+      "control": "period",
+      "sqls": [
+        "SELECT 'event_hour, x' AS label, ts, n FROM t WHERE ts >= {{period.start}}"
+      ],
+      "want": "now-7d"
+    }
+  ]
+}

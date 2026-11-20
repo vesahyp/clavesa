@@ -189,6 +189,10 @@ docker run -d --name "$KAFKA" --network "$NET" --network-alias kafka \
 log "workspace: $WS (builds the runner image; cached after the first run)"
 mkdir -p "$WS"
 : >"$RUN_FAILURES"
+# workspace init records the current workspace under XDG_CONFIG_HOME:
+# keep it beside the temp workspace, not in ~/.config/clavesa/.
+export XDG_CONFIG_HOME="$WS/../xdg-config"
+mkdir -p "$XDG_CONFIG_HOME"
 "$BIN" workspace init "$WS_NAME" --workspace "$WS" >"$WS/../init.log" 2>&1 || {
   tail -30 "$WS/../init.log"; exit 1; }
 

@@ -10,7 +10,7 @@
  * server-side at query time.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -28,6 +28,7 @@ import {
   type DashboardControl,
 } from "@/lib/queries";
 import {
+  FALLBACK_PERIOD,
   normaliseExpr,
   parseRelative,
   resolveTimeRange as resolveTimeRangeShared,
@@ -47,6 +48,10 @@ export function useDashboardParams(
   controls: DashboardControl[],
 ): Record<string, string> {
   const [searchParams] = useSearchParams();
+  // Each auto-refresh tick resolves the relative windows at the new now,
+  // so the widgets query the newer window (new keys) instead of the same
+  // window again.
+  const tick = useRefreshTick();
   return useMemo(() => {
     const out: Record<string, string> = {};
     for (const c of controls) {
@@ -72,7 +77,7 @@ export function useDashboardParams(
           out[endKey] = e;
         } else {
           const { start: s, end: e } = resolveTimeRangeShared(
-            c.default || "now-30d",
+            c.default || FALLBACK_PERIOD,
           );
           out[startKey] = s;
           out[endKey] = e;
@@ -89,7 +94,27 @@ export function useDashboardParams(
       }
     }
     return out;
-  }, [controls, searchParams]);
+  }, [controls, searchParams, tick]);
+}
+
+// The auto-refresh tick: RefreshControl bumps it, useDashboardParams
+// reads it. Module state, as there is one dashboard on screen.
+let refreshTick = 0;
+const tickListeners = new Set<() => void>();
+function bumpRefreshTick() {
+  refreshTick++;
+  for (const l of tickListeners) l();
+}
+function useRefreshTick(): number {
+  return useSyncExternalStore(
+    (cb) => {
+      tickListeners.add(cb);
+      return () => {
+        tickListeners.delete(cb);
+      };
+    },
+    () => refreshTick,
+  );
 }
 
 interface ControlStripProps {
@@ -128,7 +153,13 @@ export function ControlStrip({ controls, params }: ControlStripProps) {
 
   return (
     <div className="mb-4 flex flex-wrap items-end gap-3 rounded-md border border-border bg-card p-3">
-      <RefreshControl />
+      <RefreshControl
+        moving={controls.some(
+          (c) =>
+            c.type === "time_range" &&
+            !(searchParams.get(`${c.name}.start`) && searchParams.get(`${c.name}.end`)),
+        )}
+      />
       {controls.map((c) => {
         if (c.type === "time_range") {
           const startKey = `${c.name}.start`;
@@ -224,7 +255,7 @@ function TimeRangeControl({
       <div className="space-y-1">
         <Label className="text-xs">{control.label || control.name}</Label>
         <Select value={presetExpr} onValueChange={onPresetPick}>
-          <SelectTrigger className="h-11 md:h-9 w-44">
+          <SelectTrigger className="h-11 md:h-9 w-44" data-testid="time-range-picker">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -290,31 +321,41 @@ function TimeRangeControl({
  * re-fire. Off (default) preserves the pre-Slice-E behaviour where
  * widgets only re-fetched on React Query's stale-time expiry.
  */
+// 2026-11-19: no 30 s or 1 min. Each refresh runs every widget's query
+// again (an Athena scan in the cloud), and the data behind a dashboard
+// changes by the hour at best. A link with ?refresh=30s or 1m gets 5 min.
 const REFRESH_OPTIONS: { value: string; label: string; ms: number }[] = [
   { value: "off", label: "Off", ms: 0 },
-  { value: "30s", label: "30s", ms: 30_000 },
-  { value: "1m", label: "1 min", ms: 60_000 },
   { value: "5m", label: "5 min", ms: 5 * 60_000 },
   { value: "15m", label: "15 min", ms: 15 * 60_000 },
+  { value: "1h", label: "1 hour", ms: 60 * 60_000 },
 ];
+const RETIRED_REFRESH: Record<string, string> = { "30s": "5m", "1m": "5m" };
 
-function RefreshControl() {
+/**
+ * `moving`: the dashboard has a relative period (last 24 hours), so a
+ * tick moves the window to the new now and the widgets query that; no
+ * query runs twice for the same window. With only fixed windows or
+ * select filters a tick runs the same queries again, as new rows can
+ * still land in them.
+ */
+function RefreshControl({ moving }: { moving: boolean }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const qc = useQueryClient();
-  const raw = searchParams.get("refresh") ?? "off";
+  const asked = searchParams.get("refresh") ?? "off";
+  const raw = RETIRED_REFRESH[asked] ?? asked;
   const opt =
     REFRESH_OPTIONS.find((o) => o.value === raw) ?? REFRESH_OPTIONS[0];
 
   useEffect(() => {
     if (opt.ms <= 0) return;
     const id = window.setInterval(() => {
-      // Hits every widget query AND the dataset-column probes; matches
-      // the React-Query key prefix used by useDashboardQuery /
-      // useDatasetColumns.
-      void qc.invalidateQueries({ queryKey: ["dashboards", "query"] });
+      if (moving) bumpRefreshTick();
+      // Same key prefix as useDashboardQuery / useDatasetColumns.
+      else void qc.invalidateQueries({ queryKey: ["dashboards", "query"] });
     }, opt.ms);
     return () => window.clearInterval(id);
-  }, [opt.ms, qc]);
+  }, [opt.ms, qc, moving]);
 
   function onPick(value: string) {
     const sp = new URLSearchParams(searchParams);
@@ -327,7 +368,7 @@ function RefreshControl() {
     <div className="space-y-1">
       <Label className="text-xs">Refresh</Label>
       <Select value={opt.value} onValueChange={onPick}>
-        <SelectTrigger className="h-11 md:h-9 w-24">
+        <SelectTrigger className="h-11 md:h-9 w-24" data-testid="refresh-picker">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
@@ -350,7 +391,7 @@ function RefreshControl() {
  * dashboard's `last_24h` reads back as "Last 24 hours" on the picker.
  */
 function pickPresetExpr(relValue: string, controlDefault: string): string {
-  const candidate = normaliseExpr(relValue || controlDefault || "now-30d");
+  const candidate = normaliseExpr(relValue || controlDefault || FALLBACK_PERIOD);
   if (TIME_RANGE_PRESETS.some((p) => p.expr === candidate)) return candidate;
   return "custom";
 }

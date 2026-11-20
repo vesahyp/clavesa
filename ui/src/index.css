@@ -127,3 +127,18 @@
 @media (prefers-reduced-motion: reduce) {
   .widget-rise { animation: none; }
 }
+
+/*
+ * A chart series turned off from its legend fades out where it is
+ * (chartKit, the bar_line line); the chart's own motion is Recharts'.
+ */
+.chart-series {
+  transition: opacity 0.3s ease;
+}
+.chart-series-off {
+  opacity: 0;
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chart-series { transition: none; }
+}

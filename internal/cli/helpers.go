@@ -233,23 +233,38 @@ func walkUpForManifest() string {
 // CLI can shut down warm-worker containers spawned during a one-shot
 // command. Each `clavesa <cmd>` invocation that touches the SQL parser
 // would otherwise leave a ~1GB container behind.
-var cliCloseables []func()
+//
+// The list is per invocation, keyed by the root command: unit tests run
+// Run() in parallel, and one shared list let a test's teardown close the
+// warm workers another test was still using (and was a data race under
+// -race).
+var (
+	cliCloseablesMu sync.Mutex
+	cliCloseables   = map[*cobra.Command][]func(){}
+)
 
-// registerCloseable appends a teardown to run after the current CLI
-// command finishes. Safe to call from any newServiceDeps path.
-func registerCloseable(fn func()) {
-	cliCloseables = append(cliCloseables, fn)
+// registerCloseable appends a teardown to run after the command `cmd`
+// belongs to finishes. Safe to call from any newServiceDeps path.
+func registerCloseable(cmd *cobra.Command, fn func()) {
+	root := cmd.Root()
+	cliCloseablesMu.Lock()
+	defer cliCloseablesMu.Unlock()
+	cliCloseables[root] = append(cliCloseables[root], fn)
 }
 
-// runCloseables stops every registered teardown. Called by Execute /
-// Run after the root command returns (success or failure). Idempotent
-// — resets the slice afterward so a future Execute call starts clean
-// (relevant for unit tests that invoke Run() repeatedly).
-func runCloseables() {
-	for _, fn := range cliCloseables {
+// runCloseables stops every teardown registered under cmd's root command.
+// Called by Execute / Run after the root command returns (success or
+// failure), and by `clavesa ui` on shutdown. Idempotent: the list is
+// dropped once run.
+func runCloseables(cmd *cobra.Command) {
+	root := cmd.Root()
+	cliCloseablesMu.Lock()
+	fns := cliCloseables[root]
+	delete(cliCloseables, root)
+	cliCloseablesMu.Unlock()
+	for _, fn := range fns {
 		fn()
 	}
-	cliCloseables = nil
 }
 
 // keepMetastoreEnv is the environment variable that keeps the workspace's
@@ -352,10 +367,10 @@ func newServiceDeps(cmd *cobra.Command) (*serviceDeps, error) {
 	})
 	// A metastore this command keeps warm on purpose carries no owner
 	// label, so the dead-owner reap leaves it (owner.go).
-	observability.KeepMetastore = metastoreKept(cmd)
+	observability.SetKeepMetastore(metastoreKept(cmd))
 	d := wsdeps.New(cmd.Context(), workspace, wsdeps.Options{})
 	for _, fn := range d.Closers {
-		registerCloseable(fn)
+		registerCloseable(cmd, fn)
 	}
 	return &serviceDeps{
 		svc:       d.Svc,

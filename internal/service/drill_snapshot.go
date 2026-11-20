@@ -134,7 +134,7 @@ func (s *Service) drillSnapshot(ctx context.Context, now time.Time) *DrillSnapsh
 			continue
 		}
 		params := map[string]string{}
-		resolveControlDefaults(d.Controls, params, now)
+		resolveControlDefaults(d.Controls, d.Datasets, params, now)
 		for _, ds := range d.Datasets {
 			if outOfTime(fmt.Sprintf("dashboard %s dataset %s", sum.Slug, ds.Name)) {
 				return snap

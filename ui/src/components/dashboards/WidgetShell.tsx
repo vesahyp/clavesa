@@ -39,6 +39,13 @@ interface WidgetShellProps {
   inGrid?: boolean;
   /** The widget type: a stat tile (big_number) may share a narrow row. */
   type?: string;
+  /**
+   * Place in reading order. The cards rise 60 ms apart, as ecarbrowser's
+   * stat tiles do; from the ninth on they rise together.
+   */
+  order?: number;
+  /** The card element, for the in-view check of chart motion. */
+  cardRef?: React.Ref<HTMLDivElement>;
 }
 
 export function WidgetShell({
@@ -51,6 +58,8 @@ export function WidgetShell({
   headerExtra,
   inGrid = false,
   type,
+  order = 0,
+  cardRef,
 }: WidgetShellProps) {
   // CSS grid is 1-indexed; the spec uses 0-indexed positions for ease of
   // hand-editing the JSON. `gridColumn: "span N / span N"` when we don't
@@ -89,7 +98,8 @@ export function WidgetShell({
   const tile = type === "big_number";
   return (
     <Card
-      style={style}
+      ref={cardRef}
+      style={{ ...style, animationDelay: `${Math.min(order, 8) * 60}ms` }}
       className={cn(
         "widget-rise rounded-xl border-white/[0.08] shadow-none",
         "bg-[linear-gradient(180deg,rgb(255_255_255/0.025),transparent_40%)] bg-card",

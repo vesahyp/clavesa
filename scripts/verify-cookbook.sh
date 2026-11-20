@@ -831,7 +831,7 @@ recipe_notebooks() {
 IPYNB
 
   # notebook list shows it.
-  if clv notebook list 2>/dev/null | grep -qw exploration; then
+  if grep -qw exploration <<<"$(clv notebook list 2>/dev/null)"; then
     pass "notebook list shows exploration"
   else
     fail "notebook list does not show exploration"
@@ -862,7 +862,7 @@ IPYNB
   else
     fail "graduate did not write demo/transforms/payment_counts.sql"
   fi
-  if clv node list demo 2>/dev/null | grep -qw payment_counts; then
+  if grep -qw payment_counts <<<"$(clv node list demo 2>/dev/null)"; then
     pass "node list demo shows payment_counts (graduated node registered)"
   else
     fail "node list demo does not show payment_counts"
@@ -1375,7 +1375,7 @@ JSON
     fail "dashboards apply output unexpected: $apply_out"
   fi
 
-  if clv dashboards list 2>/dev/null | grep -qw taxi-revenue; then
+  if grep -qw taxi-revenue <<<"$(clv dashboards list 2>/dev/null)"; then
     pass "dashboards list shows taxi-revenue"
   else
     fail "dashboards list does not show taxi-revenue"
@@ -1487,7 +1487,7 @@ recipe_runner_deps() {
 
   banner "recipe runner-deps: add humanize to the runner requirements"
   clv runner requirements add humanize || die "runner requirements add failed"
-  if clv runner requirements list 2>/dev/null | grep -qw humanize; then
+  if grep -qw humanize <<<"$(clv runner requirements list 2>/dev/null)"; then
     pass "runner requirements list shows humanize"
   else
     fail "runner requirements list does not show humanize"
@@ -1578,7 +1578,7 @@ recipe_backfill() {
     --format parquet \
     --partitions y,m,d \
     --start-from "2026/06/02" || die "source register failed"
-  if clv source show "$SRC" 2>/dev/null | grep -q "s3"; then
+  if grep -q "s3" <<<"$(clv source show "$SRC" 2>/dev/null)"; then
     pass "source $SRC registered (kind=s3, partitioned)"
   else
     fail "source $SRC not registered as expected"

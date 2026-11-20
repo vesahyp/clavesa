@@ -189,7 +189,7 @@ async function fitHeight(page, only) {
 
 const failures = [];
 try {
-  const ctx = await browser.newContext({ ...iphone, colorScheme: "dark" });
+  const ctx = await browser.newContext({ ...iphone, colorScheme: "dark", reducedMotion: "reduce" });
   for (const pg of PAGES) {
     const page = await ctx.newPage();
     const errors = [];

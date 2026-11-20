@@ -20,6 +20,7 @@ import (
 	"github.com/vesahyp/clavesa/internal/graph"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
+	"github.com/vesahyp/clavesa/internal/observability"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -440,11 +441,10 @@ func (s *Service) BackfillDiff(ctx context.Context, dir, runID string) (*Backfil
 	}
 	ac := athena.NewFromConfig(cfg)
 	wg := s.athenaWorkgroup(ctx, ac)
-	bucket, err := s.athenaResultsBucket(ctx)
+	out, err := s.athenaOutput(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := bucket + "/athena-results/"
 
 	diff := &BackfillDiff{
 		RunID:          run.RunID,
@@ -684,11 +684,10 @@ func (s *Service) BackfillDedupCheck(ctx context.Context, dir, runID, col string
 	}
 	ac := athena.NewFromConfig(cfg)
 	wg := s.athenaWorkgroup(ctx, ac)
-	bucket, err := s.athenaResultsBucket(ctx)
+	out, err := s.athenaOutput(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := bucket + "/athena-results/"
 
 	// Validate col against staging columns so the SQL composition below
 	// can't be hijacked by a crafted column name. Athena identifiers are
@@ -1274,9 +1273,18 @@ func (s *Service) athenaWorkgroup(ctx context.Context, ac *athena.Client) string
 	return "primary"
 }
 
-// athenaResultsBucket returns the workspace's pipeline-bucket as an
-// s3:// prefix the Athena queries can dump results into. We read the
-// workspace manifest for the bucket name.
+// athenaOutput is where the backfill queries write their results:
+// $CLAVESA_ATHENA_OUTPUT when set, else s3://<pipeline bucket>/athena-results/.
+func (s *Service) athenaOutput(ctx context.Context) (string, error) {
+	bucket, err := s.athenaResultsBucket(ctx)
+	if err != nil {
+		return "", err
+	}
+	return observability.AthenaOutputLocation(observability.DefaultAthenaOutput(bucket))
+}
+
+// athenaResultsBucket returns the name of the workspace's pipeline bucket,
+// from the workspace manifest.
 func (s *Service) athenaResultsBucket(ctx context.Context) (string, error) {
 	ws, err := workspace.Load(s.workspace)
 	if err != nil {
@@ -1285,7 +1293,7 @@ func (s *Service) athenaResultsBucket(ctx context.Context) (string, error) {
 	if ws == nil || ws.Name == "" {
 		return "", fmt.Errorf("workspace manifest not found — cannot determine results bucket")
 	}
-	return "s3://" + ws.Name + "-clavesa", nil
+	return ws.Name + "-clavesa", nil
 }
 
 func athenaRunQuery(ctx context.Context, ac *athena.Client, workgroup, outputLocation, sql string) error {
