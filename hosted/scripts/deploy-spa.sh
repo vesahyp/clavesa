@@ -60,8 +60,8 @@ aws s3 cp "$ROOT/hosted/static/t.gif" "s3://$BUCKET/t.gif" --region "$REGION" \
 aws s3 cp "$OUT/index.html" "s3://$BUCKET/index.html" --region "$REGION" \
   --content-type "text/html; charset=utf-8" --cache-control "no-cache"
 
-echo "→ invalidating /index.html and the tracker on $DIST_ID"
+echo "→ invalidating /* on $DIST_ID (one wildcard is one billed path)"
 aws cloudfront create-invalidation --distribution-id "$DIST_ID" \
-  --paths "/index.html" "/" "/tracker.js" "/tracker-config.js" "/t.gif" \
+  --paths "/*" \
   --query "Invalidation.Id" --output text
 echo "deployed: $(out ui_url)"
