@@ -16,8 +16,7 @@
 # /api/*, /w/*/api/* and /.well-known/* are the HTTP API (CloudFront
 # behaviours in hosted/infra/spa.tf), never objects in this bucket.
 #
-# Then invalidates /index.html and the tracker files (the mutable keys a
-# browser asks for by name). AWS profile: $AWS_PROFILE, default "personal".
+# Then invalidates /* (one wildcard is one billed path). AWS profile: $AWS_PROFILE, default "personal".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
