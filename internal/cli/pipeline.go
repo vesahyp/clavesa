@@ -384,6 +384,7 @@ That preflight runs as part of` + " `workspace deploy`" + `.
 				return err
 			}
 			fmt.Printf("Synced orchestration.tf (emitter %s).\n", service.ModuleVersion)
+			printMergeBoundWarnings(cmd.ErrOrStderr(), svc, dir)
 			if err := syncDatabricksAccess(cmd, svc, dir, os.Stdout); err != nil {
 				return err
 			}
@@ -598,9 +599,13 @@ func newPipelineTerraformCmd(tfSubcmd, short string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := service.New(ws).TerraformEnv(cmd.Context())
+			svc := service.New(ws)
+			env, err := svc.TerraformEnv(cmd.Context())
 			if err != nil {
 				return err
+			}
+			if tfSubcmd == "plan" {
+				printMergeBoundWarnings(cmd.ErrOrStderr(), svc, dir)
 			}
 			if err := tfInit(dir, os.Stdout, os.Stderr); err != nil {
 				return fmt.Errorf("terraform init: %w", err)

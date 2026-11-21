@@ -16,7 +16,8 @@
 # /api/*, /w/*/api/* and /.well-known/* are the HTTP API (CloudFront
 # behaviours in hosted/infra/spa.tf), never objects in this bucket.
 #
-# Then invalidates /* (one wildcard is one billed path). AWS profile: $AWS_PROFILE, default "personal".
+# Then invalidates /index.html and the tracker files (the mutable keys a
+# browser asks for by name). AWS profile: $AWS_PROFILE, default "personal".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -59,8 +60,8 @@ aws s3 cp "$ROOT/hosted/static/t.gif" "s3://$BUCKET/t.gif" --region "$REGION" \
 aws s3 cp "$OUT/index.html" "s3://$BUCKET/index.html" --region "$REGION" \
   --content-type "text/html; charset=utf-8" --cache-control "no-cache"
 
-echo "→ invalidating /* on $DIST_ID (one wildcard is one billed path)"
+echo "→ invalidating /index.html and the tracker on $DIST_ID"
 aws cloudfront create-invalidation --distribution-id "$DIST_ID" \
-  --paths "/*" \
+  --paths "/index.html" "/" "/tracker.js" "/tracker-config.js" "/t.gif" \
   --query "Invalidation.Id" --output text
 echo "deployed: $(out ui_url)"

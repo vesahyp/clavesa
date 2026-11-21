@@ -877,6 +877,37 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	// vs 2min), memory (3008MB vs 1.5GB — new AWS accounts cap per-function
 	// memory at 3008MB; users with a raised quota can bump this in the
 	// generated .tf), and env (per-pipeline knobs).
+	// Spark's container model: memory = driver heap + memoryOverhead
+	// (spark.driver.memoryOverhead, which local mode does not apply, so the
+	// runner sets -Xmx itself through CLAVESA_JVM_HEAP_MB). The overhead
+	// default is measured, not Spark's 10%/40%: the web-traffic gold bundle
+	// (12 nodes, 3008 MB, 2026-11-21) used about 1.1 GB outside the heap
+	// (metaspace, code cache, GC, ~600 threads, malloc, and ~330 MB of
+	// Python), and was killed at heaps 2256 and 2148; 1536 passed with
+	// 535 MB to spare.
+	memMB := 3008
+	if p.Bundle != nil && p.Bundle.LambdaMemoryMB > 0 {
+		memMB = p.Bundle.LambdaMemoryMB
+	}
+	b.WriteString(`# Memory of the runner Lambda outside the Spark heap, in MB: the JVM's
+# metaspace, code cache, GC and thread stacks, and the Python driver and
+# workers (Spark's spark.driver.memoryOverhead). The Spark heap (-Xmx) is
+# the Lambda memory minus this. Raise it when a run fails with
+# Runtime.OutOfMemory; lower it to give Spark more heap. It is a fixed
+# amount, not a share: a Lambda below about 2 GB leaves the heap at its
+# 512 MB floor.
+variable "runner_memory_overhead_mb" {
+  description = "Runner Lambda memory outside the Spark heap in MB; the heap is the Lambda memory minus this."
+  type        = number
+  default     = 1472
+}
+
+`)
+	memNote := "New AWS accounts default to a 3008 MB per-function quota; raise it via Service Quotas, then here. The Spark heap follows"
+	if p.Bundle != nil && p.Bundle.LambdaMemoryMB > 0 {
+		memNote = "the bundle job's size (ADR-031). The Spark heap follows"
+	}
+	fmt.Fprintf(b, "locals {\n  # %s.\n  pipeline_runner_memory_mb = %d\n}\n\n", memNote, memMB)
 	fmt.Fprintf(b, "resource \"aws_lambda_function\" \"pipeline_runner\" {\n")
 	fmt.Fprintf(b, "  function_name = \"%s-runner\"\n", p.awsBase())
 	fmt.Fprintf(b, "  role          = aws_iam_role.pipeline_runner.arn\n")
@@ -884,11 +915,7 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	emitArchitectures(b, p)
 	fmt.Fprintf(b, "  image_uri     = \"${local.pipeline_runner_repo_uri}@${data.aws_ecr_image.pipeline_runner.image_digest}\"\n")
 	fmt.Fprintf(b, "  timeout       = 900   # 15min — the Lambda max; one container handles every transform\n")
-	if p.Bundle != nil && p.Bundle.LambdaMemoryMB > 0 {
-		fmt.Fprintf(b, "  memory_size   = %d  # the bundle job's size (ADR-031)\n\n", p.Bundle.LambdaMemoryMB)
-	} else {
-		fmt.Fprintf(b, "  memory_size   = 3008  # New AWS accounts default to a 3008MB per-function quota; bump via Service Quotas + raise this if you need more headroom for Spark broadcast tables\n\n")
-	}
+	fmt.Fprintf(b, "  memory_size   = local.pipeline_runner_memory_mb\n\n")
 	fmt.Fprintf(b, "  ephemeral_storage {\n")
 	fmt.Fprintf(b, "    size = 10240  # 10 GB — Spark shuffle/spill space; marginal cost ~$0.00026/run vs 512 MB default (GH #43)\n")
 	fmt.Fprintf(b, "  }\n\n")
@@ -898,6 +925,7 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "  environment {\n")
 	fmt.Fprintf(b, "    variables = {\n")
 	writeRunnerEnv(b, p, "      ")
+	fmt.Fprintf(b, "      CLAVESA_JVM_HEAP_MB         = tostring(max(512, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb))\n")
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  tags = local.clavesa_tags\n")

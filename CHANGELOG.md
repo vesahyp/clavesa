@@ -12,7 +12,20 @@ annotated tag pushed to origin, and green tests + `terraform validate`. See
 
 ## [Unreleased]
 
+## [v2.27.15] — 2026-11-21
+
+### Changed
+
+- **The runner Lambda's Spark heap is its memory minus `runner_memory_overhead_mb`, 1472 MB by default.** Spark sizes a container as driver heap plus `memoryOverhead`; the runner Lambda now does the same, so a 3008 MB Lambda gets a 1536 MB heap (it was 75%, 2256 MB). The JVM grows its heap toward `-Xmx`, and about 1.1 GB sits outside it (metaspace, code cache, GC, threads, the Python driver and workers): a 12-node bundle at 3008 MB was killed with `Runtime.OutOfMemory` at heaps 2256 and 2148 and ran with 535 MB to spare at 1536, in the same time. Set `runner_memory_overhead_mb` in a pipeline's `terraform.tfvars` to change it; see `docs/cookbook/debugging-runs.md`. Takes effect on the next `clavesa deploy`.
+- **The column stats pass reads the rows the write wrote** instead of computing the transform again (34% less stats time on the web-traffic gold bundle), and a node that read an incremental input's full snapshot (its first or a forced run) skips the pass with one log line; the next run computes it. A first run of a node over a long history no longer spends minutes on stats (702 s on one web-traffic run, which then hit the 15-minute Lambda timeout).
+
+### Added
+
+- **`clavesa pipeline plan|deploy` and `clavesa plan|deploy` warn when a merge output's MERGE scan bound cannot prune**: the bound columns (merge keys that are clustering columns, plus `bound_by`) are all ids such as `x_edge_request_id`, or there are none. Every run then reads the whole target table. The warning says to add `bound_by` with a date column. It never fails the command.
+
 ## [v2.27.14] — 2026-11-20
+
+Published with `CLAVESA_SKIP_LOCAL_GATES=1`: the local gate stamps leave out untracked files, and four new files were untracked while all gates ran green; the release tree without those four files is exactly the stamped tree `6385f61`.
 
 ### Added
 

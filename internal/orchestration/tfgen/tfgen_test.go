@@ -57,7 +57,8 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`command = ["runner.pipeline_handler"]`,
 		`package_type  = "Image"`,
 		`timeout       = 900`,
-		`memory_size   = 3008`,
+		`memory_size   = local.pipeline_runner_memory_mb`,
+		`pipeline_runner_memory_mb = 3008`,
 		// GH #43: 10 GB ephemeral storage — Spark shuffle/spill space.
 		`ephemeral_storage {`,
 		`size = 10240`,
@@ -74,6 +75,10 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`CLAVESA_WATERMARKS          = "s3://${data.terraform_remote_state.workspace.outputs.pipeline_bucket}/${var.pipeline_name}/_watermarks/"`,
 		`CLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest`,
 		fmt.Sprintf(`CLAVESA_MODULE_VERSION      = %q`, version.Module),
+		// Spark heap = Lambda memory minus the memoryOverhead variable.
+		`variable "runner_memory_overhead_mb"`,
+		`default     = 1472`,
+		`CLAVESA_JVM_HEAP_MB         = tostring(max(512, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb))`,
 
 		// IAM role + assume policy + at least the write statement
 		// targeting the warehouse prefix.

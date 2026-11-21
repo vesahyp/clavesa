@@ -84,3 +84,21 @@ func TestEmitMixedSegmentsGolden(t *testing.T) {
 		t.Error("a mixed job on Fargate must be refused")
 	}
 }
+
+// A bundle job sized above 3008 MB gets its heap from its own memory.
+func TestEmitBundle_HeapFromJobMemory(t *testing.T) {
+	p := twoTransforms()
+	p.Bundle = &BundleConfig{FilesDir: "bundle", JobFile: "bundle-job.json", LambdaMemoryMB: 10240}
+	out, err := Emit(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`pipeline_runner_memory_mb = 10240`,
+		`CLAVESA_JVM_HEAP_MB         = tostring(max(512, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb))`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+}

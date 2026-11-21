@@ -115,6 +115,20 @@ func TestPerWorkspaceViewers(t *testing.T) {
 		t.Errorf("ws-smoke2 reads /api/stats: %d, want 404", c)
 	}
 
+	// A test viewer of web-traffic only (Cognito group ws-web-traffic).
+	wtOnly := str("[ws-web-traffic]")
+	if c, b := call(wtOnly, "/api/workspaces"); c != 200 || len(names(b)) != 1 || !names(b)["web-traffic"] {
+		t.Errorf("ws-web-traffic lists %d %v, want web-traffic only", c, names(b))
+	}
+	if c, _ := call(wtOnly, "/w/web-traffic/api/pipelines"); c != 200 {
+		t.Errorf("ws-web-traffic opens web-traffic: %d", c)
+	}
+	for _, p := range []string{"/w/smoke2/api/pipelines", "/w/smoke2/api/workspace/summary", "POST /w/smoke2/api/dashboards/query", "/api/stats"} {
+		if c, _ := call(wtOnly, p); c != 404 {
+			t.Errorf("ws-web-traffic %s: %d, want 404", p, c)
+		}
+	}
+
 	all := str("[all]")
 	if c, b := call(all, "/api/workspaces"); c != 200 || !names(b)["smoke2"] || !names(b)["web-traffic"] {
 		t.Errorf("all lists %d %v", c, names(b))

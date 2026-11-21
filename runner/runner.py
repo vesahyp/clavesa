@@ -1710,6 +1710,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
             return spark.table(table), {
                 "uri": watermark_uri,
                 "new_cursor": (str(current_version),),
+                "full_snapshot": True,
             }
         if last_version == current_version:
             if forced:
@@ -1724,6 +1725,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
                 return spark.table(table), {
                     "uri": watermark_uri,
                     "new_cursor": (str(current_version),),
+                    "full_snapshot": True,
                 }
             print(
                 f"[clavesa] input {alias!r}: upstream {table} unchanged since version {current_version}; skipping run",
@@ -1745,6 +1747,7 @@ def _resolve_input(spark, alias: str, src: Any, backfill: dict[str, Any] | None 
             return spark.table(table), {
                 "uri": watermark_uri,
                 "new_cursor": (str(current_version),),
+                "full_snapshot": True,
             }
         # CDF read over (last_version, current_version]. Delta's
         # readChangeFeed `startingVersion` is INCLUSIVE; offset by +1 to
@@ -2993,6 +2996,9 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
     input_dfs: dict[str, Any] = {}
     pending_watermarks: list[dict[str, Any]] = []
     saw_partitioned = False
+    # Incremental inputs that read their upstream's full snapshot this run
+    # (a first run, or a forced one): the column stats pass skips them.
+    full_snapshot_inputs: list[str] = []
     forced = _is_forced(event, my_node)
     # A replace_partitions output replaces every partition in the run's
     # output with the run's rows, so the run must read each touched
@@ -3009,6 +3015,8 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
                 src = {**src, "whole_partitions": True}
         in_tok = timer.start("inputs", detail="inputs", key=alias)
         df, advance = _resolve_input(spark, alias, src, backfill=backfill, forced=forced)
+        if advance and advance.get("full_snapshot"):
+            full_snapshot_inputs.append(alias)
         if df is None:
             timer.stop(in_tok)
             # Empty partitioned input — skip the entire run.
@@ -3058,6 +3066,7 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
     uc_cfg = _uc.config()
     uc_client = _uc.Client(uc_cfg) if uc_cfg and (uc_cfg["publish"] or uc_cfg["lineage"]) else None
     uc_published: list[dict[str, Any]] = []
+    _release_stats_cache()  # a frame a failed earlier node left cached
     for key, df in result.items():
         # Write time per output; _ensure_database nests as `catalog` and is
         # subtracted. Stopped before the Glue sync / stats that follow.
@@ -3068,6 +3077,16 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
             # backfill retries rewrite the staging cleanly.
             spec = {**spec, "kind": "delta_table", "target": backfill_targets[key],
                     "mode": "replace", "merge_keys": [], "merge_update": {}, "cluster_by": []}
+        want_stats, stats_skip = _stats_plan(spec, backfill and key in backfill_targets, full_snapshot_inputs)
+        if stats_skip:
+            print(f"[clavesa] output {key!r}: {stats_skip}", file=sys.stderr, flush=True)
+        if want_stats:
+            # The stats pass reads the rows this write wrote: cache them on
+            # the write, so the transform and its inputs are not computed a
+            # second time (an uncached stats pass ran the whole transform
+            # again; on a first full snapshot that took 702 s).
+            df = df.persist()
+            _STATS_CACHED.append(df)
         if spec["kind"] == "json_object":
             # Driver-side collect is intentional here: json_object outputs are
             # small rollups (KB–MB) by design, written as one JSON file. Not
@@ -3185,7 +3204,9 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
                     # bounds — the bound would then exclude a real match and
                     # silently duplicate it. Persisting freezes the batch and
                     # closes that window (GH #70).
-                    persisted = bool(bound_cols or bb)
+                    # Already cached for the stats pass: persist once, and
+                    # leave the release to that pass.
+                    persisted = bool(bound_cols or bb) and not want_stats
                     if persisted:
                         df.persist()
                     try:
@@ -3374,7 +3395,7 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
         # for replace-mode outputs and the rows this run contributed for
         # append/merge — best-effort; a stats-write failure logs but does
         # not mask the transform outcome.
-        if spec.get("stats") and spec["kind"] == "delta_table" and not (backfill and key in backfill_targets):
+        if want_stats:
             try:
                 with timer.measure("stats"):
                     _emit_column_stats(
@@ -3389,6 +3410,8 @@ def _run_transform(event, context, run_id="", timer=None):  # noqa: ARG001
                     f"[clavesa] column_stats write failed for {spec['target']!r}: {stats_exc!r}",
                     file=sys.stderr,
                 )
+            finally:
+                _release_stats_cache()
 
     # Advance watermarks + ack drained queue messages. Best-effort atomicity:
     # outputs committed first, so a failure here causes the next run to
@@ -4108,6 +4131,42 @@ def _read_latest_snapshot(spark, table_identifier):
     if not rows:
         return None, None
     return int(rows[0]["version"]), rows[0]["timestamp"]
+
+
+# DataFrames cached for the column stats pass of the output being written
+# (_run_transform). Released after that pass, at the next node's outputs and
+# at the end of a bundle, so a node that failed mid-write leaves nothing
+# cached for long.
+_STATS_CACHED: list[Any] = []
+
+
+def _release_stats_cache() -> None:
+    while _STATS_CACHED:
+        df = _STATS_CACHED.pop()
+        try:
+            df.unpersist()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+
+def _stats_plan(spec: dict[str, Any], to_staging: bool, full_snapshot_inputs: list[str]) -> tuple[bool, str]:
+    """Whether an output gets the column stats pass, and the line that says
+    why it does not when it was asked for. Pure: no Spark.
+
+    Stats are opt-in per Delta output and never for a backfill staging
+    table. A node that read an incremental input's full snapshot (its first
+    run, or a forced one) skips them: the pass would cover all of history
+    once, which is the slow part of a first run, and the next run's stats
+    cover the new rows again.
+    """
+    if not spec.get("stats") or spec.get("kind") != "delta_table" or to_staging:
+        return False, ""
+    if full_snapshot_inputs:
+        return False, (
+            "column stats skipped: input(s) " + ", ".join(sorted(full_snapshot_inputs))
+            + " read a full snapshot this run (first or forced run); the next run computes them"
+        )
+    return True, ""
 
 
 def _emit_column_stats(*, spark, df, run_id, output_key, table_identifier):
@@ -5205,6 +5264,7 @@ def _run_pipeline_bundle(event, context):
                 pass
 
     # Every node has run — release the shared inputs cached for this bundle.
+    _release_stats_cache()
     for cached in _BUNDLE_INPUT_CACHE.values():
         try:
             cached.unpersist()
