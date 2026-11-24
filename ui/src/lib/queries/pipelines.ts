@@ -238,6 +238,9 @@ const ExecutionLogsResponse = z.object({
   function_name: z.string(),
   events: z.array(LogEvent),
   truncated: z.boolean(),
+  // True when this viewer may not read the logs (a workspace with column
+  // tags: a log can quote a row).
+  hidden: z.boolean().optional().default(false),
 });
 export type ExecutionLogsResponse = z.infer<typeof ExecutionLogsResponse>;
 

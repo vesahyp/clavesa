@@ -6,7 +6,7 @@
  * persisted (see SidebarContext).
  */
 
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink, useLocation, useSearchParams } from "react-router-dom";
 import {
   Activity,
   BookOpen,
@@ -15,6 +15,7 @@ import {
   FileInput,
   KeyRound,
   LayoutDashboard,
+  ChartColumn,
   LayoutGrid,
   Package2,
   PanelLeftClose,
@@ -25,8 +26,13 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
+import { hasStats } from "@/components/RootNav";
+import { useDashboards, usePipelines } from "@/lib/queries";
 import { runtimeConfig } from "@/lib/runtimeConfig";
 import { cn } from "@/lib/utils";
+import { seesAll } from "@/lib/viewerGroups";
+import { SECTIONS } from "@/lib/workspaceNav";
+import { SwitcherButton } from "./WorkspaceSwitcher";
 import { useSidebar } from "./SidebarContext";
 import { SignOutButton } from "./SignOutButton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -80,10 +86,62 @@ const NAV: NavItem[] = [
   { to: "/runner", label: "Runner", icon: Boxes, match: (p) => p.startsWith("/runner") },
 ];
 
-// Read-only (the hosted UI, `clavesa ui --read-only`) shows the same
-// entries as the local UI (ADR-033). A page that cannot work read-only
-// (Query, Credentials, Runner) opens and says what to do instead.
-const navItems = NAV;
+// The local UI shows every entry. The hosted UI shows only the workspace's
+// four sections (docs/ideas/hosted-navigation.md, Vesa 2026-11-21): the
+// other pages are on the Mac or not hosted; their routes still answer a
+// bookmark. The multi-workspace UI (`clavesa ui --workspaces`) keeps the
+// rest under the four sections.
+const FOUR = new Set(SECTIONS.map((s) => s.to));
+const navItems: NavItem[] =
+  runtimeConfig.mode === "local"
+    ? NAV
+    : [
+        ...SECTIONS.map((s) => ({ to: s.to, label: s.label, icon: s.icon, match: s.match })),
+        ...(runtimeConfig.mode === "hosted" ? [] : NAV.filter((n) => !FOUR.has(n.to) && n.to !== "/overview")),
+      ];
+
+/** The open section's own items, under it: its pipelines or dashboards. */
+function SectionItems({ to }: { to: string }) {
+  const { pathname } = useLocation();
+  const [params] = useSearchParams();
+  const pipelines = usePipelines();
+  const dashboards = useDashboards();
+  let items: { key: string; label: string; to: string; on: boolean }[] = [];
+  if (to === "/pipelines") {
+    const dir = params.get("dir") ?? "";
+    items = (pipelines.data ?? []).map((p) => ({
+      key: p.dir,
+      label: p.name,
+      to: `/pipelines/dashboard?dir=${encodeURIComponent(p.dir)}`,
+      on: pathname === "/pipelines/dashboard" && dir === p.dir,
+    }));
+  } else if (to === "/dashboards") {
+    items = (dashboards.data?.dashboards ?? []).map((d) => ({
+      key: d.slug,
+      label: d.title,
+      to: `/dashboards/${encodeURIComponent(d.slug)}`,
+      on: pathname === `/dashboards/${d.slug}`,
+    }));
+  }
+  if (items.length === 0) return null;
+  return (
+    <div data-testid="nav-section-items" className="mb-1 ml-5 flex flex-col border-l border-border">
+      {items.map((it) => (
+        <NavLink
+          key={it.key}
+          to={it.to}
+          aria-current={it.on ? "page" : undefined}
+          className={cn(
+            "truncate py-1.5 pl-3 pr-2 font-mono text-xs transition-colors",
+            it.on ? "text-foreground shadow-[inset_2px_0_0_var(--primary)]" : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {it.label}
+        </NavLink>
+      ))}
+    </div>
+  );
+}
 
 export function AppSidebar() {
   const { collapsed, toggle } = useSidebar();
@@ -97,7 +155,12 @@ export function AppSidebar() {
         collapsed ? "w-14" : "w-56",
       )}
     >
-      {/* Brand */}
+      {/* Brand; the workspace switcher in the hosted and multi UI. */}
+      {runtimeConfig.mode !== "local" ? (
+        <div className={cn("flex h-14 shrink-0 items-center border-b border-border", collapsed ? "px-2" : "px-2.5")}>
+          <SwitcherButton collapsed={collapsed} />
+        </div>
+      ) : (
       <div
         className={cn(
           "flex h-14 shrink-0 items-center border-b border-border",
@@ -113,34 +176,10 @@ export function AppSidebar() {
           </span>
         )}
       </div>
+      )}
 
       {/* Nav */}
       <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
-        {/* Multi-workspace / hosted (ADR-032): back to the Workspaces
-            list. A plain <a>: "/" is outside this workspace's basename,
-            so it is a full page load with the root's runtime config. */}
-        {runtimeConfig.mode !== "local" && (
-          <a
-            href="/"
-            aria-label="All workspaces"
-            title={collapsed ? "All workspaces" : undefined}
-            data-testid="nav-all-workspaces"
-            className={cn(
-              "mb-1 flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground",
-              collapsed && "justify-center px-0",
-            )}
-          >
-            <LayoutGrid className="h-4 w-4 shrink-0" />
-            {!collapsed && (
-              <span className="truncate">
-                All workspaces
-                <span className="block truncate font-mono text-[11px] font-normal">
-                  {runtimeConfig.workspace}
-                </span>
-              </span>
-            )}
-          </a>
-        )}
         {navItems.map((item) => {
           const active = item.match(pathname);
           const Icon = item.icon;
@@ -166,13 +205,46 @@ export function AppSidebar() {
               <TooltipContent side="right">{item.label}</TooltipContent>
             </Tooltip>
           ) : (
-            <span key={item.to}>{link}</span>
+            <span key={item.to}>
+              {link}
+              {active && runtimeConfig.mode !== "local" && <SectionItems to={item.to} />}
+            </span>
           );
         })}
       </nav>
 
       {/* Collapse toggle (and Sign out in hosted mode) */}
       <div className="shrink-0 border-t border-border p-2">
+        {runtimeConfig.mode !== "local" && (runtimeConfig.mode !== "hosted" || seesAll()) && (
+          <a
+            href="/"
+            aria-label="All workspaces"
+            title={collapsed ? "All workspaces" : undefined}
+            data-testid="nav-all-workspaces"
+            className={cn(
+              "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground",
+              collapsed && "justify-center px-0",
+            )}
+          >
+            <LayoutGrid className="h-4 w-4 shrink-0" />
+            {!collapsed && <span>All workspaces</span>}
+          </a>
+        )}
+        {hasStats() && (
+          <a
+            href="/stats"
+            aria-label="Site usage"
+            title={collapsed ? "Site usage" : undefined}
+            data-testid="nav-site-usage"
+            className={cn(
+              "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground",
+              collapsed && "justify-center px-0",
+            )}
+          >
+            <ChartColumn className="h-4 w-4 shrink-0" />
+            {!collapsed && <span>Site usage</span>}
+          </a>
+        )}
         <SignOutButton compact={collapsed} className="w-full font-medium" />
         <button
           type="button"

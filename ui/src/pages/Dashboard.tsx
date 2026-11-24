@@ -47,8 +47,9 @@ function pipelineScopeLabel(datasets: DashboardDataset[]): string {
   return `${dirs.length} pipelines`;
 }
 
-/** Sent by the hosted API for a dashboard of a personal_data workspace. */
-const LOCAL_ONLY_NOTICE = "This dashboard holds visitor data and opens only in the local clavesa UI";
+/** Sent by the hosted API for a dashboard of a local workspace whose Mac
+ * published no widget result (internal/hosted/local_snapshot.go). */
+const LOCAL_ONLY_NOTICE = "This dashboard's values are not published from the Mac; it opens in the local clavesa UI";
 
 export function Dashboard() {
   const readOnly = useReadOnly();
@@ -198,9 +199,8 @@ export function Dashboard() {
           }
           renderError={(error) => {
             const msg = error instanceof Error ? error.message : String(error);
-            // The hosted site keeps a personal_data workspace's dashboards
-            // to the Mac (internal/hosted/local_snapshot.go): a notice, not
-            // a failure.
+            // A local workspace with no published widget result keeps its
+            // dashboards to the Mac: a notice, not a failure.
             if (msg.includes(LOCAL_ONLY_NOTICE)) {
               return (
                 <Card data-testid="dashboard-notice">

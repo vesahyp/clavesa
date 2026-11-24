@@ -18,6 +18,7 @@ import { WorkspaceGate } from "@/components/WorkspaceGate";
 import { AppShell } from "@/components/AppShell";
 import { SidebarProvider } from "@/components/SidebarContext";
 import { Catalog } from "@/pages/Catalog";
+import { CatalogLevels } from "@/pages/CatalogLevels";
 import { TableDetail, LegacyTableDetailRedirect } from "@/pages/TableDetail";
 import { PipelinesList } from "@/pages/PipelinesList";
 import { PipelineDashboard } from "@/pages/PipelineDashboard";
@@ -150,7 +151,8 @@ const app = (
               }
             />
             {runtimeConfig.mode !== "local" && (
-              <Route path="/catalog" element={<OnTheMac title="Catalog" snapshot><Catalog /></OnTheMac>} />
+              // docs/ideas/hosted-navigation.md: one level per page.
+              <Route path="/catalog" element={<OnTheMac title="Catalog" snapshot><CatalogLevels /></OnTheMac>} />
             )}
             <Route path="/overview" element={<WorkspaceHome />} />
             <Route

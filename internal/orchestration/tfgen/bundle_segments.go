@@ -38,7 +38,7 @@ func emitSegmentStateMachine(b *strings.Builder, p Pipeline) {
 	lambda := func(in string) {
 		fmt.Fprintf(b, "%sType           = \"Task\"\n", in)
 		fmt.Fprintf(b, "%sResource       = \"arn:aws:states:::lambda:invoke\"\n", in)
-		fmt.Fprintf(b, "%sTimeoutSeconds = 900\n", in)
+		fmt.Fprintf(b, "%sTimeoutSeconds = var.runner_timeout_seconds\n", in)
 	}
 	selector := func(in string, withRun bool) {
 		fmt.Fprintf(b, "%sResultSelector = {\n", in)

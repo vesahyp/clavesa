@@ -267,3 +267,52 @@ func TestNodeRunsValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeRunsHeapColumns: a runner v2.28+ row carries the three heap
+// columns after timing; they reach NodeRun.
+func TestNodeRunsHeapColumns(t *testing.T) {
+	queryID := "nr-heap"
+	header := nodeRunsHeader()
+	header.Data = append(header.Data, nodeRunsRow("heap_old_after_gc_mb", "heap_committed_mb", "heap_max_mb").Data...)
+	row := nodeRunsRow(
+		"run-1", "gold", "fact_events",
+		"2026-11-22T06:10:00.000Z", "2026-11-22T06:10:30.000Z",
+		"30000", "ok", "lambda", "3008",
+		"false", "req", "", "",
+		"sha256:x", "v2.28.0", "10",
+		"exec-1",
+		"2900", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+		"",
+		"412", "1468", "1024",
+	)
+	athc := &mockAthenaClient{
+		startOutput: &athena.StartQueryExecutionOutput{QueryExecutionId: &queryID},
+		getExecOutput: &athena.GetQueryExecutionOutput{
+			QueryExecution: &athenatypes.QueryExecution{
+				QueryExecutionId: &queryID,
+				Status:           &athenatypes.QueryExecutionStatus{State: athenatypes.QueryExecutionStateSucceeded},
+			},
+		},
+		getResultsOutput: &athena.GetQueryResultsOutput{
+			ResultSet: &athenatypes.ResultSet{Rows: []athenatypes.Row{header, row}},
+		},
+	}
+	h := dataquery.NewHandler(&mockS3Client{}, athc, "out")
+	req := httptest.NewRequest(http.MethodGet, "/data/node-runs?pipeline=gold", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	r := decodeNodeRuns(t, w.Body.Bytes())
+	if len(r.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(r.Rows))
+	}
+	got := r.Rows[0]
+	if got.HeapOldAfterGCMB == nil || *got.HeapOldAfterGCMB != 412 || got.HeapCommittedMB == nil || *got.HeapCommittedMB != 1468 || got.HeapMaxMB == nil || *got.HeapMaxMB != 1024 {
+		t.Errorf("heap columns = %v %v %v, want 412 1468 1024", got.HeapOldAfterGCMB, got.HeapCommittedMB, got.HeapMaxMB)
+	}
+	if !strings.Contains(w.Body.String(), `"heap_old_after_gc_mb":412`) {
+		t.Errorf("JSON body lacks heap_old_after_gc_mb: %s", w.Body.String())
+	}
+}

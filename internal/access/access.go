@@ -38,6 +38,10 @@ type Config struct {
 	// Audiences map a named audience to the tag values it reads. The
 	// default audience (no audience group) reads "open" only.
 	Audiences map[string][]string `json:"audiences,omitempty"`
+	// AdminRole makes the hosted admin role clavesa-ui-admin-<workspace>,
+	// with which the hosted UI's admins (group "all") read every table
+	// and column. Off by default: a new IAM role.
+	AdminRole bool `json:"admin_role,omitempty"`
 }
 
 // Validate checks the block.

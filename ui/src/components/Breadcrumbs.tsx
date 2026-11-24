@@ -12,9 +12,9 @@ import type { ReactNode } from "react";
 import { runtimeConfig } from "@/lib/runtimeConfig";
 import { cn } from "@/lib/utils";
 
-// Hosted and multi-workspace, below md: PhoneBack is the way up, so only
-// the current page's crumb shows beside it.
-const phoneLastOnly = runtimeConfig.mode !== "local";
+// Hosted and multi-workspace, below md: PhoneTopRow is the way up and the
+// page's title says where you are, so the breadcrumb shows from md up.
+const desktopOnly = runtimeConfig.mode !== "local";
 
 export interface Crumb {
   label: ReactNode;
@@ -23,24 +23,16 @@ export interface Crumb {
 
 export function Breadcrumbs({ items }: { items: Crumb[] }) {
   return (
-    <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5">
+    <nav aria-label="Breadcrumb" className={cn("min-w-0 items-center gap-1.5", desktopOnly ? "hidden md:flex" : "flex")}>
       {items.map((c, i) => {
         const isLast = i === items.length - 1;
         return (
           <span
             key={`${c.to}-${i}`}
-            className={cn(
-              "flex min-w-0 items-center gap-1.5",
-              phoneLastOnly && !isLast && "hidden md:flex",
-            )}
+            className="flex min-w-0 items-center gap-1.5"
           >
             {i > 0 && (
-              <ChevronRight
-                className={cn(
-                  "h-3.5 w-3.5 shrink-0 text-muted-foreground/60",
-                  phoneLastOnly && "hidden md:block",
-                )}
-              />
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
             )}
             <Link
               to={c.to}

@@ -20,17 +20,25 @@
  * with its own basename and API base (see lib/runtimeConfig.ts).
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 
 import { RootHeader, RootNav, hasSiteNav } from "@/components/RootNav";
 import { WorkspaceCard, workspaceKind } from "@/components/WorkspaceCard";
+import { runtimeConfig } from "@/lib/runtimeConfig";
+import { seesAll } from "@/lib/viewerGroups";
 import { WorkspaceSummary, requestParsed, useWorkspaces } from "@/lib/queries";
 import { STATUS_RANK, cardStatus } from "@/lib/summary";
 
 export function Workspaces() {
   const { data, error, isLoading } = useWorkspaces();
+  // A hosted viewer of one workspace (not in "all") never needs a list of
+  // one: "/" opens that workspace (docs/ideas/hosted-navigation.md).
+  const only = runtimeConfig.mode === "hosted" && !seesAll() && data?.length === 1 ? data[0] : null;
+  useEffect(() => {
+    if (only) window.location.replace(`/w/${encodeURIComponent(only.slug)}/`);
+  }, [only]);
   const list = data ?? [];
   // The hosted server's stored summaries; null where none is stored or
   // one does not parse (the card then loads it live).

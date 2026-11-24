@@ -54,6 +54,7 @@ Examples:
 		newWorkspaceDisconnectCmd(),
 		newWorkspaceDatabricksCmd(),
 		newWorkspaceHostedCmd(),
+		newWorkspaceAccessCmd(),
 	)
 
 	return cmd

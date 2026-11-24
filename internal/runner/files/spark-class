@@ -14,8 +14,9 @@
 echo "JAVA_HOME: $JAVA_HOME" >&2
 echo "PATH: $PATH" >&2
 
-# Hard-code the Java executable path for maximum reliability
-JAVA_EXECUTABLE="/usr/bin/java"
+# The java on PATH (in the image, /usr/bin/java from Corretto), else /usr/bin/java
+JAVA_EXECUTABLE="$(command -v java 2>/dev/null || true)"
+JAVA_EXECUTABLE="${JAVA_EXECUTABLE:-/usr/bin/java}"
 
 # Fallback options if the hard-coded path doesn't work
 if [ ! -f "$JAVA_EXECUTABLE" ]; then
@@ -93,6 +94,26 @@ heap_mb="${heap_mb:-1024}"
 [ "$heap_mb" -lt 512 ] && heap_mb=512
 echo "[clavesa] spark-class JVM heap = ${heap_mb}m (lambda_mem=${AWS_LAMBDA_FUNCTION_MEMORY_SIZE:-none}MB, override=${CLAVESA_JVM_HEAP_MB:-none})" >&2
 
+# Garbage collector (docs/ideas/runner-memory.md). On a small runner G1's
+# remembered sets and the heap pages it touches cost about 260 MB of the
+# 3008 MB Lambda, and its parallel threads have little CPU to run on, so
+# Serial GC is smaller and faster there: the web-traffic gold step used 264
+# MB less and ran 12% faster. Small means a heap of 2 GB or less. Larger
+# heaps keep G1. CLAVESA_JVM_GC (serial | g1) overrides the choice.
+gc="${CLAVESA_JVM_GC:-}"
+if [ -z "$gc" ]; then
+  gc=g1
+  [ "$heap_mb" -le 2048 ] && gc=serial
+fi
+# g1 by choice adds no flag (the JVM's own default on these machines);
+# only an explicit CLAVESA_JVM_GC=g1 forces it.
+gc_flag=""
+case "$gc" in
+  serial) gc_flag="-XX:+UseSerialGC" ;;
+  *) gc=g1; [ "${CLAVESA_JVM_GC:-}" = "g1" ] && gc_flag="-XX:+UseG1GC" ;;
+esac
+echo "[clavesa] spark-class GC = ${gc} (override=${CLAVESA_JVM_GC:-none})" >&2
+
 # Use Python 3.12 paths for PySpark. The --add-opens set mirrors Spark 4's
 # JavaModuleOptions.java at the v4.0.2 tag — Java 17 module-system access
 # the JVM denies by default but Spark's off-heap / unsafe paths need.
@@ -112,4 +133,4 @@ exec "$JAVA_EXECUTABLE" \
   --add-opens=java.base/sun.security.action=ALL-UNNAMED \
   --add-opens=java.base/sun.util.calendar=ALL-UNNAMED \
   --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED \
-  -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx${heap_mb}m "$@"
+  -cp /var/lang/lib/python3.12/site-packages/pyspark/conf/:/var/lang/lib/python3.12/site-packages/pyspark/jars/* -Xmx${heap_mb}m ${gc_flag:+"$gc_flag"} "$@"

@@ -105,6 +105,9 @@ Visual ETL for Terraform pipelines
 | [`clavesa ui`](clavesa_ui.md) | Start the visual editor in your browser |
 | [`clavesa version`](clavesa_version.md) | Print the clavesa version |
 | [`clavesa workspace`](clavesa_workspace.md) | Manage workspaces |
+| &nbsp;&nbsp;[`clavesa workspace access`](clavesa_workspace_access.md) | Show and apply the column tags |
+| &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace access show`](clavesa_workspace_access_show.md) | List every table and its tags |
+| &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace access sync`](clavesa_workspace_access_sync.md) | Apply the column tags to the tables in Lake Formation |
 | &nbsp;&nbsp;[`clavesa workspace backend`](clavesa_workspace_backend.md) | Show the workspace's configured Terraform backend |
 | &nbsp;&nbsp;[`clavesa workspace connect`](clavesa_workspace_connect.md) | Connect the workspace to an outside catalog |
 | &nbsp;&nbsp;&nbsp;&nbsp;[`clavesa workspace connect databricks`](clavesa_workspace_connect_databricks.md) | Write this workspace's tables into a Databricks Unity Catalog |

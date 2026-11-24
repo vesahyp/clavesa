@@ -21,8 +21,9 @@ import { HostedSettings } from "./HostedSettings";
 import { TerraformBackendControl } from "./TerraformBackendControl";
 import { WarehouseToggle } from "./WarehouseToggle";
 import { PageChromeProvider, usePageChrome } from "./PageChrome";
-import { PhoneBack } from "./PhoneBack";
 import { PhoneNav } from "./PhoneNav";
+import { PhoneTopRow } from "./PhoneTopRow";
+import { runtimeConfig } from "@/lib/runtimeConfig";
 import { RuntimeStatus } from "./RuntimeStatus";
 
 function ShellFrame() {
@@ -35,7 +36,11 @@ function ShellFrame() {
       <AppSidebar />
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center gap-4 border-b border-border bg-background px-4 md:px-6">
-          <PhoneBack />
+          {/* Hosted and multi-workspace, below md: back one level, the
+              parent and the workspace chip (docs/ideas/hosted-navigation.md).
+              From md up: the full breadcrumb. The local UI keeps the
+              breadcrumb on every width. */}
+          {runtimeConfig.mode !== "local" && <PhoneTopRow crumbs={breadcrumbs} />}
           <Breadcrumbs items={breadcrumbs} />
           <div className="ml-auto flex shrink-0 items-center gap-3">
             {/* Phone (below md): the workspace chips do not fit; the
@@ -50,12 +55,18 @@ function ShellFrame() {
             {readOnly && (
               <span
                 data-testid="read-only-badge"
-                className="rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground"
+                className={cn(
+                  "rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground",
+                  // Phone: the workspace switcher says read-only.
+                  runtimeConfig.mode !== "local" && "hidden md:inline",
+                )}
               >
                 Read-only
               </span>
             )}
-            {trailing}
+            {trailing && (
+              <div className={cn(runtimeConfig.mode !== "local" && "hidden md:flex")}>{trailing}</div>
+            )}
           </div>
         </header>
         <main

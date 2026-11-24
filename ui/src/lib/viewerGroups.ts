@@ -8,6 +8,26 @@
 
 const SESSION_KEY = "clavesa.hosted.session"; // src/hosted/auth.ts
 
+function idTokenClaims(): Record<string, unknown> {
+  try {
+    const raw = window.sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return {};
+    const tok = (JSON.parse(raw) as { idToken?: string }).idToken ?? "";
+    const part = tok.split(".")[1];
+    if (!part) return {};
+    const json = atob(part.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(part.length / 4) * 4, "="));
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/** The signed-in user's email, for the workspace switcher; "" when unknown. */
+export function viewerEmail(): string {
+  const e = idTokenClaims()["email"];
+  return typeof e === "string" ? e : "";
+}
+
 export function viewerGroups(): string[] {
   try {
     const raw = window.sessionStorage.getItem(SESSION_KEY);

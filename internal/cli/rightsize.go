@@ -20,8 +20,14 @@ func newPipelineRightsizeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rightsize [pipeline-dir]",
 		Short: "Recommend per-node Lambda memory from recent run history",
-		Long: `Recommend a Lambda memory allocation per node, computed from the
-p95 of the node's recent peak RSS and how often it spilled.
+		Long: `Recommend a Lambda memory allocation per node from its recent runs.
+
+Runs from runner v2.28 on record the Spark heap in use after GC. The JVM
+grows its heap toward -Xmx whatever the data is, so peak memory follows
+the heap ceiling, not the need. Where those runs exist, the advice is a
+heap of twice the p95 heap in use after GC (HEAP, at least 512 MB: set it
+as runner_heap_max_mb) plus 1472 MB outside the heap. Older runs fall
+back to the p95 of peak RSS and how often the node spilled.
 
 Recommend-only: this prints advice; it does not re-deploy or edit the
 pipeline. Nodes with no allocated memory on record (local runs) or no
@@ -57,12 +63,14 @@ Spark memory metrics yet show confidence "n/a".
 					mbCell(r.CurrentMB),
 					mbCell(r.RecommendedMB),
 					mbCell(r.P95PeakRSSMB),
+					mbCell(r.P95HeapAfterGCMB),
+					mbCell(r.RecommendedHeapMB),
 					fmt.Sprintf("%.0f%%", r.SpillRate*100),
 					r.Confidence,
 					r.Reason,
 				}
 			}
-			printTable(os.Stdout, []string{"NODE", "CURRENT", "RECOMMENDED", "P95 PEAK", "SPILL%", "CONFIDENCE", "REASON"}, table)
+			printTable(os.Stdout, []string{"NODE", "CURRENT", "RECOMMENDED", "P95 PEAK", "P95 HEAP", "HEAP", "SPILL%", "CONFIDENCE", "REASON"}, table)
 			return nil
 		},
 	}

@@ -95,7 +95,8 @@ variable "trigger_visibility_timeout_seconds" {
     Visibility timeout for the trigger queue, in seconds. The runner Lambda
     receives a message, reads the new objects, and only deletes the message
     after the Delta write commits, so this must be at least as long as a full
-    run (the SFN task TimeoutSeconds is 900). A shorter window resurfaces
+    run (the SFN task TimeoutSeconds is the pipeline
+    variable runner_timeout_seconds: 900 by default and at most). A shorter window resurfaces
     messages mid-run and risks duplicate reads.
   EOT
 }

@@ -860,13 +860,16 @@ const WorkspacesResponse = z.object({ workspaces: z.array(WorkspaceEntry) });
  * summary from `<api_base>/workspace/summary`; the hosted server sends the
  * stored summaries in the same response (no Athena on this call).
  */
-export function useWorkspaces() {
+export function useWorkspaces(opts: { apiBase?: string } = {}) {
+  // Inside a workspace (/w/<name>/) the workspace switcher asks the root
+  // API ("/api"); on the root pages apiBase is already "/api".
   return useQuery({
-    queryKey: ["workspaces"],
+    queryKey: ["workspaces", opts.apiBase ?? ""],
     queryFn: async () =>
       (
         await requestParsed("/workspaces", WorkspacesResponse, {
           errorLabel: "GET /workspaces",
+          apiBase: opts.apiBase,
         })
       ).workspaces,
   });

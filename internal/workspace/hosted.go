@@ -41,36 +41,10 @@ type Hosted struct {
 	PublisherRoleARN string `json:"publisher_role_arn,omitempty"`
 	DataBucket       string `json:"data_bucket,omitempty"`
 	Region           string `json:"region,omitempty"`
-	// PersonalData says whether the workspace's data holds personal data
-	// (visitor IPs, visitor ids). It has three states, set by hand in
-	// clavesa.json: true, false, or absent. true: the reader role gets an
-	// explicit Deny on every pipeline whose schema is not gold (HostedRaw).
-	// Only an explicit false lets a published snapshot carry values
-	// (ADR-036): absent counts as personal data there. The hosted
-	// registry's personal_data is the API-side half.
-	PersonalData *bool `json:"personal_data,omitempty"`
 	// Snapshot turns on the catalog and dashboard snapshot of a local
 	// workspace's run-end publish (ADR-036). Off unless set:
 	// `clavesa workspace hosted enable --snapshot`.
 	Snapshot bool `json:"snapshot,omitempty"`
-}
-
-// MarksPersonalData reports an explicit "personal_data": true.
-func (h *Hosted) MarksPersonalData() bool {
-	return h != nil && h.PersonalData != nil && *h.PersonalData
-}
-
-// FreeOfPersonalData reports an explicit "personal_data": false, the only
-// state in which a published snapshot may carry values (ADR-036).
-func (h *Hosted) FreeOfPersonalData() bool {
-	return h != nil && h.PersonalData != nil && !*h.PersonalData
-}
-
-// HostedRaw is what the reader of a PersonalData workspace may not read:
-// object key patterns in the pipeline bucket and Glue databases.
-type HostedRaw struct {
-	ObjectPatterns []string
-	GlueDatabases  []string
 }
 
 // The values of Hosted.Kind.
@@ -188,6 +162,12 @@ func HostedReaderRoleName(workspaceName string) string {
 	return hostedName("clavesa-ui-reader-", workspaceName, 60)
 }
 
+// HostedAdminRoleName is the admin role of a workspace with column tags:
+// clavesa-ui-admin-<workspace>. Its Athena workgroup has the same name.
+func HostedAdminRoleName(workspaceName string) string {
+	return hostedName("clavesa-ui-admin-", workspaceName, 55)
+}
+
 // HostedWorkGroupName is the reader's Athena workgroup:
 // clavesa-ui-<workspace>. Capped at 55 so the rule names
 // (<name>-progress) fit EventBridge's 64.
@@ -269,16 +249,16 @@ func hostedLFDatabases(m *Manifest, pipelineDBs []string) string {
 // names, used only for legacy (non workspace-scoped) AWS names.
 // pipelineDBs are the Glue databases of the deployed pipelines, which get
 // Lake Formation grants for the reader (with the system database).
-func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []string, raw HostedRaw) string {
+func RenderHostedTF(m *Manifest, moduleVersion string, pipelines, pipelineDBs []string) string {
 	h := m.Hosted
 	sms, logs := HostedResourcePatterns(m, pipelines)
-	rawLines := ""
-	if h.MarksPersonalData() {
-		objs := append([]string(nil), raw.ObjectPatterns...)
-		dbs := append([]string(nil), raw.GlueDatabases...)
-		sort.Strings(objs)
-		sort.Strings(dbs)
-		rawLines = fmt.Sprintf("  raw_object_patterns    = [%s]\n  raw_glue_databases     = [%s]\n", quotedHCLList(objs), quotedHCLList(dbs))
+	extraLines := ""
+	if m.Access != nil {
+		// Column tags: lakeformation.tf, in the same root, makes the key.
+		extraLines += "  lf_tag_key             = module.lake_formation.tag_key\n"
+		if m.Access.AdminRole {
+			extraLines += fmt.Sprintf("  admin_role_name        = %q\n  admin_workgroup_name   = %q\n", HostedAdminRoleName(m.Name), HostedAdminRoleName(m.Name))
+		}
 	}
 	return hostedTFHeader + fmt.Sprintf(`module "hosted_reader" {
   source                 = "./.clavesa/modules/%s/hosted-reader/aws"
@@ -304,15 +284,36 @@ output "hosted_workgroup" {
   description = "Athena workgroup the hosted UI queries through (ADR-032)."
   value       = module.hosted_reader.workgroup_name
 }
-`, moduleVersion, HostedReaderRoleName(m.Name), HostedWorkGroupName(m.Name),
+`+hostedAdminOutputs(m)+``, moduleVersion, HostedReaderRoleName(m.Name), HostedWorkGroupName(m.Name),
 		quotedHCLList(HostedGlueDatabasePatterns(m)), hostedLFDatabases(m, pipelineDBs), quotedHCLList(sms), quotedHCLList(logs),
-		quotedHCLList(hostedStateObjectPatterns(m)), quotedHCLList(h.ReaderPrincipals), h.EventBusARN, rawLines)
+		quotedHCLList(hostedStateObjectPatterns(m)), quotedHCLList(h.ReaderPrincipals), h.EventBusARN, extraLines)
+}
+
+// hostedAdminOutputs are the admin role's outputs, for a workspace with
+// column tags. The hosted registry takes the role from
+// hosted_admin_role_arn; the tree copy's deployed.json carries
+// hosted_admin_workgroup to the Lambda.
+func hostedAdminOutputs(m *Manifest) string {
+	if m.Access == nil || !m.Access.AdminRole {
+		return ""
+	}
+	return `
+output "hosted_admin_role_arn" {
+  description = "Role the hosted UI assumes for its admins (group all) to read everything, hidden columns included; ExternalId = the workspace name."
+  value       = module.hosted_reader.admin_role_arn
+}
+
+output "hosted_admin_workgroup" {
+  description = "Athena workgroup of the hosted admin role."
+  value       = module.hosted_reader.admin_workgroup_name
+}
+`
 }
 
 // SyncHostedTF makes hosted.tf match the manifest: written when m.Hosted
 // is set, removed when it is not or when it is a local-warehouse
 // workspace's block (no stack, no reader role).
-func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pipelineDBs []string, raw HostedRaw) error {
+func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pipelineDBs []string) error {
 	path := filepath.Join(root, HostedTFFile)
 	if m.Hosted == nil || m.Hosted.IsLocal() {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -323,5 +324,5 @@ func SyncHostedTF(root string, m *Manifest, moduleVersion string, pipelines, pip
 	if moduleVersion == "" {
 		return fmt.Errorf("no module version: main.tf has no recognised workspace module source")
 	}
-	return os.WriteFile(path, []byte(RenderHostedTF(m, moduleVersion, pipelines, pipelineDBs, raw)), 0o644)
+	return os.WriteFile(path, []byte(RenderHostedTF(m, moduleVersion, pipelines, pipelineDBs)), 0o644)
 }

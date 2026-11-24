@@ -14,7 +14,7 @@ import (
 )
 
 // snapshotWorkspace is a local-warehouse workspace with a local hosted
-// block; hosted adds keys to it ("snapshot": true, "personal_data": ...).
+// block; hosted adds keys to it ("snapshot": true).
 func snapshotWorkspace(t *testing.T, hosted string) string {
 	t.Helper()
 	ws := t.TempDir()
@@ -69,26 +69,13 @@ func TestDrillSnapshotIsOptIn(t *testing.T) {
 	}
 }
 
-// Finding 2: values go only with an explicit "personal_data": false;
-// absent or true publishes names, types and counts only.
-func TestDrillSnapshotPersonalDataFailsClosed(t *testing.T) {
-	for _, c := range []struct {
-		flag    string
-		widgets bool
-	}{
-		{`,"snapshot":true`, false},
-		{`,"snapshot":true,"personal_data":true`, false},
-		{`,"snapshot":true,"personal_data":false`, true},
-	} {
-		ws := snapshotWorkspace(t, c.flag)
-		svc, _ := snapshotService(ws, catalogWithPath(ws))
-		snap := svc.drillSnapshot(context.Background(), time.Now())
-		if snap == nil || len(snap.Catalog) == 0 {
-			t.Fatalf("%s: no catalog snapshot: %+v", c.flag, snap)
-		}
-		if got := len(snap.Widgets) > 0; got != c.widgets {
-			t.Errorf("%s: widgets published = %v, want %v (notes %v)", c.flag, got, c.widgets, snap.Notes)
-		}
+// The snapshot publishes the dashboard values (widget results).
+func TestDrillSnapshotPublishesWidgets(t *testing.T) {
+	ws := snapshotWorkspace(t, `,"snapshot":true`)
+	svc, _ := snapshotService(ws, catalogWithPath(ws))
+	snap := svc.drillSnapshot(context.Background(), time.Now())
+	if snap == nil || len(snap.Catalog) == 0 || len(snap.Widgets) == 0 {
+		t.Fatalf("snapshot: %+v", snap)
 	}
 }
 
@@ -98,7 +85,7 @@ func TestDrillSnapshotBudget(t *testing.T) {
 	prev := SnapshotBudget
 	SnapshotBudget = 50 * time.Millisecond
 	t.Cleanup(func() { SnapshotBudget = prev })
-	ws := snapshotWorkspace(t, `,"snapshot":true,"personal_data":false`)
+	ws := snapshotWorkspace(t, `,"snapshot":true`)
 	slow := func(ctx context.Context) (json.RawMessage, []CatalogTableRef, error) {
 		<-ctx.Done()
 		return nil, nil, ctx.Err()
@@ -135,7 +122,7 @@ func TestDrillSnapshotBudget(t *testing.T) {
 
 // Finding 4: no path on the Mac in what is published.
 func TestDrillSnapshotNoMacPaths(t *testing.T) {
-	ws := snapshotWorkspace(t, `,"snapshot":true,"personal_data":false`)
+	ws := snapshotWorkspace(t, `,"snapshot":true`)
 	svc, _ := snapshotService(ws, catalogWithPath(ws))
 	snap := svc.drillSnapshot(context.Background(), time.Now())
 	if snap == nil || strings.Contains(string(snap.Catalog), ws) || strings.Contains(string(snap.Catalog), "location") {
@@ -163,19 +150,19 @@ func TestDrillSnapshotNoMacPaths(t *testing.T) {
 	}
 }
 
-// Re-running enable keeps a hand-set personal_data (it drives a Deny) and,
-// unless --snapshot or --no-snapshot is given, the snapshot switch.
+// Re-running enable keeps, unless --snapshot or --no-snapshot is given,
+// the snapshot switch.
 func TestEnableHostedKeepsChoices(t *testing.T) {
-	prev := &workspace.Hosted{PersonalData: boolPtr(true), Snapshot: true}
+	prev := &workspace.Hosted{Snapshot: true}
 	h := &workspace.Hosted{}
 	keepHostedChoices(prev, h, HostedInput{})
-	if !h.MarksPersonalData() || !h.Snapshot {
+	if !h.Snapshot {
 		t.Errorf("kept %+v", h)
 	}
 	off := false
 	h = &workspace.Hosted{}
 	keepHostedChoices(prev, h, HostedInput{Snapshot: &off})
-	if h.Snapshot || !h.MarksPersonalData() {
+	if h.Snapshot {
 		t.Errorf("--no-snapshot: %+v", h)
 	}
 }

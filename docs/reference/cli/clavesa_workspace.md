@@ -27,6 +27,7 @@ clavesa workspace
 
 ## Subcommands
 
+- [clavesa workspace access](clavesa_workspace_access.md) — Show and apply the column tags
 - [clavesa workspace backend](clavesa_workspace_backend.md) — Show the workspace's configured Terraform backend
 - [clavesa workspace connect](clavesa_workspace_connect.md) — Connect the workspace to an outside catalog
 - [clavesa workspace databricks](clavesa_workspace_databricks.md) — Show the workspace's Databricks connection

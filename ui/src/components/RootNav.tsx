@@ -4,11 +4,9 @@
  * and, hosted only, Stats at "/stats" (ADR-032 section 4). The header
  * carries the page links from md up; below md the bottom bar does.
  *
- * Hosted, the bottom bar is the same on every page (Vesa, 2026-11-16:
- * "The ui bottom buttons change, which is not good ux"): Workspaces and
- * Stats, in that order, also inside a workspace, where Workspaces is the
- * active item. Only the active marker moves. A page below the top level
- * gets a back button at the top (PhoneBack), never more bottom buttons.
+ * Hosted, the root pages' bottom bar is Workspaces and Site usage. Inside
+ * a workspace the bar is the workspace's four sections (PhoneNav.tsx) and
+ * these two are in the workspace switcher (docs/ideas/hosted-navigation.md).
  * The local multi-workspace UI has no Stats page (its server has no
  * /api/stats), so its root gets no bar: one page needs none.
  */

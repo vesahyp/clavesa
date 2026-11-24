@@ -1,4 +1,4 @@
-.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-go-race test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots ui-dashboard-shots ui-chart-motion hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-viewer hosted-build-lambda hosted-tracking-check hosted-live-check ui-day-windows-check ui-chart-logic-check ui-time-range-check errors
+.PHONY: setup dev build build-bin build-ui build-runner push-runner sync-runner sync-modules test test-go test-go-race test-cli test-runner test-runner-py smoke-cloud smoke-cloud-setup verify-readme verify-cookbook release-gates release-check release-public sync-public validate-examples docs-cli shadow-compare test-stream smoke-kinesis ui-phone-shots ui-nav-shots ui-dashboard-shots ui-chart-motion hosted-local hosted-init hosted-plan hosted-apply hosted-outputs hosted-deploy-spa hosted-add-user hosted-viewer hosted-build-lambda hosted-tracking-check hosted-column-check hosted-live-check ui-day-windows-check ui-chart-logic-check ui-time-range-check errors
 
 RUNNER_IMAGE   ?= clavesa/transform-runner
 RUNNER_VERSION ?= $(shell grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' internal/version/version.go | head -1)
@@ -238,6 +238,10 @@ ui-chart-motion: build ## Dashboard chart motion on an iPhone 16: first draw, a 
 	cd ui && npx playwright install chromium
 	node ui/scripts/chart-motion.mjs
 
+ui-nav-shots: ## Navigation design (docs/ideas/hosted-navigation.md): every page of its prototype at iPhone 16 and 1440x900, fails when a phone page scrolls sideways → .shots/nav/after/; BEFORE=1 the deployed hosted UI as the check user → .shots/nav/before/ (WS=smoke2, TABLE=<catalog>/<schema>/<table>, PROFILE=personal)
+	cd ui && npx playwright install chromium
+	node ui/scripts/nav-shots.mjs
+
 ui-phone-shots: build ## iPhone 16 shots of the four hosted pages (ADR-032), one per page (the app has one dark theme), with console-error and horizontal-scroll checks → .shots/phone/ (WS_DIR=~/clavesa-workspaces WS_NAME=smoke2 PIPELINE=taxi RUN=<id>; BASE_URL=<a running server, e.g. make hosted-local> instead of starting clavesa ui; AWS_PROFILE passes through)
 	cd ui && npx playwright install chromium
 	node ui/scripts/phone-shots.mjs
@@ -296,6 +300,10 @@ hosted/infra/.terraform:
 hosted-tracking-check: build-ui ## Hosted UI: a ?__throw=1 build sends the e=error type=boundary beacon (sanitized), no beacon carries the session, the local UI loads no tracker (LIVE_URL=https://ui.clavesa.dev checks the deployed site)
 	cd ui && npx playwright install chromium
 	node ui/scripts/hosted-tracking-check.mjs
+
+hosted-column-check: ## Hosted UI: what the check user sees of a table with column tags (EXPECT=hidden as a viewer, EXPECT=shown as an admin in group all; WS=smoke2 TABLE=clavesa_smoke2.taxi.trips COLUMN=trip_distance) → .shots/columns/
+	cd ui && npx playwright install chromium
+	node ui/scripts/column-access-check.mjs
 
 hosted-live-check: ## Hosted UI: iPhone 16 run of the five pages against the deployed site as the check user from SSM (/clavesa-ui/check-user), no console error, no failed API call, no horizontal scroll → .shots/live/ (BASE_URL, WS=smoke2, LOCAL_WS=site-traffic, PIPELINE, RUN, PROFILE=personal; needs make hosted-init once). Desktop: every sidebar entry of WS and LOCAL_WS opens with no console error and no failed API call (ADR-033)
 	cd ui && npx playwright install chromium

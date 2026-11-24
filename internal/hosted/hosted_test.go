@@ -219,12 +219,14 @@ func (m *memStore) Put(_ context.Context, name string, body []byte) error {
 }
 
 type fakeOpener struct {
-	ws    *Workspace
-	opens int
+	ws     *Workspace
+	opens  int
+	opened []Entry
 }
 
-func (f *fakeOpener) Open(context.Context, Entry) (*Workspace, error) {
+func (f *fakeOpener) Open(_ context.Context, e Entry) (*Workspace, error) {
 	f.opens++
+	f.opened = append(f.opened, e)
 	if f.ws == nil {
 		return nil, errors.New("no workspace")
 	}

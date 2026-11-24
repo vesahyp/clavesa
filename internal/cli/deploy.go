@@ -92,6 +92,33 @@ func newDeployFlow(cmd *cobra.Command, root, tfDir string) (deployFlow, error) {
 	return flow, nil
 }
 
+// lakeFormationLock runs service.LakeFormationLock and then
+// service.AccessSync, and prints what they changed. A no-op for a
+// workspace with no "access" block.
+func (d deployFlow) lakeFormationLock() error {
+	res, err := tuiservice.New(d.WorkspaceRoot).LakeFormationLock(context.Background())
+	if err != nil {
+		return fmt.Errorf("lake formation: %w", err)
+	}
+	for _, r := range res {
+		if r.DefaultCleared {
+			fmt.Fprintf(d.stdout(), "Lake Formation: %s gives new tables no IAM_ALLOWED_PRINCIPALS grant\n", r.Database)
+		}
+		for _, x := range r.Revoked {
+			fmt.Fprintf(d.stdout(), "Lake Formation: revoked IAM_ALLOWED_PRINCIPALS on %s %s\n", r.Database, x)
+		}
+	}
+	// Then the column tags on every table that exists (slice 1b).
+	tags, err := tuiservice.New(d.WorkspaceRoot).AccessSync(context.Background())
+	if err != nil {
+		return fmt.Errorf("column tags: %w", err)
+	}
+	if tags != nil {
+		printAccessSync(d.stdout(), d.stderr(), tags)
+	}
+	return nil
+}
+
 // pruneLineageAfterApply removes the Unity Catalog lineage objects of
 // nodes a pipeline no longer has (a task taken out of a bundle job) once
 // its deploy applied. A failure is a warning: the deploy itself is done.
@@ -205,6 +232,13 @@ func (d deployFlow) Run() error {
 		}
 	}
 
+	// Column tags (docs/ideas/column-tags.md): in a workspace with an
+	// "access" block, every apply ends with the Glue databases under Lake
+	// Formation. A failure fails the deploy (a database left open to IAM
+	// is the state the block exists to prevent), but only after the
+	// runner image push below, so a failed lock never leaves ECR behind.
+	lockErr := d.lakeFormationLock()
+
 	// Workspace deploy owns the runner-image lifecycle. The image was rebuilt
 	// in preflight; now (with the ECR repository created by the apply above)
 	// push it. The push is unconditional — no staleness gate — so a rebuild
@@ -224,8 +258,11 @@ func (d deployFlow) Run() error {
 		if file, ok := terraformPushesRunner(d.TfDir); ok {
 			fmt.Fprintf(d.stdout(), "\n→ Runner image: not pushed. %s has null_resource.push_runner, so this workspace's Terraform pins and pushes its own runner (runner_version).\n", file)
 		} else if err := d.pushRunnerImage(); err != nil {
-			return err
+			return errors.Join(err, lockErr)
 		}
+	}
+	if lockErr != nil {
+		return lockErr
 	}
 
 	// Success: remove the saved plan. A plan that already applied is
@@ -248,11 +285,27 @@ func (d deployFlow) preflight() error {
 		return err
 	}
 
+	// Column tags (docs/ideas/column-tags.md): a tag value that
+	// clavesa.json does not declare, or tags with no "access" block, stop
+	// the deploy before the apply.
+	// A workspace whose pipelines cannot be read here is left to the plan,
+	// which reports that itself.
+	if rep, err := tuiservice.New(d.WorkspaceRoot).AccessTags(); err != nil {
+		fmt.Fprintf(d.stderr(), "warning: column tags not checked: %v\n", err)
+	} else if len(rep.Problems) > 0 {
+		return fmt.Errorf("column tags have problems (clavesa workspace access show):\n  %s", strings.Join(rep.Problems, "\n  "))
+	}
+
 	// ADR-032: hosted.tf follows clavesa.json, and its legacy per-pipeline
 	// name list follows the pipelines, so re-emit it before the plan.
 	if filepath.Clean(d.TfDir) == filepath.Clean(d.WorkspaceRoot) {
 		if err := tuiservice.New(d.WorkspaceRoot).SyncHostedTF(""); err != nil {
 			return fmt.Errorf("write %s: %w", workspace.HostedTFFile, err)
+		}
+		// Column tags (docs/ideas/column-tags.md): lakeformation.tf follows
+		// clavesa.json's "access" block.
+		if err := tuiservice.New(d.WorkspaceRoot).SyncLakeFormationTF(""); err != nil {
+			return fmt.Errorf("write %s: %w", workspace.LakeFormationTFFile, err)
 		}
 	}
 

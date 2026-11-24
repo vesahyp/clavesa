@@ -84,3 +84,12 @@ Changed before it shipped (v2.27.9):
    under the workspace become relative, and the publish drops a
    snapshot whose bytes still name the workspace root.
 
+## Update 2026-11-22 (column tags)
+
+The `personal_data` parts of this ADR are superseded by
+`docs/ideas/column-tags.md`, slice 1b: the flag is removed from
+`clavesa.json` and from the hosted registry. Lake Formation column tags
+decide what a viewer reads of a cloud workspace.
+A local workspace with `--snapshot` now publishes its widget results. A
+local workspace whose snapshot holds no widget result lists no dashboards
+on the hosted site, and a link to one shows a notice.

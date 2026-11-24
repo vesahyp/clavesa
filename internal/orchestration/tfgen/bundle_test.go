@@ -95,7 +95,9 @@ func TestEmitBundle_HeapFromJobMemory(t *testing.T) {
 	}
 	for _, want := range []string{
 		`pipeline_runner_memory_mb = 10240`,
-		`CLAVESA_JVM_HEAP_MB         = tostring(max(512, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb))`,
+		// A bundle job's stated size keeps memory minus overhead as the cap.
+		`default     = 8768`,
+		`CLAVESA_JVM_HEAP_MB         = tostring(max(512, min(var.runner_heap_max_mb, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb)))`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q", want)

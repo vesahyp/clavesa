@@ -499,6 +499,101 @@ def _all_tests():
     return [(name, fn) for name, fn in sorted(g.items()) if name.startswith("test_") and callable(fn)]
 
 
+def test_jvm_heap_mb_reads_old_gen_collection_usage():
+    """The old generation's collection usage (G1 Old Gen) becomes
+    heap_old_after_gc_mb; committed and max convert to MB."""
+    runner = _load_runner()
+    MB = 1048576
+    got = runner._jvm_heap_mb(
+        [
+            ("CodeHeap 'non-nmethods'", False, None),
+            ("Metaspace", False, None),
+            ("G1 Eden Space", True, 0),
+            ("G1 Old Gen", True, 363 * MB + 5),
+            ("G1 Survivor Space", True, 12 * MB),
+        ],
+        1468 * MB,
+        1536 * MB,
+    )
+    assert got == {"heap_old_after_gc_mb": 363, "heap_committed_mb": 1468, "heap_max_mb": 1536}, got
+
+
+def test_jvm_heap_mb_other_collectors_and_missing_values():
+    """Parallel and Serial old pools match; no collection yet, a negative
+    max (undefined) and no old pool all give None."""
+    runner = _load_runner()
+    MB = 1048576
+    assert runner._jvm_heap_mb([("PS Old Gen", True, 2 * MB)], None, -1) == {
+        "heap_old_after_gc_mb": 2, "heap_committed_mb": None, "heap_max_mb": None}
+    assert runner._jvm_heap_mb([("Tenured Gen", True, None)], 0, 0)["heap_old_after_gc_mb"] is None
+    # A non-heap pool with "Old" in its name never counts.
+    assert runner._jvm_heap_mb([("Old Space", False, 9 * MB)], 0, 0)["heap_old_after_gc_mb"] is None
+
+
+def test_build_row_jvm_heap_columns():
+    """jvm_heap values land on the row; without them every column is
+    present and None."""
+    runner = _load_runner()
+    kw = dict(
+        run_id="r", started_ms=0, ended_ms=1, status="succeeded",
+        error_class=None, error_msg=None, cold_start=False, context=None,
+        env={"CLAVESA_PIPELINE": "p", "CLAVESA_NODE": "n"},
+    )
+    row = runner._build_node_run_row(**kw)
+    for k in runner._JVM_HEAP_KEYS:
+        assert k in row and row[k] is None, k
+    row = runner._build_node_run_row(
+        **kw, jvm_heap={"heap_old_after_gc_mb": 400, "heap_committed_mb": 1468, "heap_max_mb": 1536})
+    assert (row["heap_old_after_gc_mb"], row["heap_committed_mb"], row["heap_max_mb"]) == (400, 1468, 1536)
+
+
+def test_read_jvm_heap_mb_without_session_is_none():
+    runner = _load_runner()
+    runner._SPARK = None
+    assert runner._read_jvm_heap_mb() is None
+
+
+def test_process_peak_rss_adds_the_jvm():
+    """peak_rss_mb is the driver's VmHWM plus the gateway JVM's: the JVM's
+    /proc status is read through the session's gateway process pid."""
+    import builtins
+    import io
+    runner = _load_runner()
+    parse = runner._read_peak_rss_mb
+    # The driver's own /proc/self/status reads as 170 MB; a passed status
+    # text (the JVM's) is parsed for real.
+    runner._read_peak_rss_mb = lambda status_text=None: 170 if status_text is None else parse(status_text)
+
+    class _Proc:
+        pid = 4242
+
+    class _GW:
+        proc = _Proc()
+
+    class _SC:
+        _gateway = _GW()
+
+    class _S:
+        sparkContext = _SC()
+
+    runner._SPARK = _S()
+    real_open = builtins.open
+
+    def fake_open(path, *a, **k):
+        if path == "/proc/4242/status":
+            return io.StringIO("Name:\tjava\nVmHWM:\t 2097152 kB\n")
+        return real_open(path, *a, **k)
+
+    builtins.open = fake_open
+    try:
+        assert runner._read_process_peak_rss_mb() == 170 + 2048
+    finally:
+        builtins.open = real_open
+    # No session: the driver alone.
+    runner._SPARK = None
+    assert runner._read_process_peak_rss_mb() == 170
+
+
 def main():
     passed = 0
     failed: list[tuple[str, str]] = []

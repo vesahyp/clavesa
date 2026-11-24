@@ -71,6 +71,10 @@ type InputDetacher interface {
 
 // Handler holds the dependencies for all PIPELINE-API HTTP handlers.
 type Handler struct {
+	// hideColumnTags drops column_tags from the pipeline graph: a
+	// read-only (hosted) mux, whose viewers must not learn the names of
+	// the columns the tags hide (docs/ideas/column-tags.md).
+	hideColumnTags   bool
 	fo               *fileops.FileOps
 	root             string // absolute workspace root; used to resolve relative dir params
 	svc              *service.Service
@@ -85,6 +89,12 @@ type Handler struct {
 // root is the absolute workspace root directory.
 func New(fo *fileops.FileOps, root string) *Handler {
 	return &Handler{fo: fo, root: root}
+}
+
+// WithoutColumnTags drops each output's column_tags from GET /pipeline.
+func (h *Handler) WithoutColumnTags(hide bool) *Handler {
+	h.hideColumnTags = hide
+	return h
 }
 
 // WithService attaches the canonical service.Service so handlers that
@@ -244,6 +254,16 @@ func (h *Handler) GetPipeline(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httputil.WriteError(w, parseStatus(err), err.Error())
 		return
+	}
+	if h.hideColumnTags {
+		for i := range g.Nodes {
+			defs, _ := g.Nodes[i].Config["output_definitions"].(map[string]interface{})
+			for _, d := range defs {
+				if def, ok := d.(map[string]interface{}); ok {
+					delete(def, "column_tags")
+				}
+			}
+		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, g)
 }

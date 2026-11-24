@@ -36,7 +36,8 @@ resource "aws_sqs_queue" "trigger" {
 
   # The runner Lambda drains this queue with ReceiveMessage and only deletes a
   # message after the Delta write commits. Keep received-but-undeleted messages
-  # invisible for the whole run (SFN task TimeoutSeconds is 900); a shorter
+  # invisible for the whole run (SFN task TimeoutSeconds is runner_timeout_seconds,
+  # 900 by default); a shorter
   # window would resurface them mid-run and a concurrent/next fire would re-read
   # the same objects.
   visibility_timeout_seconds = var.trigger_visibility_timeout_seconds

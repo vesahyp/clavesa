@@ -161,6 +161,39 @@ export function PipelineDashboard() {
   return readOnly ? <ReadOnlyPipelineGate /> : <PipelineDashboardBody />;
 }
 
+/** The not-found page of the gate. It declares its crumbs, so back on a
+ * phone goes to Pipelines (docs/ideas/hosted-navigation.md). */
+function PipelineNotFound({ dir }: { dir: string }) {
+  const name = dir.split("/").pop() || dir;
+  useChrome(
+    useMemo<PageChrome>(
+      () => ({
+        breadcrumbs: [
+          { label: "Pipelines", to: "/pipelines" },
+          { label: name, to: `/pipelines/dashboard?dir=${encodeURIComponent(dir)}` },
+        ],
+      }),
+      [dir, name],
+    ),
+  );
+  return (
+    <div className="mx-auto w-full max-w-6xl px-4 py-8 md:px-6" data-testid="pipeline-not-found">
+      <h1 className="text-xl font-semibold tracking-tight">No pipeline with this name</h1>
+      <p className="mt-2 text-sm text-muted-foreground">
+        This workspace has no pipeline called{" "}
+        <span className="font-mono text-foreground">{dir.split("/").pop() || dir}</span>. The link
+        may be old, or the pipeline was renamed or removed.
+      </p>
+      <Link
+        to={homePath}
+        className="mt-4 inline-flex min-h-11 items-center rounded-md border border-border px-4 text-sm hover:bg-muted"
+      >
+        Back to the workspace
+      </Link>
+    </div>
+  );
+}
+
 function ReadOnlyPipelineGate() {
   const [searchParams] = useSearchParams();
   const dir = searchParams.get("dir") ?? "";
@@ -185,22 +218,7 @@ function ReadOnlyPipelineGate() {
     );
   }
   if (dir && pipelines.data && !known) {
-    return (
-      <div className="mx-auto w-full max-w-6xl px-4 py-8 md:px-6" data-testid="pipeline-not-found">
-        <h1 className="text-xl font-semibold tracking-tight">No pipeline with this name</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          This workspace has no pipeline called{" "}
-          <span className="font-mono text-foreground">{dir.split("/").pop() || dir}</span>. The link
-          may be old, or the pipeline was renamed or removed.
-        </p>
-        <Link
-          to={homePath}
-          className="mt-4 inline-flex min-h-11 items-center rounded-md border border-border px-4 text-sm hover:bg-muted"
-        >
-          Back to the workspace
-        </Link>
-      </div>
-    );
+    return <PipelineNotFound dir={dir} />;
   }
   return <PipelineDashboardBody />;
 }

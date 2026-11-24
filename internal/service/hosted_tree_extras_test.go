@@ -9,11 +9,10 @@ import (
 )
 
 // TestHostedTreeExtras: sources lose URL query strings, fragments and
-// user info; notebooks keep their outputs unless the workspace holds
-// personal data; the runner requirements go; nothing nested or of another
-// kind goes.
+// user info; notebooks keep their outputs; the runner requirements go;
+// nothing nested or of another kind goes.
 func TestHostedTreeExtras(t *testing.T) {
-	for _, personal := range []bool{false, true} {
+	{
 		root := t.TempDir()
 		write := func(rel, body string) {
 			p := filepath.Join(root, rel)
@@ -25,9 +24,6 @@ func TestHostedTreeExtras(t *testing.T) {
 			}
 		}
 		hosted := `"hosted":{"url":"https://ui.clavesa.dev","reader_principals":["arn:aws:iam::111122223333:role/x"]}`
-		if personal {
-			hosted = `"hosted":{"url":"https://ui.clavesa.dev","reader_principals":["arn:aws:iam::111122223333:role/x"],"personal_data":true}`
-		}
 		write("clavesa.json", `{"name":"w","cloud":"aws","version":1,`+hosted+`}`)
 		write(".clavesa/sources/api.json", `{"kind":"http","url":"https://user:pw@api.example.com/feed.json?key=SECRET#frag","credentials":"api"}`)
 		write(".clavesa/sources/nested/x.json", `{}`)
@@ -49,7 +45,7 @@ func TestHostedTreeExtras(t *testing.T) {
 			got[f.Key] = string(b)
 		}
 		if len(got) != 3 {
-			t.Errorf("personal=%v: keys %v, want sources/api.json, notebooks/nb.ipynb, runner-requirements.txt", personal, keys(got))
+			t.Errorf("keys %v, want sources/api.json, notebooks/nb.ipynb, runner-requirements.txt", keys(got))
 		}
 		src := got[".clavesa/sources/api.json"]
 		if strings.Contains(src, "SECRET") || strings.Contains(src, "frag") || strings.Contains(src, "pw@") || !strings.Contains(src, "https://api.example.com/feed.json") || !strings.Contains(src, `"credentials": "api"`) {
@@ -61,10 +57,10 @@ func TestHostedTreeExtras(t *testing.T) {
 			} `json:"cells"`
 		}
 		if err := json.Unmarshal([]byte(got["notebooks/nb.ipynb"]), &nb); err != nil || len(nb.Cells) != 2 {
-			t.Fatalf("personal=%v: notebook %q: %v", personal, got["notebooks/nb.ipynb"], err)
+			t.Fatalf("notebook %q: %v", got["notebooks/nb.ipynb"], err)
 		}
-		if outputs := len(nb.Cells[0].Outputs); (outputs == 0) != personal {
-			t.Errorf("personal=%v: code cell has %d output(s)", personal, outputs)
+		if outputs := len(nb.Cells[0].Outputs); outputs != 1 {
+			t.Errorf("code cell has %d output(s), want its 1", outputs)
 		}
 		if got[".clavesa/runner-requirements.txt"] != "pyasn>=1.6\n" {
 			t.Errorf("requirements = %q", got[".clavesa/runner-requirements.txt"])

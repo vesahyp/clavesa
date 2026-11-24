@@ -256,6 +256,13 @@ variable "output_definitions" {
       "json" writes a single JSON file to path. When format = "json", path is
       required (an s3:// or local path) and content_type / cache_control set
       the object's HTTP headers (content_type defaults to application/json).
+    table_tag and column_tags are the output's column tags, in a workspace
+      with an "access" block in clavesa.json (docs/ideas/column-tags.md).
+      table_tag is the table's value (for example "open": every column is
+      open unless listed); column_tags maps a column name to its value.
+      A table or column with no value is "unreviewed", which no viewer of
+      the hosted UI reads. clavesa deploy applies them in Lake Formation;
+      the module itself does not use them.
   EOT
   type = map(object({
     schema = optional(object({
@@ -279,6 +286,8 @@ variable "output_definitions" {
     path                    = optional(string)
     content_type            = optional(string, "application/json")
     cache_control           = optional(string)
+    table_tag               = optional(string)
+    column_tags             = optional(map(string), {})
   }))
 
   validation {

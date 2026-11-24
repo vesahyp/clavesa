@@ -48,7 +48,7 @@ type DeployedPipeline struct {
 // carries. Nothing else from the state is copied.
 var DeployedWorkspaceOutputs = []string{
 	"pipeline_bucket", "system_catalog", "system_pipelines_db", "athena_workgroup",
-	"hosted_workgroup", "hosted_reader_role_arn",
+	"hosted_workgroup", "hosted_reader_role_arn", "hosted_admin_workgroup",
 }
 
 // LoadDeployed reads <root>/deployed.json. (nil, nil) when the file does
@@ -77,6 +77,17 @@ func HostedAthenaWorkGroup(root string) string {
 		return ""
 	}
 	return d.Workspace.Outputs["hosted_workgroup"]
+}
+
+// HostedAdminAthenaWorkGroup is the hosted admin role's workgroup of a
+// workspace with column tags, from a hosted tree copy's deployed.json; ""
+// otherwise.
+func HostedAdminAthenaWorkGroup(root string) string {
+	d, err := LoadDeployed(root)
+	if err != nil || d == nil {
+		return ""
+	}
+	return d.Workspace.Outputs["hosted_admin_workgroup"]
 }
 
 // stackState renders the part of a Terraform state the read paths parse:

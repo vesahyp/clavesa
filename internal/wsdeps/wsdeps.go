@@ -53,6 +53,11 @@ type AWSClients struct {
 	// AthenaWorkGroup is the hosted reader's workgroup when the workspace
 	// is a hosted tree copy with deployed.json (ADR-032); empty otherwise.
 	AthenaWorkGroup string
+	// HideErrorText is true for the hosted reader of a workspace with
+	// column tags (a hosted tree copy whose clavesa.json has an "access"
+	// block): run and node error text is not served, because an error can
+	// quote a row (docs/ideas/column-tags.md).
+	HideErrorText bool
 }
 
 // LoadAWSClients resolves the AWS config once and constructs the client
@@ -69,6 +74,13 @@ func LoadAWSClients(ctx context.Context, workspaceRoot, profile string) AWSClien
 		bucket = wspkg.PipelineBucket(workspaceRoot)
 	}
 	c := AWSClients{AthenaOutputBucket: bucket, AthenaWorkGroup: wspkg.HostedAthenaWorkGroup(workspaceRoot)}
+	if c.AthenaWorkGroup != "" {
+		// Fail closed: a hosted tree copy whose clavesa.json does not load
+		// could have an "access" block.
+		if m, err := wspkg.Load(workspaceRoot); err != nil || (m != nil && m.Access != nil) {
+			c.HideErrorText = true
+		}
+	}
 	// The workspace's own profile and recorded region (GH #107): the
 	// multi-workspace UI reads each workspace in its own region.
 	var extra []func(*awsconfig.LoadOptions) error
@@ -100,7 +112,8 @@ func (c AWSClients) CloudProvider() observability.Provider {
 	return observability.NewCloudProvider(c.Athena, c.AthenaOutputBucket, c.SFN, c.CWL).
 		WithGlue(c.Glue).
 		WithS3(c.S3).
-		WithAthenaWorkGroup(c.AthenaWorkGroup)
+		WithAthenaWorkGroup(c.AthenaWorkGroup).
+		WithoutErrorText(c.HideErrorText)
 }
 
 // Options tunes New. The zero value is the CLI's behaviour.
@@ -112,6 +125,11 @@ type Options struct {
 	// The hosted UI sets it for a local-warehouse workspace, whose runs it
 	// reads from the published summary (ADR-032). Nil: the real one.
 	LocalProvider observability.Provider
+	// Admin: the hosted UI reads the workspace with its admin role
+	// (column tags): through the admin's own Athena workgroup, with error
+	// text. Only for a hosted tree copy whose deployed.json names the
+	// admin workgroup.
+	Admin bool
 }
 
 // Deps is the fully-wired Service plus the individual pieces the surfaces
@@ -133,6 +151,10 @@ type Deps struct {
 // silently drop a seam (GH #76).
 func New(ctx context.Context, root string, opts Options) *Deps {
 	clients := LoadAWSClients(ctx, root, opts.AWSProfile)
+	if opts.Admin {
+		clients.AthenaWorkGroup = wspkg.HostedAdminAthenaWorkGroup(root)
+		clients.HideErrorText = false
+	}
 	cloud := clients.CloudProvider()
 	warm := observability.NewPersistentQueryRunner(root)
 	var local observability.Provider = observability.NewLocalProvider(root).WithQueryRunner(warm)

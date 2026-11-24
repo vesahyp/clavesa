@@ -84,6 +84,10 @@ func cloudLocalDockerArgs(image string, env, perNodeEnv map[string]string, heapA
 		"CLAVESA_SYSTEM_CATALOG",
 		"CLAVESA_PIPELINE",
 		"CLAVESA_WATERMARKS",
+		// Column tags (docs/ideas/column-tags.md): the required Glue sync
+		// and no error text in _progress/ markers, as on the Lambda.
+		"CLAVESA_GLUE_SYNC_REQUIRED",
+		"CLAVESA_COLUMN_TAGS",
 		// ADR-027: the Unity Catalog publish, so a laptop run against the
 		// cloud warehouse registers tables, pushes lineage and starts jobs
 		// like the Lambda (ADR-014, ADR-024). The secret is only its

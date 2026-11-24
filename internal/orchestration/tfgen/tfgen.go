@@ -146,6 +146,10 @@ type Pipeline struct {
 	// job (ADR-031): see BundleConfig. Nil leaves the output unchanged.
 	Bundle *BundleConfig
 
+	// LakeFormation registers the pipeline's warehouse prefix and grants
+	// data location access (column tags, slice 1a). Nil: off.
+	LakeFormation *LakeFormationConfig
+
 }
 
 // awsBase returns the HCL template fragment (no quotes) that starts every
@@ -272,6 +276,7 @@ func Emit(p Pipeline) (string, error) {
 	emitDatabricksJobsVar(&b, p)
 	emitTeamS3Locals(&b, p)
 	emitUnityCatalogSchema(&b, p)
+	emitLakeFormation(&b, p)
 
 	return withGrantLifecycles(b.String())
 }
@@ -674,6 +679,14 @@ func writeRunnerEnv(b *strings.Builder, p Pipeline, in string) {
 	fmt.Fprintf(b, "%sCLAVESA_WATERMARKS          = \"s3://${%s}/${%s}/_watermarks/\"\n", in, p.BucketExpr, p.PipelineNameExpr)
 	fmt.Fprintf(b, "%sCLAVESA_RUNNER_IMAGE_DIGEST = data.aws_ecr_image.pipeline_runner.image_digest\n", in)
 	fmt.Fprintf(b, "%sCLAVESA_MODULE_VERSION      = \"%s\"\n", in, moduleVersionLiteral)
+	if p.LakeFormation != nil {
+		// Column tags need the real columns in Glue: a failed Glue schema
+		// sync of an output table fails the node.
+		fmt.Fprintf(b, "%sCLAVESA_GLUE_SYNC_REQUIRED  = \"1\"\n", in)
+		// An error can quote a row: the runner keeps error text out of
+		// the _progress/ markers and the Step Functions cause.
+		fmt.Fprintf(b, "%sCLAVESA_COLUMN_TAGS         = \"1\"\n", in)
+	}
 	if p.Bundle != nil && p.Bundle.SecretsPrefix != "" {
 		fmt.Fprintf(b, "%sCLAVESA_DBX_SECRET_PREFIX   = %q\n", in, p.Bundle.SecretsPrefix)
 	}
@@ -877,29 +890,63 @@ func emitPipelineLambda(b *strings.Builder, p Pipeline) {
 	// vs 2min), memory (3008MB vs 1.5GB — new AWS accounts cap per-function
 	// memory at 3008MB; users with a raised quota can bump this in the
 	// generated .tf), and env (per-pipeline knobs).
-	// Spark's container model: memory = driver heap + memoryOverhead
-	// (spark.driver.memoryOverhead, which local mode does not apply, so the
-	// runner sets -Xmx itself through CLAVESA_JVM_HEAP_MB). The overhead
-	// default is measured, not Spark's 10%/40%: the web-traffic gold bundle
-	// (12 nodes, 3008 MB, 2026-11-21) used about 1.1 GB outside the heap
-	// (metaspace, code cache, GC, ~600 threads, malloc, and ~330 MB of
-	// Python), and was killed at heaps 2256 and 2148; 1536 passed with
-	// 535 MB to spare.
+	// The Spark heap (-Xmx, through CLAVESA_JVM_HEAP_MB: local mode does
+	// not apply spark.driver.memory) is sized from need, not from the
+	// Lambda's memory. G1 grows the committed heap toward -Xmx whatever
+	// the live data is, so a heap of "memory minus overhead" fills the
+	// Lambda on every run. Measured on the web-traffic gold bundle (12
+	// nodes, 3008 MB, 2026-11-22, spikes/gold-memory): the heap in use
+	// after young GCs stayed at or below 512 MB even for a full read of
+	// all its history; about 1.0-1.1 GB sits outside the heap (JVM native
+	// ~0.6 GB, Python ~0.2 GB, page cache); and a 1536 MB heap peaked at
+	// 2996 of 3008 MB on Lambda (12 to 93 MB to spare in 30 days). So the
+	// heap is capped at runner_heap_max_mb (1024), and the overhead still
+	// keeps a small Lambda inside its memory. A bundle job that states its
+	// size (ADR-031) keeps memory minus overhead as its cap: that size is
+	// the job's own statement of need.
 	memMB := 3008
+	heapMaxMB := 1024
 	if p.Bundle != nil && p.Bundle.LambdaMemoryMB > 0 {
 		memMB = p.Bundle.LambdaMemoryMB
+		heapMaxMB = max(512, memMB-1472)
 	}
 	b.WriteString(`# Memory of the runner Lambda outside the Spark heap, in MB: the JVM's
 # metaspace, code cache, GC and thread stacks, and the Python driver and
 # workers (Spark's spark.driver.memoryOverhead). The Spark heap (-Xmx) is
-# the Lambda memory minus this. Raise it when a run fails with
-# Runtime.OutOfMemory; lower it to give Spark more heap. It is a fixed
-# amount, not a share: a Lambda below about 2 GB leaves the heap at its
-# 512 MB floor.
+# the Lambda memory minus this, but at most runner_heap_max_mb and at
+# least 512 MB. Raise it when a run fails with Runtime.OutOfMemory.
 variable "runner_memory_overhead_mb" {
-  description = "Runner Lambda memory outside the Spark heap in MB; the heap is the Lambda memory minus this."
+  description = "Runner Lambda memory outside the Spark heap in MB; the heap is the Lambda memory minus this, capped at runner_heap_max_mb."
   type        = number
   default     = 1472
+}
+
+`)
+	fmt.Fprintf(b, `# Largest Spark heap (-Xmx) of the runner, in MB. The JVM grows its heap
+# toward this ceiling whatever the data is, so Lambda's "Max Memory Used"
+# follows it. Compare node_runs.heap_old_after_gc_mb (the heap in use after
+# GC) with it: raise it only when that value comes close.
+variable "runner_heap_max_mb" {
+  description = "Largest Spark heap of the runner Lambda in MB."
+  type        = number
+  default     = %d
+}
+
+`, heapMaxMB)
+	b.WriteString(`# Longest one run of the runner Lambda may take, in seconds. 900 (15 minutes)
+# is the default and the maximum: Step Functions invokes the runner
+# synchronously (lambda:invoke), and a synchronous invoke keeps the 15-minute
+# limit. The Step Functions task timeout and the S3 trigger queues' visibility
+# timeout follow it. For longer runs, use compute = "fargate".
+variable "runner_timeout_seconds" {
+  description = "Longest one run of the runner Lambda may take, in seconds (1 to 900)."
+  type        = number
+  default     = 900
+
+  validation {
+    condition     = var.runner_timeout_seconds >= 1 && var.runner_timeout_seconds <= 900 && var.runner_timeout_seconds == floor(var.runner_timeout_seconds)
+    error_message = "runner_timeout_seconds must be a whole number from 1 to 900 (the Lambda maximum for a synchronous invoke)."
+  }
 }
 
 `)
@@ -914,7 +961,7 @@ variable "runner_memory_overhead_mb" {
 	fmt.Fprintf(b, "  package_type  = \"Image\"\n")
 	emitArchitectures(b, p)
 	fmt.Fprintf(b, "  image_uri     = \"${local.pipeline_runner_repo_uri}@${data.aws_ecr_image.pipeline_runner.image_digest}\"\n")
-	fmt.Fprintf(b, "  timeout       = 900   # 15min — the Lambda max; one container handles every transform\n")
+	fmt.Fprintf(b, "  timeout       = var.runner_timeout_seconds   # default 15 min; one container handles every transform\n")
 	fmt.Fprintf(b, "  memory_size   = local.pipeline_runner_memory_mb\n\n")
 	fmt.Fprintf(b, "  ephemeral_storage {\n")
 	fmt.Fprintf(b, "    size = 10240  # 10 GB — Spark shuffle/spill space; marginal cost ~$0.00026/run vs 512 MB default (GH #43)\n")
@@ -925,7 +972,7 @@ variable "runner_memory_overhead_mb" {
 	fmt.Fprintf(b, "  environment {\n")
 	fmt.Fprintf(b, "    variables = {\n")
 	writeRunnerEnv(b, p, "      ")
-	fmt.Fprintf(b, "      CLAVESA_JVM_HEAP_MB         = tostring(max(512, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb))\n")
+	fmt.Fprintf(b, "      CLAVESA_JVM_HEAP_MB         = tostring(max(512, min(var.runner_heap_max_mb, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb)))\n")
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  tags = local.clavesa_tags\n")
@@ -959,7 +1006,7 @@ func emitStateMachine(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "      RunPipeline = {\n")
 	fmt.Fprintf(b, "        Type           = \"Task\"\n")
 	fmt.Fprintf(b, "        Resource       = \"arn:aws:states:::lambda:invoke\"\n")
-	fmt.Fprintf(b, "        TimeoutSeconds = 900\n")
+	fmt.Fprintf(b, "        TimeoutSeconds = var.runner_timeout_seconds\n")
 	fmt.Fprintf(b, "        Parameters = {\n")
 	fmt.Fprintf(b, "          FunctionName = aws_lambda_function.pipeline_runner.arn\n")
 	fmt.Fprintf(b, "          Payload = {\n")
@@ -1448,6 +1495,11 @@ func emitRunsWriter(b *strings.Builder, p Pipeline) {
 	fmt.Fprintf(b, "      CLAVESA_SYSTEM_CATALOG   = \"%s\"\n", sysCatalogSafe)
 	fmt.Fprintf(b, "      CLAVESA_SYSTEM_WAREHOUSE = \"s3://${%s}/_system/pipelines/\"\n", p.BucketExpr)
 	fmt.Fprintf(b, "      CLAVESA_WAREHOUSE        = \"s3://${%s}/${%s}/_warehouse/\"\n", p.BucketExpr, p.PipelineNameExpr)
+	if p.LakeFormation != nil {
+		// Column tags: the cause holds no error text, so the runs row
+		// takes it from node_runs.
+		fmt.Fprintf(b, "      CLAVESA_COLUMN_TAGS      = \"1\"\n")
+	}
 	fmt.Fprintf(b, "    }\n")
 	fmt.Fprintf(b, "  }\n\n")
 	fmt.Fprintf(b, "  tags = local.clavesa_tags\n")

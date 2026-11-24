@@ -37,7 +37,7 @@ func TestViewerFromClaims(t *testing.T) {
 // if it did not exist; /api/stats is for "all" only; no groups sees
 // nothing.
 func TestPerWorkspaceViewers(t *testing.T) {
-	reg, err := ParseRegistry([]byte(personalRegistry)) // web-traffic and smoke2
+	reg, err := ParseRegistry([]byte(testRegistry)) // web-traffic and smoke2
 	if err != nil {
 		t.Fatal(err)
 	}

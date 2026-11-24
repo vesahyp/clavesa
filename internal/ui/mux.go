@@ -126,7 +126,8 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 		WithLineage(lineageBridge{svc: svc}).
 		WithNodeAdder(nodeAdderBridge{svc: svc}).
 		WithExternalTableAttacher(svc).
-		WithInputDetacher(svc)
+		WithInputDetacher(svc).
+		WithoutColumnTags(d.ReadOnly)
 	workspaceHandler := api.NewWorkspaceHandler(workspace).WithService(svc).WithSummaryOnly(d.SummaryOnly).WithSnapshotAt(d.SnapshotAt)
 	if d.Restart != nil {
 		workspaceHandler = workspaceHandler.WithRestart(d.Restart)
@@ -136,7 +137,8 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 		WithLocalRunner(localPipelineRunnerBridge{svc: svc}).
 		WithCloudRunner(cloudPipelineRunnerBridge{svc: svc}).
 		WithCloudLocalRunner(cloudLocalPipelineRunnerBridge{svc: svc}).
-		WithAthenaOutputBucket(athenaOutputBucket)
+		WithAthenaOutputBucket(athenaOutputBucket).
+		WithoutErrorText(d.Clients.HideErrorText)
 	// WithQueryService routes /data/query through the shared Service.Query
 	// seam (provider dispatch + Spark→Trino transpile on cloud), the same
 	// path `clavesa query` uses (ADR-015).
@@ -230,6 +232,11 @@ func registerWorkspaceRoutes(d WorkspaceDeps, r httputil.Router) {
 
 	pipelineHandler.RegisterRoutes(r)
 	workspaceHandler.RegisterRoutes(r)
+	if !d.ReadOnly {
+		// Column tags name hidden columns: the Mac's own UI only, never the
+		// hosted (read-only) one.
+		r.HandleFunc("GET /workspace/access", workspaceHandler.GetAccess)
+	}
 	statusHandler.RegisterRoutes(r)
 	catalogHandler.RegisterRoutes(r)
 	dashboardsHandler.RegisterRoutes(r)

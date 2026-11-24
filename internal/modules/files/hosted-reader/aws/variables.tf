@@ -68,14 +68,20 @@ variable "tags" {
   default     = {}
 }
 
-variable "raw_object_patterns" {
-  description = "Object key patterns in the pipeline bucket that hold personal data (a workspace with hosted.personal_data: every pipeline that is not gold, with its Delta logs). The reader gets an explicit Deny on them."
-  type        = list(string)
-  default     = []
+variable "lf_tag_key" {
+  description = "Column tags (docs/ideas/column-tags.md): the workspace's Lake Formation tag key. Set: the reader reads only tables and columns tagged \"open\" (a tag grant in place of the SELECT on all tables), reads no table files, Delta logs or run logs in S3 and CloudWatch, and keeps its Athena results under its own prefix. Empty: the reader reads every table."
+  type        = string
+  default     = ""
 }
 
-variable "raw_glue_databases" {
-  description = "Glue databases whose tables hold personal data. The reader gets an explicit Deny on reading their tables and partitions."
-  type        = list(string)
-  default     = []
+variable "admin_role_name" {
+  description = "Column tags: the admin role, clavesa-ui-admin-<workspace>, made only with lf_tag_key. The hosted UI assumes it for a viewer in the Cognito group \"all\" (the hosted admin), who reads every table and column, hidden ones included, the run logs and the Delta logs. Empty: no admin role."
+  type        = string
+  default     = ""
+}
+
+variable "admin_workgroup_name" {
+  description = "The admin role's Athena workgroup, with its own result prefix athena-results/clavesa-ui/<admin role>/, so the admin's results (which can hold hidden columns) are never where the reader reads."
+  type        = string
+  default     = ""
 }

@@ -17,6 +17,7 @@ import { useMemo, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { ChevronRight } from "lucide-react";
 
+import { ColumnTagsPanel } from "@/components/ColumnTagsPanel";
 import { useChrome, type PageChrome } from "@/components/PageChrome";
 import {
   FAILED_COLOR,
@@ -294,6 +295,7 @@ function Body({ s }: { s: WorkspaceSummary }) {
           <PipelineCard key={p.dir} p={p} />
         ))}
       </div>
+      <ColumnTagsPanel />
     </>
   );
 }

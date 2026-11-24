@@ -16,10 +16,13 @@
 #   reader_role_arn  cloud only: clavesa-ui-reader-<name> (the workspace
 #                    deploy creates it; `clavesa workspace hosted show`)
 #   bucket           cloud only: the workspace's pipeline bucket
-#   personal_data    true when the workspace's raw data holds personal
-#                    data (visitor IPs, user agents): the Lambda then
-#                    refuses raw row reads of it, and shows table rows of
-#                    gold databases only (internal/hosted/personal.go)
+#   admin_role_arn   cloud only, column tags: clavesa-ui-admin-<name>
+#                    (`terraform output hosted_admin_role_arn` in the
+#                    workspace); the Lambda reads with it for a viewer in
+#                    the group "all", who sees every column
+#
+# What a viewer may read of a cloud workspace's tables is set by its
+# column tags in Lake Formation (docs/ideas/column-tags.md).
 #
 # The list reaches the Lambda as JSON (REGISTRY), lets the event bus
 # accept the accounts, and lets the publisher role write the local names.
@@ -34,6 +37,8 @@ locals {
       region          = "eu-north-1"
       reader_role_arn = "arn:aws:iam::699166197771:role/clavesa-ui-reader-smoke2"
       bucket          = "smoke2-clavesa"
+      # Column tags: admins (group "all") read with the admin role.
+      admin_role_arn = "arn:aws:iam::699166197771:role/clavesa-ui-admin-smoke2"
     },
     {
       name            = "ucpub"
@@ -60,26 +65,25 @@ locals {
       region          = "eu-north-1"
       reader_role_arn = "arn:aws:iam::471112936790:role/clavesa-ui-reader-web-traffic"
       bucket          = "web-traffic-clavesa"
-      personal_data   = false # Vesa, 2026-11-18: no raw-data block for web-traffic
     },
     # The nightly site-traffic pipelines on the main Mac (local warehouse).
-    # personal_data: their sources are CloudFront logs with visitor IPs and
-    # their events tables hold visitor ids (slice 5 review, finding 2).
     # Each run publishes summaries/<name>.json through the publisher role
     # (hosted/README.md, "Adding a local workspace").
-    { name = "site-traffic", kind = "local", personal_data = true },
-    { name = "omatienoo-traffic", kind = "local", personal_data = true },
-    { name = "podbay-traffic", kind = "local", personal_data = true },
-    { name = "kivikko-traffic", kind = "local", personal_data = true },
-    { name = "keitos-traffic", kind = "local", personal_data = true },
-    { name = "vinkki-traffic", kind = "local", personal_data = true },
-    { name = "rakka-traffic", kind = "local", personal_data = true },
+    { name = "site-traffic", kind = "local" },
+    { name = "omatienoo-traffic", kind = "local" },
+    { name = "podbay-traffic", kind = "local" },
+    { name = "kivikko-traffic", kind = "local" },
+    { name = "keitos-traffic", kind = "local" },
+    { name = "vinkki-traffic", kind = "local" },
+    { name = "rakka-traffic", kind = "local" },
   ]
 
   # Only cloud workspaces send events, so only their accounts may put
   # events on the bus.
   workspace_accounts = distinct([for w in local.workspaces : w.account if w.kind == "cloud"])
   local_workspaces   = [for w in local.workspaces : w.name if w.kind == "local"]
+  # Column tags: the admin roles the Lambda may assume.
+  admin_role_arns = [for w in local.workspaces : w.admin_role_arn if try(w.admin_role_arn, "") != ""]
 
   # A local entry leaves account, region, reader_role_arn and bucket out;
   # they reach the Lambda as "".
@@ -90,6 +94,6 @@ locals {
     region          = try(w.region, "")
     reader_role_arn = try(w.reader_role_arn, "")
     bucket          = try(w.bucket, "")
-    personal_data   = try(w.personal_data, false)
+    admin_role_arn  = try(w.admin_role_arn, "")
   }])
 }

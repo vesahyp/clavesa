@@ -72,3 +72,9 @@ get no access until he says so.
   verified email, and a removal also signs the user out everywhere.
 - A workspace may not be named `all`.
 
+## Update 2026-11-22 (column tags)
+
+The `personal_data` parts of this ADR are superseded by
+`docs/ideas/column-tags.md`, slice 1b: the flag is removed from
+`clavesa.json` and from the hosted registry. Lake Formation column tags
+decide what a viewer reads of a cloud workspace.

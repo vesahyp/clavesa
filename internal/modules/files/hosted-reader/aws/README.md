@@ -32,6 +32,17 @@ module therefore always gives the reader role:
 - for each name in `lf_databases`: LF `DESCRIBE` on the database and
   `SELECT` + `DESCRIBE` on all its tables (wildcard).
 
+With `lf_tag_key` set (a workspace with an `"access"` block, see
+`docs/ideas/column-tags.md`), the grant on all tables is replaced by one
+Lake Formation tag grant: `SELECT` + `DESCRIBE` on the tables and columns
+whose value under that key is `open`. The reader then also loses:
+
+- `s3:GetObject` on table files and Delta logs. It reads only
+  `_clavesa/*`, `_progress/*` and its own Athena results;
+- its Athena results move to `athena-results/clavesa-ui/<role>/`;
+- the run logs (`logs:FilterLogEvents` and the others), because a failed
+  node's log can quote a row.
+
 clavesa fills `lf_databases` with the system database
 `<system_catalog>__pipelines` and the `<catalog>__<schema>` database of
 every pipeline that is deployed (its state has the Glue database). A

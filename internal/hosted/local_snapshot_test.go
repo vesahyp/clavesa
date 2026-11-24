@@ -67,18 +67,6 @@ func TestLocalSnapshotRoutes(t *testing.T) {
 		t.Errorf("GET /workspace: %d %s", c, b)
 	}
 
-	// A workspace the registry marks personal_data serves no widget result,
-	// whatever the Mac stored (slice 5 review, finding 2).
-	pws, _, err := OpenLocal(context.Background(), filepath.Join(t.TempDir(), "site-traffic"), Entry{Name: "site-traffic", Kind: KindLocal, PersonalData: true}, body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pw := httptest.NewRecorder()
-	pws.Handler.ServeHTTP(pw, httptest.NewRequest(http.MethodPost, "/dashboards/query", strings.NewReader(`{"dir":"traffic","sql":"SELECT day, n FROM daily"}`)))
-	if pw.Code != http.StatusForbidden {
-		t.Errorf("personal_data entry, stored widget: %d, want 403", pw.Code)
-	}
-
 	// A drill with no snapshot: the catalog is not kept, widgets are 403.
 	sum.Drill.Snapshot = nil
 	body, _ = json.Marshal(sum)
@@ -94,9 +82,10 @@ func TestLocalSnapshotRoutes(t *testing.T) {
 	}
 }
 
-// A personal_data local workspace lists no dashboards, and a link to one
-// (its spec or a widget query) answers 403 with the notice.
-func TestLocalSnapshotHidesPersonalDashboards(t *testing.T) {
+// A local workspace whose snapshot holds no widget result lists no
+// dashboards, and a link to one (its spec or a widget query) answers 403
+// with the notice, so no widget fails.
+func TestLocalSnapshotHidesUnpublishedDashboards(t *testing.T) {
 	spec := `{"slug":"traffic","title":"Traffic","datasets":[],"widgets":[]}`
 	sum := service.WorkspaceSummary{
 		Name: "site-traffic", Kind: "local",
@@ -108,7 +97,7 @@ func TestLocalSnapshotHidesPersonalDashboards(t *testing.T) {
 		},
 	}
 	body, _ := json.Marshal(sum)
-	ws, _, err := OpenLocal(context.Background(), filepath.Join(t.TempDir(), "site-traffic"), Entry{Name: "site-traffic", Kind: KindLocal, PersonalData: true}, body)
+	ws, _, err := OpenLocal(context.Background(), filepath.Join(t.TempDir(), "site-traffic"), Entry{Name: "site-traffic", Kind: KindLocal}, body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +110,7 @@ func TestLocalSnapshotHidesPersonalDashboards(t *testing.T) {
 		t.Errorf("GET /dashboards: %d %s, want an empty list", c, b)
 	}
 	for _, req := range [][3]string{{http.MethodGet, "/dashboards/traffic", ""}, {http.MethodPost, "/dashboards/query", `{"dir":"traffic","sql":"SELECT 1"}`}} {
-		if c, b := do(req[0], req[1], req[2]); c != http.StatusForbidden || !strings.Contains(b, "opens only in the local clavesa UI") {
+		if c, b := do(req[0], req[1], req[2]); c != http.StatusForbidden || !strings.Contains(b, "not published from the Mac") {
 			t.Errorf("%s %s: %d %s, want 403 with the notice", req[0], req[1], c, b)
 		}
 	}

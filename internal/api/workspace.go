@@ -307,6 +307,19 @@ func (wh *WorkspaceHandler) SetAWSProfile(w http.ResponseWriter, r *http.Request
 // /workspace/hosted — the hosted read-only UI (ADR-032)
 // ---------------------------------------------------------------------------
 
+// GetAccess returns the workspace's column tags: the twin of `clavesa
+// workspace access show --json` (docs/ideas/column-tags.md). It names
+// hidden columns, so it is registered only for the Mac's own UI, never in
+// a read-only (hosted) mux.
+func (wh *WorkspaceHandler) GetAccess(w http.ResponseWriter, _ *http.Request) {
+	rep, err := wh.service().AccessTags()
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, rep)
+}
+
 // GetHosted returns the recorded hosted block: the twin of `clavesa
 // workspace hosted show --json`.
 func (wh *WorkspaceHandler) GetHosted(w http.ResponseWriter, _ *http.Request) {

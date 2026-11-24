@@ -24,12 +24,17 @@
 //   net::ERR_ABORTED, the browser cancelling a request when a page or a
 //   query is replaced. It is not a server answer and is not counted.
 //   The bottom bar (Vesa, 2026-11-16: "The ui bottom buttons change, which
-//   is not good ux"): every page shows the same items, in the same order,
-//   with the same labels, hrefs and boxes; only the active item differs,
-//   and it carries the visible marker (Workspaces on pages 1 to 4, Stats
-//   on page 5). Each item must be on top at its centre (not covered, so
-//   tappable). Pages 2 to 4 and 6 (the Pipelines page) show a visible back button at
-//   the top; pages 1 and 5 show none.
+//   is not good ux"; 2026-11-21: docs/ideas/hosted-navigation.md): every
+//   page of a workspace shows its four sections, Overview, Pipelines,
+//   Catalog, Dashboards, with the same labels, hrefs and boxes; the root
+//   pages show Workspaces and Site usage. Only the active item differs,
+//   and it carries the visible marker. Each item must be on top at its
+//   centre (not covered, so tappable). A section's own page (Overview,
+//   Pipelines, Catalog) has no back button; every page below one does,
+//   and it goes one level up, never further (backTo): the Catalog levels
+//   13 to 15 and the table page 12 are reached by taps through them.
+//   No page scrolls sideways, and no box inside a page scrolls or clips
+//   sideways (text shortened with "…", charts and the graph aside).
 //   Review fixes (2026-11-16):
 //   - times are Helsinki time: the pipeline page's newest run label in the
 //     "Where the time goes" chart equals the run's start in Helsinki;
@@ -60,13 +65,12 @@
 //     Credentials or Runner entry, and /query, /credentials and /runner
 //     land on the workspace home with no Run button.
 //   - the second tab is "Site usage" (not "Stats"), on every page.
-//   - 12-personal: LOCAL_WS is personal_data in the registry, so its
-//     dashboards are kept to the Mac: GET /dashboards lists none, and a
-//     link to one (LOCAL_DASHBOARD, default pipeline-runs-traffic) shows
-//     one notice and no widget, never "Query failed": "This dashboard
-//     holds visitor data and opens only in the local clavesa UI" when the
-//     Mac publishes a snapshot, else the page's "data of this workspace is
-//     on the Mac" line (no snapshot: the page runs no query at all).
+//   - 12-local-dashboard: a dashboard of LOCAL_WS (LOCAL_DASHBOARD,
+//     default pipeline-runs-traffic) never shows "Query failed": it draws
+//     the widgets the Mac published, or shows one notice and no widget
+//     ("This dashboard's values are not published from the Mac" when the
+//     Mac published none, else the page's "data of this workspace is on
+//     the Mac" line). With no published widget, GET /dashboards lists none.
 //   A 503 (Lambda throttling on a cold load) on a page makes the script load
 //   that page once more and say so; a failure that persists fails the run.
 //
@@ -86,6 +90,11 @@
 //   PROFILE    AWS profile (default personal); region is eu-north-1
 //   PARAMETER  the SSM parameter (default /clavesa-ui/check-user)
 //   WAIT_MS    per page wait for its content (default 90000)
+//   HIDDEN     <table>:<column>,... columns that column tags hide from
+//              the reader (docs/ideas/column-tags.md): the table page of
+//              that table must not show them, in its schema, its sample
+//              rows or GET /workspace/tables (default for smoke2:
+//              trips:trip_distance)
 
 import { chromium, devices } from "playwright";
 import { execFileSync } from "node:child_process";
@@ -97,6 +106,12 @@ const REPO = new URL("../../", import.meta.url).pathname;
 const env = (k, d) => process.env[k] || d;
 const BASE = env("BASE_URL", "https://ui.clavesa.dev").replace(/\/$/, "");
 const WS = env("WS", "smoke2");
+// HIDDEN: <table>:<column>,... (column tags); smoke2 tags trips.trip_distance.
+const HIDDEN = env("HIDDEN", WS === "smoke2" ? "trips:trip_distance" : "");
+function hiddenColumns(ws, table) {
+  if (ws !== WS) return [];
+  return HIDDEN.split(",").map((x) => x.split(":")).filter(([t, c]) => t === table && c).map(([, c]) => c);
+}
 // A local-warehouse workspace for the navigation walk (ADR-033).
 const LOCAL_WS = env("LOCAL_WS", "site-traffic");
 const PROFILE = env("PROFILE", "personal");
@@ -252,7 +267,15 @@ async function buildPages(tok) {
   const dl = await api(tok, `/w/${ws}/api/dashboards`).catch(() => null);
   const dashSlugs = env("DASHBOARDS", "") ? env("DASHBOARDS", "").split(",") : [(dl?.dashboards ?? [])[0]?.slug].filter(Boolean);
   // TABLE=<catalog>.<schema>.<table>: its table page must show sample rows.
-  const table = env("TABLE", "");
+  // TABLE=<catalog>.<schema>.<table>: its table page must show sample
+  // rows. Default: the workspace's first pipeline table, reached by taps
+  // through the three Catalog levels (docs/ideas/hosted-navigation.md).
+  const tl = await api(tok, `/w/${ws}/api/workspace/tables`).catch(() => null);
+  // A table with hidden columns (HIDDEN) first, so the check sees them.
+  const pipelineTables = (tl?.tables ?? []).filter((t) => t.owning_node && t.table_type === "DELTA");
+  const firstTable = pipelineTables.find((t) => hiddenColumns(ws, t.name).length) ?? pipelineTables[0];
+  const table = env("TABLE", "") || (firstTable ? `${firstTable.catalog}.${firstTable.schema}.${firstTable.name}` : "");
+  const [tCat, tSchema, tName] = table.split(".");
   // The workspace's first notebook, for the read-only notebook view.
   const nl = await api(tok, `/w/${ws}/api/notebooks`).catch(() => null);
   const nbName = (Array.isArray(nl) ? nl : (nl?.notebooks ?? []))[0]?.name;
@@ -402,8 +425,8 @@ async function buildPages(tok) {
       path: `/w/${ws}/`,
       taps: toWs,
       testids: ["workspace-home", "workspace-home-runs-chart", "pipeline-card", "workspace-home-all-pipelines", "phone-nav"],
-      active: "workspaces",
-      back: true,
+      active: "overview",
+      back: false,
     },
     {
       name: "03-pipeline",
@@ -411,7 +434,7 @@ async function buildPages(tok) {
       taps: toPipeline,
       testids: ["deployment-status", "pipeline-phone-duration-bars", "run-timings-chart", "pipeline-phone-run-row", "phone-nav"],
       neverShow: ["Never run"],
-      active: "workspaces",
+      active: "pipelines",
       back: true,
       ready: () =>
         Number(document.querySelector('[data-testid="run-timings-chart"]')?.dataset.pointCount ?? 0) > 0,
@@ -433,7 +456,7 @@ async function buildPages(tok) {
       path: `${dash}&run=${encodeURIComponent(runId)}`,
       taps: [...toPipeline, `[data-testid="pipeline-phone-run-row"][data-run-id="${runId}"]`],
       testids: ["run-detail-sheet", "run-phone-timeline-chart", "run-phone-node-row", "phone-nav"],
-      active: "workspaces",
+      active: "pipelines",
       back: true,
       fit: '[data-testid="run-phone-view"]',
       extra: async (page) => {
@@ -453,8 +476,8 @@ async function buildPages(tok) {
       path: `/w/${ws}/pipelines`,
       taps: [...toWs, '[data-testid="workspace-home-all-pipelines"]'],
       testids: ["pipeline-card", "phone-nav"],
-      active: "workspaces",
-      back: true,
+      active: "pipelines",
+      back: false,
     },
     ...(seesAll
       ? [
@@ -501,9 +524,9 @@ async function buildPages(tok) {
     ...dashSlugs.map((dashSlug, i) => ({
             name: i ? `09-dashboard-${dashSlug}` : "09-dashboard",
             path: `/w/${ws}/dashboards/${encodeURIComponent(dashSlug)}`,
-            taps: [...toWs, '[data-testid="workspace-home-dashboards"]', `a[href$="/dashboards/${encodeURIComponent(dashSlug)}"]`],
+            taps: [...toWs, '[data-testid="workspace-home-dashboards"]', `main a[href$="/dashboards/${encodeURIComponent(dashSlug)}"]`],
             testids: ["dashboard-widget", "phone-nav"],
-            active: "workspaces",
+            active: "dashboards",
             back: true,
             // Every widget has run its query: no skeleton left.
             ready: () =>
@@ -522,18 +545,61 @@ async function buildPages(tok) {
           })),
     ...(table
       ? [
+          // The Catalog, one level per page; back goes one level up.
+          {
+            name: "13-catalog",
+            path: `/w/${ws}/catalog`,
+            taps: [...toWs, '[data-testid="phone-nav-catalog"]'],
+            testids: ["catalog-levels", "catalog-row", "phone-nav"],
+            active: "catalog",
+            back: false,
+          },
+          {
+            name: "14-catalog-one",
+            path: `/w/${ws}/catalog?catalog=${encodeURIComponent(tCat)}`,
+            taps: [...toWs, '[data-testid="phone-nav-catalog"]', `[data-testid="catalog-row"][data-catalog="${tCat}"]`],
+            testids: ["catalog-levels", "schema-row", "phone-nav"],
+            active: "catalog",
+            back: true,
+            backTo: "/catalog",
+          },
+          {
+            name: "15-schema",
+            path: `/w/${ws}/catalog?catalog=${encodeURIComponent(tCat)}&schema=${encodeURIComponent(tSchema)}`,
+            taps: [...toWs, '[data-testid="phone-nav-catalog"]', `[data-testid="catalog-row"][data-catalog="${tCat}"]`, `[data-testid="schema-row"][data-schema="${tSchema}"]`],
+            testids: ["catalog-levels", "catalog-table-row", "phone-nav"],
+            active: "catalog",
+            back: true,
+            backTo: `/catalog?catalog=${encodeURIComponent(tCat)}`,
+          },
           {
             name: "12-table",
             path: `/w/${ws}/tables/${table.split(".").map(encodeURIComponent).join("/")}`,
-            taps: [...toWs, '[data-testid="workspace-home-tables"]', `[data-testid="catalog-table-row"][data-table-catalog="${table.split(".")[0]}"][data-table-schema="${table.split(".")[1]}"][data-table-name="${table.split(".")[2]}"]`],
+            taps: [...toWs, '[data-testid="phone-nav-catalog"]', `[data-testid="catalog-row"][data-catalog="${tCat}"]`, `[data-testid="schema-row"][data-schema="${tSchema}"]`, `[data-testid="catalog-table-row"][data-table-name="${tName}"]`],
+            backTo: `/catalog?catalog=${encodeURIComponent(tCat)}&schema=${encodeURIComponent(tSchema)}`,
             testids: ["table-schema", "phone-nav"],
-            active: "workspaces",
+            active: "catalog",
             back: true,
             ready: () => /examples from first [1-9][0-9]* rows/.test(document.body.innerText),
             extra: async (page) => {
               const m = (await page.locator("body").innerText()).match(/examples from first (\d+) rows/);
               console.log(`       table ${table}: ${m ? m[1] : 0} sample row(s)`);
-              return m && Number(m[1]) > 0 ? [] : [`table ${table}: no sample rows`];
+              const probs = m && Number(m[1]) > 0 ? [] : [`table ${table}: no sample rows`];
+              // Column tags: the hidden columns of this table show nowhere.
+              const hidden = hiddenColumns(ws, tName);
+              if (hidden.length) {
+                const shown = [
+                  await page.locator('[data-testid="table-schema"]').innerText().catch(() => ""),
+                  await page.locator('[data-testid="table-sample-rows"]').innerText().catch(() => ""),
+                ].join("\n");
+                const apiCols = ((tl?.tables ?? []).find((t) => t.name === tName && t.schema === tSchema)?.columns ?? []).map((c) => c.name);
+                for (const c of hidden) {
+                  if (new RegExp(`\\b${c}\\b`).test(shown)) probs.push(`table ${table}: the hidden column ${c} shows on the page`);
+                  if (apiCols.includes(c)) probs.push(`table ${table}: GET /workspace/tables lists the hidden column ${c}`);
+                }
+                console.log(`       table ${table}: hidden column(s) ${hidden.join(", ")} ${probs.some((p) => p.includes("hidden")) ? "SHOWN" : "not shown"} (API columns: ${apiCols.join(", ")})`);
+              }
+              return probs;
             },
           },
         ]
@@ -545,7 +611,7 @@ async function buildPages(tok) {
             path: `/w/${ws}/notebooks/${encodeURIComponent(nbName)}`,
             taps: [...toWs, '[data-testid="workspace-home-notebooks"]', `a[href$="/notebooks/${encodeURIComponent(nbName)}"]`],
             testids: ["notebook-view", "phone-nav"],
-            active: "workspaces",
+            active: null,
             back: true,
             extra: async (page) => {
               const cells = await page.locator('[data-testid="notebook-view-cell"]').count();
@@ -562,7 +628,7 @@ async function buildPages(tok) {
       // Typed on purpose: no link leads to a pipeline that does not exist.
       typed: "a bad address",
       testids: ["pipeline-not-found", "phone-nav"],
-      active: "workspaces",
+      active: "pipelines",
       back: true,
       // The graph read of a pipeline that does not exist answers 404.
       allowHttp: [404],
@@ -619,11 +685,16 @@ async function readNav(page) {
           };
         })
       : [];
-    const back = [...document.querySelectorAll('[data-testid="phone-back"]')].some((el) => {
+    const shownBack = [...document.querySelectorAll('[data-testid="phone-back"]')].filter((el) => {
       const r = el.getBoundingClientRect();
       return r.width > 0 && r.height > 0 && r.top < innerHeight / 3;
     });
-    return { count: navs.length, items, back };
+    return {
+      count: navs.length,
+      items,
+      back: shownBack.length > 0,
+      backHref: shownBack[0]?.getAttribute("href") ?? null,
+    };
   });
 }
 
@@ -633,10 +704,14 @@ function navProblems(pg, nav, ref) {
   if (nav.count !== 1) out.push(`bottom bar: ${nav.count} bars on the page, want 1`);
   if (!nav.items.length) return [...out, "bottom bar: no items"];
   const labels = nav.items.map((i) => i.label);
-  const wantLabels = seesAll ? "Workspaces|Site usage" : "Workspaces";
-  if (labels.join("|") !== wantLabels) out.push(`bottom bar labels ${labels.join(" | ")}, want ${wantLabels.replace("|", " | ")}`);
+  // The root pages' bar is Workspaces and Site usage; inside a workspace
+  // it is the workspace's four sections (docs/ideas/hosted-navigation.md).
+  const wantLabels = isRootPage(pg) ? (seesAll ? "Workspaces|Site usage" : "Workspaces") : "Overview|Pipelines|Catalog|Dashboards";
+  if (labels.join("|") !== wantLabels) out.push(`bottom bar labels ${labels.join(" | ")}, want ${wantLabels.replaceAll("|", " | ")}`);
   const actives = nav.items.filter((i) => i.active).map((i) => i.testid);
-  if (actives.length !== 1 || actives[0] !== `phone-nav-${pg.active}`)
+  if (pg.active === null) {
+    if (actives.length) out.push(`bottom bar: active ${actives.join("+")}, want none (the page is in no section)`);
+  } else if (actives.length !== 1 || actives[0] !== `phone-nav-${pg.active}`)
     out.push(`bottom bar: active ${actives.join("+") || "none"}, want phone-nav-${pg.active}`);
   for (const i of nav.items) {
     const shown = i.marker && i.marker !== "rgba(0, 0, 0, 0)" && i.marker !== "transparent";
@@ -646,10 +721,18 @@ function navProblems(pg, nav, ref) {
   }
   if (ref) {
     const shape = (n) => n.items.map((i) => `${i.testid}|${i.label}|${i.href}|${i.box}`).join(" ; ");
-    if (shape(nav) !== shape(ref)) out.push(`bottom bar differs from 01-workspaces: [${shape(nav)}] vs [${shape(ref)}]`);
+    if (shape(nav) !== shape(ref)) out.push(`bottom bar differs from the first page of its kind: [${shape(nav)}] vs [${shape(ref)}]`);
   }
   if (nav.back !== pg.back) out.push(pg.back ? "no back button at the top" : "a back button on a top level page");
+  // Back goes one level up, never further (Vesa, 2026-11-21).
+  if (pg.backTo && nav.backHref !== null && !nav.backHref.endsWith(pg.backTo))
+    out.push(`back goes to ${nav.backHref}, want one level up: ${pg.backTo}`);
   return out;
+}
+
+/** A page outside any workspace: Workspaces, Site usage, or /stats refused. */
+function isRootPage(pg) {
+  return !pg.path.startsWith("/w/");
 }
 
 const isApi = (u) => /^\/(w\/[^/]+\/)?api\//.test(new URL(u).pathname);
@@ -755,6 +838,18 @@ async function visit(ctx, pg) {
       const wide = [...document.querySelectorAll("main, [data-testid='run-phone-view']")]
         .filter((el) => el.scrollWidth > el.clientWidth + 1)
         .map((el) => `${el.tagName.toLowerCase()}${el.dataset.testid ? `[${el.dataset.testid}]` : ""} ${el.scrollWidth}>${el.clientWidth}`);
+      // Any box inside the page that scrolls or clips sideways: a table in
+      // a card that scrolls on its own while the page scrolls (Vesa's
+      // Catalog, 2026-11-21). Text shortened with "…" is not one; neither
+      // is a chart (svg, recharts) or the pipeline graph (react flow).
+      for (const el of document.querySelectorAll("main *, header *")) {
+        const cs = getComputedStyle(el);
+        if (cs.display === "none" || el.clientWidth === 0 || cs.textOverflow === "ellipsis") continue;
+        if (!["auto", "scroll", "hidden", "clip"].includes(cs.overflowX)) continue;
+        if (el.closest("svg, .recharts-wrapper, .react-flow, [class*='rf__']")) continue;
+        if (el.scrollWidth > el.clientWidth + 1)
+          wide.push(`inner box ${el.tagName.toLowerCase()}${el.dataset.testid ? `[${el.dataset.testid}]` : ""}.${(el.getAttribute("class") ?? "").split(" ").slice(0, 2).join(".")} "${(el.textContent ?? "").trim().slice(0, 24)}" ${el.scrollWidth}>${el.clientWidth}`);
+      }
       // The innermost elements that reach past the screen's right edge,
       // so a failure names what to fix.
       const past = [...document.querySelectorAll("main *")].filter(
@@ -832,7 +927,7 @@ try {
     } catch {}
   }, tok);
 
-  let refNav = null;
+  const refNav = {};
   for (const pg of pages) {
     let r = await visit(ctx, pg);
     let retried = false;
@@ -849,8 +944,9 @@ try {
     await r.page.close();
 
     if (r.info.nav) {
-      r.problems.push(...navProblems(pg, r.info.nav, refNav));
-      refNav ??= r.info.nav;
+      const kind = isRootPage(pg) ? "root" : "ws";
+      r.problems.push(...navProblems(pg, r.info.nav, refNav[kind]));
+      refNav[kind] ??= r.info.nav;
     } else r.problems.push("bottom bar: not read");
     const uniq = [...new Set(r.problems)];
     console.log(
@@ -879,10 +975,12 @@ try {
       if (t.refreshToken) localStorage.setItem("clavesa.hosted.refresh", t.refreshToken);
     } catch {}
   }, tok);
-  // ADR-033: the hosted navigation is the local one. Every sidebar entry
-  // opens, on a cloud and on a local-warehouse workspace, with no console
-  // error and no failed API call; Query, Credentials and Runner open a
-  // page that says what to do instead, never a Run button.
+  // docs/ideas/hosted-navigation.md (Vesa, 2026-11-21): the hosted sidebar
+  // is the workspace's four sections, none of the pages that are on the
+  // Mac or not hosted. Every section opens, on a cloud and on a
+  // local-warehouse workspace, with no console error and no failed API
+  // call. (A section's own items, a pipeline or a dashboard under it, are
+  // opened by the phone pages.)
   for (const w of [WS, LOCAL_WS]) {
     const wsq = encodeURIComponent(w);
     const page = await desk.newPage();
@@ -903,9 +1001,11 @@ try {
     await page.goto(`${BASE}/w/${wsq}/`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
     await page.locator('[data-testid="workspace-home"]').first().waitFor({ state: "visible", timeout: WAIT_MS });
     const entries = (await page.locator("aside a[href]").evaluateAll((els) => els.map((a) => a.getAttribute("href"))))
-      .filter((h) => h.startsWith(`/w/${wsq}`));
-    for (const want of ["query", "credentials", "runner", "dashboards", "notebooks", "sources", "bundles", "unity-catalog", "pipelines"])
-      if (!entries.some((h) => h.replace(/\/$/, "").endsWith(`/${want}`))) out.push(`sidebar has no ${want}`);
+      .filter((h) => h.startsWith(`/w/${wsq}`) && !h.includes("?") && !/\/dashboards\/./.test(h));
+    const sections = entries.map((h) => h.replace(`/w/${wsq}`, "").replace(/\/$/, "") || "/");
+    if (sections.join(" ") !== "/ /pipelines /catalog /dashboards")
+      out.push(`sidebar sections ${sections.join(" ")}, want / /pipelines /catalog /dashboards`);
+    if (!(await page.locator('[data-testid="ws-switcher"]').count())) out.push("sidebar has no workspace switcher");
     for (const href of [...new Set(entries)]) {
       current = href.replace(`/w/${wsq}`, "") || "/";
       // Click the sidebar entry, as a person does: client-side navigation,
@@ -927,26 +1027,32 @@ try {
     for (const p of [...new Set(out)]) failures.push(`08-desktop ${w}: ${p}`);
     await page.close();
   }
-  // A personal_data local workspace: no dashboards listed, a link to one
-  // shows the notice and no failing widget.
+  // A local workspace's dashboard: the published widgets, or a notice;
+  // never a failing widget.
   {
     const lw = encodeURIComponent(LOCAL_WS);
     const slug = env("LOCAL_DASHBOARD", "pipeline-runs-traffic");
     const probs = [];
     const list = await api(tok, `/w/${lw}/api/dashboards`);
-    if ((list.dashboards ?? []).length) probs.push(`GET /dashboards lists ${list.dashboards.length} dashboard(s), want none`);
+    const listed = (list.dashboards ?? []).length;
     const page = await desk.newPage();
     await page.setViewportSize({ width: 393, height: 852 });
     await page.goto(`${BASE}/w/${lw}/dashboards/${encodeURIComponent(slug)}`, { waitUntil: "domcontentloaded", timeout: WAIT_MS });
-    const notice = page.locator('[data-testid="dashboard-notice"], [data-testid="not-hosted-line"]').first();
-    await notice.waitFor({ state: "visible", timeout: WAIT_MS }).catch(() => probs.push("no notice on the dashboard page"));
-    const text = ((await notice.textContent().catch(() => "")) ?? "").trim();
-    if (!/holds visitor data and opens only in the local clavesa UI|data of this workspace is on the Mac/.test(text)) probs.push(`notice reads "${text}"`);
-    if (await page.locator('[data-testid="dashboard-widget"]').count()) probs.push("widgets are drawn");
+    const shown = page.locator('[data-testid="dashboard-notice"], [data-testid="not-hosted-line"], [data-testid="dashboard-widget"]').first();
+    await shown.waitFor({ state: "visible", timeout: WAIT_MS }).catch(() => probs.push("no widget and no notice on the dashboard page"));
+    const widgets = await page.locator('[data-testid="dashboard-widget"]').count();
+    let text = "";
+    if (widgets) {
+      if (!listed) probs.push("widgets are drawn, but GET /dashboards lists none");
+    } else {
+      text = ((await shown.textContent().catch(() => "")) ?? "").trim();
+      if (!/not published from the Mac|data of this workspace is on the Mac/.test(text)) probs.push(`notice reads "${text}"`);
+      if (listed) probs.push(`GET /dashboards lists ${listed} dashboard(s) with no published widget`);
+    }
     if (await page.getByText("Query failed").count()) probs.push('"Query failed" shown');
-    await page.screenshot({ path: `${OUT}12-personal-dashboard.png` });
-    console.log(`${probs.length ? "FAIL" : "ok  "} 12-personal: ${LOCAL_WS} lists no dashboards, /dashboards/${slug} shows "${text.slice(0, 60)}…"`);
-    for (const p of probs) failures.push(`12-personal ${LOCAL_WS}: ${p}`);
+    await page.screenshot({ path: `${OUT}12-local-dashboard.png` });
+    console.log(`${probs.length ? "FAIL" : "ok  "} 12-local-dashboard: ${LOCAL_WS} /dashboards/${slug}: ${widgets ? `${widgets} widget(s)` : `"${text.slice(0, 60)}…"`}`);
+    for (const p of probs) failures.push(`12-local-dashboard ${LOCAL_WS}: ${p}`);
     await page.close();
   }
   // ADR-035: the check user is a viewer of the workspaces this check

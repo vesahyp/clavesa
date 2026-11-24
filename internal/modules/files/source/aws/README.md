@@ -66,7 +66,7 @@ in the pipeline bucket. `start_from = "all"` (default) backfills history;
 | `json_path`     | `string`       | No       | `null`  | Top-level key to unwrap when JSON payload is nested under one root key. |
 | `partitions`    | `list(string)` | No       | `[]`    | Hive-style partition columns for incremental reads. |
 | `start_from`    | `string`       | No       | `"all"` | First-run cursor for partitioned sources: `"all"`, `"now"`, or a literal cursor string. |
-| `trigger_visibility_timeout_seconds` | `number` | No | `900` | Visibility timeout for the trigger queue. Must cover a full run so received-but-undeleted messages stay invisible until the Delta write commits. |
+| `trigger_visibility_timeout_seconds` | `number` | No | `900` | Visibility timeout for the trigger queue. Clavesa sets it to the pipeline's `runner_timeout_seconds` (900 by default); a hand-written module block must do the same, so received-but-undeleted messages stay invisible until the Delta write commits. |
 | `trigger_max_receive_count` | `number` | No | `5` | Receives before a trigger message moves to the DLQ. Bounds retries on a poison/unreadable object. |
 | `manage_bucket_notifications` | `bool` | No | `false` | Have terraform own `aws_s3_bucket_notification` on the source bucket. Authoritative; replaces other notification config. Set on one pipeline only when a source attaches to multiple. |
 

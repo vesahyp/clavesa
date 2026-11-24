@@ -115,17 +115,25 @@ echo 'print("ivy resolution complete")' > /tmp/clavesa-noop.py
 rm /tmp/clavesa-noop.py
 
 # Copy resolved JARs into the Spark classpath, skipping anything pyspark
-# already bundles (avoids duplicate-class headaches).
+# already bundles (avoids duplicate-class headaches). Ivy names its copies
+# <organisation>_<artifact>-<revision>.jar, so the check also looks for the
+# bare <artifact>-<revision>.jar that pyspark ships: without it ten jars
+# (68 MB, hadoop-client-runtime and -api, spark-connect, snappy, lz4, ...)
+# went in twice (docs/ideas/runner-memory.md).
 copied=0
+skipped=0
 for jar in /tmp/clavesa-ivy/jars/*.jar; do
     [ -f "$jar" ] || continue
     name="$(basename "$jar")"
-    if [ ! -f "${JARS_DIR}/${name}" ]; then
-        cp "$jar" "${JARS_DIR}/"
-        copied=$((copied + 1))
+    bare="${name#*_}"
+    if [ -f "${JARS_DIR}/${name}" ] || [ -f "${JARS_DIR}/${bare}" ]; then
+        skipped=$((skipped + 1))
+        continue
     fi
+    cp "$jar" "${JARS_DIR}/"
+    copied=$((copied + 1))
 done
-echo "Added ${copied} Spark Connect JAR(s) from Ivy resolution."
+echo "Added ${copied} Spark Connect JAR(s) from Ivy resolution; ${skipped} already present."
 rm -rf /tmp/clavesa-ivy
 
 echo "Installed JARs:"

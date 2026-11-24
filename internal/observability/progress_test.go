@@ -378,3 +378,33 @@ func TestCloudProviderProgressRunsViaS3Stub(t *testing.T) {
 		t.Errorf("ProgressRuns(unwired) = (%v, %v), want empty + nil", runs, err)
 	}
 }
+
+// TestCloudProviderWithoutErrorText: for the hosted reader of a workspace
+// with column tags, error text read from _progress/ markers is dropped
+// (an error can quote a row); the error class stays.
+func TestCloudProviderWithoutErrorText(t *testing.T) {
+	const bucket = "demo-bucket"
+	s3stub := &stubS3Snap{
+		objects: map[string][]byte{
+			bucket + "/_progress/local-abc/_run.json": []byte(`{"status":"FAILED","pipeline":"taxi","started_ms":1700000000000,"ended_ms":1700000030000,"error_class":"ValueError","error_msg":"bad row 203.0.113.7"}`),
+		},
+	}
+	for _, hide := range []bool{false, true} {
+		c := NewCloudProvider(nil, bucket, nil, nil).WithS3(s3stub).WithoutErrorText(hide)
+		runs, err := c.ProgressRuns(context.Background(), "taxi", 20)
+		if err != nil || len(runs) != 1 {
+			t.Fatalf("hide=%v: ProgressRuns = %+v, %v", hide, runs, err)
+		}
+		d, err := c.RunDetail(context.Background(), "local-abc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		shown := runs[0].ErrorMsg != "" || d.ErrorMsg != ""
+		if shown == hide {
+			t.Errorf("hide=%v: run error %q, detail error %q", hide, runs[0].ErrorMsg, d.ErrorMsg)
+		}
+		if d.ErrorClass != "ValueError" {
+			t.Errorf("hide=%v: error class %q, want it kept", hide, d.ErrorClass)
+		}
+	}
+}

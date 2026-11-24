@@ -56,7 +56,11 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		`resource "aws_lambda_function" "pipeline_runner"`,
 		`command = ["runner.pipeline_handler"]`,
 		`package_type  = "Image"`,
-		`timeout       = 900`,
+		`timeout       = var.runner_timeout_seconds`,
+		`variable "runner_timeout_seconds"`,
+		`default     = 900`,
+		`var.runner_timeout_seconds <= 900`,
+		`TimeoutSeconds = var.runner_timeout_seconds`,
 		`memory_size   = local.pipeline_runner_memory_mb`,
 		`pipeline_runner_memory_mb = 3008`,
 		// GH #43: 10 GB ephemeral storage — Spark shuffle/spill space.
@@ -78,7 +82,10 @@ func TestEmit_PipelineLambda(t *testing.T) {
 		// Spark heap = Lambda memory minus the memoryOverhead variable.
 		`variable "runner_memory_overhead_mb"`,
 		`default     = 1472`,
-		`CLAVESA_JVM_HEAP_MB         = tostring(max(512, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb))`,
+		// The heap is sized from need: capped at runner_heap_max_mb.
+		`variable "runner_heap_max_mb"`,
+		`default     = 1024`,
+		`CLAVESA_JVM_HEAP_MB         = tostring(max(512, min(var.runner_heap_max_mb, local.pipeline_runner_memory_mb - var.runner_memory_overhead_mb)))`,
 
 		// IAM role + assume policy + at least the write statement
 		// targeting the warehouse prefix.

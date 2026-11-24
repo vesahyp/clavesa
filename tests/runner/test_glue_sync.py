@@ -265,6 +265,37 @@ def test_noop_when_warehouse_is_not_s3():
     assert fake.updated is None, "non-s3 warehouse must be a no-op"
 
 
+class _FailingGlue(_FakeGlue):
+    def update_table(self, DatabaseName, TableInput):  # noqa: N803
+        raise RuntimeError("AccessDenied")
+
+
+def test_required_sync_raises_for_an_output_table():
+    """Column tags: with CLAVESA_GLUE_SYNC_REQUIRED=1 a failed sync of an
+    output table fails the node; without it the sync stays best-effort;
+    a system table (location set) never raises."""
+    runner = _load_runner()
+    table = {"Name": "trips", "StorageDescriptor": {"Columns": [{"Name": "col", "Type": "array<string>"}]}, "Parameters": {}}
+    _install_glue(runner, _FailingGlue(table))
+    schema = _Schema([("fare", "double")])
+
+    def body():
+        runner._sync_glue_table_schema("db.trips", schema)  # best-effort: no raise
+        os.environ["CLAVESA_GLUE_SYNC_REQUIRED"] = "1"
+        try:
+            try:
+                runner._sync_glue_table_schema("db.trips", schema)
+            except RuntimeError as e:
+                assert "column tags" in str(e), e
+            else:
+                raise AssertionError("required sync did not raise")
+            runner._sync_glue_table_schema("sys.node_runs", schema, location="s3://b/_system/x/")
+        finally:
+            os.environ.pop("CLAVESA_GLUE_SYNC_REQUIRED", None)
+
+    _with_cloud_warehouse(body)
+
+
 # ---------------------------------------------------------------------------
 # Test runner — same pattern as test_node_runs_row.py.
 # ---------------------------------------------------------------------------

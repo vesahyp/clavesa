@@ -112,6 +112,14 @@ type NodeRun struct {
 	// string the `timing` column holds. Empty for older runners and on the
 	// dashboard's progress-marker fast path; internal/runtiming decodes it.
 	Timing string `json:"timing,omitempty"`
+	// The Spark driver JVM's heap at the end of the node (runner v2.28+):
+	// the old generation in use after the last GC (an upper bound of the
+	// long-lived data), the heap committed from the OS, and -Xmx. The
+	// committed heap grows toward -Xmx whatever the data is, so the real
+	// need is HeapOldAfterGCMB. Nil on older rows.
+	HeapOldAfterGCMB *int64 `json:"heap_old_after_gc_mb,omitempty"`
+	HeapCommittedMB  *int64 `json:"heap_committed_mb,omitempty"`
+	HeapMaxMB        *int64 `json:"heap_max_mb,omitempty"`
 }
 
 // NodeRunsResult is the body of GET /data/node-runs.
@@ -515,6 +523,10 @@ type ExecutionLogsResult struct {
 	FunctionName string     `json:"function_name"`
 	Events       []LogEvent `json:"events"`
 	Truncated    bool       `json:"truncated"`
+	// Hidden is true when the reader may not read the logs: the hosted
+	// reader of a workspace with column tags, because a log can quote a
+	// row (docs/ideas/column-tags.md).
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // Source values for ExecutionLogsResult.Source.

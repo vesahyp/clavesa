@@ -1012,14 +1012,15 @@ function LiteColumnsCard({
             }
             const nullPct = sampleN > 0 ? nullCount / sampleN : null;
             return (
-              <li key={c.name} className="grid grid-cols-12 items-start gap-3 px-6 py-3 text-xs">
-                <div className="col-span-3 min-w-0">
-                  <div className="truncate font-mono text-foreground">{c.name}</div>
-                  <div className="truncate font-mono text-[10px] text-muted-foreground">
+              <li key={c.name} className="grid grid-cols-12 items-start gap-x-3 gap-y-2 px-4 py-3 text-xs md:px-6">
+                {/* Phone: the name on its own line, whole (it wraps). */}
+                <div className="col-span-12 min-w-0 md:col-span-3">
+                  <div className="break-all font-mono text-foreground md:truncate md:break-normal">{c.name}</div>
+                  <div className="break-all font-mono text-[10px] text-muted-foreground md:truncate md:break-normal">
                     {c.type}
                   </div>
                 </div>
-                <div className="col-span-2 flex min-w-0 flex-col gap-1 break-words">
+                <div className="col-span-3 flex min-w-0 flex-col gap-1 break-words md:col-span-2">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
                     Null
                   </span>
@@ -1041,7 +1042,7 @@ function LiteColumnsCard({
                     </div>
                   )}
                 </div>
-                <div className="col-span-7 flex min-w-0 flex-col gap-1">
+                <div className="col-span-9 flex min-w-0 flex-col gap-1 md:col-span-7">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
                     Examples
                   </span>

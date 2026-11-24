@@ -84,10 +84,13 @@ resource "aws_iam_role_policy" "api" {
       {
         # Every workspace's reader role; each one's trust policy names
         # this role and an ExternalId of the workspace name.
-        Sid      = "AssumeReaders"
-        Effect   = "Allow"
-        Action   = "sts:AssumeRole"
-        Resource = "arn:aws:iam::*:role/clavesa-ui-reader-*"
+        Sid    = "AssumeReaders"
+        Effect = "Allow"
+        Action = "sts:AssumeRole"
+        # clavesa-ui-admin-* (column tags): the role an admin (group
+        # "all") reads a workspace with; same trust and ExternalId.
+        # Only the admin roles the registry names.
+        Resource = concat(["arn:aws:iam::*:role/clavesa-ui-reader-*"], local.admin_role_arns)
       },
       {
         Sid      = "ListData"

@@ -166,6 +166,8 @@ func TestSyncOrchestrationMaterialisesS3SourceModule(t *testing.T) {
 		`partitions    = ["year", "month"]`,
 		`start_from    = "now"`,
 		`manage_bucket_notifications = true`,
+		// The queue hides a message for a full run: it follows the runner timeout.
+		`trigger_visibility_timeout_seconds = var.runner_timeout_seconds`,
 		// v1.1.5+: trigger queue ARNs flow into the poller's local._poller_queue_arns
 		// list rather than a module variable (orchestration is now inline TF).
 		`_poller_queue_arns = [module.src_events.trigger_queue_arn]`,

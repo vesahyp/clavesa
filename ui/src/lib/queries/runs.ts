@@ -58,6 +58,12 @@ const NodeRun = z.object({
   // JSON text of the node's phase timing (spark_session, transform, write...).
   // Optional: older runners and rows predate the column.
   timing: z.string().nullish(),
+  // The Spark heap at the end of the node (runner v2.28+): the old
+  // generation in use after GC (the real need), the heap committed from
+  // the OS, and -Xmx. Null on older rows.
+  heap_old_after_gc_mb: z.number().nullish(),
+  heap_committed_mb: z.number().nullish(),
+  heap_max_mb: z.number().nullish(),
 });
 export type NodeRun = z.infer<typeof NodeRun>;
 
@@ -225,6 +231,11 @@ const NodeRightsize = z.object({
   // Recommended memory_mb; null when confidence is "n/a".
   recommended_mb: z.number().nullish(),
   p95_peak_rss_mb: z.number().nullish(),
+  // Heap-based advice (runner v2.28+ rows): p95 heap in use after GC,
+  // the newest -Xmx, and the heap to set as runner_heap_max_mb.
+  p95_heap_after_gc_mb: z.number().nullish(),
+  heap_max_mb: z.number().nullish(),
+  recommended_heap_mb: z.number().nullish(),
   samples: z.number(),
   spill_rate: z.number(),
   reason: z.string(),

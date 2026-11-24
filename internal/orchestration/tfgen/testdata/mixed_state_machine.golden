@@ -15,7 +15,7 @@ resource "aws_sfn_state_machine" "pipeline" {
       Seg0 = {
         Type           = "Task"
         Resource       = "arn:aws:states:::lambda:invoke"
-        TimeoutSeconds = 900
+        TimeoutSeconds = var.runner_timeout_seconds
         Parameters = {
           FunctionName = aws_lambda_function.pipeline_runner.arn
           Payload = {
@@ -39,7 +39,7 @@ resource "aws_sfn_state_machine" "pipeline" {
       Seg1Start = {
         Type           = "Task"
         Resource       = "arn:aws:states:::lambda:invoke"
-        TimeoutSeconds = 900
+        TimeoutSeconds = var.runner_timeout_seconds
         Parameters = {
           FunctionName = aws_lambda_function.pipeline_runner.arn
           Payload = {
@@ -65,7 +65,7 @@ resource "aws_sfn_state_machine" "pipeline" {
       Seg1Poll = {
         Type           = "Task"
         Resource       = "arn:aws:states:::lambda:invoke"
-        TimeoutSeconds = 900
+        TimeoutSeconds = var.runner_timeout_seconds
         Parameters = {
           FunctionName = aws_lambda_function.pipeline_runner.arn
           Payload = {
@@ -102,7 +102,7 @@ resource "aws_sfn_state_machine" "pipeline" {
       Seg2 = {
         Type           = "Task"
         Resource       = "arn:aws:states:::lambda:invoke"
-        TimeoutSeconds = 900
+        TimeoutSeconds = var.runner_timeout_seconds
         Parameters = {
           FunctionName = aws_lambda_function.pipeline_runner.arn
           Payload = {

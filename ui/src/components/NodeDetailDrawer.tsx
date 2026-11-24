@@ -92,6 +92,13 @@ function StepLogs({
       </div>
     );
   }
+  if (logs.data?.hidden) {
+    return (
+      <div className="text-xs text-muted-foreground">
+        Log lines are hidden in this workspace, because a log can quote row values.
+      </div>
+    );
+  }
   const events = logs.data?.events ?? [];
   if (events.length === 0) {
     return (
@@ -292,6 +299,19 @@ function Rightsizing({
       {row.p95_peak_rss_mb != null && (
         <Field label="p95 peak" value={`${row.p95_peak_rss_mb} MB`} />
       )}
+      {row.p95_heap_after_gc_mb != null && (
+        <Field
+          label="p95 heap in use"
+          value={
+            row.heap_max_mb != null
+              ? `${row.p95_heap_after_gc_mb} / ${row.heap_max_mb} MB`
+              : `${row.p95_heap_after_gc_mb} MB`
+          }
+        />
+      )}
+      {row.recommended_heap_mb != null && (
+        <Field label="Heap" value={`${row.recommended_heap_mb} MB`} />
+      )}
       <div
         className={cn(
           "mt-1.5 text-[11px] leading-snug",
@@ -361,6 +381,26 @@ function RunFacts({ nr, outputMode }: { nr: NodeRun; outputMode: string }) {
               </>
             ) : (
               `${nr.peak_rss_mb.toLocaleString()} MB`
+            )
+          }
+        />
+      )}
+      {nr.heap_old_after_gc_mb != null && (
+        <Field
+          label="Heap in use"
+          value={
+            nr.heap_max_mb != null ? (
+              <>
+                {nr.heap_old_after_gc_mb.toLocaleString()} /{" "}
+                {nr.heap_max_mb.toLocaleString()} MB{" "}
+                <span className="text-muted-foreground">
+                  after GC
+                  {nr.heap_committed_mb != null &&
+                    ` · ${nr.heap_committed_mb.toLocaleString()} MB held`}
+                </span>
+              </>
+            ) : (
+              `${nr.heap_old_after_gc_mb.toLocaleString()} MB after GC`
             )
           }
         />

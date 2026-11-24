@@ -323,6 +323,7 @@ func (s *Service) SyncOrchestration(dir, schedule string) error {
 		UpstreamSchemas:   upstreamSchemas,
 		UnityCatalog:      ucConfig,
 		Bundle:            bundleCfg,
+		LakeFormation:     lakeFormationConfig(ws),
 	})
 	if err != nil {
 		return fmt.Errorf("orchestration: emit tf: %w", err)
@@ -753,6 +754,9 @@ func emitS3SourceModule(b *strings.Builder, sourceModuleSrc string, spec sources
 	fmt.Fprintf(b, "  bucket        = %q\n", spec.Bucket)
 	fmt.Fprintf(b, "  prefix        = %q\n", spec.Prefix)
 	fmt.Fprintf(b, "  format        = %q\n", spec.Format)
+	// The queue hides a received message for as long as a run may take, so
+	// it follows the pipeline's runner timeout and cannot be set too short.
+	fmt.Fprintf(b, "  trigger_visibility_timeout_seconds = var.runner_timeout_seconds\n")
 	if len(spec.Partitions) > 0 {
 		fmt.Fprintf(b, "  partitions    = [%s]\n", quoteList(spec.Partitions))
 		startFrom := spec.StartFrom

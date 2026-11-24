@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 )
 
 // Workspace kinds in the registry (ADR-032 section 2).
@@ -31,9 +32,23 @@ type Entry struct {
 	// workspace only.
 	ReaderRoleARN string `json:"reader_role_arn,omitempty"`
 	Bucket        string `json:"bucket,omitempty"`
-	// PersonalData: the workspace's raw data holds personal data, so the
-	// hosted API refuses raw row reads of it (personal.go).
-	PersonalData bool `json:"personal_data,omitempty"`
+	// AdminRoleARN (column tags, cloud only): clavesa-ui-admin-<name>,
+	// which reads every table and column. The Lambda assumes it for a
+	// viewer in the group "all"; empty: admins read with the reader role.
+	AdminRoleARN string `json:"admin_role_arn,omitempty"`
+	// Admin is set on the copy of the entry the server opens for an
+	// admin. Not in the registry.
+	Admin bool `json:"-"`
+}
+
+// AdminView returns the entry an admin opens: the admin role when the
+// registry names one, else e itself.
+func (e Entry) AdminView() Entry {
+	if e.Kind != KindCloud || e.AdminRoleARN == "" {
+		return e
+	}
+	e.Admin = true
+	return e
 }
 
 var (
@@ -80,6 +95,15 @@ func (e Entry) validate() error {
 	}
 	if !entryNameRE.MatchString(e.Name) {
 		return fmt.Errorf("name must match %s", entryNameRE)
+	}
+	if strings.HasSuffix(e.Name, "--admin") {
+		return fmt.Errorf("workspace name %q is reserved: \"--admin\" names an admin's view of a workspace", e.Name)
+	}
+	if e.AdminRoleARN != "" && e.Kind != KindCloud {
+		return fmt.Errorf("admin_role_arn is for a cloud workspace only")
+	}
+	if e.AdminRoleARN != "" && !roleARNRE.MatchString(e.AdminRoleARN) {
+		return fmt.Errorf("admin_role_arn %q is not an IAM role ARN", e.AdminRoleARN)
 	}
 	// A local workspace lives on a Mac, not in an account: account and
 	// region are optional there (its summary names its region).

@@ -92,12 +92,10 @@ in at all.
 
 `infra/workspaces.tf` lists the workspaces: `name`, `kind` (`cloud` or
 `local`), `account`, `region`, and for a cloud workspace
-`reader_role_arn` and `bucket` (its pipeline bucket). Set
-`personal_data = true` when the workspace's raw data holds personal data
-(web-traffic: visitor IPs): the Lambda then answers 403 to raw row reads
-of it (`/data/source`, `/preview/*`, `/sources/<name>/preview`, and
-`/data/table` and column statistics of any database that is not gold).
-Its runs, logs, catalog and gold tables still show. The list reaches
+`reader_role_arn` and `bucket` (its pipeline bucket). What a viewer may
+read of a cloud workspace's tables is set by its column tags in Lake
+Formation (`docs/ideas/column-tags.md`); previews (`/preview/*`,
+`/sources/<name>/preview`) answer 403 for every workspace. The list reaches
 the Lambda as JSON in its `REGISTRY` variable, opens the bus to the
 accounts, and lets the publisher role write the local names.
 

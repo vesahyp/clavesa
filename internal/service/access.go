@@ -8,6 +8,8 @@ import (
 	"github.com/vesahyp/clavesa/internal/access"
 	"github.com/vesahyp/clavesa/internal/hclparser"
 	"github.com/vesahyp/clavesa/internal/identutil"
+	"github.com/vesahyp/clavesa/internal/modules"
+	"github.com/vesahyp/clavesa/internal/orchestration/tfgen"
 	"github.com/vesahyp/clavesa/internal/workspace"
 )
 
@@ -146,4 +148,41 @@ func (s *Service) AccessTags() (*AccessReport, error) {
 		return a.Table < b.Table
 	})
 	return rep, nil
+}
+
+// SyncLakeFormationTF makes lakeformation.tf match clavesa.json: written
+// while the workspace has an "access" block, removed otherwise
+// (docs/ideas/column-tags.md, slice 1a). Deploy calls it before the
+// workspace plan. version "" means the binary's ModuleVersion; the
+// lake-formation module is self-contained, so its tree is extracted when
+// it is not there yet, as for hosted.tf.
+func (s *Service) SyncLakeFormationTF(version string) error {
+	m, err := s.loadManifest()
+	if err != nil {
+		return err
+	}
+	if m.Access == nil {
+		return workspace.SyncLakeFormationTF(s.workspace, m, "")
+	}
+	if version == "" {
+		version = ModuleVersion
+	}
+	if err := modules.Extract(s.workspace, version); err != nil {
+		return fmt.Errorf("extract modules %s: %w", version, err)
+	}
+	return workspace.SyncLakeFormationTF(s.workspace, m, version)
+}
+
+// lakeFormationConfig is the tfgen side of column tags: set for a
+// workspace with an "access" block and a remote backend (the pipeline
+// reads the registration role from the workspace's remote state).
+func lakeFormationConfig(ws *workspace.Manifest) *tfgen.LakeFormationConfig {
+	if ws == nil || ws.Access == nil {
+		return nil
+	}
+	return &tfgen.LakeFormationConfig{
+		RoleExpr:           "data.terraform_remote_state.workspace.outputs.lf_register_role_arn",
+		SystemLocationExpr: "data.terraform_remote_state.workspace.outputs.lf_system_location_arn",
+		TagKeyExpr:         "data.terraform_remote_state.workspace.outputs.lf_tag_key",
+	}
 }

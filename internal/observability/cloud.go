@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	sfntypes "github.com/aws/aws-sdk-go-v2/service/sfn/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/vesahyp/clavesa/internal/delta"
 	"github.com/vesahyp/clavesa/internal/delta/s3fs"
@@ -76,6 +77,33 @@ type CloudProvider struct {
 	// only workgroup the reader role may use. Empty: the account's
 	// default workgroup with results under athena-results/.
 	athenaWorkGroup string
+	// hideErrorText drops error text from the run and node records this
+	// provider reads from _progress/ markers (column tags: an error can
+	// quote a row). Set for the hosted reader of a workspace with an
+	// "access" block; the owner's own reads keep it.
+	hideErrorText bool
+}
+
+// WithoutErrorText drops error text from the progress-marker records
+// (see hideErrorText).
+func (c *CloudProvider) WithoutErrorText(hide bool) *CloudProvider {
+	c.hideErrorText = hide
+	return c
+}
+
+// statesWithoutErrorText blanks each state's error text when the provider
+// hides it.
+func (c *CloudProvider) statesWithoutErrorText(states map[string]StateStatus) map[string]StateStatus {
+	if !c.hideErrorText {
+		return states
+	}
+	for k, st := range states {
+		if st.ErrorMsg != "" {
+			st.ErrorMsg = ""
+			states[k] = st
+		}
+	}
+	return states
 }
 
 // WithAthenaWorkGroup runs every Athena query in workgroup (see
@@ -148,6 +176,37 @@ func isAthenaMissingColumnErr(err error, column string) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "column '"+strings.ToLower(column)+"'") &&
 		(strings.Contains(msg, "cannot be resolved") || strings.Contains(msg, "column_not_found"))
+}
+
+// selectWithoutColumns runs sql, and each time Athena says one of the
+// optional string columns does not exist, runs it again with that column
+// read as NULL. A column is missing when the table predates it, or when
+// Lake Formation hides it from the caller (column tags): Athena then
+// treats it as a column the table does not have. Each optional column
+// must sit in sql as "\n  <name>," or "\n  <name>\nFROM".
+func (c *CloudProvider) selectWithoutColumns(ctx context.Context, sql string, limit int, optional ...string) ([]athenatypes.Row, bool, error) {
+	for {
+		rows, truncated, _, err := c.runAthenaSelect(ctx, sql, limit)
+		if err == nil {
+			return rows, truncated, nil
+		}
+		replaced := false
+		for _, col := range optional {
+			if !isAthenaMissingColumnErr(err, col) {
+				continue
+			}
+			null := "\n  CAST(NULL AS varchar) AS " + col
+			for _, end := range []string{",", "\nFROM"} {
+				if strings.Contains(sql, "\n  "+col+end) {
+					sql = strings.Replace(sql, "\n  "+col+end, null+end, 1)
+					replaced = true
+				}
+			}
+		}
+		if !replaced {
+			return rows, truncated, err
+		}
+	}
 }
 
 func isAthenaMissingTableErr(err error) bool {
@@ -284,20 +343,22 @@ func (c *CloudProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
   executor_cpu_time_ms,
   executor_run_time_ms,
   max_task_duration_ms,
-  %s
+  %s,
+  heap_old_after_gc_mb,
+  heap_committed_mb,
+  heap_max_mb
 FROM "%s"."node_runs"
 %s
 ORDER BY started_at DESC
 LIMIT %d`, "timing", dbName, whereClause, q.Limit+1)
 
-	rows, truncated, _, err := c.runAthenaSelect(ctx, sql, q.Limit)
-	if err != nil && isAthenaMissingColumnErr(err, "timing") {
-		// A deployed workspace whose node_runs table predates v2.22.0 has
-		// no `timing` column until its next run appends one (mergeSchema).
-		// Read the table without it rather than blank the run history.
-		sql = strings.Replace(sql, "\n  timing\nFROM", "\n  CAST(NULL AS varchar) AS timing\nFROM", 1)
-		rows, truncated, _, err = c.runAthenaSelect(ctx, sql, q.Limit)
-	}
+	// A deployed workspace whose node_runs table predates v2.22.0 has no
+	// `timing` column until its next run appends one (mergeSchema); in a
+	// workspace with column tags, Lake Formation hides error_msg from the
+	// hosted reader. Read the table without them rather than blank the run
+	// history.
+	rows, truncated, err := c.selectWithoutColumns(ctx, sql, q.Limit, "timing", "error_msg",
+		"heap_old_after_gc_mb", "heap_committed_mb", "heap_max_mb")
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			return &NodeRunsResult{Rows: []NodeRun{}}, nil
@@ -310,7 +371,7 @@ LIMIT %d`, "timing", dbName, whereClause, q.Limit+1)
 		if len(row.Data) < 33 {
 			continue
 		}
-		out = append(out, NodeRun{
+		nr := NodeRun{
 			RunID:             stringDatum(row.Data[0]),
 			Pipeline:          stringDatum(row.Data[1]),
 			Node:              stringDatum(row.Data[2]),
@@ -346,7 +407,13 @@ LIMIT %d`, "timing", dbName, whereClause, q.Limit+1)
 			MaxTaskDurationMs:     intDatum(row.Data[31]),
 
 			Timing: stringDatum(row.Data[32]),
-		})
+		}
+		if len(row.Data) >= 36 {
+			nr.HeapOldAfterGCMB = intDatum(row.Data[33])
+			nr.HeapCommittedMB = intDatum(row.Data[34])
+			nr.HeapMaxMB = intDatum(row.Data[35])
+		}
+		out = append(out, nr)
 	}
 	return &NodeRunsResult{Rows: out, Truncated: truncated}, nil
 }
@@ -386,7 +453,8 @@ WHERE pipeline = '%s'
 ORDER BY started_at DESC
 LIMIT %d`, dbName, safePipeline, q.Limit+1)
 
-	rows, truncated, _, err := c.runAthenaSelect(ctx, sql, q.Limit)
+	// Column tags hide error_msg from the hosted reader.
+	rows, truncated, err := c.selectWithoutColumns(ctx, sql, q.Limit, "error_msg")
 	if err != nil {
 		if isAthenaMissingTableErr(err) {
 			return &RunsResult{Rows: []Run{}}, nil
@@ -529,6 +597,12 @@ func (c *CloudProvider) Snapshots(ctx context.Context, q SnapshotsQuery) (*Snaps
 	st, err := delta.ReadTableState(fsys)
 	if err != nil {
 		if errors.Is(err, delta.ErrNotDelta) {
+			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
+		}
+		// The hosted reader of a workspace with column tags may not read
+		// Delta logs (their statistics hold row values): no snapshots.
+		var denied smithy.APIError
+		if errors.As(err, &denied) && denied.ErrorCode() == "AccessDenied" {
 			return &SnapshotsResult{Snapshots: []SnapshotInfo{}}, nil
 		}
 		return nil, fmt.Errorf("read delta log: %w", err)
@@ -907,7 +981,7 @@ func (c *CloudProvider) ExecutionStates(ctx context.Context, q ExecutionStatesQu
 	// StateStatus — authoritative for both live and completed nodes (ADR-014
 	// parity with local). Backend-blind via the shared progressStates helper.
 	store := c.progressStore()
-	states := progressStates(ctx, store, runID, c.nowFn().UnixMilli())
+	states := c.statesWithoutErrorText(progressStates(ctx, store, runID, c.nowFn().UnixMilli()))
 
 	// Overall status: prefer SFN DescribeExecution when the ref is a real
 	// execution ARN and SFN is wired. A cloud-local run has a `local-…` run id
@@ -989,13 +1063,17 @@ func (c *CloudProvider) RunDetail(ctx context.Context, run string) (RunDetail, e
 	if !ok || m == nil {
 		return RunDetail{}, nil
 	}
-	return RunDetail{
+	d := RunDetail{
 		Status:     m.Status,
 		FailedStep: m.FailedStep,
 		ErrorClass: m.ErrorClass,
 		ErrorMsg:   m.ErrorMsg,
 		Found:      true,
-	}, nil
+	}
+	if c.hideErrorText {
+		d.ErrorMsg = ""
+	}
+	return d, nil
 }
 
 // ProgressRuns lists the S3 warehouse's `_progress/<run>/_run.json` run
@@ -1006,7 +1084,13 @@ func (c *CloudProvider) RunDetail(ctx context.Context, run string) (RunDetail, e
 // into the SFN execution list (GH #65). Best-effort: an unwired store (no
 // S3 client, undeployed workspace) returns empty with nil error.
 func (c *CloudProvider) ProgressRuns(ctx context.Context, pipeline string, limit int) ([]Run, error) {
-	return progressRuns(ctx, c.progressStore(), pipeline, limit)
+	runs, err := progressRuns(ctx, c.progressStore(), pipeline, limit)
+	if c.hideErrorText {
+		for i := range runs {
+			runs[i].ErrorMsg = ""
+		}
+	}
+	return runs, err
 }
 
 // progressSnapshot is the JSON the runner writes to
@@ -1047,7 +1131,7 @@ const freshnessWindowMs = 12000
 // (ADR-014). Kept as a thin method for the cloud-specific tests that drive
 // it directly; production code goes through ExecutionStates.
 func (c *CloudProvider) liveProgressStates(ctx context.Context, execARN string, now time.Time) map[string]StateStatus {
-	return progressStates(ctx, c.progressStore(), execARN, now.UnixMilli())
+	return c.statesWithoutErrorText(progressStates(ctx, c.progressStore(), execARN, now.UnixMilli()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1206,16 @@ func (c *CloudProvider) ExecutionLogs(ctx context.Context, q ExecutionLogsQuery)
 		Limit:        aws.Int32(filterLogEventsLimit(q.MaxLines)),
 	})
 	if err != nil {
+		var denied smithy.APIError
+		if errors.As(err, &denied) && denied.ErrorCode() == "AccessDeniedException" {
+			return &ExecutionLogsResult{
+				Source:       LogSourceCloudWatch,
+				LogGroup:     logGroup,
+				FunctionName: functionName,
+				Events:       []LogEvent{},
+				Hidden:       true,
+			}, nil
+		}
 		return nil, fmt.Errorf("filter log events: %w", err)
 	}
 

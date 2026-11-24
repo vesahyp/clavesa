@@ -198,6 +198,183 @@ simulate_denied() {
   fi
 }
 
+# reader_athena <workgroup> <sql>: runs sql as the reader. Prints the
+# final state on the first line, then the result as JSON (the
+# ResultSet) or the failure reason.
+reader_athena() {
+  local qid state
+  qid="$(reader_env aws athena start-query-execution --work-group "$1" \
+    --query-string "$2" --query QueryExecutionId --output text 2>&1)" \
+    || { echo "REFUSED"; echo "$qid"; return; }
+  while :; do
+    state="$(reader_env aws athena get-query-execution --query-execution-id "$qid" --query QueryExecution.Status.State --output text)"
+    case "$state" in SUCCEEDED|FAILED|CANCELLED) break ;; *) sleep 2 ;; esac
+  done
+  echo "$state"
+  if [[ "$state" == "SUCCEEDED" ]]; then
+    reader_env aws athena get-query-results --query-execution-id "$qid" --query ResultSet --output json
+  else
+    reader_env aws athena get-query-execution --query-execution-id "$qid" --query QueryExecution.Status.StateChangeReason --output text
+  fi
+}
+
+# access_leg <bucket> <workgroup>: column tags (docs/ideas/column-tags.md).
+# The reader reads by tag: a column tagged other than "open" is not in
+# Glue GetTable or in SELECT *, a query that names it returns no value, a
+# table with no table_tag ("unreviewed") is not readable, and no table
+# file or Delta log is readable in S3.
+access_leg() {
+  local bucket="$1" workgroup="$2" report
+  banner "column tags: the reader reads by tag"
+  report="$("$BIN" workspace access show --json --workspace "$SMOKE_WS")" \
+    || die "clavesa workspace access show failed"
+  local acct
+  acct="$(aws sts get-caller-identity --query Account --output text)"
+  simulate_denied s3:GetObject "arn:aws:s3:::$bucket/$SMOKE_PIPELINE/_warehouse/smoke-probe/part-0.parquet"
+  simulate_denied s3:GetObject "arn:aws:s3:::$bucket/$SMOKE_PIPELINE/_warehouse/smoke-probe/_delta_log/00000000000000000000.json"
+  # sm_name is hosted_leg's, which calls this.
+  simulate_denied logs:FilterLogEvents "arn:aws:logs:$AWS_REGION:$acct:log-group:/aws/lambda/$sm_name-runner:*"
+
+  local tagged=0 row db table hidden open_col cols out state
+  # The system catalog: column_stats holds row values (min, max, top 10)
+  # and error_msg can quote a row; both are hidden.
+  out="$(reader_athena "$workgroup" "SELECT count(*) FROM \"$SYSTEM_DB\".\"column_stats\"")"
+  state="$(echo "$out" | head -1)"
+  if [[ "$state" == "SUCCEEDED" ]]; then
+    fail "reader: $SYSTEM_DB.column_stats is readable"
+  else
+    pass "reader: $SYSTEM_DB.column_stats is not readable: $state $(echo "$out" | sed -n 2p | cut -c1-120)"
+  fi
+  local t
+  for t in runs node_runs; do
+    out="$(reader_athena "$workgroup" "SELECT error_msg FROM \"$SYSTEM_DB\".\"$t\" WHERE error_msg IS NOT NULL LIMIT 1")"
+    state="$(echo "$out" | head -1)"
+    if [[ "$state" == "SUCCEEDED" ]] && [[ "$(echo "$out" | tail -n +2 | jq '.Rows | length')" -gt 1 ]]; then
+      fail "reader: $SYSTEM_DB.$t.error_msg returned a value"
+    else
+      pass "reader: $SYSTEM_DB.$t.error_msg gives no value ($state: $(echo "$out" | sed -n 2p | cut -c1-120))"
+    fi
+  done
+  while IFS= read -r row; do
+    db="$(echo "$row" | jq -r .database)"
+    table="$(echo "$row" | jq -r .table)"
+    hidden="$(echo "$row" | jq -r '[.columns[] | select(.tag != "open") | .name] | join(" ")')"
+    if [[ "$(echo "$row" | jq -r .table_tag)" != "open" ]]; then
+      out="$(reader_athena "$workgroup" "SELECT count(*) FROM \"$db\".\"$table\"")"
+      state="$(echo "$out" | head -1)"
+      if [[ "$state" == "SUCCEEDED" ]]; then
+        fail "reader: $db.$table has no table_tag (unreviewed), yet count(*) succeeded"
+      else
+        pass "reader: $db.$table (unreviewed) is not readable: $state $(echo "$out" | sed -n 2p | cut -c1-120)"
+      fi
+      continue
+    fi
+    [[ -z "$hidden" ]] && continue
+    tagged=$((tagged + 1))
+    cols="$(reader_env aws glue get-table --database-name "$db" --name "$table" \
+      --query 'Table.StorageDescriptor.Columns[].Name' --output text 2>&1)" \
+      || { fail "reader: glue get-table $db.$table: $cols"; continue; }
+    out="$(reader_athena "$workgroup" "SELECT * FROM \"$db\".\"$table\" LIMIT 1")"
+    state="$(echo "$out" | head -1)"
+    local header=""
+    if [[ "$state" == "SUCCEEDED" ]]; then
+      header="$(echo "$out" | tail -n +2 | jq -r '[.ResultSetMetadata.ColumnInfo[].Name] | join(" ")')"
+      pass "reader: SELECT * on $db.$table returns: $header"
+    else
+      fail "reader: SELECT * on $db.$table $state: $(echo "$out" | sed -n 2p)"
+    fi
+    local c
+    for c in $hidden; do
+      if [[ " $cols " == *" $c "* ]]; then
+        fail "reader: glue get-table $db.$table lists the hidden column $c"
+      else
+        pass "reader: glue get-table $db.$table leaves out $c"
+      fi
+      if [[ " $header " == *" $c "* ]]; then
+        fail "reader: SELECT * on $db.$table returns the hidden column $c"
+      fi
+      # A query that names the hidden column: it must not return a value.
+      out="$(reader_athena "$workgroup" "SELECT \"$c\" FROM \"$db\".\"$table\" WHERE \"$c\" IS NOT NULL LIMIT 1")"
+      state="$(echo "$out" | head -1)"
+      if [[ "$state" == "SUCCEEDED" ]] && [[ "$(echo "$out" | tail -n +2 | jq '.Rows | length')" -gt 1 ]]; then
+        fail "reader: SELECT $c on $db.$table returned a value"
+      else
+        pass "reader: SELECT $c on $db.$table gives no value ($state: $(echo "$out" | sed -n 2p | cut -c1-120))"
+      fi
+    done
+  done < <(echo "$report" | jq -c '.tables[] | select(.pipeline == "'"$SMOKE_PIPELINE"'")')
+  if [[ "$tagged" -eq 0 ]]; then
+    fail "column tags: no table of $SMOKE_PIPELINE has a hidden column, so nothing is tested (tag one column in $SMOKE_WS)"
+  fi
+}
+
+# admin_leg: column tags, the hosted admin role (clavesa-ui-admin-<ws>).
+# Only the hosted Lambda may assume it, so this checks its setup: it
+# trusts no IAM user, it has SELECT on every table of the pipeline
+# database (named grants, every column), its workgroup writes to its own
+# prefix, and the reader may not read or list that prefix. What an admin
+# sees through the Lambda is make hosted-column-check EXPECT=shown.
+admin_leg() {
+  local bucket="$1" admin_arn admin_wg admin_role trust loc perms
+  admin_arn="$(terraform -chdir="$SMOKE_WS" output -raw hosted_admin_role_arn 2>/dev/null)" || admin_arn=""
+  admin_wg="$(terraform -chdir="$SMOKE_WS" output -raw hosted_admin_workgroup 2>/dev/null)" || admin_wg=""
+  banner "column tags: the hosted admin role"
+  if [[ -z "$admin_arn" || -z "$admin_wg" ]]; then
+    fail "column tags: no hosted_admin_role_arn / hosted_admin_workgroup output in $SMOKE_WS"
+    return
+  fi
+  admin_role="${admin_arn##*/}"
+  # The trust must be exactly one Allow of sts:AssumeRole to the hosted
+  # Lambda's role in the role's own account, with ExternalId = workspace
+  # name: no "*", no other principal, no other account.
+  local acct ws_name want got
+  acct="$(cut -d: -f5 <<<"$admin_arn")"
+  ws_name="$(jq -r .name "$SMOKE_WS/clavesa.json")"
+  want="$(jq -cn --arg p "arn:aws:iam::$acct:role/clavesa-ui-api" --arg x "$ws_name" \
+    '[{Effect: "Allow", Principal: {AWS: [$p]}, Action: ["sts:AssumeRole"], Condition: {StringEquals: {"sts:ExternalId": [$x]}}}]')"
+  trust="$(aws iam get-role --role-name "$admin_role" --query 'Role.AssumeRolePolicyDocument' --output json)"
+  got="$(jq -c '[.Statement[] | del(.Sid)
+    | .Principal |= with_entries(.value |= (if type == "array" then . else [.] end))
+    | .Action |= (if type == "array" then . else [.] end)
+    | .Condition |= (if . == null then null else with_entries(.value |= with_entries(.value |= (if type == "array" then . else [.] end))) end)]' <<<"$trust")"
+  if [[ "$got" == "$want" ]]; then
+    pass "admin role $admin_role trusts only arn:aws:iam::$acct:role/clavesa-ui-api with sts:ExternalId=$ws_name"
+  else
+    fail "admin role $admin_role trust is $got, want $want"
+  fi
+  # Lake Formation needs a resource when a principal is given.
+  perms="$(aws lakeformation list-permissions --principal "DataLakePrincipalIdentifier=$admin_arn" \
+    --resource "{\"Table\":{\"DatabaseName\":\"$PIPELINE_DB\",\"TableWildcard\":{}}}" \
+    --query 'PrincipalResourcePermissions[].join(`,`, Permissions)' --output text)"
+  if [[ "$perms" == *SELECT* ]]; then
+    pass "admin role: SELECT on every table of $PIPELINE_DB"
+  else
+    fail "admin role: no SELECT grant on the tables of $PIPELINE_DB ($perms)"
+  fi
+  # The admin role reads everything, so it must hold no grant option
+  # (docs/ideas/access-step1-decision.md): Terraform does not see one
+  # added by hand on a single table, so look at every table.
+  local t grantable="" g
+  for t in $(aws glue get-tables --database-name "$PIPELINE_DB" --query 'TableList[].Name' --output text); do
+    g="$(aws lakeformation list-permissions --principal "DataLakePrincipalIdentifier=$admin_arn" \
+      --resource "{\"Table\":{\"DatabaseName\":\"$PIPELINE_DB\",\"Name\":\"$t\"}}" \
+      --query 'PrincipalResourcePermissions[].PermissionsWithGrantOption[]' --output text)"
+    [[ -z "$g" || "$g" == None ]] || grantable+=" $t($g)"
+  done
+  if [[ -z "$grantable" ]]; then
+    pass "admin role: no grant option on any table of $PIPELINE_DB"
+  else
+    fail "admin role holds a grant option:$grantable"
+  fi
+  loc="$(aws athena get-work-group --work-group "$admin_wg" --query 'WorkGroup.Configuration.ResultConfiguration.OutputLocation' --output text)"
+  if [[ "$loc" == *"/$admin_role/" ]]; then
+    pass "admin workgroup $admin_wg writes results to $loc"
+  else
+    fail "admin workgroup $admin_wg writes results to $loc, not its own prefix"
+  fi
+  simulate_denied s3:GetObject "arn:aws:s3:::$bucket/athena-results/clavesa-ui/$admin_role/probe.csv"
+}
+
 # hosted_leg <exec_arn> <state_bucket> <state_key_prefix>: the read-only
 # reader the workspace stack creates (ADR-032 section 2). Assumes the role
 # with ExternalId = workspace name for 15 minutes and reads what the hosted
@@ -260,8 +437,16 @@ hosted_leg() {
   # arn:aws:states:<region>:<account>:execution:<state machine>:<id>
   sm_name="$(echo "$exec_arn" | cut -d: -f7)"
   sm_arn="$(echo "$exec_arn" | cut -d: -f1-5):stateMachine:$sm_name"
-  if reader_env aws logs filter-log-events --log-group-name "/aws/lambda/$sm_name-runner" --limit 1 >/dev/null; then
-    pass "reader: FilterLogEvents on /aws/lambda/$sm_name-runner"
+  local access=0
+  jq -e '.access' "$SMOKE_WS/clavesa.json" >/dev/null 2>&1 && access=1
+  if reader_env aws logs filter-log-events --log-group-name "/aws/lambda/$sm_name-runner" --limit 1 >/dev/null 2>&1; then
+    if [[ "$access" -eq 1 ]]; then
+      fail "reader: FilterLogEvents on /aws/lambda/$sm_name-runner allowed; with column tags the reader reads no logs"
+    else
+      pass "reader: FilterLogEvents on /aws/lambda/$sm_name-runner"
+    fi
+  elif [[ "$access" -eq 1 ]]; then
+    pass "reader: no FilterLogEvents on /aws/lambda/$sm_name-runner (column tags)"
   else
     fail "reader: FilterLogEvents on /aws/lambda/$sm_name-runner denied"
   fi
@@ -269,6 +454,11 @@ hosted_leg() {
     pass "reader: GetObject s3://$bucket/_clavesa/tree/deployed.json"
   else
     fail "reader: GetObject on the tree copy's deployed.json denied"
+  fi
+
+  [[ "$access" -eq 1 ]] && access_leg "$bucket" "$workgroup"
+  if [[ "$access" -eq 1 ]] && jq -e '.access.admin_role' "$SMOKE_WS/clavesa.json" >/dev/null 2>&1; then
+    admin_leg "$bucket"
   fi
 
   # Writes and state, by the policy simulator (no write is attempted).
@@ -1032,6 +1222,33 @@ EOF
 # ---------------------------------------------------------------------------
 # setup — one-time workspace creation (recreate-after-destroy friendly)
 # ---------------------------------------------------------------------------
+# write_ecr_lifecycle <ws_dir>: the smoke workspace's runner repository
+# keeps its last 10 images. Every deploy pushes one (about 1.8 GB), and
+# with no policy smoke2 held 31 (55 GB, up to 5.5 USD a month) by
+# 2026-11-23. Only the smoke workspace gets this file.
+write_ecr_lifecycle() {
+  cat >"$1/ecr_lifecycle.tf" <<'TFEOF'
+# Written by scripts/cloud-smoke.sh setup: the runner repository keeps its
+# last 10 images, so the smoke workspace's ECR does not grow with every
+# deploy.
+resource "aws_ecr_lifecycle_policy" "runner" {
+  repository = aws_ecr_repository.runner.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep the last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+TFEOF
+}
+
 cmd_setup() {
   require_tools
   if [[ -e "$SMOKE_WS" ]]; then
@@ -1046,6 +1263,7 @@ cmd_setup() {
   banner "workspace init $ws_name at $SMOKE_WS"
   mkdir -p "$(dirname "$SMOKE_WS")"
   "$BIN" workspace init "$ws_name" --workspace "$SMOKE_WS"
+  write_ecr_lifecycle "$SMOKE_WS"
 
   banner "workspace use --env cloud --profile $SMOKE_PROFILE"
   "$BIN" workspace use --env cloud --profile "$SMOKE_PROFILE" --workspace "$SMOKE_WS"

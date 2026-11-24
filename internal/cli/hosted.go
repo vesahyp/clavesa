@@ -99,7 +99,7 @@ smoke gate's reader leg). --event-bus-arn overrides the bus.`,
 	cmd.Flags().StringArrayVar(&in.ReaderPrincipals, "reader-principal", nil, "extra IAM principal ARN allowed to assume the reader role, beside the hosted UI's own (repeatable)")
 	cmd.Flags().StringVar(&in.EventBusARN, "event-bus-arn", "", "the hosted clavesa-ui event bus; empty: the one the hosted UI names")
 	var snapshotOn, snapshotOff bool
-	cmd.Flags().BoolVar(&snapshotOn, "snapshot", false, "local workspace: publish its catalog and dashboard snapshot at run end (ADR-036; off unless set). Values go only with \"personal_data\": false in clavesa.json")
+	cmd.Flags().BoolVar(&snapshotOn, "snapshot", false, "local workspace: publish its catalog and dashboard snapshot at run end (ADR-036; off unless set)")
 	cmd.Flags().BoolVar(&snapshotOff, "no-snapshot", false, "local workspace: stop publishing the snapshot")
 	cmd.MarkFlagsMutuallyExclusive("snapshot", "no-snapshot")
 	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {

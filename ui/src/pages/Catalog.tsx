@@ -100,7 +100,7 @@ const CLAVESA_SYSTEM_TABLES = new Set([
   "dashboards",
 ]);
 
-function isSystemTable(name: string): boolean {
+export function isSystemTable(name: string): boolean {
   return CLAVESA_SYSTEM_TABLES.has(name);
 }
 
@@ -112,7 +112,7 @@ function isSystemCatalog(catalog: string): boolean {
   return catalog.endsWith("_system");
 }
 
-function tableHref(t: CatalogTable): string {
+export function tableHref(t: CatalogTable): string {
   return `/tables/${encodeURIComponent(t.catalog)}/${encodeURIComponent(t.schema)}/${encodeURIComponent(t.name)}`;
 }
 
@@ -240,7 +240,7 @@ const columns = [
 // the totals), so the catalog sends one request per table, not two.
 const CATALOG_SNAPSHOT_LIMIT = 20;
 
-function RowsCell({ table }: { table: CatalogTable }) {
+export function RowsCell({ table }: { table: CatalogTable }) {
   const isClavesaManaged = table.table_type === "DELTA";
   const { data, isLoading } = useTableSnapshots(
     isClavesaManaged ? table.database : "",
@@ -373,7 +373,7 @@ function lookupFileStats(
   return undefined;
 }
 
-function UpdatedCell({ table }: { table: CatalogTable }) {
+export function UpdatedCell({ table }: { table: CatalogTable }) {
   const isClavesaManaged = table.table_type === "DELTA";
   const { data } = useTableSnapshots(
     isClavesaManaged ? table.database : "",
@@ -423,12 +423,12 @@ function UpdatedCell({ table }: { table: CatalogTable }) {
   );
 }
 
-interface SchemaGroup {
+export interface SchemaGroup {
   schema: string;
   tables: CatalogTable[];
 }
 
-interface CatalogGroup {
+export interface CatalogGroup {
   catalog: string;
   isSystem: boolean;
   schemas: SchemaGroup[];
@@ -444,7 +444,7 @@ interface CatalogGroup {
 // the UI consumes them directly — no `__`-marker parsing client-side.
 // System catalogs sort last so the user's pipeline outputs sit where
 // the eye looks first.
-function groupByCatalog(tables: CatalogTable[]): CatalogGroup[] {
+export function groupByCatalog(tables: CatalogTable[]): CatalogGroup[] {
   const byCatalog = new Map<string, Map<string, CatalogTable[]>>();
   for (const t of tables) {
     let schemas = byCatalog.get(t.catalog);

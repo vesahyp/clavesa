@@ -86,3 +86,10 @@ denied to the reader (personal_data).
   empty chart.
 - Athena cost: about 6 widgets x 10 opens a day at the 10 MB minimum,
   about $0.10 a month per workspace, less with result reuse.
+
+## Update 2026-11-22 (column tags)
+
+The `personal_data` parts of this ADR are superseded by
+`docs/ideas/column-tags.md`, slice 1b: the flag is removed from
+`clavesa.json` and from the hosted registry. Lake Formation column tags
+decide what a viewer reads of a cloud workspace.

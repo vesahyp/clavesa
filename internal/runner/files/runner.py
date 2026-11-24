@@ -381,6 +381,91 @@ def _read_peak_rss_mb(status_text: str | None = None) -> int | None:
     return None
 
 
+# JVM heap columns of node_runs, read once at the end of each node. The
+# Lambda's "Max Memory Used" reads close to its memory size on every run,
+# because G1 grows the committed heap toward -Xmx whatever the live data
+# is (spikes/gold-memory). These columns tell the real need from that:
+#   heap_old_after_gc_mb  old generation in use after the last GC that
+#                         collected it (MemoryPoolMXBean.getCollectionUsage),
+#                         an upper bound of the long-lived data
+#   heap_committed_mb     heap the JVM holds from the OS now
+#   heap_max_mb           the -Xmx ceiling
+_JVM_HEAP_KEYS = ("heap_old_after_gc_mb", "heap_committed_mb", "heap_max_mb")
+
+
+def _jvm_heap_mb(
+    pools: Iterable[tuple[str, bool, int | None]],
+    committed_bytes: int | None,
+    max_bytes: int | None,
+) -> dict[str, int | None]:
+    """Pure: the _JVM_HEAP_KEYS values in MB from the JVM's memory pools.
+
+    ``pools`` holds (name, is_heap, collection_used_bytes) per pool;
+    collection_used_bytes is None when the pool has no collection usage
+    (not yet collected, or not supported). The old generation is the heap
+    pool whose name has "Old" or "Tenured" in it (G1 Old Gen, PS Old Gen,
+    Tenured Gen). Values that are missing or negative become None."""
+    def mb(v):
+        return int(v) // 1048576 if isinstance(v, int) and v >= 0 else None
+
+    old = None
+    for name, is_heap, used in pools:
+        if is_heap and ("Old" in name or "Tenured" in name):
+            old = mb(used)
+            break
+    return {
+        "heap_old_after_gc_mb": old,
+        "heap_committed_mb": mb(committed_bytes),
+        "heap_max_mb": mb(max_bytes),
+    }
+
+
+def _read_jvm_heap_mb() -> dict[str, int | None] | None:
+    """The _JVM_HEAP_KEYS values of the live Spark driver JVM, through
+    py4j and java.lang.management. None when there is no session or the
+    read fails; the columns are nullable."""
+    if _SPARK is None:
+        return None
+    try:
+        mgmt = _SPARK.sparkContext._jvm.java.lang.management
+        heap_type = mgmt.MemoryType.HEAP
+        pools = []
+        for pool in mgmt.ManagementFactory.getMemoryPoolMXBeans():
+            cu = pool.getCollectionUsage()
+            pools.append((
+                str(pool.getName()),
+                bool(pool.getType().equals(heap_type)),
+                int(cu.getUsed()) if cu is not None else None,
+            ))
+        heap = mgmt.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
+        return _jvm_heap_mb(pools, int(heap.getCommitted()), int(heap.getMax()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _read_process_peak_rss_mb() -> int | None:
+    """Peak RSS in MB of the Python driver plus its Spark JVM.
+
+    The JVM is a child process (py4j's gateway), so the driver's own
+    VmHWM leaves out the heap and the JVM's native memory: about 170 MB
+    on a run whose JVM held 2 GB. Each VmHWM is its process's lifetime
+    high-water mark and the two peaks may come at different times, so
+    the sum is an upper bound. The JVM's part is skipped when there is
+    no session or its /proc entry cannot be read."""
+    driver = _read_peak_rss_mb()
+    jvm = None
+    try:
+        pid = _SPARK.sparkContext._gateway.proc.pid if _SPARK is not None else None
+        if pid:
+            with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as f:
+                jvm = _read_peak_rss_mb(f.read())
+    except Exception:  # noqa: BLE001
+        jvm = None
+    if driver is None and jvm is None:
+        return None
+    return (driver or 0) + (jvm or 0)
+
+
 def _aggregate_event_log(lines: Iterable[str]) -> dict[str, int | None]:
     """Aggregate Spark task metrics from newline-delimited event-log JSON.
 
@@ -2302,6 +2387,13 @@ def _written_schema(spark, table_id: str, fallback):
         return fallback
 
 
+def _column_tags() -> bool:
+    """True in a workspace with column tags (docs/ideas/column-tags.md):
+    an error can quote a row, so its text stays out of what the hosted
+    reader can read (the _progress/ markers, the Step Functions cause)."""
+    return os.environ.get("CLAVESA_COLUMN_TAGS") == "1"
+
+
 def _sync_glue_table_schema(table_id: str, schema, location: str | None = None) -> None:
     """Write the real Delta schema into a Glue table's ``StorageDescriptor.Columns``.
 
@@ -2329,7 +2421,9 @@ def _sync_glue_table_schema(table_id: str, schema, location: str | None = None) 
     equal the computed ones), preserves the existing TableInput
     (StorageDescriptor location + serde + format, PartitionKeys,
     parameters, …), and never raises — a sync failure logs to stderr and
-    the next write retries it. Region comes from the default boto3 session
+    the next write retries it. The exception: CLAVESA_GLUE_SYNC_REQUIRED=1
+    (a workspace with column tags) makes a failed sync of an output table
+    (``location=None``) raise, so the node fails. Region comes from the default boto3 session
     (Lambda provides it).
 
     ``location`` (cloud system-table callers only): when not None, the
@@ -2432,6 +2526,16 @@ def _sync_glue_table_schema(table_id: str, schema, location: str | None = None) 
             f"[clavesa] glue schema sync failed for {table_id!r}: {exc!r}",
             file=sys.stderr,
         )
+        # Column tags (docs/ideas/column-tags.md): in a workspace with an
+        # "access" block the sync is required for an output table, because
+        # Athena applies Lake Formation to a Delta table only when Glue has
+        # its real schema, and the column tags need the real columns. The
+        # system tables (location set) keep the best-effort sync.
+        if location is None and os.environ.get("CLAVESA_GLUE_SYNC_REQUIRED") == "1":
+            raise RuntimeError(
+                f"glue schema sync failed for {table_id}, and this workspace has column tags, "
+                f"which need the real schema in Glue: {exc}"
+            ) from exc
 
 
 def _v2_layout_path(base: str, db_part: str) -> str:
@@ -3466,6 +3570,7 @@ def _build_node_run_row(
     peak_rss_mb: int | None = None,
     spark_metrics: dict | None = None,
     timing: dict | None = None,
+    jvm_heap: dict | None = None,
 ) -> dict[str, Any]:
     """Pure helper: construct one node_runs row from invocation telemetry.
 
@@ -3560,6 +3665,9 @@ def _build_node_run_row(
     sm = spark_metrics or {}
     for k in _SPARK_METRIC_KEYS:
         row[k] = sm.get(k)
+    jh = jvm_heap or {}
+    for k in _JVM_HEAP_KEYS:
+        row[k] = jh.get(k)
     # Per-phase timing object as compact JSON text. phases.system is 0 here:
     # the node_runs write IS the system phase and has not finished yet.
     # None (SQL NULL) when no timing was captured.
@@ -3593,6 +3701,34 @@ def _node_runs_table_id() -> str:
     (ADR-016 "Workspace system catalog", v0.20.0). Every pipeline appends
     here; the `pipeline` column distinguishes rows."""
     return f"{_system_glue_db()}.node_runs"
+
+
+def _system_df(spark, rows, schema):
+    """A DataFrame of the runner's own rows (node_runs, runs, tables,
+    column_stats) built through Arrow.
+
+    spark.createDataFrame(<python list>, schema) goes through a Python RDD,
+    which starts pyspark.daemon and its workers (about 96 MB on the
+    web-traffic gold step, docs/ideas/runner-memory.md). A pyarrow.Table
+    is read by the JVM with no Python worker. The rows are dicts keyed by
+    field name; a missing key is null. pyarrow does not check nullability,
+    so a None in a non-nullable field raises here, as the classic path does.
+    tests/runner/system_rows_check.py checks that both paths write the same
+    rows.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+    from pyspark.sql.pandas.types import to_arrow_schema  # noqa: PLC0415
+
+    rows = list(rows)
+    required = [f.name for f in schema.fields if not f.nullable]
+    for r in rows:
+        for name in required:
+            if r.get(name) is None:
+                raise ValueError(
+                    f"field {name}: This field is not nullable, but got None"
+                )
+    table = pa.Table.from_pylist(rows, schema=to_arrow_schema(schema))
+    return spark.createDataFrame(table, schema=schema)
 
 
 def _node_runs_schema():
@@ -3639,7 +3775,8 @@ def _node_runs_schema():
         StructField("output_rows", LongType(), True),
         # Resource + Spark task-metric columns (Spark-observability slice).
         # All nullable LongType. `peak_rss_mb` is the process-lifetime
-        # high-water mark (VmHWM) — monotonic across warm-worker
+        # high-water mark (VmHWM) of the Python driver plus its Spark JVM
+        # (the driver alone before v2.28) — monotonic across warm-worker
         # invocations, not per-invocation. The remaining 14 are
         # per-invocation aggregates parsed from the event-log tail written
         # by this run (sums/max/counts over its tasks + stages). Null when
@@ -3664,6 +3801,11 @@ def _node_runs_schema():
         # per-output ms, Spark stage summary per phase. Nullable: rows from
         # older runners read as null; mergeSchema evolves the column in.
         StructField("timing", StringType(), True),
+        # JVM heap at the end of the node (_JVM_HEAP_KEYS). Nullable: rows
+        # from older runners and failed reads stay null.
+        StructField("heap_old_after_gc_mb", LongType(), True),
+        StructField("heap_committed_mb", LongType(), True),
+        StructField("heap_max_mb", LongType(), True),
     ])
 
 
@@ -3707,7 +3849,7 @@ def _record_node_run(row: dict[str, Any]) -> None:
     db_part = table_id.rsplit(".", 1)[0]
     _ensure_database(spark, db_part)
 
-    df = spark.createDataFrame([row], schema=_node_runs_schema())
+    df = _system_df(spark, [row], _node_runs_schema())
     location = _system_table_location("node_runs")
     created = not spark.catalog.tableExists(table_id)
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
@@ -3778,7 +3920,7 @@ def _record_run(row: dict[str, Any]) -> None:
     db_part = table_id.rsplit(".", 1)[0]
     _ensure_database(spark, db_part)
 
-    df = spark.createDataFrame([row], schema=_runs_schema())
+    df = _system_df(spark, [row], _runs_schema())
     created = not spark.catalog.tableExists(table_id)
     df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_id)
     if created:
@@ -3970,7 +4112,7 @@ def _record_table_state(run_id: str, output_key: str, table_id: str) -> int | No
     db_part = tables_id.rsplit(".", 1)[0]
     _ensure_database(spark, db_part)
 
-    df = spark.createDataFrame([row], schema=_tables_schema())
+    df = _system_df(spark, [row], _tables_schema())
     location = _system_table_location("tables")
     created = not spark.catalog.tableExists(tables_id)
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
@@ -4290,7 +4432,7 @@ def _record_column_stats(rows):
     db_part = table_id.rsplit(".", 1)[0]
     _ensure_database(spark, db_part)
 
-    df = spark.createDataFrame(rows, schema=_column_stats_schema())
+    df = _system_df(spark, rows, _column_stats_schema())
     location = _system_table_location("column_stats")
     created = not spark.catalog.tableExists(table_id)
     writer = df.write.format("delta").mode("append").option("mergeSchema", "true")
@@ -4527,6 +4669,27 @@ def _runs_writer_build_row(detail):
     }
 
 
+def _runs_writer_node_error(sf_execution_arn: str, node: str) -> str:
+    """The error_msg node_runs holds for this execution's failed node (any
+    failed node when node is ""), or "" when there is none or the read
+    fails. Best-effort: the runs row is written either way."""
+    if not sf_execution_arn:
+        return ""
+    try:
+        from pyspark.sql import functions as F  # noqa: PLC0415
+
+        df = _spark().table(_node_runs_table_id()).where(
+            (F.col("sf_execution_arn") == sf_execution_arn) & (F.col("status") == "failed")
+        )
+        if node:
+            df = df.where(F.col("node") == node)
+        rows = df.orderBy(F.col("started_at").desc()).select("error_msg").limit(1).collect()
+        return str(rows[0]["error_msg"] or "") if rows else ""
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        print(f"[clavesa] runs_writer: node_runs error lookup failed: {exc!r}", file=sys.stderr)
+        return ""
+
+
 def runs_writer_handler(event, context):
     """Lambda entry point for the runs_writer image (ADR-018).
 
@@ -4555,6 +4718,13 @@ def runs_writer_handler(event, context):
         return {"skipped": "non-terminal status: " + repr(status)}
 
     row = _runs_writer_build_row(detail)
+    if _column_tags() and status != "SUCCEEDED":
+        # The cause carries no error text here (column tags): take the
+        # failed node's text from node_runs, so the owner's runs row keeps
+        # it. runs.error_msg is hidden from the hosted reader by its tag.
+        text = _runs_writer_node_error(row["sf_execution_arn"], row["failed_step"])
+        if text:
+            row["error_msg"] = _runs_writer_truncate(text)
     _record_run(row)
     return {"ok": True, "run_id": row["run_id"], "status": status}
 
@@ -4726,7 +4896,7 @@ def handler(event, context):
                 "ended_ms": ended_ms,
                 "output_rows": output_rows_total,
                 "error": (error_msg or "")[:500]
-                if status == "failed"
+                if status == "failed" and not _column_tags()
                 else "",
                 "updated_ms": ended_ms,
                 "metrics": timing if timing is not None else {},
@@ -4737,7 +4907,7 @@ def handler(event, context):
             # Resource + Spark task-metric capture. Both are best-effort and
             # already inside this try, so a failure here logs and is
             # swallowed below without ever masking the transform outcome.
-            peak_rss = _read_peak_rss_mb()
+            peak_rss = _read_process_peak_rss_mb()
             spark_metrics = _read_spark_metrics(eventlog_offset)
             row = _build_node_run_row(
                 run_id=run_id,
@@ -4753,6 +4923,7 @@ def handler(event, context):
                 peak_rss_mb=peak_rss,
                 spark_metrics=spark_metrics,
                 timing=timing,
+                jvm_heap=_read_jvm_heap_mb(),
             )
             _record_node_run(row)
         except Exception as record_exc:  # noqa: BLE001
@@ -5317,14 +5488,25 @@ def _run_pipeline_bundle(event, context):
     # ADR-031: a segment of a mixed bundle job returns its states to the
     # state machine, which fails the execution at its end.
     in_segment = "_bundle_states" in event
+    if in_segment and _column_tags():
+        # The segment's output stays in the execution history, which the
+        # hosted reader may read: no error text in it.
+        for r in results:
+            if isinstance(r, dict) and r.get("error_msg"):
+                r["error_msg"] = ""
     if overall_status == "failed" and os.environ.get("AWS_LAMBDA_FUNCTION_NAME") and not in_segment:
         failed_recs = [r for r in results if r.get("node") == failed_node and r.get("status") == "failed"]
         last = failed_recs[0] if failed_recs else (results[-1] if results else {})
+        msg = last.get("error_msg", "no error message")
+        if _column_tags():
+            # The cause is readable to the hosted reader; the text stays
+            # in node_runs (hidden by its tag) and the run log.
+            msg = "error text hidden (column tags); see node_runs.error_msg or the run log"
         raise RuntimeError(
             "clavesa runner: {node} failed ({cls}: {msg})".format(
                 node=failed_node,
                 cls=last.get("error_class", "Error"),
-                msg=last.get("error_msg", "no error message"),
+                msg=msg,
             )
         )
     return result

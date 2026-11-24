@@ -72,9 +72,7 @@ var SnapshotBudget = 15 * time.Second
 
 // drillSnapshot builds the snapshot of a local-warehouse workspace, or nil
 // when the workspace has not turned it on (hosted.snapshot, ADR-036: off
-// unless set). Values (widget results) go only when clavesa.json says
-// "personal_data": false explicitly; otherwise the snapshot holds names,
-// types and counts only. Each part that fails or runs out of time is left
+// unless set). Each part that fails or runs out of time is left
 // out with a note; the publish never fails here.
 func (s *Service) drillSnapshot(ctx context.Context, now time.Time) *DrillSnapshot {
 	m, _ := workspace.Load(s.workspace)
@@ -119,10 +117,6 @@ func (s *Service) drillSnapshot(ctx context.Context, now time.Time) *DrillSnapsh
 		}
 	}
 
-	if !m.Hosted.FreeOfPersonalData() {
-		snap.Notes = append(snap.Notes, "dashboard values not published: clavesa.json does not say \"personal_data\": false")
-		return snap
-	}
 	list, err := s.ListDashboards(ctx)
 	if err != nil {
 		snap.Notes = append(snap.Notes, "dashboards not published: "+err.Error())

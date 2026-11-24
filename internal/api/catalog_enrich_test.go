@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -385,5 +388,48 @@ func TestParseCatalogS3URI(t *testing.T) {
 		if b != c.bucket || k != c.key {
 			t.Errorf("parseCatalogS3URI(%q) = (%q, %q), want (%q, %q)", c.uri, b, k, c.bucket, c.key)
 		}
+	}
+}
+
+// TestEnrichDeltaColumnsSkippedWithColumnTags: a workspace with an
+// "access" block keeps the Glue columns, which Lake Formation filters per
+// reader; the Delta log would show every column.
+func TestEnrichDeltaColumnsSkippedWithColumnTags(t *testing.T) {
+	const bucket = "mybucket"
+	const key = "warehouse/clavesa_demo_ws__taxis/trips__default"
+	schema := `{"type":"struct","fields":[{"name":"pickup_ip","type":"string","nullable":true,"metadata":{}}]}`
+	stub := &stubS3{objects: deltaLogObjects(bucket, key, schema)}
+	root := t.TempDir()
+	manifest := `{"name":"demo-ws","access":{"tags":["open","ip"]}}`
+	if err := os.WriteFile(filepath.Join(root, "clavesa.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := NewCatalogHandler(nil).WithS3(stub).WithWorkspace(root)
+	glueCols := []CatalogColumn{{Name: "fare", Type: "double"}}
+	tables := []CatalogTable{{Database: "clavesa_demo_ws__taxis", Name: "trips__default", Location: "s3://" + bucket + "/" + key, Columns: glueCols}}
+	h.enrichDeltaColumns(context.Background(), tables)
+	if len(tables[0].Columns) != 1 || tables[0].Columns[0].Name != "fare" {
+		t.Errorf("columns = %+v, want the Glue columns", tables[0].Columns)
+	}
+}
+
+// A Glue table that Spark marks with spark.sql.sources.provider=delta is
+// DELTA without a Delta log read (the catalog of a workspace with column
+// tags reads none).
+func TestGlueProviderDeltaIsDelta(t *testing.T) {
+	ct := glueTableToCatalog("clavesa_demo_ws__taxis", gluetypes.Table{
+		Name:       aws.String("trips"),
+		Parameters: map[string]string{"spark.sql.sources.provider": "delta"},
+	})
+	if ct.TableType != "DELTA" {
+		t.Errorf("TableType = %q, want DELTA", ct.TableType)
+	}
+	// What a column-limited reader gets: no provider, the protocol stays.
+	ct = glueTableToCatalog("clavesa_demo_ws__taxis", gluetypes.Table{
+		Name:       aws.String("trips"),
+		Parameters: map[string]string{"delta.minReaderVersion": "3"},
+	})
+	if ct.TableType != "DELTA" {
+		t.Errorf("reader view: TableType = %q, want DELTA", ct.TableType)
 	}
 }

@@ -216,7 +216,7 @@ function LineageEdgeRow({ edge, direction, database }: LineageEdgeRowProps) {
         }
       >
         <Database className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground group-hover:text-primary" />
-        <code className="min-w-0 truncate font-mono text-xs">
+        <code className="min-w-0 break-all font-mono text-xs md:truncate md:break-normal">
           {displayWireRef(wireRef)}
         </code>
         <span className="ml-auto flex flex-shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-muted-foreground">
@@ -241,7 +241,7 @@ function LineageEdgeRow({ edge, direction, database }: LineageEdgeRowProps) {
       }
     >
       <Database className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-      <code className="min-w-0 truncate font-mono text-xs">{otherNode}</code>
+      <code className="min-w-0 break-all font-mono text-xs md:truncate md:break-normal">{otherNode}</code>
       <span className="ml-auto flex flex-shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] uppercase text-muted-foreground">
         {isCrossPipeline && (
           <span className="rounded bg-indigo-500/10 px-1 py-0.5 font-mono normal-case text-indigo-700 dark:text-indigo-300">

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/vesahyp/clavesa/internal/access"
 )
 
 const testPrincipal = "arn:aws:iam::111122223333:role/clavesa-ui-hosted"
@@ -109,19 +111,16 @@ func TestRenderHostedTFGolden(t *testing.T) {
 			Hosted: &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal},
 				EventBusARN: "arn:aws:events:eu-north-1:111122223333:event-bus/clavesa-ui"},
 		},
-		// Personal data (web-traffic): the raw pipelines are denied.
-		"hosted_personal_data": {
-			Name: "acme", Catalog: "clavesa_acme", SystemCatalog: "clavesa_acme_system",
-			Backend: &Backend{Type: "s3", Bucket: "acme-clavesa", Region: "eu-north-1"},
-			Hosted:  &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}, PersonalData: ptrTrue()},
+		// Column tags: the reader reads by tag (lf_tag_key).
+		"hosted_access": {
+			Name: "smoke2", Catalog: "clavesa_smoke2", SystemCatalog: "clavesa_smoke2_system", AWSNames: AWSNamesWorkspace,
+			Hosted: &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}},
+			Access: &access.Config{Tags: []string{"open"}, AdminRole: true},
 		},
 	}
-	// The raw data is passed even where PersonalData is off: only the
-	// personal_data case may emit it.
-	raw := HostedRaw{ObjectPatterns: []string{"silver/*", "bronze/*"}, GlueDatabases: []string{"clavesa_acme__silver", "clavesa_acme__bronze"}}
 	for name, m := range cases {
 		// events is deployed, orders not yet; the system DB is never listed twice.
-		got := RenderHostedTF(m, "v9.9.9", []string{"orders", "events"}, []string{m.Catalog + "__events", m.SystemCatalog + "__pipelines", m.Catalog + "__events"}, raw)
+		got := RenderHostedTF(m, "v9.9.9", []string{"orders", "events"}, []string{m.Catalog + "__events", m.SystemCatalog + "__pipelines", m.Catalog + "__events"})
 		path := filepath.Join("testdata", name+".golden")
 		if os.Getenv("UPDATE_GOLDEN") == "1" {
 			_ = os.MkdirAll("testdata", 0o755)
@@ -138,20 +137,20 @@ func TestSyncHostedTF(t *testing.T) {
 	root := t.TempDir()
 	m := &Manifest{Name: "ws", Catalog: "clavesa_ws", SystemCatalog: "clavesa_ws_system",
 		Hosted: &Hosted{URL: "https://ui.clavesa.dev", ReaderPrincipals: []string{testPrincipal}}}
-	if err := SyncHostedTF(root, m, "v1.0.0", nil, nil, HostedRaw{}); err != nil {
+	if err := SyncHostedTF(root, m, "v1.0.0", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(root, HostedTFFile))
 	if err != nil || !strings.Contains(string(data), `./.clavesa/modules/v1.0.0/hosted-reader/aws`) {
 		t.Fatalf("hosted.tf = %q, %v", data, err)
 	}
-	if err := SyncHostedTF(root, m, "", nil, nil, HostedRaw{}); err == nil {
+	if err := SyncHostedTF(root, m, "", nil, nil); err == nil {
 		t.Error("no module version must be refused")
 	}
 	// Hosted off: the file goes, twice is fine.
 	m.Hosted = nil
 	for i := 0; i < 2; i++ {
-		if err := SyncHostedTF(root, m, "", nil, nil, HostedRaw{}); err != nil {
+		if err := SyncHostedTF(root, m, "", nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -251,4 +250,3 @@ func TestGlueDatabaseFromState(t *testing.T) {
 	}
 }
 
-func ptrTrue() *bool { v := true; return &v }

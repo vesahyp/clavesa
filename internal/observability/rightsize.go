@@ -17,6 +17,14 @@ type NodeRightsize struct {
 	CurrentMB     *int64  `json:"current_mb,omitempty"`
 	RecommendedMB *int64  `json:"recommended_mb,omitempty"`
 	P95PeakRSSMB  *int64  `json:"p95_peak_rss_mb,omitempty"`
+	// Heap-based advice (runner v2.28+ rows). P95HeapAfterGCMB is the p95
+	// of node_runs.heap_old_after_gc_mb, HeapMaxMB the newest -Xmx, and
+	// RecommendedHeapMB the runner_heap_max_mb the history supports. Set
+	// when the node has rows with heap columns; the recommendation then
+	// comes from them, not from peak RSS.
+	P95HeapAfterGCMB  *int64 `json:"p95_heap_after_gc_mb,omitempty"`
+	HeapMaxMB         *int64 `json:"heap_max_mb,omitempty"`
+	RecommendedHeapMB *int64 `json:"recommended_heap_mb,omitempty"`
 	Samples       int     `json:"samples"`
 	SpillRate     float64 `json:"spill_rate"`
 	Reason        string  `json:"reason"`
@@ -45,9 +53,11 @@ type NodeRightsize struct {
 func Rightsize(rows []NodeRun) []NodeRightsize {
 	type agg struct {
 		peaks     []int64
+		heaps     []int64
 		spilled   int
 		metricRow int
 		current   *int64
+		heapMax   *int64
 	}
 	byNode := map[string]*agg{}
 	order := []string{}
@@ -63,6 +73,13 @@ func Rightsize(rows []NodeRun) []NodeRightsize {
 		if a.current == nil && r.MemoryMB != nil {
 			v := *r.MemoryMB
 			a.current = &v
+		}
+		if a.heapMax == nil && r.HeapMaxMB != nil {
+			v := *r.HeapMaxMB
+			a.heapMax = &v
+		}
+		if r.HeapOldAfterGCMB != nil {
+			a.heaps = append(a.heaps, *r.HeapOldAfterGCMB)
 		}
 		if r.PeakRSSMB != nil {
 			a.metricRow++
@@ -82,38 +99,34 @@ func Rightsize(rows []NodeRun) []NodeRightsize {
 
 		if a.metricRow > 0 {
 			nr.SpillRate = float64(a.spilled) / float64(a.metricRow)
-			sorted := append([]int64(nil), a.peaks...)
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-			n := len(sorted)
-			idx := int(math.Ceil(0.95*float64(n))) - 1
-			if idx < 0 {
-				idx = 0
-			}
-			if idx > n-1 {
-				idx = n - 1
-			}
-			p95 := sorted[idx]
+			p95 := percentile95(a.peaks)
 			nr.P95PeakRSSMB = &p95
+		}
+		if len(a.heaps) > 0 {
+			p95 := percentile95(a.heaps)
+			nr.P95HeapAfterGCMB = &p95
+			nr.HeapMaxMB = a.heapMax
+			heap := recommendHeapMB(p95)
+			nr.RecommendedHeapMB = &heap
 		}
 
 		switch {
 		case a.current == nil:
 			nr.Confidence = "n/a"
 			nr.Reason = "no allocated memory on record (local runs carry no memory_mb)"
+		case len(a.heaps) > 0:
+			rec := clampLambdaMB(*nr.RecommendedHeapMB + runnerMemoryOverheadMB)
+			nr.RecommendedMB = &rec
+			nr.Samples = len(a.heaps)
+			nr.Confidence = confidenceFor(len(a.heaps))
+			nr.Reason = heapReason(*a.current, rec, *nr.P95HeapAfterGCMB, *nr.RecommendedHeapMB, a.heapMax, len(a.heaps))
 		case a.metricRow == 0:
 			nr.Confidence = "n/a"
 			nr.Reason = "no runs with Spark memory metrics yet"
 		default:
 			rec := recommendMemoryMB(*nr.P95PeakRSSMB, nr.SpillRate)
 			nr.RecommendedMB = &rec
-			switch {
-			case a.metricRow >= 10:
-				nr.Confidence = "high"
-			case a.metricRow >= 4:
-				nr.Confidence = "medium"
-			default:
-				nr.Confidence = "low"
-			}
+			nr.Confidence = confidenceFor(a.metricRow)
 			nr.Reason = rightsizeReason(*a.current, rec, *nr.P95PeakRSSMB, nr.SpillRate, a.metricRow)
 		}
 		out = append(out, nr)
@@ -139,6 +152,95 @@ func rightsizeReason(current, recommended, p95 int64, spillRate float64, samples
 	}
 	return fmt.Sprintf("p95 peak %d MB vs %d MB allocated%s — %s %d MB (n=%d)",
 		p95, current, spillNote, dir, recommended, samples)
+}
+
+// Heap-based advice. The JVM grows its committed heap toward -Xmx whatever
+// the data is, so peak RSS and Lambda's "Max Memory Used" follow the heap
+// ceiling, not the need (spikes/gold-memory, 2026-11-22). The need is the
+// old generation in use after GC; the heap gives it room twice over: on
+// the web-traffic gold bundle 363 MB in use at a 512 MB heap cost 75% more
+// GC time, at 768 MB and above it ran as fast as at 1536 MB.
+const (
+	heapHeadroomFactor = 2
+	minHeapMB          = 512
+	// runnerMemoryOverheadMB is tfgen's runner_memory_overhead_mb default:
+	// the runner Lambda's memory outside the Spark heap.
+	runnerMemoryOverheadMB = 1472
+)
+
+// recommendHeapMB is the Spark heap (runner_heap_max_mb) for a p95
+// old-generation-after-GC value: twice it, rounded up to 64 MB, at least
+// 512 MB.
+func recommendHeapMB(p95HeapAfterGCMB int64) int64 {
+	heap := roundUp64(p95HeapAfterGCMB * heapHeadroomFactor)
+	if heap < minHeapMB {
+		heap = minHeapMB
+	}
+	return heap
+}
+
+// heapReason renders the one-line explanation of a heap-based
+// recommendation.
+func heapReason(current, recommended, p95Heap, recHeap int64, heapMax *int64, samples int) string {
+	dir := "keep at"
+	switch {
+	case recommended < current:
+		dir = "lower to"
+	case recommended > current:
+		dir = "raise to"
+	}
+	maxNote := ""
+	if heapMax != nil {
+		maxNote = fmt.Sprintf(" of a %d MB heap", *heapMax)
+	}
+	return fmt.Sprintf("p95 heap in use after GC %d MB%s — heap %d MB + %d MB outside it: %s %d MB (n=%d)",
+		p95Heap, maxNote, recHeap, runnerMemoryOverheadMB, dir, recommended, samples)
+}
+
+// percentile95 is the ceil(0.95*n)-1 element of the values sorted
+// ascending, clamped into range. values must not be empty.
+func percentile95(values []int64) int64 {
+	sorted := append([]int64(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	n := len(sorted)
+	idx := int(math.Ceil(0.95*float64(n))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx > n-1 {
+		idx = n - 1
+	}
+	return sorted[idx]
+}
+
+func confidenceFor(samples int) string {
+	switch {
+	case samples >= 10:
+		return "high"
+	case samples >= 4:
+		return "medium"
+	default:
+		return "low"
+	}
+}
+
+func roundUp64(mb int64) int64 {
+	const step = 64
+	if mb%step != 0 {
+		mb = (mb/step + 1) * step
+	}
+	return mb
+}
+
+// clampLambdaMB keeps a Lambda memory size within 512..10240 MB.
+func clampLambdaMB(mb int64) int64 {
+	if mb < 512 {
+		return 512
+	}
+	if mb > 10240 {
+		return 10240
+	}
+	return mb
 }
 
 // recommendMemoryMB turns a p95 peak-RSS observation plus a spill rate into

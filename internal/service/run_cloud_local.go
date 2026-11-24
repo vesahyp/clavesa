@@ -153,6 +153,7 @@ func (s *Service) prepareCloudLocalRun(ctx context.Context, dir string, opts Run
 	// *s3.Client (PutObject-capable) — the read-only s3fs.S3API a CloudProvider
 	// holds would no-op WriteKey.
 	outcome := newRunOutcome(runID, pipelineName, "manual")
+	outcome.hideErrorText = lambdaEnv["CLAVESA_COLUMN_TAGS"] == "1"
 	var store observability.ProgressStore
 	if bucket := progressBucketFromEnv(lambdaEnv); bucket != "" {
 		store = observability.NewS3ProgressStore(s3.NewFromConfig(cfg), bucket)

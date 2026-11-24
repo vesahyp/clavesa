@@ -100,7 +100,7 @@ function NotebookView() {
                   <CellMarkdown source={source} />
                 ) : (
                   <>
-                    <pre className="overflow-x-auto whitespace-pre rounded bg-muted p-3 font-mono text-xs">{source}</pre>
+                    <pre className="whitespace-pre-wrap break-all rounded bg-muted p-3 font-mono text-xs md:overflow-x-auto md:whitespace-pre md:break-normal">{source}</pre>
                     {(c.outputs ?? []).map((o, i) => (
                       <CellOutput key={i} output={o} />
                     ))}

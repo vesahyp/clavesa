@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/vesahyp/clavesa/internal/identutil"
 	"io"
 	"net/http"
 	"os"
@@ -36,12 +35,10 @@ type HostedInput struct {
 	Snapshot *bool `json:"snapshot,omitempty"`
 }
 
-// keepHostedChoices carries over what the user set by hand or by an
-// earlier enable: personal_data and, unless in says otherwise, snapshot.
-// Re-running enable must never drop personal_data (it drives a Deny).
+// keepHostedChoices carries over what an earlier enable set: snapshot,
+// unless in says otherwise.
 func keepHostedChoices(prev, h *workspace.Hosted, in HostedInput) {
 	if prev != nil {
-		h.PersonalData = prev.PersonalData
 		h.Snapshot = prev.Snapshot
 	}
 	if in.Snapshot != nil {
@@ -282,7 +279,7 @@ func (s *Service) SyncHostedTF(version string) error {
 	}
 	if m.Hosted == nil || m.Hosted.IsLocal() {
 		// A local-warehouse workspace has no stack: nothing to deploy.
-		return workspace.SyncHostedTF(s.workspace, m, "", nil, nil, workspace.HostedRaw{})
+		return workspace.SyncHostedTF(s.workspace, m, "", nil, nil)
 	}
 	if version == "" {
 		version = ModuleVersion
@@ -302,26 +299,7 @@ func (s *Service) SyncHostedTF(version string) error {
 	if err != nil {
 		return err
 	}
-	return workspace.SyncHostedTF(s.workspace, m, version, names, dbs, hostedRaw(m, pipes))
-}
-
-// hostedRaw is the raw data of a PersonalData workspace: every pipeline
-// whose schema is not gold (the default serving layer, parity plan),
-// as its prefix in the pipeline bucket (<dir>/*, where its tables and
-// their Delta logs are) and its Glue database.
-func hostedRaw(m *workspace.Manifest, pipes []PipelineInfo) workspace.HostedRaw {
-	var raw workspace.HostedRaw
-	if !m.Hosted.MarksPersonalData() {
-		return raw
-	}
-	for _, p := range pipes {
-		if p.Schema == "gold" {
-			continue
-		}
-		raw.ObjectPatterns = append(raw.ObjectPatterns, filepath.ToSlash(p.Dir)+"/*")
-		raw.GlueDatabases = append(raw.GlueDatabases, identutil.EncodeGlueDatabase(m.CatalogIdentifier(), p.Schema))
-	}
-	return raw
+	return workspace.SyncHostedTF(s.workspace, m, version, names, dbs)
 }
 
 // deployedPipelineDatabases returns the Glue database of every deployed

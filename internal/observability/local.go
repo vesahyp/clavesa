@@ -334,13 +334,21 @@ func (p *LocalProvider) NodeRuns(ctx context.Context, q NodeRunsQuery) (*NodeRun
   jvm_gc_time_ms,
   executor_cpu_time_ms,
   executor_run_time_ms,
-  max_task_duration_ms
+  max_task_duration_ms,
+  heap_old_after_gc_mb,
+  heap_committed_mb,
+  heap_max_mb
 FROM %s.node_runs
 %s
 ORDER BY started_at DESC
 LIMIT %d`, dbName, whereClause, q.Limit+1)
 
 	res, err := p.runQueryFor(ctx, q.PipelineDir, sql)
+	if err != nil && isMissingHeapColumnErr(err) {
+		// A node_runs table no runner v2.28+ has written to yet has no heap
+		// columns; read them as NULL rather than blank the run history.
+		res, err = p.runQueryFor(ctx, q.PipelineDir, withoutHeapColumns(sql))
+	}
 	if err != nil {
 		// Fresh workspace where no pipeline has produced node_runs yet —
 		// the workspace system DB exists in the Hadoop catalog but the
@@ -397,6 +405,10 @@ LIMIT %d`, dbName, whereClause, q.Limit+1)
 			ExecutorCPUTimeMs:     int64Pointer(rowAt(r, idx, "executor_cpu_time_ms")),
 			ExecutorRunTimeMs:     int64Pointer(rowAt(r, idx, "executor_run_time_ms")),
 			MaxTaskDurationMs:     int64Pointer(rowAt(r, idx, "max_task_duration_ms")),
+
+			HeapOldAfterGCMB: int64Pointer(rowAt(r, idx, "heap_old_after_gc_mb")),
+			HeapCommittedMB:  int64Pointer(rowAt(r, idx, "heap_committed_mb")),
+			HeapMaxMB:        int64Pointer(rowAt(r, idx, "heap_max_mb")),
 		})
 	}
 	p.fillTimingFromProgress(ctx, out)
@@ -1273,6 +1285,33 @@ func validPipelineName(s string) bool { return pipelineNameRE.MatchString(s) }
 // the UI can render a fresh-pipeline empty state. Spark surfaces these via
 // AnalysisException with a "Table or view not found" / "Path does not
 // exist" / "TABLE_OR_VIEW_NOT_FOUND" substring.
+// nodeRunsHeapColumns are the node_runs columns runner v2.28 added.
+var nodeRunsHeapColumns = []string{"heap_old_after_gc_mb", "heap_committed_mb", "heap_max_mb"}
+
+// isMissingHeapColumnErr reports whether Spark could not resolve one of
+// nodeRunsHeapColumns: the table predates them.
+func isMissingHeapColumnErr(err error) bool {
+	s := err.Error()
+	if !strings.Contains(s, "UNRESOLVED_COLUMN") && !strings.Contains(s, "cannot be resolved") {
+		return false
+	}
+	for _, c := range nodeRunsHeapColumns {
+		if strings.Contains(s, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutHeapColumns reads each of nodeRunsHeapColumns in sql as NULL.
+func withoutHeapColumns(sql string) string {
+	for _, c := range nodeRunsHeapColumns {
+		sql = strings.Replace(sql, "\n  "+c+",", "\n  CAST(NULL AS BIGINT) AS "+c+",", 1)
+		sql = strings.Replace(sql, "\n  "+c+"\nFROM", "\n  CAST(NULL AS BIGINT) AS "+c+"\nFROM", 1)
+	}
+	return sql
+}
+
 func isMissingTableErr(err error) bool {
 	s := err.Error()
 	for _, marker := range []string{

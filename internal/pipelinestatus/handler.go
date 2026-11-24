@@ -99,6 +99,11 @@ type Handler struct {
 	// short-circuits and in-flight node states never surface.
 	athenaOutputBucket string
 
+	// hideErrorText drops run and step error text (Step Functions causes,
+	// _progress/ markers) from what the handler serves: the hosted reader
+	// of a workspace with column tags, where an error can quote a row.
+	hideErrorText bool
+
 	// resolver, when set, lets the execution endpoints dispatch by the
 	// workspace warehouse (ADR-024, workspace.LoadWarehouse). When nil, the
 	// handler falls through to the cloud-only ARN path — preserves the
@@ -148,6 +153,22 @@ func (h *Handler) WithResolver(r *observability.Resolver) *Handler {
 func (h *Handler) WithAthenaOutputBucket(b string) *Handler {
 	h.athenaOutputBucket = b
 	return h
+}
+
+// WithoutErrorText drops error text from what the handler serves (see
+// hideErrorText). The error names (error class, Step Functions error)
+// stay.
+func (h *Handler) WithoutErrorText(hide bool) *Handler {
+	h.hideErrorText = hide
+	return h
+}
+
+// served blanks a detail's error text when the handler hides it.
+func (h *Handler) served(d executionDetail) executionDetail {
+	if h.hideErrorText {
+		d.Cause, d.StepCause = "", ""
+	}
+	return d
 }
 
 // WithLocalRunner enables POST /pipeline/run to dispatch local pipelines
@@ -207,7 +228,8 @@ func (h *Handler) ensureAWS(ctx context.Context) {
 		// colour the run DAG live. Without both, the provider short-circuits
 		// and in-flight node states stay empty (the DAG never colours).
 		h.cloud = observability.NewCloudProvider(nil, h.athenaOutputBucket, h.sfnClient, h.cwlClient).
-			WithS3(s3.NewFromConfig(cfg))
+			WithS3(s3.NewFromConfig(cfg)).
+			WithoutErrorText(h.hideErrorText)
 	})
 }
 
@@ -463,14 +485,14 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusNotFound, "read run detail: "+err.Error())
 			return
 		}
-		httputil.WriteJSON(w, http.StatusOK, executionDetail{
+		httputil.WriteJSON(w, http.StatusOK, h.served(executionDetail{
 			Status:     detail.Status,
 			Error:      detail.ErrorClass,
 			Cause:      detail.ErrorMsg,
 			FailedStep: detail.FailedStep,
 			StepError:  detail.ErrorClass,
 			StepCause:  detail.ErrorMsg,
-		})
+		}))
 		return
 	}
 
@@ -502,7 +524,7 @@ func (h *Handler) GetExecutionDetail(w http.ResponseWriter, r *http.Request) {
 		detail.FailedStep, detail.StepError, detail.StepCause = findFailedStep(hist.Events)
 	}
 
-	httputil.WriteJSON(w, http.StatusOK, detail)
+	httputil.WriteJSON(w, http.StatusOK, h.served(detail))
 }
 
 // ---------------------------------------------------------------------------

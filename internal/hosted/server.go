@@ -158,10 +158,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusForbidden, previewRefusal)
 		return
 	}
-	if e.PersonalData && refusesPersonalData(pathpkg.Clean(strings.TrimPrefix(rest, "/api")), r) {
-		httputil.WriteError(w, http.StatusForbidden, personalDataRefusal)
-		return
-	}
 	// A local workspace has only its stored summary: ?live=1 reads it too.
 	if rest == "/api/workspace/summary" && (r.URL.Query().Get("live") != "1" || e.Kind == KindLocal) {
 		if body, err := s.store.Get(r.Context(), name); err == nil && body != nil {
@@ -177,6 +173,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusNotFound, "workspace "+name+": "+ErrNoSummary.Error())
 			return
 		}
+	}
+	// Column tags: an admin (group "all") reads with the admin role.
+	if viewerFrom(r.Context()).All() {
+		e = e.AdminView()
 	}
 	ws, err := s.opener.Open(r.Context(), e)
 	if errors.Is(err, ErrNoSummary) || errors.Is(err, ErrNoDrill) {

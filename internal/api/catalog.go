@@ -401,8 +401,13 @@ func (h *CatalogHandler) listTablesInDatabase(ctx context.Context, db string) ([
 // writes only its own slice index so the shared slice needs no lock. A fresh
 // cache hit is resolved synchronously in the loop before the decision to
 // spawn, so it consumes neither a worker slot nor a goroutine.
+//
+// A workspace with column tags (an "access" block) keeps the Glue columns:
+// the runner keeps them real (its Glue sync is required there), and Lake
+// Formation leaves out of GetTable the columns the caller may not read,
+// which the Delta log would show.
 func (h *CatalogHandler) enrichDeltaColumns(ctx context.Context, tables []CatalogTable) {
-	if h.s3 == nil {
+	if h.s3 == nil || h.columnsFromGlue() {
 		return
 	}
 	sem := make(chan struct{}, catalogEnrichConcurrency)
@@ -471,6 +476,15 @@ func (h *CatalogHandler) storeSchema(location string, cols []CatalogColumn) {
 		h.schemaCache = map[string]catalogSchemaEntry{}
 	}
 	h.schemaCache[location] = catalogSchemaEntry{cols: cols, fetchedAt: h.now()}
+}
+
+// columnsFromGlue is true for a workspace with column tags.
+func (h *CatalogHandler) columnsFromGlue() bool {
+	if h.workspaceRoot == "" {
+		return false
+	}
+	m, _ := workspace.Load(h.workspaceRoot)
+	return m != nil && m.Access != nil
 }
 
 // readDeltaColumns parses an `s3://bucket/key` table root, reads the
@@ -550,6 +564,13 @@ func glueTableToCatalog(db string, t gluetypes.Table) CatalogTable {
 		// Iceberg tables tag themselves via "table_type=ICEBERG".
 		if v, ok := t.Parameters["table_type"]; ok {
 			tableType = strings.ToUpper(v)
+		} else if _, delta := t.Parameters["delta.minReaderVersion"]; delta || strings.EqualFold(t.Parameters["spark.sql.sources.provider"], "delta") {
+			// Spark's saveAsTable marks a Delta table with its provider and
+			// its Delta protocol versions. The catalog of a workspace with
+			// column tags reads no Delta log, so these are its only signs,
+			// and Lake Formation leaves the provider out of what a
+			// column-limited reader gets (smoke2, 2026-11-22).
+			tableType = "DELTA"
 		}
 	}
 

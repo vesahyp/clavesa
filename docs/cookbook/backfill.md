@@ -79,7 +79,7 @@ Unpromoted staging tables get swept by the Delta-maintenance slice after `backfi
 
 ## Troubleshooting
 
-**Backfill stage runs for 15 minutes then times out.** Lambda's 15-minute hard ceiling. Narrow the cursor range and run multiple smaller backfills, or move the transform to `compute = "fargate"` (longer-running, similar cost shape) for the backfill.
+**Backfill stage runs for 15 minutes then times out.** Lambda's run limit (15 minutes, the maximum for the synchronous invoke that Step Functions makes; `runner_timeout_seconds` in `terraform.tfvars` can only set it lower). Narrow the cursor range and run multiple smaller backfills, or move the transform to `compute = "fargate"` (longer-running, similar cost shape) for the backfill.
 
 **Promote button is disabled.** Either the output is `mode = "replace"` (partial-window replace not yet supported — re-stage with `--direct` instead), or your `append`-mode target hasn't declared `merge_keys`. Set them with `clavesa node edit … --output-merge-keys <col>` and re-deploy; future backfills get the merge path automatically.
 

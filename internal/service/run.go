@@ -2126,6 +2126,11 @@ type runOutcome struct {
 	errorClass string
 	errorMsg   string
 
+	// hideErrorText keeps errorMsg out of the _run.json marker: a run in
+	// a workspace with column tags, whose markers the hosted reader reads
+	// (an error can quote a row). The runs row keeps it.
+	hideErrorText bool
+
 	mu sync.Mutex
 }
 
@@ -2204,6 +2209,9 @@ func writeRunMarker(ctx context.Context, store observability.ProgressStore, outc
 		FailedStep: outcome.failedStep,
 		ErrorClass: outcome.errorClass,
 		ErrorMsg:   outcome.errorMsg,
+	}
+	if outcome.hideErrorText {
+		m.ErrorMsg = ""
 	}
 	if outcome.endedMs != 0 {
 		m.EndedMs = int64Ptr(outcome.endedMs)

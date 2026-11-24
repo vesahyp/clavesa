@@ -19,24 +19,24 @@ import (
 //
 // Everything else goes to next.
 //
-// A workspace the registry marks personal_data serves no widget result,
-// whatever the Mac sent (slice 5 review, finding 2): the registry is the
-// hosted side's own word. Its dashboards are hidden too (2026-11-19: every
-// widget showed "Query failed", for something that works as designed):
-// the list is empty, and a link to one answers 403 with personalDashboards,
-// which the dashboard page shows.
-// personalDashboards is what a link to a dashboard of a personal_data
-// local workspace answers on the hosted site.
-const personalDashboards = "This dashboard holds visitor data and opens only in the local clavesa UI"
+// A workspace whose snapshot holds no widget result (no snapshot, or a
+// Mac that published none) lists no dashboards, and a link to one answers
+// 403 with noPublishedDashboards, which the dashboard page shows as a
+// notice: every widget would fail otherwise (2026-11-19).
+
+// noPublishedDashboards is what a link to a dashboard answers when the
+// Mac published no widget result of the workspace.
+const noPublishedDashboards = "This dashboard's values are not published from the Mac; it opens in the local clavesa UI"
 
 func snapshotRoutes(e Entry, snap *service.DrillSnapshot, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		published := snap != nil && len(snap.Widgets) > 0
 		switch {
-		case e.PersonalData && r.URL.Path == "/dashboards" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		case !published && r.URL.Path == "/dashboards" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 			httputil.WriteJSON(w, http.StatusOK, map[string][]struct{}{"dashboards": {}})
 			return
-		case e.PersonalData && strings.HasPrefix(r.URL.Path, "/dashboards/"):
-			httputil.WriteError(w, http.StatusForbidden, personalDashboards)
+		case !published && strings.HasPrefix(r.URL.Path, "/dashboards/"):
+			httputil.WriteError(w, http.StatusForbidden, noPublishedDashboards)
 			return
 		case r.URL.Path == "/workspace/tables" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 			if snap == nil || len(snap.Catalog) == 0 {
@@ -56,7 +56,7 @@ func snapshotRoutes(e Entry, snap *service.DrillSnapshot, next http.Handler) htt
 				httputil.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 				return
 			}
-			if snap != nil && !e.PersonalData {
+			if snap != nil {
 				if res, ok := snap.Widgets[service.DashboardWidgetKey(req.Dir, req.SQL)]; ok && res != nil {
 					httputil.WriteJSON(w, http.StatusOK, res)
 					return
